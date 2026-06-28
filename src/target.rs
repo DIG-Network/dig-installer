@@ -12,12 +12,9 @@
 //! These names MUST match what the upstream release workflows actually upload,
 //! or the installer 404s. They are pinned here and asserted by tests.
 //!
-//! * **digstore** (`DIG-Network/digstore` `release.yml`) ships ONE run-once
-//!   per OS — historically a GUI installer. The universal installer instead
-//!   consumes the **raw `digstore` CLI binary**, which `publish-binary.yml`
-//!   builds; the raw per-OS CLI binaries are published as release assets named
-//!   `digstore-<ver>-<os_arch>[.exe]` by the migrated release workflow in this
-//!   repo's sibling (see README → "What the installer downloads").
+//! * **digstore** (`DIG-Network/digstore` `release.yml`, post-extraction)
+//!   publishes the raw per-OS CLI binary as `digstore-<ver>-<os_arch>[.exe]` —
+//!   exactly what this installer downloads and places on PATH.
 //! * **dig-node** (`DIG-Network/dig-node`, formerly `dig-companion`)
 //!   `release.yml` publishes `dig-node-<ver>-<os_arch>[.exe]` per OS/arch.
 //!
