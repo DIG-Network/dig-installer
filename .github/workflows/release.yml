@@ -1,0 +1,264 @@
+name: Release dig-installer
+
+# Tag-driven release (mirrors digstore's / dig-node's pattern). On a version tag
+# (v*) build the universal `dig-installer` CLI binary for every supported OS/arch
+# AND the Tauri GUI installers, then attach them all to one GitHub Release.
+#
+# Universal CLI (the canonical artifact the install.sh/install.ps1 bootstrap
+# downloads):
+#   * windows-x64  → dig-installer-<ver>-windows-x64.exe
+#   * linux-x64    → dig-installer-<ver>-linux-x64
+#   * macos-arm64  → dig-installer-<ver>-macos-arm64
+#   * macos-x64    → dig-installer-<ver>-macos-x64
+#
+# GUI installer (migrated from digstore; embeds the released digstore binary):
+#   * windows → DigStore-Setup-<ver>-windows-x64.exe   (raw Tauri exe)
+#   * macos   → DigStore-Setup-<ver>-macos.dmg
+#   * linux   → DigStore-Setup-<ver>-linux-x86_64.AppImage
+#
+# A push to main also builds the CLI (no publish) so a broken build is caught
+# before tagging.
+on:
+  push:
+    tags:
+      - "v*"
+    branches: [main]
+    paths:
+      - "src/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "gui/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: fmt + clippy + tests once. A tag that doesn't pass never publishes.
+  # ---------------------------------------------------------------------------
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + components)
+        run: |
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-check-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  # Build the universal CLI installer binary per OS/arch.
+  # ---------------------------------------------------------------------------
+  build-cli:
+    name: build cli (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: dig-installer.exe
+            out_name: windows-x64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: dig-installer
+            out_name: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: dig-installer
+            out_name: macos-arm64
+          - os: macos-13 # Intel runner
+            target: x86_64-apple-darwin
+            bin: dig-installer
+            out_name: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust + target
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-build-${{ matrix.target }}-
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-installer
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+          DEST="dist/dig-installer-${VER}-${{ matrix.out_name }}"
+          cp "$SRC" "$DEST"
+          ls -la dist
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-installer-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Build the Tauri GUI installer per OS. It embeds the LATEST released digstore
+  # binary (downloaded here), so each artifact is a single self-contained file.
+  # Only runs on a tag (the GUI is heavier; main pushes just gate the CLI).
+  # ---------------------------------------------------------------------------
+  build-gui:
+    name: build gui (${{ matrix.os }})
+    needs: check
+    if: github.ref_type == 'tag'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            digstore_asset_os: windows-x64.exe
+            digstore_bin: digstore.exe
+            build_args: "--no-bundle"
+            artifact_glob: "src-tauri/target/release/*.exe"
+            out_name: "windows-x64.exe"
+          - os: macos-latest
+            digstore_asset_os: macos-arm64
+            digstore_bin: digstore
+            build_args: "--bundles dmg"
+            artifact_glob: "src-tauri/target/release/bundle/dmg/*.dmg"
+            out_name: "macos.dmg"
+          - os: ubuntu-22.04
+            digstore_asset_os: linux-x64
+            digstore_bin: digstore
+            build_args: "--bundles appimage"
+            artifact_glob: "src-tauri/target/release/bundle/appimage/*.AppImage"
+            out_name: "linux-x86_64.AppImage"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+      - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gui/app/src-tauri/target
+          key: ${{ runner.os }}-installer-gui-${{ hashFiles('gui/app/src-tauri/Cargo.lock', 'gui/app/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-installer-gui-
+      - name: Derive version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      # Download the LATEST released digstore CLI for this OS so the GUI installer
+      # can embed it (single-file install). dig-installer does NOT build digstore.
+      - name: Fetch latest released digstore binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(curl -fsSL https://api.github.com/repos/DIG-Network/digstore/releases/latest | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+          dver="${tag#v}"
+          asset="digstore-${dver}-${{ matrix.digstore_asset_os }}"
+          url="https://github.com/DIG-Network/digstore/releases/download/${tag}/${asset}"
+          echo "fetching $url"
+          mkdir -p _digstore
+          curl -fsSL "$url" -o "_digstore/${{ matrix.digstore_bin }}"
+          chmod +x "_digstore/${{ matrix.digstore_bin }}" || true
+      - name: Install frontend deps
+        working-directory: gui/app
+        run: npm ci || npm install
+      - name: Stage bundled digstore binary
+        working-directory: gui/app
+        run: node scripts/stage-binary.mjs --src ../../_digstore/${{ matrix.digstore_bin }}
+      - name: Build the GUI installer
+        working-directory: gui/app
+        run: npx tauri build ${{ matrix.build_args }}
+      - name: Collect single installer artifact
+        shell: bash
+        working-directory: gui/app
+        run: |
+          mkdir -p ../../dist-gui
+          artifact="$(ls -1 ${{ matrix.artifact_glob }} | head -n1)"
+          [ -n "$artifact" ] || { echo "no artifact matched ${{ matrix.artifact_glob }}"; exit 1; }
+          cp "$artifact" "../../dist-gui/DigStore-Setup-${VERSION}-${{ matrix.out_name }}"
+          ls -la ../../dist-gui
+      - name: Upload GUI installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digstore-gui-installer-${{ matrix.os }}
+          path: dist-gui/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # One publish job after all builds — no race to create the Release. Tag only.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    needs: [build-cli, build-gui]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+      - name: Create / update the release and attach assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

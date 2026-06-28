@@ -1,0 +1,57 @@
+# The universal DIG installer.
+#
+# `dig-installer` downloads the released `digstore` CLI binary (and, optionally,
+# the `dig-node` local-node binary) for the current OS/arch from the canonical
+# DIG-Network GitHub releases, places `digstore` on PATH, and — when asked —
+# installs + starts `dig-node` as an OS service by delegating to dig-node's own
+# `install`/`start` subcommands (it is the standalone-server twin of the native
+# DIG Browser's in-process dig-node; see SYSTEM.md → dig-companion/dig-node).
+#
+# It does NOT build either binary itself: digstore still `cargo`-builds and
+# publishes the `digstore` binary from its own repo; dig-installer only CONSUMES
+# those released artifacts. This is the canonical home of the DIG installer,
+# migrated out of digstore (which previously shipped a Tauri GUI installer).
+[package]
+name = "dig-installer"
+version = "0.1.0"
+description = "Universal DIG installer — installs the digstore CLI and (optionally) the dig-node service"
+authors = ["DIG Network"]
+edition = "2021"
+license = "GPL-2.0-only"
+repository = "https://github.com/DIG-Network/dig-installer"
+# Standalone single-crate repo — its own workspace root.
+
+[[bin]]
+name = "dig-installer"
+path = "src/main.rs"
+
+[lib]
+name = "dig_installer"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking HTTP with rustls (no system OpenSSL) — matches the digstore/dig-node
+# crates' rustls-only posture so the installer is a self-contained binary.
+ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
+sha2 = "0.10"
+hex = "0.4"
+dirs = "5"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+# User-PATH update on Windows: read/write HKCU\Environment directly (no setx
+# truncation) and broadcast WM_SETTINGCHANGE so new shells pick up the change.
+winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+overflow-checks = true
+opt-level = "s"
+lto = true
+strip = true

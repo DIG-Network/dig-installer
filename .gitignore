@@ -1,0 +1,18 @@
+# Rust build output
+/target
+/gui/app/src-tauri/target
+
+# Node / Tauri GUI build output
+/gui/app/node_modules
+/gui/app/dist
+/gui/app/src-tauri/resources/bin/digstore
+/gui/app/src-tauri/resources/bin/digstore.exe
+/gui/app/src-tauri/resources/bin/*.sha256
+
+# CI scratch
+/dist
+/dist-gui
+/_digstore
+
+# OS noise
+.DS_Store
