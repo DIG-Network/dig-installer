@@ -32,7 +32,12 @@ src = resolve(src);
 
 if (!existsSync(src)) {
   console.error(`[stage-binary] source not found: ${src}`);
-  console.error(`[stage-binary] build it first: cargo build -p digstore-cli --release`);
+  console.error(
+    `[stage-binary] pass --src <path-to-digstore[.exe]> pointing at a released ` +
+      `digstore binary (the GUI installer embeds it). The release workflow ` +
+      `downloads it from DIG-Network/digstore releases; locally you can use a ` +
+      `binary built from the digstore repo (cargo build -p digstore-cli --release).`
+  );
   process.exit(1);
 }
 
