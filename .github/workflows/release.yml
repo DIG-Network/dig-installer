@@ -86,11 +86,27 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: dig-installer
             out_name: linux-x64
-          - os: macos-latest
+          # Both macOS arches build on the fast Apple-silicon macos-14 runner.
+          # The Intel binary is CROSS-COMPILED there (host arm64 → target
+          # x86_64-apple-darwin) rather than on a native macos-13 (Intel)
+          # runner: that Intel runner pool is chronically backlogged, so the
+          # macos-x64 job used to hang for hours (pending, never failing) and
+          # the release never completed. Cross-compiling needs no extra
+          # toolchain here — Apple's clang (Xcode on macos-14) targets both
+          # arches and the build steps are already `--target`-parameterized
+          # (rustup target add + cargo build --target). The only C/asm
+          # dependency in the macOS build graph is `ring` (via rustls, used by
+          # ureq), which the Apple toolchain assembles for x86_64 natively from
+          # an arm host. There is no `openssl-sys` in the graph at all (ureq is
+          # rustls-only — default-features off), so there is no vendored-openssl
+          # cross-compile to worry about. Artifact names (out_name, upload name,
+          # staged filename) are unchanged so the install.sh/install.ps1 thin
+          # shim + apt asset matchers still resolve the assets.
+          - os: macos-14 # Apple silicon (arm64)
             target: aarch64-apple-darwin
             bin: dig-installer
             out_name: macos-arm64
-          - os: macos-13 # Intel runner
+          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
             target: x86_64-apple-darwin
             bin: dig-installer
             out_name: macos-x64
