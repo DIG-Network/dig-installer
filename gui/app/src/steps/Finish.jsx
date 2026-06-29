@@ -11,7 +11,8 @@ export function Finish({ path, onCopy, copied, meta }) {
         DigStore is <span className="gt">installed</span>
       </h2>
       <p className="lead">
-        The CLI and host runtime are ready. Initialize your first content-addressable store and commit a generation.
+        The CLI and host runtime are ready. Initialize your first store, then commit a <b>capsule</b>
+        (<code>storeId:rootHash</code> — one immutable generation) and push it to <b>DIGHUb</b>.
       </p>
       <div className="recap">
         <span className="chip">
@@ -47,7 +48,7 @@ export function Finish({ path, onCopy, copied, meta }) {
           </div>
           <div className="c-line">
             <span className="p">$</span> <span className="cmd-t">digstore commit -m "v1"</span>{"  "}
-            <span className="cc"># compile a .wasm generation</span>
+            <span className="cc"># compile + publish a capsule to DIGHUb</span>
           </div>
         </div>
       </div>

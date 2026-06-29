@@ -69,6 +69,48 @@ fn help_json_emits_the_full_contract() {
     assert!(targets.contains(&"macos-arm64"));
 }
 
+/// Regression guard (terminology gap): the installer GUI must read as PART of
+/// the DIG ecosystem, not a standalone tool. SYSTEM.md → "Canonical terminology
+/// & branding" requires the user-facing copy to use the shared vocabulary; the
+/// wizard previously surfaced none of it. This asserts each canonical term lands
+/// somewhere in the shipped wizard copy so the framing can't silently regress.
+#[test]
+fn gui_copy_uses_canonical_ecosystem_vocabulary() {
+    use std::fs;
+    use std::path::Path;
+
+    let dir = env!("CARGO_MANIFEST_DIR");
+    // Concatenate the user-facing wizard copy (the screens a user actually reads).
+    let copy: String = [
+        "gui/app/src/steps/Welcome.jsx",
+        "gui/app/src/steps/Finish.jsx",
+        "gui/app/src/data.jsx",
+    ]
+    .iter()
+    .map(|rel| fs::read_to_string(Path::new(dir).join(rel)).unwrap_or_default())
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    for term in [
+        "DIGHUb",
+        "dig-node",
+        "capsule",
+        "$DIG",
+        "DigStore",
+        "DIG Network",
+    ] {
+        assert!(
+            copy.contains(term),
+            "GUI copy must reference the canonical term {term:?}"
+        );
+    }
+    // The off-canon hub casing must never reappear in the wizard copy.
+    assert!(
+        !copy.contains("DIGHub"),
+        "GUI copy must not use the off-canon 'DIGHub' casing"
+    );
+}
+
 #[test]
 fn help_lists_the_selectable_component_flags() {
     let out = bin().arg("--help").assert().success();
@@ -88,6 +130,53 @@ fn help_lists_the_selectable_component_flags() {
 #[test]
 fn version_flag_works() {
     bin().arg("--version").assert().success();
+}
+
+/// Regression guard (license-correctness bug): every license-bearing surface in
+/// the repo must declare the crate's actual license — GNU GPL-2.0-only (see the
+/// root `Cargo.toml`). The GUI wizard + its design/handoff docs previously
+/// claimed "Apache-2.0", contradicting the binary's real license. This walks the
+/// shipped GUI sources + the asset docs and fails if any of them re-assert an
+/// Apache license, so the contradiction can never silently resurface.
+#[test]
+fn no_surface_claims_a_non_gpl_license() {
+    use std::fs;
+    use std::path::Path;
+
+    // Files a user (or a redistributor) reads to learn the license: the shipped
+    // wizard steps, the design prototype it was ported from, and the handoff doc.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let surfaces = [
+        "gui/app/src/steps/License.jsx",
+        "gui/app/src/steps/Welcome.jsx",
+        "gui/assets/README.md",
+        "gui/assets/design/installer/installer-app.jsx",
+    ];
+
+    let mut offenders = Vec::new();
+    for rel in surfaces {
+        let path = Path::new(manifest_dir).join(rel);
+        let body = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read license surface {rel}: {e}"));
+        // "Apache" anywhere in a license-bearing surface is the contradiction.
+        if body.contains("Apache") {
+            offenders.push(rel);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "license surfaces still claim Apache (must be GPL-2.0): {offenders:?}"
+    );
+
+    // The shipped license step must affirmatively name the GPL — proves the fix
+    // is a real correction, not just a deletion of the word "Apache".
+    let license_step =
+        fs::read_to_string(Path::new(manifest_dir).join("gui/app/src/steps/License.jsx"))
+            .expect("read License.jsx");
+    assert!(
+        license_step.contains("General Public License"),
+        "License.jsx must name the GNU General Public License"
+    );
 }
 
 #[test]

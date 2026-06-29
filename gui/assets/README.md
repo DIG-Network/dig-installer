@@ -178,20 +178,21 @@ Pane padding `44px 56px` (density-dependent).
      zero-knowledge proofs of execution. No embedded secret to extract."
 - **Meta chips** (pill row, Space Mono `12px`, bg `rgba(255,255,255,.04)`, border
   `1px solid rgba(255,255,255,.08)`): `version 1.0.0`, `install size ~46 MB`,
-  `platforms macOS · Linux · Windows`, `license Apache-2.0`.
+  `platforms macOS · Linux · Windows`, `license GPL-2.0`.
 - **Primary CTA:** "Install DigStore". No Back button.
 
 ### Step 1 — License Agreement
 - **Purpose:** present terms; gate continuation on agreement.
 - Eyebrow "Step 02 — Terms". Title "License Agreement". Lead "Review the terms below.
-  DigStore is open source under the Apache License 2.0."
-- **License box:** `height: 288px`, scrollable, bg `#0A0A20`, border
-  `1px solid rgba(255,255,255,.08)`, radius `14px`, Space Mono `12.5px`, line-height
-  `1.85`, color `#C5C1E0`. Contains an Apache-2.0-style EULA whose clauses reflect the
-  product: (1) Grant, (2) The module is the artifact, (3) URN as credential, (4)
-  Provider blindness, (5) Warranty AS-IS, (6) Limitation of liability. Use the exact
-  text in `design/installer/installer-app.jsx` (`License` component) — or ship the real
-  Apache-2.0 text plus a short DigStore preamble.
+  DigStore is free software under the GNU General Public License v2.0 — the same
+  license as Git."
+- **License box:** `height: 288px`, scrollable, white surface, subtle border,
+  radius `14px`, Space Mono `12.5px`, line-height `1.85`. Contains a GPL-2.0 EULA
+  whose clauses reflect the product: (1) Grant (copyleft — derivative works pass on
+  the same freedoms and make source available), (2) The module is the artifact,
+  (3) URN as credential, (4) Provider blindness, (5) Warranty AS-IS, (6) Limitation
+  of liability. Use the exact text in `design/installer/installer-app.jsx`
+  (`License` component) — or ship the real GPL-2.0 text plus a short DigStore preamble.
 - **Agree control:** a `22px` custom checkbox + label "I have read and agree to the
   DigStore License Agreement." Unchecked = outlined; checked = brand-gradient fill,
   white check, magenta glow. Clicking the row toggles it.
@@ -405,7 +406,7 @@ substitute your icon set. Use brand colors; don't introduce new hues.
 
 **Brand rules:** keep clear space around the wordmark ≈ the height of the "D"; never
 recolor/stretch the logo; glow "D" on dark only (gradient/black "D" on light). The DIG
-**mascot** is intentionally **not** used here — it's reserved for the consumer DIGHub
+**mascot** is intentionally **not** used here — it's reserved for the consumer DIGHUb
 app, not the developer tooling.
 
 ---
