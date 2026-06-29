@@ -15,7 +15,16 @@ use crate::release::Repo;
 /// GitHub requires a User-Agent on API requests.
 const USER_AGENT: &str = concat!("dig-installer/", env!("CARGO_PKG_VERSION"));
 
-/// Parse the `tag_name` out of a GitHub `releases/latest` JSON payload.
+/// A GitHub release reduced to what the installer needs: the tag and the names
+/// of every uploaded asset (so the OS/arch matcher in [`crate::asset`] can pick
+/// the right one, instead of betting on a single guessed filename).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    pub tag_name: String,
+    pub asset_names: Vec<String>,
+}
+
+/// Parse the `tag_name` out of a GitHub release JSON payload.
 /// Pure — takes the raw body, returns the tag (e.g. `v0.6.0`).
 pub fn tag_name_from_release_json(body: &str) -> Result<String, String> {
     let v: serde_json::Value =
@@ -26,16 +35,59 @@ pub fn tag_name_from_release_json(body: &str) -> Result<String, String> {
         .ok_or_else(|| "release JSON had no tag_name".to_string())
 }
 
+/// Parse a GitHub release JSON payload into a [`Release`] (tag + asset names).
+/// Pure — the heart of the thin-shim asset resolution, unit-tested without a
+/// network.
+pub fn release_from_json(body: &str) -> Result<Release, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("parse release JSON: {e}"))?;
+    let tag_name = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "release JSON had no tag_name".to_string())?;
+    let asset_names = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Release {
+        tag_name,
+        asset_names,
+    })
+}
+
 /// Discover the latest published tag for a repo via the GitHub API.
 pub fn latest_tag(repo: &Repo) -> Result<String, String> {
+    Ok(latest_release(repo)?.tag_name)
+}
+
+/// Fetch the latest release (tag + asset list) for a repo via the GitHub API.
+pub fn latest_release(repo: &Repo) -> Result<Release, String> {
     let url = repo.latest_release_api();
-    let resp = ureq::get(&url)
+    let body = get_text(&url)?;
+    release_from_json(&body)
+}
+
+/// Fetch a specific release by tag (tag + asset list) via the GitHub API.
+pub fn release_by_tag(repo: &Repo, tag: &str) -> Result<Release, String> {
+    let url = repo.release_by_tag_api(tag);
+    let body = get_text(&url)?;
+    release_from_json(&body)
+}
+
+/// GET a URL as text with the GitHub API headers. Internal helper.
+fn get_text(url: &str) -> Result<String, String> {
+    let resp = ureq::get(url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| format!("GET {url}: {e}"))?;
-    let body = resp.into_string().map_err(|e| format!("read {url}: {e}"))?;
-    tag_name_from_release_json(&body)
+    resp.into_string().map_err(|e| format!("read {url}: {e}"))
 }
 
 /// Hex SHA-256 of a byte slice.
@@ -109,6 +161,41 @@ mod tests {
     fn errors_without_tag_name() {
         assert!(tag_name_from_release_json(r#"{"name":"x"}"#).is_err());
         assert!(tag_name_from_release_json("not json").is_err());
+    }
+
+    #[test]
+    fn release_from_json_extracts_tag_and_asset_names() {
+        let body = r#"{
+            "tag_name": "v0.6.0",
+            "assets": [
+                {"name": "digstore-0.6.0-linux-x64", "size": 123},
+                {"name": "digstore-0.6.0-windows-x64.exe"},
+                {"name": "digstore-0.6.0-macos-arm64"}
+            ]
+        }"#;
+        let r = release_from_json(body).unwrap();
+        assert_eq!(r.tag_name, "v0.6.0");
+        assert_eq!(
+            r.asset_names,
+            vec![
+                "digstore-0.6.0-linux-x64".to_string(),
+                "digstore-0.6.0-windows-x64.exe".to_string(),
+                "digstore-0.6.0-macos-arm64".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn release_from_json_tolerates_no_assets() {
+        let r = release_from_json(r#"{"tag_name":"v1.0.0"}"#).unwrap();
+        assert_eq!(r.tag_name, "v1.0.0");
+        assert!(r.asset_names.is_empty());
+    }
+
+    #[test]
+    fn release_from_json_errors_without_tag() {
+        assert!(release_from_json(r#"{"assets":[]}"#).is_err());
+        assert!(release_from_json("not json").is_err());
     }
 
     #[test]

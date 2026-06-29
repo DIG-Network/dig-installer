@@ -41,6 +41,11 @@ hex = "0.4"
 dirs = "5"
 tempfile = "3"
 
+[dev-dependencies]
+# End-to-end CLI contract tests: drive the built `dig-installer` binary and
+# assert its --help-json/--help/exit-code surface (no network).
+assert_cmd = "2"
+
 [target.'cfg(windows)'.dependencies]
 # User-PATH update on Windows: read/write HKCU\Environment directly (no setx
 # truncation) and broadcast WM_SETTINGCHANGE so new shells pick up the change.

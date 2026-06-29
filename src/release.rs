@@ -49,12 +49,29 @@ impl Repo {
         Repo::new("DIG-Network", "dig-companion", "dig-companion")
     }
 
+    /// The DIG Browser release source (`DIG-Network/DIG_Browser`). Publishes a
+    /// native installer per OS (`.exe` / `.dmg` / `.AppImage`), so it is matched
+    /// as an [`AssetKind::Installer`](crate::asset::AssetKind::Installer), not a
+    /// raw PATH binary.
+    pub fn dig_browser() -> Repo {
+        Repo::new("DIG-Network", "DIG_Browser", "DIG-Browser")
+    }
+
     /// GitHub API URL for the latest release of this repo (returns JSON with a
-    /// `tag_name`).
+    /// `tag_name` and an `assets` array).
     pub fn latest_release_api(&self) -> String {
         format!(
             "https://api.github.com/repos/{}/{}/releases/latest",
             self.owner, self.name
+        )
+    }
+
+    /// GitHub API URL for a specific release by tag (returns the same shape as
+    /// [`latest_release_api`](Self::latest_release_api)).
+    pub fn release_by_tag_api(&self, tag: &str) -> String {
+        format!(
+            "https://api.github.com/repos/{}/{}/releases/tags/{}",
+            self.owner, self.name, tag
         )
     }
 
@@ -127,6 +144,18 @@ mod tests {
             Repo::dig_node_legacy(),
             Repo::new("DIG-Network", "dig-companion", "dig-companion")
         );
+        assert_eq!(
+            Repo::dig_browser(),
+            Repo::new("DIG-Network", "DIG_Browser", "DIG-Browser")
+        );
+    }
+
+    #[test]
+    fn dig_browser_latest_release_api_url() {
+        assert_eq!(
+            Repo::dig_browser().latest_release_api(),
+            "https://api.github.com/repos/DIG-Network/DIG_Browser/releases/latest"
+        );
     }
 
     #[test]
@@ -134,6 +163,14 @@ mod tests {
         assert_eq!(
             Repo::digstore().latest_release_api(),
             "https://api.github.com/repos/DIG-Network/digstore/releases/latest"
+        );
+    }
+
+    #[test]
+    fn release_by_tag_api_url() {
+        assert_eq!(
+            Repo::digstore().release_by_tag_api("v0.6.0"),
+            "https://api.github.com/repos/DIG-Network/digstore/releases/tags/v0.6.0"
         );
     }
 
