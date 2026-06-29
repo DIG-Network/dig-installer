@@ -1,0 +1,257 @@
+//! `dig.local` hosts-file registration (installer side of task #91).
+//!
+//! When the dig-node service is installed, the installer best-effort registers a
+//! loopback hosts entry **`127.0.0.2   dig.local`** so consumers (the DIG
+//! Browser, the extension) can address the local node port-free at
+//! `http://dig.local` (with `localhost` as the fallback). `127.0.0.2` — rather
+//! than `127.0.0.1` — keeps `dig.local` on its own loopback IP so it never
+//! collides with whatever else the user runs on `localhost`.
+//!
+//! Scope (installer side ONLY): this module writes/removes the hosts entry. The
+//! dig-node *dual-listener* (`127.0.0.2:80` + `localhost:<port>` + Host
+//! allowlist) that makes the entry actually resolve to the node is a SEPARATE
+//! dig-node task and is NOT done here.
+//!
+//! Contract:
+//! * **Idempotent** — [`with_dig_local_entry`] is a no-op (returns `None`) if the
+//!   exact entry is already present, so re-running the installer never duplicates.
+//! * **Reversible** — [`without_dig_local_entry`] removes only the lines this
+//!   installer added (tagged with [`MARKER`]), for a clean uninstall.
+//! * **Best-effort** — the actual file write needs elevation; a failure is
+//!   surfaced but **never aborts the install** (the caller keeps `localhost`).
+//!
+//! The pure edit logic here is unit-tested; the elevated file I/O is in
+//! [`write_dig_local`] / [`remove_dig_local`].
+
+use std::path::PathBuf;
+
+/// The loopback IP `dig.local` resolves to. Distinct from `127.0.0.1` so the
+/// DIG local node owns its own address (see module docs).
+pub const DIG_LOCAL_IP: &str = "127.0.0.2";
+
+/// The hostname the local DIG node is reachable at, port-free.
+pub const DIG_LOCAL_HOST: &str = "dig.local";
+
+/// Trailing tag on the line we add, so an uninstall can find + remove exactly
+/// the installer's own entry without touching anything the user wrote.
+pub const MARKER: &str = "# added by dig-installer (dig.local → local DIG node)";
+
+/// The canonical hosts line this installer writes.
+pub fn dig_local_line() -> String {
+    format!("{DIG_LOCAL_IP}\t{DIG_LOCAL_HOST}\t{MARKER}")
+}
+
+/// Platform hosts-file path: `%SystemRoot%\System32\drivers\etc\hosts` on
+/// Windows (honouring `%SystemRoot%`), `/etc/hosts` elsewhere.
+pub fn hosts_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        PathBuf::from(root)
+            .join("System32")
+            .join("drivers")
+            .join("etc")
+            .join("hosts")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/etc/hosts")
+    }
+}
+
+/// Is an active (non-commented) `dig.local` mapping already present in `contents`?
+///
+/// "Active" = a line that, with comments stripped, maps some IP to the
+/// `dig.local` host. We treat ANY existing active mapping as "present" so we
+/// don't fight a user who pointed `dig.local` somewhere deliberately.
+pub fn has_dig_local(contents: &str) -> bool {
+    contents.lines().any(line_maps_dig_local)
+}
+
+/// Does a single hosts line actively map `dig.local`? (Ignores comment-only and
+/// blank lines; a trailing `# ...` comment after the mapping is fine.)
+fn line_maps_dig_local(line: &str) -> bool {
+    let code = match line.split_once('#') {
+        // Keep the part before the FIRST '#', unless the whole line is a comment.
+        Some((before, _)) => before,
+        None => line,
+    };
+    let mut fields = code.split_whitespace();
+    // First field is the IP; the rest are hostnames/aliases.
+    let _ip = match fields.next() {
+        Some(ip) => ip,
+        None => return false,
+    };
+    fields.any(|host| host.eq_ignore_ascii_case(DIG_LOCAL_HOST))
+}
+
+/// Compute the new hosts-file contents with the `dig.local` entry **appended**,
+/// or `None` if an active mapping already exists (idempotent no-op).
+///
+/// Pure: no I/O. Preserves the existing content verbatim and appends one line,
+/// ensuring exactly one trailing newline before it.
+pub fn with_dig_local_entry(contents: &str) -> Option<String> {
+    if has_dig_local(contents) {
+        return None;
+    }
+    let mut out = String::from(contents);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&dig_local_line());
+    out.push('\n');
+    Some(out)
+}
+
+/// Compute the new hosts-file contents with the installer's `dig.local` line(s)
+/// **removed**, or `None` if there is nothing tagged to remove.
+///
+/// Only removes lines carrying our [`MARKER`] — a hand-written `dig.local` entry
+/// the user added is left untouched. Pure: no I/O.
+pub fn without_dig_local_entry(contents: &str) -> Option<String> {
+    if !contents.contains(MARKER) {
+        return None;
+    }
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.contains(MARKER))
+        .collect();
+    let mut out = kept.join("\n");
+    // Preserve a trailing newline if the original had one.
+    if contents.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Best-effort: ensure `127.0.0.2 dig.local` is in the system hosts file.
+///
+/// Returns:
+/// * `Ok(Some(note))` — the entry was added (note describes it),
+/// * `Ok(None)`       — already present (idempotent no-op),
+/// * `Err(reason)`    — could not write (e.g. needs elevation). The CALLER must
+///   treat this as best-effort and continue (keep `localhost`).
+pub fn write_dig_local() -> Result<Option<String>, String> {
+    let path = hosts_path();
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    match with_dig_local_entry(&current) {
+        None => Ok(None),
+        Some(updated) => {
+            std::fs::write(&path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+            Ok(Some(format!(
+                "{DIG_LOCAL_IP} {DIG_LOCAL_HOST} → {}",
+                path.display()
+            )))
+        }
+    }
+}
+
+/// Best-effort: remove the installer's `dig.local` entry from the hosts file
+/// (for uninstall). Same result contract as [`write_dig_local`].
+pub fn remove_dig_local() -> Result<Option<String>, String> {
+    let path = hosts_path();
+    let current = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    match without_dig_local_entry(&current) {
+        None => Ok(None),
+        Some(updated) => {
+            std::fs::write(&path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+            Ok(Some(format!(
+                "removed {DIG_LOCAL_HOST} from {}",
+                path.display()
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_when_absent() {
+        let before = "127.0.0.1\tlocalhost\n::1\tlocalhost\n";
+        let after = with_dig_local_entry(before).expect("should append");
+        assert!(after.starts_with(before));
+        assert!(after.contains("127.0.0.2\tdig.local"));
+        assert!(after.contains(MARKER));
+        assert!(after.ends_with('\n'));
+    }
+
+    #[test]
+    fn idempotent_when_our_entry_present() {
+        let before = format!("127.0.0.1 localhost\n{}\n", dig_local_line());
+        assert_eq!(with_dig_local_entry(&before), None);
+    }
+
+    #[test]
+    fn idempotent_when_user_added_dig_local() {
+        // A user-written mapping (no marker, even different IP) counts as present —
+        // we never fight a deliberate override.
+        let before = "127.0.0.1 localhost\n10.0.0.5   dig.local\n";
+        assert_eq!(with_dig_local_entry(before), None);
+        assert!(has_dig_local(before));
+    }
+
+    #[test]
+    fn commented_dig_local_is_not_active() {
+        let before = "127.0.0.1 localhost\n# 127.0.0.2 dig.local (disabled)\n";
+        assert!(!has_dig_local(before));
+        let after = with_dig_local_entry(before).expect("should append");
+        assert!(after.contains(&dig_local_line()));
+    }
+
+    #[test]
+    fn adds_newline_before_entry_when_file_lacks_trailing_newline() {
+        let before = "127.0.0.1 localhost"; // no trailing newline
+        let after = with_dig_local_entry(before).expect("should append");
+        assert_eq!(
+            after,
+            format!("127.0.0.1 localhost\n{}\n", dig_local_line())
+        );
+    }
+
+    #[test]
+    fn appends_to_empty_file() {
+        let after = with_dig_local_entry("").expect("should append");
+        assert_eq!(after, format!("{}\n", dig_local_line()));
+    }
+
+    #[test]
+    fn removes_only_our_marked_line() {
+        let before = format!(
+            "127.0.0.1 localhost\n{}\n10.0.0.9   dig.local\n",
+            dig_local_line()
+        );
+        let after = without_dig_local_entry(&before).expect("should remove");
+        assert!(!after.contains(MARKER));
+        // The user's own dig.local override survives.
+        assert!(after.contains("10.0.0.9   dig.local"));
+        assert!(after.contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn remove_is_noop_when_marker_absent() {
+        let before = "127.0.0.1 localhost\n10.0.0.9 dig.local\n";
+        assert_eq!(without_dig_local_entry(before), None);
+    }
+
+    #[test]
+    fn write_then_remove_roundtrips_to_original() {
+        let original = "127.0.0.1\tlocalhost\n::1\tlocalhost\n";
+        let added = with_dig_local_entry(original).unwrap();
+        let removed = without_dig_local_entry(&added).unwrap();
+        assert_eq!(removed, original);
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        assert!(line_maps_dig_local("127.0.0.2   DIG.LOCAL"));
+        assert!(line_maps_dig_local("127.0.0.2 dig.local # note"));
+        assert!(!line_maps_dig_local("127.0.0.2 notdig.local"));
+        assert!(!line_maps_dig_local("# 127.0.0.2 dig.local"));
+        assert!(!line_maps_dig_local(""));
+    }
+}
