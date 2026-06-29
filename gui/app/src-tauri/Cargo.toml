@@ -9,6 +9,8 @@ version = "1.0.0"
 description = "DigStore desktop installer (DIG Network)"
 authors = ["DIG Network"]
 edition = "2021"
+# Same license as the root `dig-installer` crate (and DigStore itself): GPLv2.
+license = "GPL-2.0-only"
 # Standalone: deliberately NOT a member of the root workspace so building the
 # installer never drags in / rebuilds the digstore crates under crates/.
 

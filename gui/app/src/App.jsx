@@ -311,7 +311,7 @@ function openLog(lines) {
     const w = window.open("", "_blank", "width=720,height=520");
     if (w) {
       w.document.title = "DigStore install log";
-      w.document.body.style.cssText = "background:#0A0A20;color:#C5C1E0;font:12.5px ui-monospace,monospace;padding:18px;white-space:pre-wrap;";
+      w.document.body.style.cssText = "background:#ffffff;color:#45417A;font:12.5px ui-monospace,monospace;padding:18px;white-space:pre-wrap;";
       w.document.body.textContent = text;
     }
   } catch {

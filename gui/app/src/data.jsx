@@ -9,7 +9,7 @@ export const FEATURES = [
   {
     ic: Ic.git,
     h: "A Git-shaped workflow",
-    p: "init, add, commit, log, diff, checkout, clone — the verbs you already know. Chunking, encryption and WASM compilation stay under the surface.",
+    p: "init, add, commit, log, diff, checkout, clone — the verbs you already know. Each commit advances your store to a new capsule; chunking, encryption and WASM compilation stay under the surface.",
   },
   {
     ic: Ic.lock,
@@ -18,8 +18,8 @@ export const FEATURES = [
   },
   {
     ic: Ic.shield,
-    h: "Provable & secretless",
-    p: "Each store compiles to one portable .wasm that defends itself — merkle proofs, host attestation, and zero-knowledge proofs of execution. No embedded secret to extract.",
+    h: "Publish to DIGHUb, serve anywhere",
+    p: "Each capsule compiles to one portable .wasm that defends itself — merkle proofs and host attestation. Push it to DIGHUb (the blind host) and read it back through a local dig-node or any DIG client.",
   },
 ];
 

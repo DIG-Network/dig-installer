@@ -3,13 +3,14 @@ import { FEATURES } from "../data.jsx";
 export function Welcome({ meta }) {
   return (
     <div className="fade-key">
-      <div className="eyebrow">DigStore CLI · Host Runtime</div>
+      <div className="eyebrow">DIG Network · DigStore CLI · Host Runtime</div>
       <h2>
         Install <span className="gt">DigStore</span>
       </h2>
       <p className="lead">
-        The content-addressable WASM store format. Your content and the logic that serves it compile into one portable,
-        encrypted, self-defending executable.
+        Your front door to the DIG Network. <b>DigStore</b> turns content into a portable, encrypted, self-defending
+        WASM module: each commit is a <b>capsule</b> you publish to <b>DIGHUb</b> (the blind host) and serve through a
+        local <b>dig-node</b>. Publishing a capsule costs a small amount of <b>$DIG</b>; reading is free.
       </p>
       <div className="feats">
         {FEATURES.map((f, i) => (

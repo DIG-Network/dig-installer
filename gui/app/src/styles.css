@@ -41,32 +41,38 @@
 }
 
 :root {
+  /* DIG product theme — clean WHITE surface (SYSTEM.md → Canonical branding:
+     product surfaces use the white DIG theme; dig.net/docs.dig.net keep the dark
+     marketing front-door). The accent gradient violet→magenta + Space Grotesk /
+     Space Mono are unchanged — only the SURFACE/text tokens flip light. */
   --dig-violet: #5800d6;
   --dig-magenta: #ff00de;
-  --dig-pink: #ff3df5;
+  --dig-pink: #d6009e; /* magenta darkened so it reads on white (was #ff3df5 on dark) */
   --accent-a: #5800d6;
   --accent-b: #ff00de;
   --accent-grad: linear-gradient(115deg, var(--accent-a) 0%, var(--accent-b) 100%);
-  --grad-text: linear-gradient(100deg, #b98cff 0%, #ff6bee 100%);
+  --grad-text: linear-gradient(100deg, #5800d6 0%, #ff00de 100%);
 
-  --bg-void: #0a0a20;
-  --bg-space: #101132;
-  --bg-panel: #16153a;
-  --bg-card: #191248;
-  --bg-card-2: #221a59;
-  --glass: rgba(25, 18, 72, 0.55);
-  --glass-strong: rgba(16, 17, 50, 0.82);
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --border-soft: rgba(138, 110, 255, 0.18);
-  --border-bright: rgba(255, 0, 222, 0.55);
+  /* light surfaces */
+  --bg-void: #f5f3fb;   /* recessed wells (license box, terminal, cmd block) */
+  --bg-space: #ffffff;  /* window / primary surface */
+  --bg-panel: #faf9ff;  /* raised panel */
+  --bg-card: #ffffff;   /* card fill */
+  --bg-card-2: #f5f3fb; /* hover / nested card */
+  --glass: rgba(255, 255, 255, 0.7);
+  --glass-strong: rgba(255, 255, 255, 0.9);
+  --border-subtle: rgba(16, 17, 50, 0.1);
+  --border-soft: rgba(88, 0, 214, 0.22);
+  --border-bright: rgba(255, 0, 222, 0.5);
 
-  --fg1: #ffffff;
-  --fg2: #c5c1e0;
-  --fg3: #9a95c0;
-  --fg4: #6e6a99;
-  --ok: #38e1b0;
-  --warn: #e0a640;
-  --error: #ff5c8a;
+  /* ink on white */
+  --fg1: #101132; /* primary text / headlines (brand navy ink) */
+  --fg2: #45417a; /* secondary body */
+  --fg3: #6e6a99; /* muted / captions */
+  --fg4: #9a95c0; /* faint meta */
+  --ok: #12a877;
+  --warn: #b67916;
+  --error: #d6336c;
 
   --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
   --font-body: "Open Sans", system-ui, sans-serif;
@@ -98,9 +104,9 @@ body {
 body {
   font-family: var(--font-body);
   background:
-    radial-gradient(1200px 800px at 18% -10%, rgba(88, 0, 214, 0.3), transparent 60%),
-    radial-gradient(1000px 700px at 110% 120%, rgba(255, 0, 222, 0.18), transparent 55%),
-    #06061a;
+    radial-gradient(1200px 800px at 18% -10%, rgba(88, 0, 214, 0.12), transparent 60%),
+    radial-gradient(1000px 700px at 110% 120%, rgba(255, 0, 222, 0.08), transparent 55%),
+    #efecf8;
   color: var(--fg1);
   -webkit-font-smoothing: antialiased;
   display: flex;
@@ -123,9 +129,9 @@ body {
   border-radius: var(--win-radius);
   border: 1px solid var(--border-subtle);
   box-shadow:
-    0 50px 130px rgba(0, 0, 0, 0.65),
-    0 0 0 1px rgba(255, 255, 255, 0.03) inset,
-    0 0 80px rgba(88, 0, 214, 0.12);
+    0 50px 130px rgba(16, 17, 50, 0.18),
+    0 0 0 1px rgba(16, 17, 50, 0.03) inset,
+    0 0 80px rgba(88, 0, 214, 0.08);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -140,7 +146,7 @@ body {
   align-items: center;
   gap: 12px;
   padding: 0 16px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
+  background: linear-gradient(180deg, rgba(88, 0, 214, 0.04), rgba(88, 0, 214, 0));
   border-bottom: 1px solid var(--border-subtle);
   position: relative;
   z-index: 5;
@@ -179,7 +185,7 @@ body {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(16, 17, 50, 0.18);
   cursor: pointer;
 }
 .ctrls.frameless .c.close {
@@ -218,7 +224,7 @@ body {
   cursor: pointer;
 }
 .ctrls.winchrome .c:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(16, 17, 50, 0.06);
 }
 .ctrls.winchrome .c.close:hover {
   background: #e81123;
@@ -245,9 +251,10 @@ body {
   position: relative;
   overflow: hidden;
   border-right: 1px solid var(--border-subtle);
+  /* soft violet→magenta wash on white — the brand rail on the product theme */
   background:
-    linear-gradient(180deg, rgba(10, 8, 30, 0.2), rgba(10, 8, 30, 0.86)),
-    linear-gradient(160deg, #1a0f4a 0%, #11103a 55%, #0c0a28 100%);
+    linear-gradient(180deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0.92)),
+    linear-gradient(160deg, rgba(88, 0, 214, 0.16) 0%, rgba(255, 0, 222, 0.1) 55%, rgba(255, 255, 255, 0) 100%);
   display: flex;
   flex-direction: column;
   padding: 30px 28px 24px;
@@ -257,8 +264,8 @@ body {
   inset: -10% -20% auto -20%;
   height: 62%;
   background: center / cover no-repeat;
-  opacity: var(--bg-img-opacity);
-  mix-blend-mode: screen;
+  opacity: 0.16;
+  mix-blend-mode: multiply;
   pointer-events: none;
   -webkit-mask-image: linear-gradient(180deg, #000 40%, transparent 100%);
   mask-image: linear-gradient(180deg, #000 40%, transparent 100%);
@@ -315,7 +322,7 @@ body {
   font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--fg2);
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(88, 0, 214, 0.05);
   border: 1px solid var(--border-soft);
   padding: 5px 11px;
   border-radius: var(--r-pill);
@@ -376,7 +383,7 @@ body {
 }
 .step.active {
   color: var(--fg1);
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(88, 0, 214, 0.05);
   border-color: var(--border-soft);
 }
 .step.active .idx {
@@ -385,7 +392,7 @@ body {
   box-shadow: 0 0 0 4px rgba(255, 0, 222, 0.12);
 }
 .step.done:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(88, 0, 214, 0.04);
 }
 .rail-foot {
   position: relative;
@@ -420,7 +427,7 @@ body {
   width: 10px;
 }
 .pane::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(88, 0, 214, 0.1);
   border-radius: 10px;
   border: 3px solid transparent;
   background-clip: content-box;
@@ -455,6 +462,18 @@ body {
   margin: 14px 0 0;
   max-width: 560px;
 }
+.lead b {
+  color: var(--fg1);
+  font-weight: 600;
+}
+.lead code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--dig-violet);
+  background: rgba(88, 0, 214, 0.07);
+  padding: 1px 6px;
+  border-radius: 6px;
+}
 
 /* feature rows */
 .feats {
@@ -482,7 +501,7 @@ body {
 .feat .ic svg {
   width: 20px;
   height: 20px;
-  stroke: #e4c7ff;
+  stroke: var(--dig-violet);
 }
 .feat h4 {
   font-family: var(--font-display);
@@ -510,7 +529,7 @@ body {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--fg2);
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(88, 0, 214, 0.04);
   border: 1px solid var(--border-subtle);
   padding: 8px 13px;
   border-radius: var(--r-pill);
@@ -541,7 +560,7 @@ body {
   width: 10px;
 }
 .license::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(88, 0, 214, 0.12);
   border-radius: 10px;
   border: 3px solid transparent;
   background-clip: content-box;
@@ -577,7 +596,7 @@ body {
   align-items: center;
   justify-content: center;
   transition: 0.16s;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(88, 0, 214, 0.03);
 }
 .check.on {
   background: var(--accent-grad);
@@ -643,7 +662,7 @@ body {
   flex: 0 0 16px;
 }
 .btn-ghost {
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(88, 0, 214, 0.05);
   border: 1px solid var(--border-soft);
   color: var(--fg1);
   font-family: var(--font-display);
@@ -655,7 +674,7 @@ body {
   transition: 0.16s;
 }
 .btn-ghost:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(88, 0, 214, 0.1);
 }
 
 .comp {
@@ -667,7 +686,7 @@ body {
   border-radius: var(--r-md);
   margin-bottom: 10px;
   max-width: 620px;
-  background: rgba(255, 255, 255, 0.018);
+  background: rgba(88, 0, 214, 0.018);
   transition: 0.16s;
   cursor: pointer;
 }
@@ -734,7 +753,7 @@ body {
 .track {
   height: 10px;
   border-radius: var(--r-pill);
-  background: rgba(255, 255, 255, 0.07);
+  background: rgba(88, 0, 214, 0.07);
   overflow: hidden;
 }
 .fill {
@@ -782,7 +801,7 @@ body {
   width: 9px;
 }
 .term::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(88, 0, 214, 0.1);
   border-radius: 8px;
 }
 
@@ -875,7 +894,7 @@ body {
   position: absolute;
   top: 13px;
   right: 13px;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(88, 0, 214, 0.06);
   border: 1px solid var(--border-soft);
   color: var(--fg2);
   border-radius: 7px;
@@ -890,7 +909,7 @@ body {
   transition: 0.16s;
 }
 .copy:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(88, 0, 214, 0.12);
 }
 .copy svg {
   width: 12px;
@@ -906,7 +925,7 @@ body {
   gap: 16px;
   padding: 18px var(--pad-x);
   border-top: 1px solid var(--border-subtle);
-  background: rgba(10, 8, 28, 0.5);
+  background: rgba(88, 0, 214, 0.03);
 }
 .dots {
   display: flex;
@@ -916,7 +935,7 @@ body {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(88, 0, 214, 0.16);
   transition: 0.2s;
 }
 .dots .d.on {
@@ -944,7 +963,7 @@ body {
   color: var(--fg2);
 }
 .btn-secondary:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(88, 0, 214, 0.06);
   color: var(--fg1);
 }
 .btn-primary {
