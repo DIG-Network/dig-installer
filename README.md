@@ -1,18 +1,28 @@
 # dig-installer
 
-**The universal DIG installer.** One command installs the **digstore CLI** (the
-$DIG content tooling) for your OS and adds it to your `PATH` — and, optionally,
-installs the **dig-node** local node as an OS service so apps and the DIG Browser
-can resolve `chia://` content through your own machine.
+**The universal DIG installer — a thin shim.** One command resolves and installs
+the latest DIG components for your OS/arch:
 
-It does **not** build anything itself. It downloads the official, released
-binaries from the DIG-Network GitHub releases:
+- the **digstore CLI** (the $DIG content tooling) — added to your `PATH`,
+- the **dig-node** local node — installed + started as an OS service (Windows
+  service / systemd / launchd), with a best-effort `127.0.0.2 dig.local` hosts
+  entry so apps and the DIG Browser can reach it port-free at `http://dig.local`,
+- the **DIG Browser** — the native installer (`.exe` / `.dmg` / `.AppImage`)
+  downloaded for you to run.
+
+It **bundles nothing** and builds nothing. At install time it asks each
+component's GitHub release for its **actual asset list** and picks the right
+artifact for your OS/arch (resilient to naming differences across repos), then
+downloads it. Sources:
 
 - the **digstore CLI** from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
 - the **dig-node** local node from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
+- the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
 
-This is the canonical home of the DIG installer, migrated out of `digstore`.
+By default only the digstore CLI is installed; add `--with-dig-node` /
+`--with-browser` (and `--service`) to select more. This is the canonical home of
+the DIG installer, migrated out of `digstore`.
 
 ---
 
@@ -39,7 +49,9 @@ digstore --version
 ### Also run a local DIG node
 
 Add `--with-dig-node` to install the `dig-node` local node and register it as an
-OS service (Windows service / systemd / launchd), started automatically:
+OS service (Windows service / systemd / launchd), started automatically. This
+also best-effort writes a `127.0.0.2 dig.local` hosts entry so consumers reach
+the node port-free at `http://dig.local` (falling back to `localhost`):
 
 ```sh
 # macOS / Linux
@@ -47,9 +59,17 @@ curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/inst
 ```
 
 ```powershell
-# Windows — registering a service needs an elevated console
+# Windows — registering a service (and writing the hosts entry) needs an elevated console
 $s = irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1
 & ([scriptblock]::Create($s)) --with-dig-node
+```
+
+### Also install the DIG Browser
+
+Add `--with-browser` to download the DIG Browser native installer for your OS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh -s -- --with-browser
 ```
 
 The bootstrap scripts just download the `dig-installer` binary for your machine
@@ -65,23 +85,30 @@ Download the `dig-installer` binary for your OS/arch from the
 
 ```sh
 dig-installer                      # install latest digstore CLI + add to PATH
-dig-installer --with-dig-node      # ALSO install + start the dig-node service
+dig-installer --with-dig-node      # ALSO install + start the dig-node service (+ dig.local)
+dig-installer --with-browser       # ALSO download the DIG Browser installer
 dig-installer --dry-run            # show exactly what would happen, change nothing
+dig-installer --dry-run --json     # the same, as a machine-readable plan
 ```
 
 ### Flags
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--with-dig-node` | off | Also install the `dig-node` local node and register it as an OS service. |
-| `--service` *(implied by `--with-dig-node`)* | — | The dig-node service is installed and started by default; see `--no-service-start`. |
+| `--with-digstore` | on | Install the digstore CLI (default; explicit form of the always-on behaviour). |
+| `--no-digstore` | off | Skip installing the digstore CLI. |
+| `--digstore-version <VER>` | latest | Install a specific digstore version (e.g. `0.6.0`). |
+| `--with-dig-node` (alias `--service`) | off | Also install the `dig-node` local node + register it as an OS service + write the `dig.local` hosts entry. |
 | `--no-service-start` | off | Install the dig-node service but don't start it. |
 | `--dig-node-port <PORT>` | `8080` | Loopback port the dig-node service serves on. |
-| `--digstore-version <VER>` | latest | Install a specific digstore version (e.g. `0.6.0`). |
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
+| `--with-browser` | off | Also download the DIG Browser native installer for this OS. |
+| `--browser-version <VER>` | latest | Install a specific DIG Browser version. |
 | `--bin-dir <DIR>` | per-user DIG bin dir | Where to place the binaries. |
 | `--no-path` | off | Don't modify `PATH` (just place the binaries). |
-| `--dry-run` | off | Print actions without downloading or changing anything. |
+| `--dry-run` | off | Print/resolve actions without downloading or changing anything. |
+| `--json` | off | Emit a single structured JSON result to stdout (prose → stderr, no prompts). |
+| `--help-json` | — | Print the full machine-readable invocation contract (commands, flags, exit codes). |
 
 Default install location (`--bin-dir`):
 
@@ -94,21 +121,84 @@ Default install location (`--bin-dir`):
 
 1. **Resolve target** — detects OS/arch (`windows-x64`, `linux-x64`,
    `macos-arm64`, `macos-x64`).
-2. **digstore CLI** — resolves the version (latest release, or `--digstore-version`),
-   downloads the matching `digstore-<ver>-<os_arch>[.exe]` release asset, and
-   writes it to the bin dir (executable bit set on unix).
-3. **PATH** — adds the bin dir to your user `PATH` (HKCU on Windows with a
+2. **Resolve each component's asset** — for every selected component it fetches
+   the latest GitHub release (or a pinned `--*-version`), reads the release's
+   **actual asset list**, and picks the asset for this OS/arch by matching
+   OS/arch tokens + the accepted file extension (raw binary for the CLI/node,
+   `.exe`/`.dmg`/`.AppImage` for the browser). No single guessed filename, so a
+   naming change in a producing repo doesn't break the installer.
+3. **digstore CLI** — downloads the resolved raw binary and writes it to the bin
+   dir (executable bit set on unix).
+4. **PATH** — adds the bin dir to your user `PATH` (HKCU on Windows with a
    `WM_SETTINGCHANGE` broadcast; a profile `export PATH` line on unix). Idempotent.
-4. **dig-node** *(with `--with-dig-node`)* — downloads the `dig-node` binary the
+5. **dig-node** *(with `--with-dig-node`)* — downloads the `dig-node` binary the
    same way, then **delegates to dig-node's own `install` (+ `start`)**
-   subcommands to register it as an OS service. dig-node already implements
-   Windows SCM / systemd / launchd registration (via the `service-manager`
-   crate); the installer does not reimplement it. On Windows, service
-   registration needs an elevated console — dig-node prints a clear message if
-   you aren't elevated, and the digstore install still succeeds.
+   subcommands to register it as an OS service (Windows SCM / systemd / launchd —
+   the installer does not reimplement it), and best-effort writes the `dig.local`
+   hosts entry (see below). On Windows, service registration needs an elevated
+   console — if you aren't elevated the installer surfaces a clear message and
+   the digstore install still succeeds.
+6. **DIG Browser** *(with `--with-browser`)* — downloads the native installer
+   for your OS into the bin dir; run it to finish.
 
-`--dry-run` prints every URL, destination, and service command without touching
-the system — useful to see exactly what will be fetched.
+Every download is integrity-checkable (SHA-256). `--dry-run` resolves and prints
+every asset, URL, destination, and service command without touching the system
+(`--dry-run --json` emits it as a side-effect-free plan).
+
+---
+
+## `dig.local` (port-free local node)
+
+When you install the dig-node service, the installer best-effort adds a hosts
+entry so consumers (the DIG Browser, the extension) can reach your local node
+**port-free** at `http://dig.local`:
+
+```
+127.0.0.2   dig.local
+```
+
+- It uses `127.0.0.2` (not `127.0.0.1`) so `dig.local` has its own loopback IP
+  and never collides with anything else you run on `localhost`.
+- The write is **idempotent** (skipped if a `dig.local` mapping already exists),
+  **reversible** (an uninstall removes only the line this installer tagged), and
+  **best-effort** — it needs elevation, and if it can't be written the install
+  is **never aborted**: the node stays reachable at `localhost` and you can
+  re-run elevated to add it.
+- Hosts file: `%SystemRoot%\System32\drivers\etc\hosts` (Windows) / `/etc/hosts`.
+
+> The dig-node *dual-listener* that makes `dig.local` actually resolve to the
+> node (`127.0.0.2:80` + `localhost:<port>` + a Host allowlist) is a separate
+> dig-node change; this installer only writes the hosts entry.
+
+---
+
+## Agent-friendly surfaces
+
+`dig-installer` is scriptable for both humans and agents:
+
+- **`--json`** — emits a single structured object to **stdout** (all human prose
+  goes to **stderr**, no prompts/spinners). On success:
+  `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,installed:[…]}}`.
+  On failure: `{"ok":false,"error":{"code","exit_code","message","hint"}}`.
+- **`--help-json`** — prints the full invocation contract (components, flags,
+  supported targets, and the exit-code table) as JSON.
+- **Stable error codes + exit codes** — every failure carries an `UPPER_SNAKE`
+  `code` and a distinct exit code, so a script can branch on the failure class
+  (and tell a recoverable "needs elevation" apart from a hard failure):
+
+  | Exit | Code | Meaning |
+  |------|------|---------|
+  | 0 | `OK` | success |
+  | 2 | `UNSUPPORTED_TARGET` | host OS/arch is not a supported DIG release target |
+  | 3 | `ASSET_NOT_FOUND` | release or matching per-OS/arch asset not found |
+  | 4 | `NETWORK` | network/HTTP error contacting GitHub or downloading |
+  | 5 | `CHECKSUM_MISMATCH` | downloaded artifact failed its SHA-256 verification |
+  | 6 | `PATH_UPDATE_FAILED` | could not update PATH (the binary was still placed) |
+  | 7 | `SERVICE_NEEDS_ELEVATION` | dig-node service registration needs an elevated console |
+  | 8 | `SERVICE_START_FAILED` | the dig-node service failed to install or start |
+  | 9 | `IO` | failed to write a downloaded binary to disk |
+
+  (Usage errors from argument parsing return clap's own exit code 2.)
 
 ---
 

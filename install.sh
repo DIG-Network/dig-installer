@@ -1,16 +1,23 @@
 #!/bin/sh
-# Universal DIG installer bootstrap (macOS / Linux).
+# Universal DIG installer bootstrap (macOS / Linux) — the one-line install.
 #
 #   curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh
 #
 # Downloads the dig-installer binary for this OS/arch from the latest
-# DIG-Network/dig-installer release, then runs it to install the digstore CLI
-# (the $DIG content tooling) and add it to PATH. Pass dig-installer flags after
-# `-s --`, e.g. to also install + start the dig-node local node as a service:
+# DIG-Network/dig-installer release, then runs it. By default the installer is a
+# THIN SHIM that resolves + installs the latest digstore CLI (the $DIG content
+# tooling) for this OS/arch and adds it to PATH. Pass installer flags after
+# `-s --` to also install other components:
 #
+#   # ALSO install + start the dig-node local node as a service (+ dig.local):
 #   curl -fsSL .../install.sh | sh -s -- --with-dig-node
+#   # ALSO download the DIG Browser native installer:
+#   curl -fsSL .../install.sh | sh -s -- --with-browser
+#   # Everything, machine-readable result:
+#   curl -fsSL .../install.sh | sh -s -- --with-dig-node --with-browser --json
 #
-# Flags are forwarded verbatim to dig-installer (see `dig-installer --help`).
+# Flags are forwarded verbatim to dig-installer (see `dig-installer --help` /
+# `dig-installer --help-json`).
 set -eu
 
 REPO="DIG-Network/dig-installer"

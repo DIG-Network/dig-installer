@@ -1,20 +1,24 @@
-# Universal DIG installer bootstrap (Windows, PowerShell).
+# Universal DIG installer bootstrap (Windows, PowerShell) — the one-line install.
 #
 #   irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1 | iex
 #
 # Downloads the dig-installer binary for this machine from the latest
-# DIG-Network/dig-installer release, then runs it to install the digstore CLI
-# (the $DIG content tooling) and add it to PATH. To pass dig-installer flags
-# (e.g. also install + start the dig-node local node as a Windows service),
-# download then invoke with args:
+# DIG-Network/dig-installer release, then runs it. By default the installer is a
+# THIN SHIM that resolves + installs the latest digstore CLI (the $DIG content
+# tooling) and adds it to PATH. To pass installer flags (e.g. also install the
+# dig-node service or the DIG Browser), download then invoke with args:
 #
 #   $s = irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1
-#   & ([scriptblock]::Create($s)) --with-dig-node
+#   & ([scriptblock]::Create($s)) --with-dig-node          # + dig-node service + dig.local
+#   & ([scriptblock]::Create($s)) --with-browser           # + DIG Browser installer
+#   & ([scriptblock]::Create($s)) --with-dig-node --json   # machine-readable result
 #
-# Flags are forwarded verbatim to dig-installer (see `dig-installer --help`).
+# Flags are forwarded verbatim to dig-installer (see `dig-installer --help` /
+# `dig-installer --help-json`).
 #
-# Note: registering the dig-node Windows service requires an elevated console;
-# dig-node detects this and prints a clear message if you are not elevated.
+# Note: registering the dig-node Windows service (and writing the dig.local hosts
+# entry) requires an elevated console; the installer surfaces a clear message and
+# continues best-effort if you are not elevated.
 [CmdletBinding()]
 param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Args)
 
