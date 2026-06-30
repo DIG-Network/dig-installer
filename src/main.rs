@@ -76,6 +76,23 @@ struct Cli {
     #[arg(long, value_name = "VERSION")]
     browser_version: Option<String>,
 
+    /// Also install + register dig-relay as a service (run-your-own-relay). ADVANCED/optional —
+    /// the default node already points at relay.dig.net, so most users do NOT need this.
+    #[arg(long)]
+    with_relay: bool,
+
+    /// dig-relay version to install (e.g. 0.1.0); default: latest released.
+    #[arg(long, value_name = "VERSION")]
+    relay_version: Option<String>,
+
+    /// Relay WebSocket port the relay service serves on (with --with-relay).
+    #[arg(long, value_name = "PORT", default_value_t = 9450)]
+    relay_port: u16,
+
+    /// Relay HTTP /health port the relay service serves on (with --with-relay).
+    #[arg(long, value_name = "PORT", default_value_t = 9451)]
+    relay_health_port: u16,
+
     /// Do not modify PATH (just place the binaries).
     #[arg(long)]
     no_path: bool,
@@ -119,6 +136,13 @@ fn main() -> std::process::ExitCode {
         },
         with_browser: cli.with_browser,
         browser_version: cli.browser_version,
+        with_relay: cli.with_relay,
+        relay_version: cli.relay_version,
+        relay_service: dig_installer::ServiceConfigRelay {
+            port: cli.relay_port,
+            health_port: cli.relay_health_port,
+            start: !cli.no_service_start,
+        },
         modify_path: !cli.no_path,
         dry_run: cli.dry_run,
     };
@@ -192,6 +216,7 @@ fn help_json() -> String {
         "components": [
             { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local" },
+            { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
         ],
         "targets": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"],
@@ -210,7 +235,11 @@ fn help_json() -> String {
             { "flag": "--dig-node-port", "value": "PORT", "default": 8080, "description": "loopback port for the dig-node service" },
             { "flag": "--no-service-start", "description": "install the service but do not start it" },
             { "flag": "--with-browser", "description": "download the DIG Browser native installer" },
-            { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" }
+            { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
+            { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced — the default node uses relay.dig.net)" },
+            { "flag": "--relay-version", "value": "VERSION", "description": "pin dig-relay version (default: latest)" },
+            { "flag": "--relay-port", "value": "PORT", "default": 9450, "description": "relay WebSocket port for the relay service" },
+            { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" }
         ],
         "exit_codes": exit_codes
     });

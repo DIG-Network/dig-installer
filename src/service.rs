@@ -74,6 +74,92 @@ pub fn install_service(bin: &Path, cfg: &ServiceConfig) -> Result<String, String
     Ok(note)
 }
 
+// ---------------------------------------------------------------------------
+// Run-your-own-relay service (component `relay`).
+//
+// The relay is OPTIONAL and for advanced users: the default node points at the
+// canonical relay.dig.net out of the box, so most users never run one. When a
+// user opts in (`--with-relay`), we register the downloaded dig-relay binary as
+// an OS service by delegating to ITS OWN `install`/`start` subcommands — the same
+// pattern as dig-node (see SYSTEM.md), so the installer never reimplements
+// systemd/launchd/SCM wiring. The relay's listen/health ports are pinned via the
+// DIG_RELAY_* env the relay's `install` snapshots into the service definition.
+// ---------------------------------------------------------------------------
+
+/// Configuration for the run-your-own-relay service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayServiceConfig {
+    /// Relay WebSocket listen port (default 9450, matching dig-relay).
+    pub port: u16,
+    /// HTTP /health listen port (default 9451).
+    pub health_port: u16,
+    /// Start the service immediately after installing it.
+    pub start: bool,
+}
+
+impl Default for RelayServiceConfig {
+    fn default() -> Self {
+        RelayServiceConfig {
+            port: 9450,
+            health_port: 9451,
+            start: true,
+        }
+    }
+}
+
+/// Environment passed to `dig-relay install` so the registered service binds the configured
+/// addresses (the relay's `install` snapshots its effective config into the service definition).
+/// Sorted (`BTreeMap`) so the output is deterministic and testable.
+pub fn relay_install_env(cfg: &RelayServiceConfig) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert(
+        "DIG_RELAY_LISTEN".to_string(),
+        format!("0.0.0.0:{}", cfg.port),
+    );
+    env.insert(
+        "DIG_RELAY_HEALTH_LISTEN".to_string(),
+        format!("0.0.0.0:{}", cfg.health_port),
+    );
+    env
+}
+
+/// Run `dig-relay install` (and, if `cfg.start`, `dig-relay start`) using the downloaded binary at
+/// `bin`. Returns a human note. On Windows, installing a service needs an elevated console;
+/// dig-relay detects this and returns a clear message, surfaced verbatim.
+pub fn install_relay_service(bin: &Path, cfg: &RelayServiceConfig) -> Result<String, String> {
+    run_relay(bin, &install_args(), &relay_install_env(cfg))
+        .map_err(|e| format!("dig-relay install failed: {e}"))?;
+    let mut note = String::from("dig-relay installed as an OS service");
+    if cfg.start {
+        run_relay(bin, &start_args(), &BTreeMap::new())
+            .map_err(|e| format!("dig-relay start failed: {e}"))?;
+        note.push_str(" and started");
+    }
+    Ok(note)
+}
+
+/// Spawn the dig-relay binary with args + env, inheriting stdio (so the user sees the elevation
+/// hint on Windows). Errors if it can't be launched or exits non-zero.
+fn run_relay(bin: &Path, args: &[String], env: &BTreeMap<String, String>) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "{} {} exited with {}",
+            bin.display(),
+            args.join(" "),
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
 /// Spawn the dig-node binary with args + env, inheriting stdio so the user sees
 /// dig-node's own messages (e.g. the elevation hint on Windows). Errors if the
 /// process can't be launched or exits non-zero.
@@ -135,5 +221,32 @@ mod tests {
             env.get("DIG_COMPANION_PORT").map(String::as_str),
             Some("8080")
         );
+    }
+
+    #[test]
+    fn default_relay_service_config() {
+        let c = RelayServiceConfig::default();
+        assert_eq!(c.port, 9450, "matches dig-relay DEFAULT_RELAY_PORT");
+        assert_eq!(c.health_port, 9451);
+        assert!(c.start);
+    }
+
+    #[test]
+    fn relay_install_env_pins_listen_addrs() {
+        let env = relay_install_env(&RelayServiceConfig {
+            port: 9550,
+            health_port: 9551,
+            start: false,
+        });
+        assert_eq!(
+            env.get("DIG_RELAY_LISTEN").map(String::as_str),
+            Some("0.0.0.0:9550")
+        );
+        assert_eq!(
+            env.get("DIG_RELAY_HEALTH_LISTEN").map(String::as_str),
+            Some("0.0.0.0:9551")
+        );
+        // Exactly the two listen addrs are pinned.
+        assert_eq!(env.len(), 2);
     }
 }
