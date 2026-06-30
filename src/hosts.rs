@@ -132,12 +132,18 @@ pub fn without_dig_local_entry(contents: &str) -> Option<String> {
 /// * `Err(reason)`    — could not write (e.g. needs elevation). The CALLER must
 ///   treat this as best-effort and continue (keep `localhost`).
 pub fn write_dig_local() -> Result<Option<String>, String> {
-    let path = hosts_path();
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    write_dig_local_at(&hosts_path())
+}
+
+/// [`write_dig_local`] against an explicit hosts-file `path`. The real call uses
+/// [`hosts_path`]; tests point this at a temp file so the read→compute→write
+/// roundtrip is exercised without touching the system hosts file.
+pub(crate) fn write_dig_local_at(path: &std::path::Path) -> Result<Option<String>, String> {
+    let current = std::fs::read_to_string(path).unwrap_or_default();
     match with_dig_local_entry(&current) {
         None => Ok(None),
         Some(updated) => {
-            std::fs::write(&path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+            std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
             Ok(Some(format!(
                 "{DIG_LOCAL_IP} {DIG_LOCAL_HOST} → {}",
                 path.display()
@@ -149,15 +155,20 @@ pub fn write_dig_local() -> Result<Option<String>, String> {
 /// Best-effort: remove the installer's `dig.local` entry from the hosts file
 /// (for uninstall). Same result contract as [`write_dig_local`].
 pub fn remove_dig_local() -> Result<Option<String>, String> {
-    let path = hosts_path();
-    let current = match std::fs::read_to_string(&path) {
+    remove_dig_local_at(&hosts_path())
+}
+
+/// [`remove_dig_local`] against an explicit hosts-file `path` (see
+/// [`write_dig_local_at`]). A missing file is a no-op (`Ok(None)`).
+pub(crate) fn remove_dig_local_at(path: &std::path::Path) -> Result<Option<String>, String> {
+    let current = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Ok(None),
     };
     match without_dig_local_entry(&current) {
         None => Ok(None),
         Some(updated) => {
-            std::fs::write(&path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+            std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
             Ok(Some(format!(
                 "removed {DIG_LOCAL_HOST} from {}",
                 path.display()
@@ -253,5 +264,72 @@ mod tests {
         assert!(!line_maps_dig_local("127.0.0.2 notdig.local"));
         assert!(!line_maps_dig_local("# 127.0.0.2 dig.local"));
         assert!(!line_maps_dig_local(""));
+    }
+
+    #[test]
+    fn dig_local_line_carries_ip_host_and_marker() {
+        let line = dig_local_line();
+        assert!(line.contains(DIG_LOCAL_IP));
+        assert!(line.contains(DIG_LOCAL_HOST));
+        assert!(line.contains(MARKER));
+    }
+
+    #[test]
+    fn hosts_path_is_platform_correct() {
+        let p = hosts_path().to_string_lossy().to_string();
+        #[cfg(windows)]
+        assert!(p.to_lowercase().ends_with("drivers\\etc\\hosts"), "got {p}");
+        #[cfg(not(windows))]
+        assert_eq!(p, "/etc/hosts");
+    }
+
+    // -- File-I/O wrapper tests against a TEMP hosts file (never the real one). --
+
+    fn tmp_hosts(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("dig-installer-hosts-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("hosts")
+    }
+
+    #[test]
+    fn write_dig_local_at_adds_then_is_idempotent() {
+        let path = tmp_hosts("write");
+        std::fs::write(&path, "127.0.0.1\tlocalhost\n").unwrap();
+
+        let note = write_dig_local_at(&path).expect("write ok").expect("added");
+        assert!(note.contains("dig.local"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains(&dig_local_line()));
+
+        // Second write is a no-op (entry already present).
+        assert_eq!(write_dig_local_at(&path).expect("ok"), None);
+    }
+
+    #[test]
+    fn write_then_remove_at_roundtrips_the_file() {
+        let path = tmp_hosts("roundtrip");
+        let original = "127.0.0.1\tlocalhost\n::1\tlocalhost\n";
+        std::fs::write(&path, original).unwrap();
+
+        write_dig_local_at(&path).expect("ok").expect("added");
+        let removed = remove_dig_local_at(&path)
+            .expect("remove ok")
+            .expect("removed something");
+        assert!(removed.contains("removed dig.local"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn remove_dig_local_at_is_noop_when_marker_absent() {
+        let path = tmp_hosts("noop");
+        std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+        assert_eq!(remove_dig_local_at(&path).expect("ok"), None);
+    }
+
+    #[test]
+    fn remove_dig_local_at_missing_file_is_ok_none() {
+        let path = std::env::temp_dir().join("dig-installer-hosts-does-not-exist-xyz/hosts");
+        assert_eq!(remove_dig_local_at(&path).expect("missing file ok"), None);
     }
 }

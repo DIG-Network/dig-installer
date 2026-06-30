@@ -249,4 +249,122 @@ mod tests {
         // Exactly the two listen addrs are pinned.
         assert_eq!(env.len(), 2);
     }
+
+    // -- Service spawn tests: exercise install_service / install_relay_service /
+    //    run_dig_node / run_relay against a HARMLESS local stub binary (a tiny
+    //    script that exits with a chosen code, ignoring its args/env). No network,
+    //    no real service registration — just the spawn + status + note/error
+    //    assembly logic these functions own. --------------------------------------
+
+    /// Write an executable stub at `dir` that exits with `code`, ignoring args.
+    /// Windows → a `.cmd` batch file (directly executable); unix → a shell script
+    /// with a shebang, chmod +x. Returns the path to run via `Command::new`.
+    fn stub_exit(dir: &std::path::Path, name: &str, code: i32) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        #[cfg(windows)]
+        {
+            let p = dir.join(format!("{name}.cmd"));
+            // @echo off so the batch text doesn't pollute output; exit /b sets the
+            // process exit code.
+            std::fs::write(&p, format!("@echo off\r\nexit /b {code}\r\n")).unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+            p
+        }
+    }
+
+    fn tmp_subdir(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("dig-installer-svc-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn install_service_installs_and_starts_on_success() {
+        let dir = tmp_subdir("node-ok");
+        let bin = stub_exit(&dir, "dig-node", 0);
+        let note = install_service(
+            &bin,
+            &ServiceConfig {
+                port: 8080,
+                start: true,
+            },
+        )
+        .expect("stub exits 0 → ok");
+        assert!(note.contains("installed as an OS service"));
+        assert!(note.contains("and started"));
+    }
+
+    #[test]
+    fn install_service_without_start_omits_started_note() {
+        let dir = tmp_subdir("node-nostart");
+        let bin = stub_exit(&dir, "dig-node", 0);
+        let note = install_service(
+            &bin,
+            &ServiceConfig {
+                port: 8080,
+                start: false,
+            },
+        )
+        .expect("ok");
+        assert!(note.contains("installed as an OS service"));
+        assert!(!note.contains("started"));
+    }
+
+    #[test]
+    fn install_service_surfaces_a_nonzero_install_exit() {
+        let dir = tmp_subdir("node-fail");
+        let bin = stub_exit(&dir, "dig-node", 3);
+        let err = install_service(
+            &bin,
+            &ServiceConfig {
+                port: 8080,
+                start: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("dig-node install failed"), "got: {err}");
+    }
+
+    #[test]
+    fn install_service_errors_when_binary_is_missing() {
+        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-xyz");
+        let err = install_service(&missing, &ServiceConfig::default()).unwrap_err();
+        assert!(err.contains("dig-node install failed"), "got: {err}");
+        assert!(err.contains("could not run"), "got: {err}");
+    }
+
+    #[test]
+    fn install_relay_service_installs_and_starts_on_success() {
+        let dir = tmp_subdir("relay-ok");
+        let bin = stub_exit(&dir, "dig-relay", 0);
+        let note = install_relay_service(
+            &bin,
+            &RelayServiceConfig {
+                port: 9450,
+                health_port: 9451,
+                start: true,
+            },
+        )
+        .expect("ok");
+        assert!(note.contains("dig-relay installed as an OS service"));
+        assert!(note.contains("and started"));
+    }
+
+    #[test]
+    fn install_relay_service_surfaces_a_nonzero_install_exit() {
+        let dir = tmp_subdir("relay-fail");
+        let bin = stub_exit(&dir, "dig-relay", 4);
+        let err = install_relay_service(&bin, &RelayServiceConfig::default()).unwrap_err();
+        assert!(err.contains("dig-relay install failed"), "got: {err}");
+    }
 }
