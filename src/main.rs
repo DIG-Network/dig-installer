@@ -13,9 +13,8 @@
 
 use clap::Parser;
 
-use dig_installer::error::{InstallError, EXIT_CODES};
 use dig_installer::service::ServiceConfig;
-use dig_installer::{paths, InstallPlan};
+use dig_installer::{error_json, help_json, paths, InstallPlan};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -119,6 +118,8 @@ fn main() -> std::process::ExitCode {
         print!("{}", help_json());
         return std::process::ExitCode::SUCCESS;
     }
+    // (`help_json`/`error_json` live in the library so they are unit-tested
+    // directly; main.rs only wires them to stdout/exit codes.)
 
     // digstore is installed by default; --no-digstore opts out, --with-digstore
     // is the explicit (redundant) opt-in. --no-digstore wins if both are given.
@@ -183,65 +184,4 @@ fn run_json(plan: &InstallPlan) -> std::process::ExitCode {
             std::process::ExitCode::from(e.exit_code())
         }
     }
-}
-
-/// The structured error envelope emitted to stdout under `--json` on failure.
-fn error_json(e: &InstallError) -> String {
-    let envelope = serde_json::json!({
-        "ok": false,
-        "error": {
-            "code": e.code(),
-            "exit_code": e.exit_code(),
-            "message": e.message(),
-            "hint": e.hint(),
-        }
-    });
-    serde_json::to_string(&envelope).unwrap()
-}
-
-/// The full machine-readable invocation contract for `--help-json`.
-fn help_json() -> String {
-    let exit_codes: Vec<_> = EXIT_CODES
-        .iter()
-        .map(|(code, name, meaning)| {
-            serde_json::json!({ "exit_code": code, "code": name, "meaning": meaning })
-        })
-        .collect();
-    let doc = serde_json::json!({
-        "name": "dig-installer",
-        "version": env!("CARGO_PKG_VERSION"),
-        "schema_version": dig_installer::SCHEMA_VERSION,
-        "description": "Universal DIG installer (thin shim): resolves + downloads the latest \
-    per-OS/arch release asset for the digstore CLI, dig-node service, and DIG Browser.",
-        "components": [
-            { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
-            { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local" },
-            { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
-            { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
-        ],
-        "targets": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"],
-        "global_flags": [
-            { "flag": "--json", "description": "single structured JSON result to stdout, prose to stderr" },
-            { "flag": "--help-json", "description": "print this contract" },
-            { "flag": "--dry-run", "description": "resolve + print the plan, change nothing" },
-            { "flag": "--no-path", "description": "do not modify PATH" }
-        ],
-        "flags": [
-            { "flag": "--bin-dir", "value": "DIR", "description": "where to place binaries" },
-            { "flag": "--no-digstore", "description": "skip the digstore CLI" },
-            { "flag": "--digstore-version", "value": "VERSION", "description": "pin digstore version (default: latest)" },
-            { "flag": "--with-dig-node", "alias": "--service", "description": "install + start the dig-node service" },
-            { "flag": "--dig-node-version", "value": "VERSION", "description": "pin dig-node version (default: latest)" },
-            { "flag": "--dig-node-port", "value": "PORT", "default": 8080, "description": "loopback port for the dig-node service" },
-            { "flag": "--no-service-start", "description": "install the service but do not start it" },
-            { "flag": "--with-browser", "description": "download the DIG Browser native installer" },
-            { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
-            { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced — the default node uses relay.dig.net)" },
-            { "flag": "--relay-version", "value": "VERSION", "description": "pin dig-relay version (default: latest)" },
-            { "flag": "--relay-port", "value": "PORT", "default": 9450, "description": "relay WebSocket port for the relay service" },
-            { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" }
-        ],
-        "exit_codes": exit_codes
-    });
-    serde_json::to_string_pretty(&doc).unwrap() + "\n"
 }
