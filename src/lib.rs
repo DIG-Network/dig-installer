@@ -168,8 +168,20 @@ pub struct RelayResult {
 /// The `--json` schema version. Bump on a breaking change to the payload shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Resolve a component's release (tag + asset list): an explicit version
-/// (specific tag) or the repo's latest release.
+/// A release resolver: given a [`Repo`] and an optional requested version, return
+/// that repo's release (tag + asset list) or a typed [`InstallError`].
+///
+/// This is the **single network boundary** of the orchestration. The production
+/// resolver ([`resolve_release`]) hits the GitHub API; tests inject a
+/// pure in-memory resolver so the entire [`run_report`] flow — component
+/// resolution, asset selection, URL/dest building, the PATH/service/relay report
+/// branches, and dry-run — is exercised without any I/O.
+type ReleaseResolver<'a> =
+    dyn Fn(&Repo, &Option<String>) -> Result<download::Release, InstallError> + 'a;
+
+/// The production [`ReleaseResolver`]: resolve a component's release (tag + asset
+/// list) over the network — an explicit version (specific tag) or the repo's
+/// latest release.
 fn resolve_release(
     repo: &Repo,
     requested: &Option<String>,
@@ -207,16 +219,19 @@ fn classify_release_error(repo: &Repo, requested: &Option<String>, e: &str) -> I
 }
 
 /// Resolve which asset to download for `target`, returning the component result
-/// shell (the dest is filled by the caller). Pure resolution against the release
-/// asset list; raises `ASSET_NOT_FOUND` if no asset matches this OS/arch.
+/// shell (the dest is filled by the caller). The release (tag + asset list) is
+/// obtained via `resolve` (the network boundary); the asset selection, URL, and
+/// dest building below are pure. Raises `ASSET_NOT_FOUND` if no asset matches
+/// this OS/arch.
 fn resolve_component(
+    resolve: &ReleaseResolver<'_>,
     repo: &Repo,
     requested: &Option<String>,
     target: &Target,
     kind: AssetKind,
     bin_dir: &std::path::Path,
 ) -> Result<ComponentResult, InstallError> {
-    let rel = resolve_release(repo, requested)?;
+    let rel = resolve(repo, requested)?;
     let asset =
         asset::select_asset(&rel.asset_names, target, kind, &repo.stem).ok_or_else(|| {
             InstallError::asset_not_found(format!(
@@ -269,6 +284,21 @@ pub fn run_report(
     plan: &InstallPlan,
     log: &mut dyn FnMut(&str),
 ) -> Result<InstallReport, InstallError> {
+    run_report_with(plan, &resolve_release, log)
+}
+
+/// [`run_report`] with an injectable release resolver (the network boundary).
+///
+/// Production code calls [`run_report`], which passes the real
+/// [`resolve_release`]. Tests pass a pure in-memory resolver so the whole
+/// orchestration — component resolution, asset selection, dest building, the
+/// PATH/service/relay report branches, and dry-run — runs deterministically
+/// without any I/O. (Dry-run still never spawns a process or writes a file.)
+fn run_report_with(
+    plan: &InstallPlan,
+    resolve: &ReleaseResolver<'_>,
+    log: &mut dyn FnMut(&str),
+) -> Result<InstallReport, InstallError> {
     let target = Target::current().map_err(|e| {
         InstallError::unsupported_target(e)
             .with_hint("DIG releases target windows-x64, linux-x64, macos-arm64, macos-x64")
@@ -294,6 +324,7 @@ pub fn run_report(
     if plan.with_digstore {
         log("Installing the digstore CLI:");
         let c = resolve_component(
+            resolve,
             &Repo::digstore(),
             &plan.digstore_version,
             &target,
@@ -346,7 +377,7 @@ pub fn run_report(
     // 3. dig-node service (optional) + dig.local hosts entry.
     if plan.with_dig_node {
         log("Installing the dig-node local node:");
-        let c = resolve_dig_node(&plan.dig_node_version, &target, &plan.bin_dir, log)?;
+        let c = resolve_dig_node(resolve, &plan.dig_node_version, &target, &plan.bin_dir, log)?;
         log_component(log, &c);
         download_component(&c, plan.dry_run)?;
         if !plan.dry_run {
@@ -363,6 +394,7 @@ pub fn run_report(
     if plan.with_relay {
         log("Installing the dig-relay (run-your-own-relay):");
         let c = resolve_component(
+            resolve,
             &Repo::dig_relay(),
             &plan.relay_version,
             &target,
@@ -384,6 +416,7 @@ pub fn run_report(
     if plan.with_browser {
         log("Downloading the DIG Browser installer:");
         let c = resolve_component(
+            resolve,
             &Repo::dig_browser(),
             &plan.browser_version,
             &target,
@@ -461,12 +494,14 @@ fn register_relay(
 /// Resolve dig-node, falling back to the pre-rename `dig-companion` release if
 /// the renamed repo has no matching release yet.
 fn resolve_dig_node(
+    resolve: &ReleaseResolver<'_>,
     requested: &Option<String>,
     target: &Target,
     bin_dir: &std::path::Path,
     log: &mut dyn FnMut(&str),
 ) -> Result<ComponentResult, InstallError> {
     match resolve_component(
+        resolve,
         &Repo::dig_node(),
         requested,
         target,
@@ -480,6 +515,7 @@ fn resolve_dig_node(
             // The legacy repo's stem is dig-companion; normalize the on-PATH name
             // back to dig-node so the service command + later use are consistent.
             let mut c = resolve_component(
+                resolve,
                 &Repo::dig_node_legacy(),
                 requested,
                 target,
@@ -590,4 +626,503 @@ fn log_component(log: &mut dyn FnMut(&str), c: &ComponentResult) {
 pub fn run(plan: &InstallPlan) -> Result<Vec<PathBuf>, String> {
     let report = run_report(plan, &mut |line| println!("{line}")).map_err(|e| e.to_string())?;
     Ok(report.installed.into_iter().map(PathBuf::from).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Agent-facing JSON surfaces (AGENT_FRIENDLY.md → dig-installer). Pure string
+// builders, so they live in the library and are unit-tested directly rather than
+// only through the binary's e2e contract test.
+// ---------------------------------------------------------------------------
+
+/// The structured error envelope emitted to stdout under `--json` on failure:
+/// `{"ok":false,"error":{code,exit_code,message,hint}}`.
+pub fn error_json(e: &InstallError) -> String {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": e.code(),
+            "exit_code": e.exit_code(),
+            "message": e.message(),
+            "hint": e.hint(),
+        }
+    });
+    serde_json::to_string(&envelope).expect("error envelope serializes")
+}
+
+/// The full machine-readable invocation contract for `--help-json`: the
+/// component catalogue, supported targets, global/per-command flags, and the
+/// exit-code table. An agent introspects this instead of scraping `--help`.
+pub fn help_json() -> String {
+    let exit_codes: Vec<_> = error::EXIT_CODES
+        .iter()
+        .map(|(code, name, meaning)| {
+            serde_json::json!({ "exit_code": code, "code": name, "meaning": meaning })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "name": "dig-installer",
+        "version": env!("CARGO_PKG_VERSION"),
+        "schema_version": SCHEMA_VERSION,
+        "description": "Universal DIG installer (thin shim): resolves + downloads the latest \
+    per-OS/arch release asset for the digstore CLI, dig-node service, and DIG Browser.",
+        "components": [
+            { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
+            { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local" },
+            { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
+            { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
+        ],
+        "targets": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"],
+        "global_flags": [
+            { "flag": "--json", "description": "single structured JSON result to stdout, prose to stderr" },
+            { "flag": "--help-json", "description": "print this contract" },
+            { "flag": "--dry-run", "description": "resolve + print the plan, change nothing" },
+            { "flag": "--no-path", "description": "do not modify PATH" }
+        ],
+        "flags": [
+            { "flag": "--bin-dir", "value": "DIR", "description": "where to place binaries" },
+            { "flag": "--no-digstore", "description": "skip the digstore CLI" },
+            { "flag": "--digstore-version", "value": "VERSION", "description": "pin digstore version (default: latest)" },
+            { "flag": "--with-dig-node", "alias": "--service", "description": "install + start the dig-node service" },
+            { "flag": "--dig-node-version", "value": "VERSION", "description": "pin dig-node version (default: latest)" },
+            { "flag": "--dig-node-port", "value": "PORT", "default": 8080, "description": "loopback port for the dig-node service" },
+            { "flag": "--no-service-start", "description": "install the service but do not start it" },
+            { "flag": "--with-browser", "description": "download the DIG Browser native installer" },
+            { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
+            { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced — the default node uses relay.dig.net)" },
+            { "flag": "--relay-version", "value": "VERSION", "description": "pin dig-relay version (default: latest)" },
+            { "flag": "--relay-port", "value": "PORT", "default": 9450, "description": "relay WebSocket port for the relay service" },
+            { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" }
+        ],
+        "exit_codes": exit_codes
+    });
+    serde_json::to_string_pretty(&doc).expect("help doc serializes") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // -- Test scaffolding: a pure, in-memory release resolver ----------------
+    //
+    // The orchestration's only I/O is release discovery (the GitHub API) and the
+    // actual download/service/hosts side effects. We inject a fake resolver and
+    // drive every run in `dry_run` mode, so the full plan — component resolution,
+    // asset selection, dest building, the PATH/service/relay/dig.local report
+    // branches — runs deterministically with NO network and NO side effects.
+
+    /// Build a resolver from a map of `repo.name` → (tag, asset names). A repo
+    /// absent from the map resolves to an `ASSET_NOT_FOUND`-classified error
+    /// (mirroring a GitHub 404), exercising the legacy-fallback + error paths.
+    fn resolver_from(
+        releases: HashMap<&'static str, (&'static str, Vec<&'static str>)>,
+    ) -> impl Fn(&Repo, &Option<String>) -> Result<download::Release, InstallError> {
+        move |repo: &Repo, requested: &Option<String>| match releases.get(repo.name.as_str()) {
+            Some((tag, assets)) => Ok(download::Release {
+                tag_name: tag.to_string(),
+                asset_names: assets.iter().map(|s| s.to_string()).collect(),
+            }),
+            None => Err(classify_release_error(
+                repo,
+                requested,
+                "HTTP 404 Not Found",
+            )),
+        }
+    }
+
+    /// The full DIG asset set across every component repo, for the current OS
+    /// (the test runs against `Target::current()`, so resolve the live slug).
+    fn all_releases() -> HashMap<&'static str, (&'static str, Vec<&'static str>)> {
+        // Names cover all four OS/arch slugs + the browser installers, so the
+        // asset matcher finds a match whatever host the test runs on.
+        let digstore: Vec<&'static str> = vec![
+            "digstore-0.6.0-windows-x64.exe",
+            "digstore-0.6.0-linux-x64",
+            "digstore-0.6.0-macos-arm64",
+            "digstore-0.6.0-macos-x64",
+        ];
+        let node: Vec<&'static str> = vec![
+            "dig-node-0.2.0-windows-x64.exe",
+            "dig-node-0.2.0-linux-x64",
+            "dig-node-0.2.0-macos-arm64",
+            "dig-node-0.2.0-macos-x64",
+        ];
+        let relay: Vec<&'static str> = vec![
+            "dig-relay-0.1.0-windows-x64.exe",
+            "dig-relay-0.1.0-linux-x64",
+            "dig-relay-0.1.0-macos-arm64",
+            "dig-relay-0.1.0-macos-x64",
+        ];
+        let browser: Vec<&'static str> = vec![
+            "DIG-Browser-1.0.0-windows-x64.exe",
+            "DIG-Browser-1.0.0-macos.dmg",
+            "DIG-Browser-1.0.0-linux-x86_64.AppImage",
+        ];
+        let mut m = HashMap::new();
+        m.insert("digstore", ("v0.6.0", digstore));
+        m.insert("dig-node", ("v0.2.0", node));
+        m.insert("dig-relay", ("v0.1.0", relay));
+        m.insert("DIG_Browser", ("v1.0.0", browser));
+        m
+    }
+
+    /// A plan with every component OFF, dry-run on — the caller flips on what a
+    /// given test needs.
+    fn base_plan() -> InstallPlan {
+        InstallPlan {
+            bin_dir: std::env::temp_dir().join("dig-installer-test-bin"),
+            with_digstore: false,
+            digstore_version: None,
+            with_dig_node: false,
+            dig_node_version: None,
+            service: ServiceConfig::default(),
+            with_browser: false,
+            browser_version: None,
+            with_relay: false,
+            relay_version: None,
+            relay_service: ServiceConfigRelay::default(),
+            modify_path: false,
+            dry_run: true,
+        }
+    }
+
+    fn run_dry(
+        plan: &InstallPlan,
+        releases: HashMap<&'static str, (&'static str, Vec<&'static str>)>,
+    ) -> Result<InstallReport, InstallError> {
+        let resolve = resolver_from(releases);
+        run_report_with(plan, &resolve, &mut |_| {})
+    }
+
+    #[test]
+    fn empty_plan_resolves_nothing_but_reports_target() {
+        // Nothing selected: the report still carries the schema/target/installer
+        // metadata and empty component/path/service sections.
+        let report = run_dry(&base_plan(), HashMap::new()).expect("empty plan ok");
+        assert_eq!(report.schema_version, SCHEMA_VERSION);
+        assert_eq!(report.installer_version, env!("CARGO_PKG_VERSION"));
+        assert!(!report.target.is_empty());
+        assert!(report.dry_run);
+        assert!(report.components.is_empty());
+        assert!(report.path.is_none());
+        assert!(report.service.is_none());
+        assert!(report.relay.is_none());
+        assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn digstore_only_resolves_the_cli_component() {
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        let report = run_dry(&plan, all_releases()).expect("digstore resolves");
+        assert_eq!(report.components.len(), 1);
+        let c = &report.components[0];
+        assert_eq!(c.component, "digstore");
+        assert_eq!(c.version, "0.6.0");
+        assert_eq!(c.tag, "v0.6.0");
+        assert!(c.asset.starts_with("digstore-0.6.0-"));
+        assert!(c
+            .url
+            .contains("github.com/DIG-Network/digstore/releases/download/v0.6.0/"));
+        // dry-run installs nothing on disk.
+        assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn modify_path_records_a_would_add_path_result_on_dry_run() {
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.modify_path = true;
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        let path = report.path.expect("path result present");
+        // dry-run never mutates PATH; it records the intent.
+        assert!(!path.modified);
+        assert_eq!(path.note, "would add to PATH");
+        assert!(path.dir.contains("dig-installer-test-bin"));
+    }
+
+    #[test]
+    fn path_is_skipped_when_no_path_binary_is_installed() {
+        // modify_path is on, but only the browser (an installer, not a PATH
+        // binary) is selected → no PATH result.
+        let mut plan = base_plan();
+        plan.with_browser = true;
+        plan.modify_path = true;
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        assert!(report.path.is_none());
+        assert_eq!(report.components.len(), 1);
+        assert_eq!(report.components[0].component, "DIG-Browser");
+    }
+
+    #[test]
+    fn dig_node_dry_run_reports_service_and_dig_local_intent() {
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.service = ServiceConfig {
+            port: 9099,
+            start: true,
+        };
+        let report = run_dry(&plan, all_releases()).expect("dig-node resolves");
+        // The node component is resolved...
+        assert!(report.components.iter().any(|c| c.component == "dig-node"));
+        // ...and the service section records the would-install + would-start +
+        // would-add-dig.local intent (no process spawned, no hosts write).
+        let svc = report.service.expect("service result present");
+        assert!(!svc.installed);
+        assert_eq!(svc.port, 9099);
+        assert!(svc.note.contains("would run `dig-node install`"));
+        assert!(svc.note.contains("`dig-node start`"));
+        assert!(svc.dig_local.contains("dig.local"));
+    }
+
+    #[test]
+    fn dig_node_dry_run_without_start_omits_start_from_note() {
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.service = ServiceConfig {
+            port: 8080,
+            start: false,
+        };
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        let svc = report.service.expect("service");
+        assert!(svc.note.contains("would run `dig-node install`"));
+        assert!(!svc.note.contains("start"));
+    }
+
+    #[test]
+    fn dig_node_falls_back_to_legacy_dig_companion_release() {
+        // The renamed dig-node repo has no release; the legacy dig-companion repo
+        // does. Resolution must fall back AND normalize the on-PATH name to
+        // dig-node (so the service command stays consistent across the rename).
+        let mut releases = all_releases();
+        releases.remove("dig-node");
+        releases.insert(
+            "dig-companion",
+            (
+                "v0.1.5",
+                vec![
+                    "dig-companion-0.1.5-windows-x64.exe",
+                    "dig-companion-0.1.5-linux-x64",
+                    "dig-companion-0.1.5-macos-arm64",
+                    "dig-companion-0.1.5-macos-x64",
+                ],
+            ),
+        );
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        let report = run_dry(&plan, releases).expect("legacy fallback resolves");
+        let node = report
+            .components
+            .iter()
+            .find(|c| c.component == "dig-node")
+            .expect("normalized to dig-node");
+        // Sourced from the legacy repo + asset, but presented as dig-node.
+        assert!(node.url.contains("dig-companion"));
+        assert!(node.dest.contains("dig-node"));
+    }
+
+    #[test]
+    fn relay_dry_run_reports_relay_service_intent() {
+        let mut plan = base_plan();
+        plan.with_relay = true;
+        plan.relay_service = ServiceConfigRelay {
+            port: 9450,
+            health_port: 9451,
+            start: true,
+        };
+        let report = run_dry(&plan, all_releases()).expect("relay resolves");
+        assert!(report.components.iter().any(|c| c.component == "dig-relay"));
+        let relay = report.relay.expect("relay result present");
+        assert!(!relay.installed);
+        assert_eq!(relay.port, 9450);
+        assert_eq!(relay.health_port, 9451);
+        assert!(relay.note.contains("would run `dig-relay install`"));
+        assert!(relay.note.contains("`dig-relay start`"));
+    }
+
+    #[test]
+    fn relay_dry_run_without_start_omits_start_from_note() {
+        let mut plan = base_plan();
+        plan.with_relay = true;
+        plan.relay_service = ServiceConfigRelay {
+            port: 9450,
+            health_port: 9451,
+            start: false,
+        };
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        let relay = report.relay.expect("relay");
+        assert!(relay.note.contains("would run `dig-relay install`"));
+        assert!(!relay.note.contains("start"));
+    }
+
+    #[test]
+    fn full_plan_resolves_all_components_in_order() {
+        // digstore + dig-node + relay + browser, PATH on. All four components
+        // resolve, plus path/service/relay sections.
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.with_dig_node = true;
+        plan.with_relay = true;
+        plan.with_browser = true;
+        plan.modify_path = true;
+        let report = run_dry(&plan, all_releases()).expect("full plan ok");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["digstore", "dig-node", "dig-relay", "DIG-Browser"]
+        );
+        assert!(report.path.is_some());
+        assert!(report.service.is_some());
+        assert!(report.relay.is_some());
+    }
+
+    #[test]
+    fn missing_digstore_release_is_asset_not_found() {
+        // No release published at all → a typed ASSET_NOT_FOUND (a 404 means
+        // "nothing published", distinct from a transport error).
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        let err = run_dry(&plan, HashMap::new()).unwrap_err();
+        assert_eq!(err.code(), "ASSET_NOT_FOUND");
+        assert!(err.message().contains("digstore"));
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn release_present_but_no_matching_asset_is_asset_not_found() {
+        // The release exists but ships nothing for any OS/arch (only a tarball).
+        let mut releases = HashMap::new();
+        releases.insert(
+            "digstore",
+            ("v0.6.0", vec!["source-code.tar.gz", "notes.txt"]),
+        );
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        let err = run_dry(&plan, releases).unwrap_err();
+        assert_eq!(err.code(), "ASSET_NOT_FOUND");
+        assert!(err.message().contains("no digstore asset"));
+    }
+
+    #[test]
+    fn pinned_version_is_threaded_through_resolution() {
+        // A pinned digstore version is honoured: the resolver receives the
+        // request, and the resolved component reflects the returned tag.
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.digstore_version = Some("0.6.0".to_string());
+        let report = run_dry(&plan, all_releases()).expect("pinned resolves");
+        assert_eq!(report.components[0].tag, "v0.6.0");
+    }
+
+    #[test]
+    fn report_serializes_to_the_stable_json_shape() {
+        // The --json payload shape is a stable contract; assert the top-level
+        // keys + nested field names serialize as documented (snake_case).
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.with_dig_node = true;
+        plan.modify_path = true;
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        let v: serde_json::Value = serde_json::to_value(&report).unwrap();
+        for key in [
+            "schema_version",
+            "installer_version",
+            "target",
+            "dry_run",
+            "components",
+            "path",
+            "service",
+            "relay",
+            "installed",
+        ] {
+            assert!(v.get(key).is_some(), "report JSON missing key {key}");
+        }
+        let c = &v["components"][0];
+        for key in ["component", "version", "tag", "asset", "url", "dest"] {
+            assert!(c.get(key).is_some(), "component JSON missing key {key}");
+        }
+        let svc = &v["service"];
+        for key in ["installed", "started", "port", "note", "dig_local"] {
+            assert!(svc.get(key).is_some(), "service JSON missing key {key}");
+        }
+    }
+
+    #[test]
+    fn capturing_logger_records_progress_lines() {
+        // run_report_with drives the `log` sink for every step; assert it is
+        // exercised end-to-end (the pretty/--json front-ends route these).
+        let mut lines: Vec<String> = Vec::new();
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        let resolve = resolver_from(all_releases());
+        let report =
+            run_report_with(&plan, &resolve, &mut |l| lines.push(l.to_string())).expect("ok");
+        assert_eq!(report.components.len(), 1);
+        assert!(lines.iter().any(|l| l.contains("DIG installer — target")));
+        assert!(lines.iter().any(|l| l.contains("dry run")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Installing the digstore CLI")));
+        assert!(lines.iter().any(|l| l == "Done."));
+    }
+
+    // -- Agent-facing JSON surfaces -----------------------------------------
+
+    #[test]
+    fn help_json_is_valid_and_lists_every_component_and_exit_code() {
+        let doc = help_json();
+        let v: serde_json::Value = serde_json::from_str(&doc).expect("help-json is valid JSON");
+        assert_eq!(v["name"], "dig-installer");
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+
+        let ids: Vec<&str> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        for id in ["digstore", "dig-node", "dig-relay", "browser"] {
+            assert!(ids.contains(&id), "help-json missing component {id}");
+        }
+
+        // The exit-code table mirrors EXIT_CODES exactly.
+        let codes: Vec<&str> = v["exit_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["code"].as_str().unwrap())
+            .collect();
+        for &(_, name, _) in error::EXIT_CODES.iter() {
+            assert!(codes.contains(&name), "help-json missing exit code {name}");
+        }
+        assert!(v["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "linux-x64"));
+    }
+
+    #[test]
+    fn error_json_carries_code_exit_code_message_and_hint() {
+        let e = InstallError::network("github unreachable").with_hint("retry later");
+        let v: serde_json::Value = serde_json::from_str(&error_json(&e)).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "NETWORK");
+        assert_eq!(v["error"]["exit_code"], 4);
+        assert_eq!(v["error"]["message"], "github unreachable");
+        assert_eq!(v["error"]["hint"], "retry later");
+    }
+
+    #[test]
+    fn error_json_emits_null_hint_when_absent() {
+        let e = InstallError::io("disk full");
+        let v: serde_json::Value = serde_json::from_str(&error_json(&e)).unwrap();
+        assert_eq!(v["error"]["code"], "IO");
+        assert!(v["error"]["hint"].is_null());
+    }
 }
