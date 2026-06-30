@@ -123,18 +123,31 @@ pub fn download_binary(
     expected_sha256: Option<&str>,
 ) -> Result<(), String> {
     let bytes = fetch_bytes(url)?;
+    verify_and_write(&bytes, dest, expected_sha256).map_err(|e| e.replace("the artifact", url))
+}
+
+/// Verify `bytes` against `expected_sha256` (if given) and write them to `dest`,
+/// creating the parent dir and marking the file executable on unix. Split out
+/// from [`download_binary`] (which adds the network fetch) so the checksum +
+/// write + perms logic is unit-tested WITHOUT a network. On a checksum mismatch
+/// nothing is written.
+fn verify_and_write(
+    bytes: &[u8],
+    dest: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<(), String> {
     if let Some(expected) = expected_sha256 {
-        let got = sha256_hex(&bytes);
+        let got = sha256_hex(bytes);
         if !got.eq_ignore_ascii_case(expected.trim()) {
             return Err(format!(
-                "checksum mismatch for {url}: expected {expected}, got {got}"
+                "checksum mismatch for the artifact: expected {expected}, got {got}"
             ));
         }
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(dest, &bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    std::fs::write(dest, bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -205,5 +218,71 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn release_from_json_skips_assets_without_a_name() {
+        // An asset entry missing `name` is filtered out (not a crash, not an empty
+        // string) — only well-formed asset names survive.
+        let body = r#"{
+            "tag_name": "v1.2.3",
+            "assets": [
+                {"size": 10},
+                {"name": "good-1.2.3-linux-x64"},
+                {"name": 42}
+            ]
+        }"#;
+        let r = release_from_json(body).unwrap();
+        assert_eq!(r.tag_name, "v1.2.3");
+        assert_eq!(r.asset_names, vec!["good-1.2.3-linux-x64".to_string()]);
+    }
+
+    #[test]
+    fn release_from_json_treats_non_array_assets_as_empty() {
+        // `assets` present but not an array → no asset names (no panic).
+        let r = release_from_json(r#"{"tag_name":"v1.0.0","assets":"oops"}"#).unwrap();
+        assert!(r.asset_names.is_empty());
+    }
+
+    #[test]
+    fn verify_and_write_writes_bytes_when_no_checksum_given() {
+        let dir = std::env::temp_dir().join(format!("dig-dl-nohash-{}", std::process::id()));
+        let dest = dir.join("nested").join("artifact.bin");
+        verify_and_write(b"hello dig", &dest, None).expect("write ok");
+        // The nested parent dir was created and the bytes round-trip.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello dig");
+    }
+
+    #[test]
+    fn verify_and_write_accepts_a_matching_checksum() {
+        let dir = std::env::temp_dir().join(format!("dig-dl-ok-{}", std::process::id()));
+        let dest = dir.join("artifact.bin");
+        let data = b"verified payload";
+        let sum = sha256_hex(data);
+        // Upper-cased + padded to prove the compare is case-insensitive + trimmed.
+        let expected = format!("  {}  ", sum.to_uppercase());
+        verify_and_write(data, &dest, Some(&expected)).expect("matching checksum ok");
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    #[test]
+    fn verify_and_write_rejects_a_mismatched_checksum_and_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("dig-dl-bad-{}", std::process::id()));
+        let dest = dir.join("artifact.bin");
+        let err = verify_and_write(b"payload", &dest, Some("deadbeef")).unwrap_err();
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+        // Nothing is written on a mismatch.
+        assert!(!dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_and_write_marks_the_file_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dig-dl-exec-{}", std::process::id()));
+        let dest = dir.join("tool");
+        verify_and_write(b"#!/bin/sh\n", &dest, None).expect("ok");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "owner/group/other exec bits set");
     }
 }

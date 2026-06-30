@@ -109,11 +109,20 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<String, String> {
 
 #[cfg(not(windows))]
 fn unix_add_to_path(bin_dir: &Path) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("no home directory")?;
+    unix_add_to_path_in(bin_dir, &home)
+}
+
+/// [`unix_add_to_path`] against an explicit `home` directory. The real call uses
+/// `dirs::home_dir()`; tests point `home` at a temp dir so the idempotent
+/// profile-append logic (which `.zshrc`/`.bashrc`/`.profile` to touch, the
+/// re-run guard) is exercised without writing the developer's real dotfiles.
+#[cfg(not(windows))]
+fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<String, String> {
     use std::fs;
     use std::io::Write;
 
     let dir = bin_dir.to_string_lossy().to_string();
-    let home = dirs::home_dir().ok_or("no home directory")?;
     // Idempotent guard line the installer recognises on re-run.
     let marker = "# added by dig-installer";
     let line = format!("\n{marker}\nexport PATH=\"{dir}:$PATH\"\n");
@@ -249,5 +258,74 @@ mod tests {
             path_append("/usr/bin:/home/u/.dig/bin", "/home/u/.dig/bin", ':'),
             None
         );
+    }
+
+    #[test]
+    fn default_bin_dir_is_under_a_dig_prefix() {
+        // The default install dir is the per-user DIG bin dir on every platform.
+        let p = default_bin_dir().to_string_lossy().to_lowercase();
+        assert!(
+            p.contains("dig"),
+            "default bin dir should be DIG-scoped: {p}"
+        );
+        assert!(
+            p.ends_with("bin"),
+            "default bin dir should end in /bin: {p}"
+        );
+    }
+
+    // -- unix profile-append tests against a TEMP home (never the real dotfiles).
+    //    These run on the Linux CI coverage job (where the unix cfg compiles). ----
+
+    #[cfg(not(windows))]
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("dig-installer-home-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_creates_profile_when_no_dotfiles_exist() {
+        let home = tmp_home("fresh");
+        let bin = PathBuf::from("/opt/dig/bin");
+        let note = unix_add_to_path_in(&bin, &home).expect("ok");
+        // With no existing dotfiles, it creates ~/.profile.
+        assert!(note.contains(".profile"), "got: {note}");
+        let profile = std::fs::read_to_string(home.join(".profile")).unwrap();
+        assert!(profile.contains("/opt/dig/bin"));
+        assert!(profile.contains("export PATH"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_updates_existing_shell_rc_files() {
+        let home = tmp_home("existing");
+        // A pre-existing .bashrc → it gets the export appended; .zshrc absent stays
+        // absent; .profile (the POSIX fallback) is always touched.
+        std::fs::write(home.join(".bashrc"), "# my bashrc\n").unwrap();
+        let bin = PathBuf::from("/home/u/.dig/bin");
+        let note = unix_add_to_path_in(&bin, &home).expect("ok");
+        assert!(note.contains(".bashrc"), "got: {note}");
+        let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+        assert!(bashrc.contains("# my bashrc")); // preserved
+        assert!(bashrc.contains("/home/u/.dig/bin")); // appended
+        assert!(!home.join(".zshrc").exists()); // absent rc not created
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_is_idempotent_on_rerun() {
+        let home = tmp_home("idem");
+        std::fs::write(home.join(".bashrc"), "# rc\n").unwrap();
+        let bin = PathBuf::from("/home/u/.dig/bin");
+        unix_add_to_path_in(&bin, &home).expect("first ok");
+        let after_first = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+        // Re-running must not append the export a second time.
+        unix_add_to_path_in(&bin, &home).expect("second ok");
+        let after_second = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+        assert_eq!(after_first, after_second, "rerun must be idempotent");
     }
 }
