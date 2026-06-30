@@ -256,29 +256,47 @@ mod tests {
     //    no real service registration — just the spawn + status + note/error
     //    assembly logic these functions own. --------------------------------------
 
-    /// Write an executable stub at `dir` that exits with `code`, ignoring args.
-    /// Windows → a `.cmd` batch file (directly executable); unix → a shell script
-    /// with a shebang, chmod +x. Returns the path to run via `Command::new`.
-    fn stub_exit(dir: &std::path::Path, name: &str, code: i32) -> std::path::PathBuf {
+    /// A harmless stub binary that exits 0 (`success = true`) or non-zero
+    /// (`success = false`), ignoring its args/env — used to drive the service
+    /// spawn logic (`run_dig_node` / `run_relay`) without registering a real
+    /// service. The exact exit code doesn't matter to the code under test: it
+    /// branches only on `status.success()`, so a stub only needs to choose
+    /// success vs failure.
+    ///
+    /// On unix we point at the pre-existing `/bin/true` / `/bin/false` (or the
+    /// `/usr/bin` fallbacks) rather than writing + immediately exec'ing a fresh
+    /// script. A just-written, just-`chmod`'d file can transiently fail exec with
+    /// `ETXTBSY` ("Text file busy", `os error 26`) on Linux — the kernel refuses
+    /// to exec a file that is (or was just) open for writing — which made these
+    /// tests flaky in CI (the regression this guards). Using a pre-existing
+    /// system binary has no such write/exec race. On Windows `Command` runs a
+    /// `.cmd` via the shell (not `execve`), so there is no `ETXTBSY` and no
+    /// `/bin/true`; we write a tiny batch file into `dir`.
+    #[cfg(windows)]
+    fn stub_exit(dir: &std::path::Path, success: bool) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
-        #[cfg(windows)]
-        {
-            let p = dir.join(format!("{name}.cmd"));
-            // @echo off so the batch text doesn't pollute output; exit /b sets the
-            // process exit code.
-            std::fs::write(&p, format!("@echo off\r\nexit /b {code}\r\n")).unwrap();
-            p
+        let p = dir.join(if success { "ok.cmd" } else { "fail.cmd" });
+        let code = if success { 0 } else { 1 };
+        // @echo off so the batch text doesn't pollute output; exit /b sets the
+        // process exit code.
+        std::fs::write(&p, format!("@echo off\r\nexit /b {code}\r\n")).unwrap();
+        p
+    }
+
+    /// See the Windows variant above. On unix we return a pre-existing system
+    /// binary (`true`/`false`) to dodge the `ETXTBSY` write-then-exec race.
+    #[cfg(not(windows))]
+    fn stub_exit(_dir: &std::path::Path, success: bool) -> std::path::PathBuf {
+        let base = if success { "true" } else { "false" };
+        for cand in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
+            let p = std::path::PathBuf::from(&cand);
+            if p.exists() {
+                return p;
+            }
         }
-        #[cfg(not(windows))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\nexit {code}\n")).unwrap();
-            let mut perms = std::fs::metadata(&p).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&p, perms).unwrap();
-            p
-        }
+        // Fallback to the conventional path; every CI runner / POSIX system
+        // ships `/bin/true` and `/bin/false`.
+        std::path::PathBuf::from(format!("/bin/{base}"))
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
@@ -291,7 +309,7 @@ mod tests {
     #[test]
     fn install_service_installs_and_starts_on_success() {
         let dir = tmp_subdir("node-ok");
-        let bin = stub_exit(&dir, "dig-node", 0);
+        let bin = stub_exit(&dir, true);
         let note = install_service(
             &bin,
             &ServiceConfig {
@@ -307,7 +325,7 @@ mod tests {
     #[test]
     fn install_service_without_start_omits_started_note() {
         let dir = tmp_subdir("node-nostart");
-        let bin = stub_exit(&dir, "dig-node", 0);
+        let bin = stub_exit(&dir, true);
         let note = install_service(
             &bin,
             &ServiceConfig {
@@ -323,7 +341,7 @@ mod tests {
     #[test]
     fn install_service_surfaces_a_nonzero_install_exit() {
         let dir = tmp_subdir("node-fail");
-        let bin = stub_exit(&dir, "dig-node", 3);
+        let bin = stub_exit(&dir, false);
         let err = install_service(
             &bin,
             &ServiceConfig {
@@ -346,7 +364,7 @@ mod tests {
     #[test]
     fn install_relay_service_installs_and_starts_on_success() {
         let dir = tmp_subdir("relay-ok");
-        let bin = stub_exit(&dir, "dig-relay", 0);
+        let bin = stub_exit(&dir, true);
         let note = install_relay_service(
             &bin,
             &RelayServiceConfig {
@@ -363,7 +381,7 @@ mod tests {
     #[test]
     fn install_relay_service_surfaces_a_nonzero_install_exit() {
         let dir = tmp_subdir("relay-fail");
-        let bin = stub_exit(&dir, "dig-relay", 4);
+        let bin = stub_exit(&dir, false);
         let err = install_relay_service(&bin, &RelayServiceConfig::default()).unwrap_err();
         assert!(err.contains("dig-relay install failed"), "got: {err}");
     }
