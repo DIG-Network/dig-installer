@@ -63,11 +63,21 @@ pub struct InstallPlan {
     pub with_browser: bool,
     /// DIG Browser version/tag to install: `None` ⇒ latest released.
     pub browser_version: Option<String>,
+    /// Also install + register dig-relay as a service (run-your-own-relay). OPTIONAL/advanced —
+    /// the default node points at the canonical relay.dig.net, so most users never run one.
+    pub with_relay: bool,
+    /// dig-relay version/tag to install: `None` ⇒ latest released.
+    pub relay_version: Option<String>,
+    /// Relay service configuration when `with_relay` is set.
+    pub relay_service: ServiceConfigRelay,
     /// Add the bin dir to PATH (default true).
     pub modify_path: bool,
     /// Print actions without performing them.
     pub dry_run: bool,
 }
+
+/// Re-export alias so `InstallPlan` reads cleanly (`service::RelayServiceConfig`).
+pub use service::RelayServiceConfig as ServiceConfigRelay;
 
 impl Default for InstallPlan {
     fn default() -> Self {
@@ -80,6 +90,9 @@ impl Default for InstallPlan {
             service: ServiceConfig::default(),
             with_browser: false,
             browser_version: None,
+            with_relay: false,
+            relay_version: None,
+            relay_service: ServiceConfigRelay::default(),
             modify_path: true,
             dry_run: false,
         }
@@ -136,8 +149,20 @@ pub struct InstallReport {
     pub components: Vec<ComponentResult>,
     pub path: Option<PathResult>,
     pub service: Option<ServiceResult>,
+    /// The run-your-own-relay service result (only when `--with-relay`).
+    pub relay: Option<RelayResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
+}
+
+/// The dig-relay service result (run-your-own-relay).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayResult {
+    pub installed: bool,
+    pub started: bool,
+    pub port: u16,
+    pub health_port: u16,
+    pub note: String,
 }
 
 /// The `--json` schema version. Bump on a breaking change to the payload shape.
@@ -261,6 +286,7 @@ pub fn run_report(
         components: Vec::new(),
         path: None,
         service: None,
+        relay: None,
         installed: Vec::new(),
     };
 
@@ -332,7 +358,29 @@ pub fn run_report(
         report.service = Some(register_dig_node(&dig_node_path, plan, log));
     }
 
-    // 4. DIG Browser native installer (optional).
+    // 4. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
+    //    points at relay.dig.net, so this is only for users who want to operate a relay.
+    if plan.with_relay {
+        log("Installing the dig-relay (run-your-own-relay):");
+        let c = resolve_component(
+            &Repo::dig_relay(),
+            &plan.relay_version,
+            &target,
+            AssetKind::RawBinary,
+            &plan.bin_dir,
+        )?;
+        log_component(log, &c);
+        download_component(&c, plan.dry_run)?;
+        if !plan.dry_run {
+            report.installed.push(c.dest.clone());
+        }
+        let relay_path = PathBuf::from(c.dest.clone());
+        report.components.push(c);
+
+        report.relay = Some(register_relay(&relay_path, plan, log));
+    }
+
+    // 5. DIG Browser native installer (optional).
     if plan.with_browser {
         log("Downloading the DIG Browser installer:");
         let c = resolve_component(
@@ -353,6 +401,61 @@ pub fn run_report(
 
     log("Done.");
     Ok(report)
+}
+
+/// Register dig-relay as an OS service by delegating to its own `install`/`start` subcommands.
+/// Never returns `Err` — a service failure is recorded in the result, not propagated (the binary
+/// is already placed). Mirrors [`register_dig_node`].
+fn register_relay(
+    relay_path: &std::path::Path,
+    plan: &InstallPlan,
+    log: &mut dyn FnMut(&str),
+) -> RelayResult {
+    log(&format!(
+        "Registering dig-relay as an OS service (relay {}, health {}):",
+        plan.relay_service.port, plan.relay_service.health_port
+    ));
+    let mut result = RelayResult {
+        installed: false,
+        started: false,
+        port: plan.relay_service.port,
+        health_port: plan.relay_service.health_port,
+        note: String::new(),
+    };
+
+    if plan.dry_run {
+        result.note = format!(
+            "would run `dig-relay install`{}",
+            if plan.relay_service.start {
+                " && `dig-relay start`"
+            } else {
+                ""
+            }
+        );
+        log(&format!("    ({})", result.note));
+        return result;
+    }
+
+    match service::install_relay_service(relay_path, &plan.relay_service) {
+        Ok(note) => {
+            log(&format!("    ✓ {note}"));
+            result.installed = true;
+            result.started = plan.relay_service.start;
+            result.note = note;
+        }
+        Err(e) => {
+            // Service install can need elevation (Windows SCM). Best-effort: surface it, do NOT
+            // fail the install — the binary is placed.
+            log(&format!("    ! {e}"));
+            log(&format!(
+                "    dig-relay is installed at {}; run `dig-relay install` from an elevated console to register the service.",
+                relay_path.display()
+            ));
+            result.note = e;
+        }
+    }
+
+    result
 }
 
 /// Resolve dig-node, falling back to the pre-rename `dig-companion` release if

@@ -35,6 +35,7 @@ fn help_json_emits_the_full_contract() {
         .collect();
     assert!(ids.contains(&"digstore"));
     assert!(ids.contains(&"dig-node"));
+    assert!(ids.contains(&"dig-relay"));
     assert!(ids.contains(&"browser"));
 
     // The full exit-code table is present, including the distinct elevation code.
@@ -118,6 +119,8 @@ fn help_lists_the_selectable_component_flags() {
     for flag in [
         "--with-dig-node",
         "--with-browser",
+        "--with-relay",
+        "--relay-port",
         "--no-digstore",
         "--dig-node-port",
         "--json",

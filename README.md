@@ -7,6 +7,9 @@ the latest DIG components for your OS/arch:
 - the **dig-node** local node — installed + started as an OS service (Windows
   service / systemd / launchd), with a best-effort `127.0.0.2 dig.local` hosts
   entry so apps and the DIG Browser can reach it port-free at `http://dig.local`,
+- the **dig-relay** *(advanced, optional)* — run your own NAT-traversal relay,
+  installed + started as an OS service. Most users do **not** need this: every
+  node already uses the canonical `relay.dig.net` out of the box.
 - the **DIG Browser** — the native installer (`.exe` / `.dmg` / `.AppImage`)
   downloaded for you to run.
 
@@ -18,6 +21,7 @@ downloads it. Sources:
 - the **digstore CLI** from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
 - the **dig-node** local node from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
+- the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
 - the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
 
 By default only the digstore CLI is installed; add `--with-dig-node` /
@@ -104,6 +108,10 @@ dig-installer --dry-run --json     # the same, as a machine-readable plan
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
 | `--with-browser` | off | Also download the DIG Browser native installer for this OS. |
 | `--browser-version <VER>` | latest | Install a specific DIG Browser version. |
+| `--with-relay` | off | **Advanced.** Also install the `dig-relay` NAT-traversal relay + register it as an OS service (run your own relay). Most users don't need this — nodes use `relay.dig.net` by default. |
+| `--relay-port <PORT>` | `9450` | Relay WebSocket port the relay service serves on. |
+| `--relay-health-port <PORT>` | `9451` | Relay HTTP `/health` port the relay service serves on. |
+| `--relay-version <VER>` | latest | Install a specific dig-relay version. |
 | `--bin-dir <DIR>` | per-user DIG bin dir | Where to place the binaries. |
 | `--no-path` | off | Don't modify `PATH` (just place the binaries). |
 | `--dry-run` | off | Print/resolve actions without downloading or changing anything. |

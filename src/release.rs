@@ -57,6 +57,15 @@ impl Repo {
         Repo::new("DIG-Network", "DIG_Browser", "DIG-Browser")
     }
 
+    /// The DIG Relay release source (`DIG-Network/dig-relay`). Publishes a raw
+    /// per-OS/arch binary `dig-relay-<ver>-<os_arch>[.exe]` (matched as a
+    /// [`AssetKind::RawBinary`](crate::asset::AssetKind::RawBinary)); the
+    /// run-your-own-relay component registers it as an OS service via the binary's
+    /// own `install`/`start` subcommands (like dig-node).
+    pub fn dig_relay() -> Repo {
+        Repo::new("DIG-Network", "dig-relay", "dig-relay")
+    }
+
     /// GitHub API URL for the latest release of this repo (returns JSON with a
     /// `tag_name` and an `assets` array).
     pub fn latest_release_api(&self) -> String {
@@ -147,6 +156,24 @@ mod tests {
         assert_eq!(
             Repo::dig_browser(),
             Repo::new("DIG-Network", "DIG_Browser", "DIG-Browser")
+        );
+        assert_eq!(
+            Repo::dig_relay(),
+            Repo::new("DIG-Network", "dig-relay", "dig-relay")
+        );
+    }
+
+    #[test]
+    fn dig_relay_binary_url_matches_published_asset_naming() {
+        // The release workflow names assets dig-relay-<ver>-<os_arch>[.exe]; the installer must
+        // build the SAME URL so it resolves the binary.
+        assert_eq!(
+            Repo::dig_relay().binary_url("v0.1.0", "0.1.0", &lin()),
+            "https://github.com/DIG-Network/dig-relay/releases/download/v0.1.0/dig-relay-0.1.0-linux-x64"
+        );
+        assert_eq!(
+            Repo::dig_relay().binary_url("v0.1.0", "0.1.0", &win()),
+            "https://github.com/DIG-Network/dig-relay/releases/download/v0.1.0/dig-relay-0.1.0-windows-x64.exe"
         );
     }
 
