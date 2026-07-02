@@ -6,7 +6,7 @@
 //! exposes `install`/`uninstall`/`start`/`stop`/`status` and uses the
 //! `service-manager` crate internally (see SYSTEM.md). The universal installer
 //! therefore just downloads that binary and runs `dig-node install` (+ `start`),
-//! passing the loopback port via `DIG_COMPANION_PORT` so the service serves on
+//! passing the loopback port via `DIG_NODE_PORT` so the service serves on
 //! the configured endpoint. This module builds those invocations; the pure
 //! arg/env construction is unit-tested without spawning anything.
 
@@ -25,7 +25,7 @@ pub struct ServiceConfig {
 
 impl Default for ServiceConfig {
     fn default() -> Self {
-        // 8080 matches dig-node's own default (config.rs DIG_COMPANION_PORT).
+        // 8080 matches dig-node's own default (config.rs DIG_NODE_PORT).
         ServiceConfig {
             port: 8080,
             start: true,
@@ -51,9 +51,9 @@ pub fn start_args() -> Vec<String> {
 /// Sorted (`BTreeMap`) so the output is deterministic and testable.
 pub fn install_env(cfg: &ServiceConfig) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    // dig-node still reads the DIG_COMPANION_* names across the rename (its
-    // config.rs keeps them as the stable env contract).
-    env.insert("DIG_COMPANION_PORT".to_string(), cfg.port.to_string());
+    // dig-node reads the canonical DIG_NODE_* names (its config.rs stable env
+    // contract, SPEC 3.1) — DIG_NODE_PORT is what pins the service's port.
+    env.insert("DIG_NODE_PORT".to_string(), cfg.port.to_string());
     env
 }
 
@@ -206,10 +206,7 @@ mod tests {
             port: 9090,
             start: false,
         });
-        assert_eq!(
-            env.get("DIG_COMPANION_PORT").map(String::as_str),
-            Some("9090")
-        );
+        assert_eq!(env.get("DIG_NODE_PORT").map(String::as_str), Some("9090"));
         // Only the port is pinned (host/upstream keep dig-node defaults).
         assert_eq!(env.len(), 1);
     }
@@ -217,10 +214,7 @@ mod tests {
     #[test]
     fn install_env_default_port() {
         let env = install_env(&ServiceConfig::default());
-        assert_eq!(
-            env.get("DIG_COMPANION_PORT").map(String::as_str),
-            Some("8080")
-        );
+        assert_eq!(env.get("DIG_NODE_PORT").map(String::as_str), Some("8080"));
     }
 
     #[test]
