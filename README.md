@@ -23,6 +23,14 @@ downloads it. Sources:
   (formerly `dig-companion`)
 - the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
 - the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
+  — resolution works against DIG Browser's current **alpha/prerelease-only**
+  channel (GitHub's "latest release" API excludes prereleases, so the
+  installer falls back to the full releases list when that happens) and
+  against its current asset naming
+  (`ungoogled-chromium_<ver>_installer_x64.exe`, no `windows`/`win` token — the
+  matcher keys off the `.exe` extension + the bare `x64` token instead). The
+  eventual rebrand to `dig-browser_*` asset names needs no matcher change —
+  only the token/extension pattern is checked, not the product-name prefix.
 
 By default only the digstore CLI is installed; add `--with-dig-node` /
 `--with-browser` (and `--service`) to select more. This is the canonical home of

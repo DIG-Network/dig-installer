@@ -35,12 +35,11 @@ pub fn tag_name_from_release_json(body: &str) -> Result<String, String> {
         .ok_or_else(|| "release JSON had no tag_name".to_string())
 }
 
-/// Parse a GitHub release JSON payload into a [`Release`] (tag + asset names).
-/// Pure — the heart of the thin-shim asset resolution, unit-tested without a
-/// network.
-pub fn release_from_json(body: &str) -> Result<Release, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("parse release JSON: {e}"))?;
+/// Extract a [`Release`] (tag + asset names) from a single release JSON object
+/// (`serde_json::Value`). Shared by [`release_from_json`] (a single-release API
+/// response) and [`release_from_list_json`] (one entry of a releases-list
+/// response) so both parse identically.
+fn release_from_value(v: &serde_json::Value) -> Result<Release, String> {
     let tag_name = v
         .get("tag_name")
         .and_then(|t| t.as_str())
@@ -61,16 +60,67 @@ pub fn release_from_json(body: &str) -> Result<Release, String> {
     })
 }
 
+/// Parse a GitHub release JSON payload into a [`Release`] (tag + asset names).
+/// Pure — the heart of the thin-shim asset resolution, unit-tested without a
+/// network.
+pub fn release_from_json(body: &str) -> Result<Release, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("parse release JSON: {e}"))?;
+    release_from_value(&v)
+}
+
+/// Parse a GitHub *releases list* JSON payload (an array, newest first) into
+/// the newest [`Release`], regardless of its prerelease/draft flags.
+///
+/// This is the fallback for [`latest_release`] when `/releases/latest` 404s:
+/// that endpoint excludes prereleases AND drafts, so a repo whose newest (or
+/// only) release is prerelease-flagged — e.g. DIG Browser's alpha channel —
+/// never appears there even though a real, asset-bearing release exists. The
+/// list endpoint has no such filter, so its first entry is the newest release
+/// GitHub knows about.
+pub fn release_from_list_json(body: &str) -> Result<Release, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("parse releases list JSON: {e}"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "releases list JSON was not an array".to_string())?;
+    let first = arr
+        .first()
+        .ok_or_else(|| "no releases published".to_string())?;
+    release_from_value(first)
+}
+
+/// True when a release-lookup error indicates "no such release" (HTTP 404) —
+/// the signal that `/releases/latest` found nothing published, so the caller
+/// should fall back to the full releases list ([`release_from_list_json`])
+/// rather than treating it as a transport failure.
+fn is_release_not_found(err: &str) -> bool {
+    err.contains("404") || err.contains("Not Found")
+}
+
 /// Discover the latest published tag for a repo via the GitHub API.
 pub fn latest_tag(repo: &Repo) -> Result<String, String> {
     Ok(latest_release(repo)?.tag_name)
 }
 
 /// Fetch the latest release (tag + asset list) for a repo via the GitHub API.
+///
+/// Tries `/releases/latest` first; that endpoint excludes prereleases and
+/// drafts, so it 404s for a repo whose newest release is prerelease-only
+/// (DIG Browser's alpha channel). On a 404, fall back to the full releases
+/// list ([`release_from_list_json`]) and take the newest entry regardless of
+/// prerelease status. Repos that always ship a non-prerelease "latest" (the
+/// common case) never hit the fallback.
 pub fn latest_release(repo: &Repo) -> Result<Release, String> {
     let url = repo.latest_release_api();
-    let body = get_text(&url)?;
-    release_from_json(&body)
+    match get_text(&url) {
+        Ok(body) => release_from_json(&body),
+        Err(e) if is_release_not_found(&e) => {
+            let body = get_text(&repo.releases_list_api())?;
+            release_from_list_json(&body)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Fetch a specific release by tag (tag + asset list) via the GitHub API.
@@ -242,6 +292,73 @@ mod tests {
         // `assets` present but not an array → no asset names (no panic).
         let r = release_from_json(r#"{"tag_name":"v1.0.0","assets":"oops"}"#).unwrap();
         assert!(r.asset_names.is_empty());
+    }
+
+    #[test]
+    fn is_release_not_found_detects_404_variants() {
+        // ureq's Status Display is "{url}: status code {code}"; get_text wraps it
+        // as "GET {url}: {ureq display}" — both forms must be recognised, plus
+        // the plain-English "Not Found" the rest of the codebase also checks for
+        // (see lib.rs::classify_release_error, same convention).
+        assert!(is_release_not_found(
+            "GET https://api.github.com/x: https://api.github.com/x: status code 404"
+        ));
+        assert!(is_release_not_found(
+            "GET https://api.github.com/x: 404 Not Found"
+        ));
+        assert!(!is_release_not_found(
+            "GET https://api.github.com/x: status code 500"
+        ));
+        assert!(!is_release_not_found(
+            "GET https://api.github.com/x: timed out"
+        ));
+    }
+
+    #[test]
+    fn release_from_list_json_takes_the_newest_entry_regardless_of_prerelease() {
+        // Regression (#40): DIG Browser's only release
+        // (149.0.7827.155-1.1-alpha) is prerelease-flagged, so GitHub's
+        // `/releases/latest` (which excludes prereleases/drafts) 404s even
+        // though a real release exists. The fallback list-parse must pick the
+        // newest (first) entry regardless of its prerelease flag.
+        let body = r#"[
+            {
+                "tag_name": "149.0.7827.155-1.1-alpha",
+                "prerelease": true,
+                "draft": false,
+                "assets": [
+                    {"name": "ungoogled-chromium_149.0.7827.155-1.1_installer_x64.exe"},
+                    {"name": "ungoogled-chromium_149.0.7827.155-1.1_windows_x64.zip"}
+                ]
+            },
+            {
+                "tag_name": "148.0.0.0-1.0-alpha",
+                "prerelease": true,
+                "draft": false,
+                "assets": []
+            }
+        ]"#;
+        let r = release_from_list_json(body).unwrap();
+        assert_eq!(r.tag_name, "149.0.7827.155-1.1-alpha");
+        assert_eq!(
+            r.asset_names,
+            vec![
+                "ungoogled-chromium_149.0.7827.155-1.1_installer_x64.exe".to_string(),
+                "ungoogled-chromium_149.0.7827.155-1.1_windows_x64.zip".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn release_from_list_json_errors_on_empty_list() {
+        let err = release_from_list_json("[]").unwrap_err();
+        assert!(err.contains("no releases"), "got: {err}");
+    }
+
+    #[test]
+    fn release_from_list_json_errors_on_non_array() {
+        assert!(release_from_list_json(r#"{"tag_name":"v1.0.0"}"#).is_err());
+        assert!(release_from_list_json("not json").is_err());
     }
 
     #[test]
