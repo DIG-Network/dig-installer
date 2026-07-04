@@ -84,6 +84,18 @@ impl Repo {
         )
     }
 
+    /// GitHub API URL for the FULL releases list (returns a JSON array, newest
+    /// first, with NO prerelease/draft filtering). The fallback source when
+    /// [`latest_release_api`](Self::latest_release_api) 404s because the
+    /// newest release is prerelease-only (e.g. DIG Browser's alpha channel) —
+    /// see [`crate::download::latest_release`].
+    pub fn releases_list_api(&self) -> String {
+        format!(
+            "https://api.github.com/repos/{}/{}/releases",
+            self.owner, self.name
+        )
+    }
+
     /// Browser download URL for a named asset at a given tag.
     ///
     /// `tag` is the git tag exactly as published (e.g. `v0.6.0`).
@@ -190,6 +202,14 @@ mod tests {
         assert_eq!(
             Repo::digstore().latest_release_api(),
             "https://api.github.com/repos/DIG-Network/digstore/releases/latest"
+        );
+    }
+
+    #[test]
+    fn releases_list_api_url() {
+        assert_eq!(
+            Repo::dig_browser().releases_list_api(),
+            "https://api.github.com/repos/DIG-Network/DIG_Browser/releases"
         );
     }
 

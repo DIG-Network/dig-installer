@@ -36,6 +36,18 @@ pub enum AssetKind {
 /// The bare-OS tokens (`macos`/`darwin`/`linux`/`windows`) are deliberately last
 /// so an arch-less asset (e.g. `...-macos.dmg`) still matches — but only when no
 /// *competing* arch token is present (see [`competing_arch_tokens`]).
+///
+/// For Windows/Linux (single-arch platforms today) the bare arch token (`x64`)
+/// is the LAST-resort fallback, lower priority even than the bare-OS token:
+/// some producing repos' asset names encode neither the OS name nor a
+/// `win`/`linux` prefix at all — e.g. DIG Browser's first release names its
+/// Windows installer `ungoogled-chromium_<ver>_installer_x64.exe` (no
+/// "win"/"windows" substring anywhere). The accepted-extension check
+/// ([`accepted_extensions`]) already pins that asset to a single OS for a given
+/// [`AssetKind`] (`.exe`/`.msi` only ever means Windows), so a bare arch token
+/// is enough to place it once extension + competing-arch rejection have run —
+/// and this stays indifferent to a product-name-prefix rebrand (e.g. to
+/// `dig-browser_*`).
 pub fn os_arch_tokens(target: &Target) -> Vec<&'static str> {
     match (target.os, target.arch) {
         (Os::Windows, _) => vec![
@@ -44,8 +56,15 @@ pub fn os_arch_tokens(target: &Target) -> Vec<&'static str> {
             "win64",
             "x86_64-pc-windows",
             "windows",
+            "x64",
         ],
-        (Os::Linux, _) => vec!["linux-x64", "linux-x86_64", "x86_64-unknown-linux", "linux"],
+        (Os::Linux, _) => vec![
+            "linux-x64",
+            "linux-x86_64",
+            "x86_64-unknown-linux",
+            "linux",
+            "x64",
+        ],
         (Os::MacOs, crate::target::Arch::Arm64) => {
             vec![
                 "macos-arm64",
@@ -396,6 +415,52 @@ mod tests {
                 "digstore"
             ),
             Some("DigStore-Setup-0.6.0-macos.dmg".to_string())
+        );
+    }
+
+    #[test]
+    fn installer_matches_current_dig_browser_alpha_asset_naming() {
+        // Regression (#40): DIG Browser's actual first release
+        // (149.0.7827.155-1.1-alpha) publishes an installer named
+        // `ungoogled-chromium_<ver>_installer_x64.exe` — it carries NEITHER
+        // "windows" nor "win" anywhere, only the bare arch token "x64", plus a
+        // portable `_windows_x64.zip` sibling that IS os-tokened but is the
+        // wrong extension for an Installer (that .zip is the portable build,
+        // not the thing we want to run). The matcher must still resolve the
+        // installer .exe via the extension (Windows-only for Installer) + the
+        // bare "x64" fallback token, and must be indifferent to the
+        // `ungoogled-chromium` product-name prefix so the tracked rebrand to
+        // `dig-browser_*` (#39) keeps resolving with zero matcher changes.
+        let names = vec![
+            "ungoogled-chromium_149.0.7827.155-1.1_installer_x64.exe".to_string(),
+            "ungoogled-chromium_149.0.7827.155-1.1_windows_x64.zip".to_string(),
+        ];
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Windows, Arch::X64),
+                AssetKind::Installer,
+                "DIG-Browser"
+            ),
+            Some("ungoogled-chromium_149.0.7827.155-1.1_installer_x64.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_x64_fallback_still_rejects_an_arm64_tagged_windows_asset() {
+        // The new bare-"x64" fallback token must not defeat the existing
+        // competing-arch guard: an asset explicitly tagged arm64 is still
+        // rejected for a Windows x64 target even though it has an accepted
+        // extension.
+        let names = vec!["tool_installer_arm64.exe".to_string()];
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Windows, Arch::X64),
+                AssetKind::Installer,
+                "tool"
+            ),
+            None
         );
     }
 
