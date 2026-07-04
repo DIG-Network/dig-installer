@@ -1,0 +1,95 @@
+# PR quality gates for dig-installer (Rust single-crate).
+#
+# Runs on every pull request to main (and on pushes to main so the default
+# branch stays green). Enforces the professional gate set: formatting, lints
+# (clippy -D warnings), and the test suite with line coverage gated at >=80%.
+# These job names are the stable required-check contexts wired on the branch.
+#
+# Mirrors the gate commands already used by the release workflow's `check`
+# job, but fires pre-merge on the PR rather than post-tag.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + rustfmt)
+        run: |
+          rustup toolchain install stable --component rustfmt
+          rustup default stable
+          rustc --version
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + clippy)
+        run: |
+          rustup toolchain install stable --component clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-ci-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-clippy-
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test + coverage (>=80% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + llvm-tools)
+        run: |
+          rustup toolchain install stable --component llvm-tools-preview
+          rustup default stable
+          rustc --version
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-ci-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-test-
+      # Unit + integration tests with line coverage, gated at >=80%. main.rs is
+      # excluded: it is thin binary glue (arg-parse -> run_report -> stdout/exit)
+      # whose only paths require the network; all agent-facing logic lives in the
+      # library and is unit-tested there. Repo currently measures ~87% lines.
+      - name: Test with coverage (gate >=80% lines)
+        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'
