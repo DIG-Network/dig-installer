@@ -226,15 +226,24 @@ jobs:
       # can embed it (single-file install). dig-installer does NOT build digstore.
       - name: Fetch latest released digstore binary
         shell: bash
+        env:
+          # Authenticate both the release lookup and the asset download via
+          # `gh` (preinstalled on GitHub-hosted runners). Anonymous curl hit
+          # GitHub's unauthenticated REST rate limit (60 req/hour per source
+          # IP, shared across the runner pool) and got a 403 on the FIRST
+          # call (the `releases/latest` lookup) before the asset URL was even
+          # constructed. `GH_TOKEN` raises that to the authenticated quota
+          # and is far less likely to be exhausted by other jobs on the same
+          # runner IP range.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$(curl -fsSL https://api.github.com/repos/DIG-Network/digstore/releases/latest | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+          tag="$(gh api repos/DIG-Network/digstore/releases/latest --jq .tag_name)"
           dver="${tag#v}"
           asset="digstore-${dver}-${{ matrix.digstore_asset_os }}"
-          url="https://github.com/DIG-Network/digstore/releases/download/${tag}/${asset}"
-          echo "fetching $url"
+          echo "fetching ${asset} from digstore release ${tag}"
           mkdir -p _digstore
-          curl -fsSL "$url" -o "_digstore/${{ matrix.digstore_bin }}"
+          gh release download "$tag" -R DIG-Network/digstore -p "$asset" -O "_digstore/${{ matrix.digstore_bin }}"
           chmod +x "_digstore/${{ matrix.digstore_bin }}" || true
       - name: Install frontend deps
         working-directory: gui/app
