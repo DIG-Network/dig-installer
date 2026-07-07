@@ -6,7 +6,7 @@
 //! warned about, never rewritten), and a Chrome/Chromium policy JSON —
 //! NEVER editing the hosts file, NEVER a URL rewrite, NEVER TLS interception.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -405,15 +405,14 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     removed.extend(remove_split_dns());
     removed.extend(remove_chrome_policies());
 
-    if user_exists(plan::LINUX_SERVICE_USER) {
-        if Command::new("userdel")
+    if user_exists(plan::LINUX_SERVICE_USER)
+        && Command::new("userdel")
             .arg(plan::LINUX_SERVICE_USER)
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
-        {
-            removed.push(format!("{} user", plan::LINUX_SERVICE_USER));
-        }
+    {
+        removed.push(format!("{} user", plan::LINUX_SERVICE_USER));
     }
 
     DnsUninstallResult {
@@ -431,6 +430,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tmp_subdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

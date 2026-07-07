@@ -110,6 +110,10 @@ pub fn install(
     cfg: &DnsInstallConfig,
     dry_run: bool,
 ) -> DnsInstallResult {
+    // `persist_bin` is used only by the Windows branch (see the doc comment
+    // above); this no-op reference keeps it from being flagged as unused on
+    // macOS/Linux, where the reference itself (Copy) is still available below.
+    let _ = persist_bin;
     #[cfg(windows)]
     {
         windows::install(dig_dns_bin, persist_bin, cfg, dry_run)
