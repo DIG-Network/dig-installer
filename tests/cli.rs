@@ -36,6 +36,7 @@ fn help_json_emits_the_full_contract() {
     assert!(ids.contains(&"digstore"));
     assert!(ids.contains(&"dig-node"));
     assert!(ids.contains(&"dig-relay"));
+    assert!(ids.contains(&"dig-dns"));
     assert!(ids.contains(&"browser"));
 
     // The full exit-code table is present, including the distinct elevation code.
@@ -123,6 +124,10 @@ fn help_lists_the_selectable_component_flags() {
         "--relay-port",
         "--no-digstore",
         "--dig-node-port",
+        "--with-dig-dns",
+        "--dig-dns-version",
+        "--dig-dns-node",
+        "--uninstall-dig-dns",
         "--json",
         "--dry-run",
     ] {
@@ -133,6 +138,27 @@ fn help_lists_the_selectable_component_flags() {
 #[test]
 fn version_flag_works() {
     bin().arg("--version").assert().success();
+}
+
+/// `--uninstall-dig-dns --dry-run` must be network-free, side-effect-free, and
+/// always succeed (task #177: a permission issue is reported via
+/// `needs_elevation`, never a process failure) — safe to run in CI on every OS.
+#[test]
+fn uninstall_dig_dns_dry_run_is_side_effect_free_and_succeeds() {
+    let out = bin()
+        .arg("--uninstall-dig-dns")
+        .arg("--dry-run")
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["uninstalled"], false);
+    assert!(v["result"]["residue_removed"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 /// Regression guard (license-correctness bug): every license-bearing surface in
