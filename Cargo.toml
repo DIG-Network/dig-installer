@@ -6,6 +6,11 @@
 # installs + starts `dig-node` as an OS service by delegating to dig-node's own
 # `install`/`start` subcommands (it is the standalone-server twin of the native
 # DIG Browser's in-process dig-node; see SYSTEM.md → dig-companion/dig-node).
+# It also installs `dig-dns` (local `*.dig` name resolution, #177/#174) as an
+# OS service — Windows Service / macOS LaunchDaemon / Linux systemd — but,
+# unlike dig-node/dig-relay, dig-dns ships no service subcommands of its own,
+# so this installer owns the full per-OS service + split-DNS/NRPT +
+# browser-policy wiring directly (`src/dns/`).
 #
 # It does NOT build either binary itself: digstore still `cargo`-builds and
 # publishes the `digstore` binary from its own repo; dig-installer only CONSUMES
@@ -13,8 +18,8 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.1.3"
-description = "Universal DIG installer — installs the digstore CLI and (optionally) the dig-node service"
+version = "0.2.0"
+description = "Universal DIG installer — installs the digstore CLI and (optionally) the dig-node and dig-dns services"
 authors = ["DIG Network"]
 edition = "2021"
 license = "GPL-2.0-only"
@@ -40,6 +45,14 @@ sha2 = "0.10"
 hex = "0.4"
 dirs = "5"
 tempfile = "3"
+# Cross-platform service manager (Windows SCM via sc.exe, Linux systemd,
+# macOS launchd) — used to register dig-dns as an OS service (task #177):
+# unlike dig-node/dig-relay (which register THEMSELVES via their own
+# `install`/`start` subcommands), dig-dns ships no such subcommand, so
+# dig-installer registers it directly. `ServiceInstallCtx.contents` lets us
+# supply a fully custom unit-file/plist body (CAP_NET_BIND_SERVICE, a
+# dedicated user, log paths) that the crate's own generator does not cover.
+service-manager = "0.7"
 
 [dev-dependencies]
 # End-to-end CLI contract tests: drive the built `dig-installer` binary and
@@ -54,6 +67,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# Windows Service Control Protocol. `service-manager` only REGISTERS the
+# service in the SCM; the binary the SCM launches must itself speak the
+# service protocol (StartServiceCtrlDispatcher -> report RUNNING/STOPPED) or
+# the SCM kills it with error 1053. dig-dns has no such entrypoint of its own
+# (it is a plain blocking CLI), so dig-installer's OWN persisted binary hosts
+# the service (the hidden `run-dig-dns-service` entrypoint) and spawns the
+# real `dig-dns serve` as a child process. Mirrors dig-node-service's
+# win_service.rs pattern (see DEVELOPMENT_LOG.md).
+windows-service = "0.7"
 
 [profile.release]
 overflow-checks = true

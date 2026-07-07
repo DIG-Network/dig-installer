@@ -7,6 +7,10 @@ the latest DIG components for your OS/arch:
 - the **dig-node** local node — installed + started as an OS service (Windows
   service / systemd / launchd), with a best-effort `127.0.0.2 dig.local` hosts
   entry so apps and the DIG Browser can reach it port-free at `http://dig.local`,
+- the **dig-dns** local `*.dig` name resolver — installed + started as an OS
+  service (Windows Service / macOS LaunchDaemon / Linux systemd), with the OS
+  DNS/proxy wiring (split-DNS, NRPT, browser DoH policy) so a browser can open
+  `http://<storeId>.dig/…` directly (see [dig-dns](#dig-dns-local-dig-name-resolution) below),
 - the **dig-relay** *(advanced, optional)* — run your own NAT-traversal relay,
   installed + started as an OS service. Most users do **not** need this: every
   node already uses the canonical `relay.dig.net` out of the box.
@@ -21,6 +25,7 @@ downloads it. Sources:
 - the **digstore CLI** from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
 - the **dig-node** local node from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
+- the **dig-dns** local resolver from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
 - the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
 - the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
   — resolution works against DIG Browser's current **alpha/prerelease-only**
@@ -33,8 +38,8 @@ downloads it. Sources:
   only the token/extension pattern is checked, not the product-name prefix.
 
 By default only the digstore CLI is installed; add `--with-dig-node` /
-`--with-browser` (and `--service`) to select more. This is the canonical home of
-the DIG installer, migrated out of `digstore`.
+`--with-dig-dns` / `--with-browser` (and `--service`) to select more. This is
+the canonical home of the DIG installer, migrated out of `digstore`.
 
 ---
 
@@ -76,6 +81,24 @@ $s = irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/instal
 & ([scriptblock]::Create($s)) --with-dig-node
 ```
 
+### Also resolve `.dig` names in your browser
+
+Add `--with-dig-dns` to install `dig-dns` and register it as an OS service (Windows
+Service / macOS LaunchDaemon / Linux systemd), started automatically, with the OS
+DNS/proxy wiring so `http://<storeId>.dig/…` loads directly in a browser. See
+[dig-dns](#dig-dns-local-dig-name-resolution) below for what gets installed per OS:
+
+```sh
+# macOS / Linux — elevation (sudo) needed to register the service + wire split-DNS
+curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh -s -- --with-dig-dns
+```
+
+```powershell
+# Windows — registering the service + NRPT rule needs an elevated console
+$s = irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1
+& ([scriptblock]::Create($s)) --with-dig-dns
+```
+
 ### Also install the DIG Browser
 
 Add `--with-browser` to download the DIG Browser native installer for your OS:
@@ -98,9 +121,11 @@ Download the `dig-installer` binary for your OS/arch from the
 ```sh
 dig-installer                      # install latest digstore CLI + add to PATH
 dig-installer --with-dig-node      # ALSO install + start the dig-node service (+ dig.local)
+dig-installer --with-dig-dns       # ALSO install + start dig-dns (local *.dig name resolution)
 dig-installer --with-browser       # ALSO download the DIG Browser installer
 dig-installer --dry-run            # show exactly what would happen, change nothing
 dig-installer --dry-run --json     # the same, as a machine-readable plan
+dig-installer --uninstall-dig-dns  # remove the dig-dns service + OS wiring this installer created
 ```
 
 ### Flags
@@ -120,6 +145,10 @@ dig-installer --dry-run --json     # the same, as a machine-readable plan
 | `--relay-port <PORT>` | `9450` | Relay WebSocket port the relay service serves on. |
 | `--relay-health-port <PORT>` | `9451` | Relay HTTP `/health` port the relay service serves on. |
 | `--relay-version <VER>` | latest | Install a specific dig-relay version. |
+| `--with-dig-dns` | off | Also install `dig-dns` + register it as an OS service (local `*.dig` name resolution) + wire OS split-DNS/NRPT + the Chrome/Edge DoH policy. |
+| `--dig-dns-version <VER>` | latest | Install a specific dig-dns version. |
+| `--dig-dns-node <URL>` | dig-dns's own ladder | Explicit dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node <URL>`). |
+| `--uninstall-dig-dns` | — | Remove the dig-dns service + every OS artifact (service, split-DNS/NRPT rule, browser policy key) THIS installer created; leaves zero residue. Standalone action — ignores every other flag except `--dry-run`/`--json`. |
 | `--bin-dir <DIR>` | per-user DIG bin dir | Where to place the binaries. |
 | `--no-path` | off | Don't modify `PATH` (just place the binaries). |
 | `--dry-run` | off | Print/resolve actions without downloading or changing anything. |
@@ -154,7 +183,16 @@ Default install location (`--bin-dir`):
    hosts entry (see below). On Windows, service registration needs an elevated
    console — if you aren't elevated the installer surfaces a clear message and
    the digstore install still succeeds.
-6. **DIG Browser** *(with `--with-browser`)* — downloads the native installer
+6. **dig-dns** *(with `--with-dig-dns`)* — downloads the `dig-dns` binary, then
+   **owns the full per-OS service + DNS/browser wiring itself** (unlike
+   dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of its
+   own): registers + starts the OS service, wires OS split-DNS/NRPT, applies the
+   Chrome/Edge DoH policy (never clobbering an existing org policy), then
+   self-verifies with `dig-dns doctor` + `dig-dns pac` and prints the report —
+   which resolution path(s) are live, the bound gateway port, the PAC URL, and a
+   browser-fallback instruction. See [dig-dns](#dig-dns-local-dig-name-resolution)
+   below for the full per-OS contract.
+7. **DIG Browser** *(with `--with-browser`)* — downloads the native installer
    for your OS into the bin dir; run it to finish.
 
 Every download is integrity-checkable (SHA-256). `--dry-run` resolves and prints
@@ -188,14 +226,77 @@ entry so consumers (the DIG Browser, the extension) can reach your local node
 
 ---
 
+## dig-dns (local `.dig` name resolution)
+
+`--with-dig-dns` installs [`dig-dns`](https://github.com/DIG-Network/dig-dns) — the
+local `*.dig` name resolver (a DNS responder + HTTP gateway) — and registers it as an
+OS service so a browser can open `http://<storeId>.dig/…` directly. Its own README
+(`https://github.com/DIG-Network/dig-dns#readme`) is the authoritative per-OS
+contract; this installer implements it. The install is **elevated, idempotent** (safe
+to re-run — it converges, never duplicates a rule/policy/service), and **fully
+reversible** by `--uninstall-dig-dns`. It **never** edits `/etc/hosts` (`dig.local`
+above is a separate, unrelated mechanism), never URL-rewrites, and never intercepts
+TLS — dig-dns serves plain `http://` on its own dedicated loopback IP.
+
+### What gets installed per OS
+
+| OS | Service | DNS/proxy wiring | Browser policy |
+|----|---------|-------------------|-----------------|
+| **macOS** | A **LaunchDaemon** (root, `KeepAlive`, logs to `/var/log/dig-dns.{out,err}.log`) runs `dig-dns serve`. A second, one-shot LaunchDaemon re-applies the `127.0.0.5` `lo0` alias at every boot (macOS does not persist `ifconfig` aliases across reboot). | `/etc/resolver/dig` → `nameserver 127.0.0.5` (macOS's per-TLD resolver mechanism). | A best-effort Chrome managed-preference plist (DoH off + built-in-resolver off) — written ONLY if no existing MDM-provisioned policy is detected; manual instructions are always also printed. |
+| **Ubuntu / Linux** | A **systemd unit** runs `dig-dns serve` as a dedicated, unprivileged `dig-dns` user granted ONLY `CAP_NET_BIND_SERVICE` (`CapabilityBoundingSet`, `NoNewPrivileges=yes`), `Restart=always`. | The resolv.conf owner is detected and wired accordingly: a `systemd-resolved` `~dig` domain drop-in, OR a NetworkManager-dnsmasq `server=/dig/127.0.0.5` config. A plain (unmanaged) `resolv.conf` is left untouched — never blindly rewritten — relying on the PAC fallback (Path B) instead. | Chrome **and** Chromium managed-policy JSON files (uniquely named, merged alongside any existing admin policy — never overwrites one). |
+| **Windows** | A **Windows Service** (admin-checked; the SCM launches dig-installer's own persisted binary via a hidden `run-dig-dns-service` entrypoint, which spawns `dig-dns serve` as a supervised child — dig-dns itself has no Windows-service-protocol entrypoint). | An **NRPT rule** (`Add-DnsClientNrptRule -Namespace .dig -NameServers 127.0.0.5`), added idempotently (never fights a pre-existing `.dig` rule). | Chrome **and** Edge HKLM policy (`DnsOverHttpsMode=off`, `BuiltInDnsClientEnabled=0`) — written ONLY under a key this installer created or already owns; a pre-existing org GPO is never touched. |
+
+Every artifact this installer writes is tagged with a stable marker so a re-run is a
+no-op (idempotent) and `--uninstall-dig-dns` removes ONLY what it created — a
+pre-existing `.dig` NRPT rule, org browser policy, or resolv.conf config is never
+touched. `127.0.0.5:53`/`:80` binding, the `:80` → `:8053` fallback (with the PAC
+advertising the actual bound port), and the two independent resolution paths (OS
+split-DNS vs. the PAC proxy) are all dig-dns's own runtime behaviour — see its README.
+
+### Self-verification
+
+After starting the service, the installer runs `dig-dns doctor` (+ `dig-dns pac`) and
+prints: the per-check pass/fail/warn report, which resolution path(s) are live
+(`dns` / `gateway`), the gateway's actually-bound port, the PAC URL, and a one-line
+browser-fallback instruction:
+
+```sh
+dig-installer --with-dig-dns
+#   ...
+#   dig-dns doctor:
+#     [PASS] Loopback IP is up: 127.0.0.5 is assigned
+#     [PASS] HTTP gateway answers (Path B): answered on :80
+#   live path(s): dns, gateway
+#   gateway bound port: 80
+#   PAC URL: http://127.0.0.5:80/.dig/proxy.pac
+#   If a browser doesn't resolve .dig sites (e.g. it forces DNS-over-HTTPS), point its
+#   proxy configuration at the PAC file: http://127.0.0.5:80/.dig/proxy.pac
+```
+
+### Uninstalling
+
+```sh
+dig-installer --uninstall-dig-dns            # remove the service + OS wiring, zero residue
+dig-installer --uninstall-dig-dns --dry-run  # preview what would be removed
+```
+
+Stops + removes the OS service, the split-DNS/NRPT rule, and any browser policy key
+this installer created. It does **not** remove the downloaded `dig-dns` binary or any
+pre-existing org DNS/browser policy.
+
+---
+
 ## Agent-friendly surfaces
 
 `dig-installer` is scriptable for both humans and agents:
 
 - **`--json`** — emits a single structured object to **stdout** (all human prose
   goes to **stderr**, no prompts/spinners). On success:
-  `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,installed:[…]}}`.
+  `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,relay,dns,installed:[…]}}`
+  — `dns` (present with `--with-dig-dns`) carries `{installed,started,needs_elevation,note,doctor,paths_live,bound_port,pac_url,fallback_instruction}`.
   On failure: `{"ok":false,"error":{"code","exit_code","message","hint"}}`.
+  `--uninstall-dig-dns --json` emits `{"ok":true,"result":{uninstalled,needs_elevation,note,residue_removed:[…]}}`
+  standalone (it never touches the other components).
 - **`--help-json`** — prints the full invocation contract (components, flags,
   supported targets, and the exit-code table) as JSON.
 - **Stable error codes + exit codes** — every failure carries an `UPPER_SNAKE`
@@ -227,6 +328,9 @@ Following the ecosystem's canonical branding (see the superproject's `SYSTEM.md`
 - **DIGHUb** — the blind host (`hub.dig.net`).
 - **dig-node** — the local DIG node (renamed from `dig-companion`); the
   standalone-server twin of the DIG Browser's in-process node.
+- **dig-dns** — the local `*.dig` name resolver (a DNS responder + HTTP
+  gateway) that lets a browser open `http://<storeId>.dig/…` directly, backed
+  by a dig-node as its content source.
 
 ---
 
