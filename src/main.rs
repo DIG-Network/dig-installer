@@ -80,6 +80,28 @@ struct Cli {
     #[arg(long)]
     with_relay: bool,
 
+    /// Also install dig-dns and register it as an OS service (Windows Service / macOS
+    /// LaunchDaemon / Linux systemd): local `*.dig` name resolution (a DNS responder + HTTP
+    /// gateway), split-DNS/NRPT wiring, and the Chrome/Edge DoH policy.
+    #[arg(long)]
+    with_dig_dns: bool,
+
+    /// dig-dns version to install (e.g. 0.6.0); default: latest released.
+    #[arg(long, value_name = "VERSION")]
+    dig_dns_version: Option<String>,
+
+    /// An explicit dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve
+    /// --node <URL>`); default: dig-dns's own §5.3 ladder (dig.local -> localhost:9778 ->
+    /// rpc.dig.net).
+    #[arg(long, value_name = "URL")]
+    dig_dns_node: Option<String>,
+
+    /// Uninstall the dig-dns OS service + OS wiring this installer created (idempotent, leaves
+    /// zero residue; never removes the downloaded binary or a pre-existing org DNS/browser
+    /// policy). Runs standalone — ignores every other install flag.
+    #[arg(long = "uninstall-dig-dns")]
+    uninstall_dig_dns: bool,
+
     /// dig-relay version to install (e.g. 0.1.0); default: latest released.
     #[arg(long, value_name = "VERSION")]
     relay_version: Option<String>,
@@ -112,6 +134,26 @@ struct Cli {
 }
 
 fn main() -> std::process::ExitCode {
+    // The Windows Service Control Manager launches THIS binary with the hidden
+    // `run-dig-dns-service` subcommand (task #177 — dig-dns has no service-protocol
+    // entrypoint of its own; see `dig_installer::dns::service_host`). It carries no public
+    // `--help` surface, so it must be sniffed BEFORE handing argv to clap (clap would reject
+    // it as an unrecognised argument — the `Cli` struct below defines no subcommands).
+    #[cfg(windows)]
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(rest) = dig_installer::dns::service_host::matches_service_host_invocation(&argv)
+        {
+            return match dig_installer::dns::service_host::run(&rest) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("dig-dns service host error: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
+    }
+
     let cli = Cli::parse();
 
     if cli.help_json {
@@ -120,6 +162,10 @@ fn main() -> std::process::ExitCode {
     }
     // (`help_json`/`error_json` live in the library so they are unit-tested
     // directly; main.rs only wires them to stdout/exit codes.)
+
+    if cli.uninstall_dig_dns {
+        return run_uninstall_dig_dns(cli.dry_run, cli.json);
+    }
 
     // digstore is installed by default; --no-digstore opts out, --with-digstore
     // is the explicit (redundant) opt-in. --no-digstore wins if both are given.
@@ -143,6 +189,12 @@ fn main() -> std::process::ExitCode {
             port: cli.relay_port,
             health_port: cli.relay_health_port,
             start: !cli.no_service_start,
+        },
+        with_dig_dns: cli.with_dig_dns,
+        dig_dns_version: cli.dig_dns_version,
+        dns_service: dig_installer::dns::DnsInstallConfig {
+            start: !cli.no_service_start,
+            node: cli.dig_dns_node,
         },
         modify_path: !cli.no_path,
         dry_run: cli.dry_run,
@@ -184,4 +236,25 @@ fn run_json(plan: &InstallPlan) -> std::process::ExitCode {
             std::process::ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// `--uninstall-dig-dns`: tear down the dig-dns OS service + OS wiring this
+/// installer created (idempotent; leaves zero residue). Standalone action —
+/// [`dig_installer::dns::uninstall`] never fails (a permission issue is
+/// reported via `needs_elevation`, not an `Err`), so this always exits
+/// success; the caller re-runs elevated if prompted.
+fn run_uninstall_dig_dns(dry_run: bool, json: bool) -> std::process::ExitCode {
+    let result = dig_installer::dns::uninstall(dry_run);
+    if json {
+        println!("{}", dig_installer::dns_uninstall_json(&result));
+    } else {
+        println!("dig-dns uninstall: {}", result.note);
+        if result.needs_elevation {
+            eprintln!("hint: re-run in an elevated (Administrator/root) console");
+        }
+        for artifact in &result.residue_removed {
+            println!("  removed: {artifact}");
+        }
+    }
+    std::process::ExitCode::SUCCESS
 }

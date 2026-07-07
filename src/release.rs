@@ -66,6 +66,17 @@ impl Repo {
         Repo::new("DIG-Network", "dig-relay", "dig-relay")
     }
 
+    /// The dig-dns release source (`DIG-Network/dig-dns`). Publishes a raw
+    /// per-OS/arch binary `dig-dns-<ver>-<os_arch>[.exe]` (matched as a
+    /// [`AssetKind::RawBinary`](crate::asset::AssetKind::RawBinary)) — the local
+    /// `*.dig` name resolver (DNS responder + HTTP gateway + `doctor`). Unlike
+    /// dig-node/dig-relay, dig-dns ships NO `install`/`start` subcommands of its
+    /// own, so this installer registers it as an OS service directly (see
+    /// [`crate::dns`]) rather than delegating.
+    pub fn dig_dns() -> Repo {
+        Repo::new("DIG-Network", "dig-dns", "dig-dns")
+    }
+
     /// GitHub API URL for the latest release of this repo (returns JSON with a
     /// `tag_name` and an `assets` array).
     pub fn latest_release_api(&self) -> String {
@@ -172,6 +183,22 @@ mod tests {
         assert_eq!(
             Repo::dig_relay(),
             Repo::new("DIG-Network", "dig-relay", "dig-relay")
+        );
+        assert_eq!(
+            Repo::dig_dns(),
+            Repo::new("DIG-Network", "dig-dns", "dig-dns")
+        );
+    }
+
+    #[test]
+    fn dig_dns_binary_url_matches_published_asset_naming() {
+        assert_eq!(
+            Repo::dig_dns().binary_url("v0.6.0", "0.6.0", &lin()),
+            "https://github.com/DIG-Network/dig-dns/releases/download/v0.6.0/dig-dns-0.6.0-linux-x64"
+        );
+        assert_eq!(
+            Repo::dig_dns().binary_url("v0.6.0", "0.6.0", &win()),
+            "https://github.com/DIG-Network/dig-dns/releases/download/v0.6.0/dig-dns-0.6.0-windows-x64.exe"
         );
     }
 

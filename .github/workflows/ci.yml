@@ -93,3 +93,41 @@ jobs:
       # library and is unit-tested there. Repo currently measures ~87% lines.
       - name: Test with coverage (gate >=80% lines)
         run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'
+
+  # Per-OS compile verification (task #177). fmt/clippy/test above run ONLY on
+  # ubuntu-latest, so `#[cfg(windows)]`/`#[cfg(target_os = "macos")]` modules
+  # (the dig-dns Windows-service host + macOS LaunchDaemon wiring, `src/dns/`)
+  # are cfg'd OUT of every job above and never actually compiled pre-merge —
+  # the per-OS release binaries in `release.yml` only build AFTER a merge to
+  # main, which is too late to gate a PR. This job closes that gap: a plain
+  # `cargo build --all-targets` on the two OSes ubuntu-latest cannot compile,
+  # catching a platform-specific compile error before merge instead of after
+  # (this task's own review found — and fixed — two such bugs: a struct
+  # literal missing a field, present ONLY in code this job now exercises).
+  build-os-matrix:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-ci-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-build-
+      - run: cargo build --all-targets --locked

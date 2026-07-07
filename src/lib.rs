@@ -9,10 +9,16 @@
 //!   dig-node's own `install`/`start` subcommands, and (best-effort) a
 //!   `127.0.0.2 dig.local` hosts entry so consumers reach it port-free,
 //! * the **DIG Browser** (`DIG-Network/DIG_Browser`) → the native installer
-//!   (`.exe`/`.dmg`/`.AppImage`) downloaded for the user to run.
+//!   (`.exe`/`.dmg`/`.AppImage`) downloaded for the user to run, and
+//! * **dig-dns** (`DIG-Network/dig-dns`) → installed + registered as an OS
+//!   service (Windows Service / macOS LaunchDaemon / Linux systemd unit) for
+//!   local `*.dig` name resolution. Unlike dig-node/dig-relay, dig-dns ships
+//!   no `install`/`start` subcommands of its own, so this installer owns the
+//!   full per-OS service + split-DNS/NRPT + browser-policy wiring directly
+//!   (see [`dns`]), self-verifying with `dig-dns doctor` when done.
 //!
 //! Each component is selectable (`--with-digstore`/`--with-dig-node`/
-//! `--with-browser`/`--service`) with a pinnable per-artifact version override,
+//! `--with-browser`/`--with-dig-dns`/`--service`) with a pinnable per-artifact version override,
 //! and every download is integrity-checked. The asset for a release is resolved
 //! from the release's *actual* asset list ([`asset::select_asset`]) rather than a
 //! single guessed filename, so the installer is resilient to naming differences
@@ -28,6 +34,7 @@
 //! is unit-tested; [`run`] is the imperative orchestration that performs I/O.
 
 pub mod asset;
+pub mod dns;
 pub mod download;
 pub mod error;
 pub mod hosts;
@@ -70,6 +77,14 @@ pub struct InstallPlan {
     pub relay_version: Option<String>,
     /// Relay service configuration when `with_relay` is set.
     pub relay_service: ServiceConfigRelay,
+    /// Also install dig-dns and register it as an OS service (local `*.dig`
+    /// name resolution: a DNS responder + HTTP gateway).
+    pub with_dig_dns: bool,
+    /// dig-dns version/tag to install: `None` ⇒ latest released.
+    pub dig_dns_version: Option<String>,
+    /// dig-dns service configuration when `with_dig_dns` is set (start +
+    /// optional dig-node endpoint override forwarded to `dig-dns serve --node`).
+    pub dns_service: dns::DnsInstallConfig,
     /// Add the bin dir to PATH (default true).
     pub modify_path: bool,
     /// Print actions without performing them.
@@ -93,6 +108,9 @@ impl Default for InstallPlan {
             with_relay: false,
             relay_version: None,
             relay_service: ServiceConfigRelay::default(),
+            with_dig_dns: false,
+            dig_dns_version: None,
+            dns_service: dns::DnsInstallConfig::default(),
             modify_path: true,
             dry_run: false,
         }
@@ -151,6 +169,8 @@ pub struct InstallReport {
     pub service: Option<ServiceResult>,
     /// The run-your-own-relay service result (only when `--with-relay`).
     pub relay: Option<RelayResult>,
+    /// The dig-dns OS-service install result (only when `--with-dig-dns`).
+    pub dns: Option<dns::DnsInstallResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
 }
@@ -317,6 +337,7 @@ fn run_report_with(
         path: None,
         service: None,
         relay: None,
+        dns: None,
         installed: Vec::new(),
     };
 
@@ -340,7 +361,7 @@ fn run_report_with(
     }
 
     // 2. PATH (only meaningful if we placed a PATH binary).
-    if plan.modify_path && (plan.with_digstore || plan.with_dig_node) {
+    if plan.modify_path && (plan.with_digstore || plan.with_dig_node || plan.with_dig_dns) {
         log(&format!("Adding {} to PATH:", plan.bin_dir.display()));
         let dir = plan.bin_dir.to_string_lossy().into_owned();
         if plan.dry_run {
@@ -389,7 +410,32 @@ fn run_report_with(
         report.service = Some(register_dig_node(&dig_node_path, plan, log));
     }
 
-    // 4. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
+    // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service. Unlike
+    //    dig-node/dig-relay, dig-dns has no `install`/`start` subcommands of its own, so this
+    //    installer owns the full per-OS service + split-DNS/NRPT + browser-policy wiring (see
+    //    the `dns` module) and self-verifies with `dig-dns doctor` once started.
+    if plan.with_dig_dns {
+        log("Installing dig-dns (local *.dig name resolution):");
+        let c = resolve_component(
+            resolve,
+            &Repo::dig_dns(),
+            &plan.dig_dns_version,
+            &target,
+            AssetKind::RawBinary,
+            &plan.bin_dir,
+        )?;
+        log_component(log, &c);
+        download_component(&c, plan.dry_run)?;
+        if !plan.dry_run {
+            report.installed.push(c.dest.clone());
+        }
+        let dig_dns_path = PathBuf::from(c.dest.clone());
+        report.components.push(c);
+
+        report.dns = Some(register_dig_dns(&dig_dns_path, &target, plan, log));
+    }
+
+    // 5. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
     //    points at relay.dig.net, so this is only for users who want to operate a relay.
     if plan.with_relay {
         log("Installing the dig-relay (run-your-own-relay):");
@@ -412,7 +458,7 @@ fn run_report_with(
         report.relay = Some(register_relay(&relay_path, plan, log));
     }
 
-    // 5. DIG Browser native installer (optional).
+    // 6. DIG Browser native installer (optional).
     if plan.with_browser {
         log("Downloading the DIG Browser installer:");
         let c = resolve_component(
@@ -486,6 +532,85 @@ fn register_relay(
             ));
             result.note = e;
         }
+    }
+
+    result
+}
+
+/// Register dig-dns as an OS service (DNS responder + HTTP gateway for local
+/// `*.dig` name resolution) by delegating to [`dns::install`] — dig-dns ships
+/// no `install`/`start` subcommands of its own, so this installer owns the
+/// full per-OS wiring (systemd/LaunchDaemon/Windows Service, split-DNS/NRPT,
+/// the Chrome/Edge DoH policy) directly. Never panics/aborts the overall
+/// install — a permission or platform issue is recorded in the result, not
+/// propagated (the binary is already placed). Prints the `doctor`
+/// self-verification report, the live path(s), the bound gateway port, the
+/// PAC URL, and the browser-fallback instruction once the service starts
+/// (task #177).
+fn register_dig_dns(
+    dig_dns_path: &std::path::Path,
+    target: &Target,
+    plan: &InstallPlan,
+    log: &mut dyn FnMut(&str),
+) -> dns::DnsInstallResult {
+    log("Registering dig-dns as an OS service (DNS responder + HTTP gateway):");
+    // The Windows Service Control Manager needs a binary that itself speaks the
+    // service protocol; dig-dns's `serve` is a plain blocking CLI loop, so the
+    // SCM is pointed at THIS installer's own binary (persisted here) running
+    // the hidden `run-dig-dns-service` entrypoint, which spawns the real
+    // `dig-dns serve` as a supervised child (see `dns::windows`). Unused on
+    // macOS/Linux, where the service execs `dig_dns_path` directly.
+    let persist_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
+
+    let result = dns::install(dig_dns_path, &persist_bin, &plan.dns_service, plan.dry_run);
+
+    if plan.dry_run {
+        log(&format!("    ({})", result.note));
+        return result;
+    }
+
+    if result.installed {
+        log(&format!("    ✓ {}", result.note));
+    } else {
+        log(&format!("    ! {}", result.note));
+        if !result.needs_elevation {
+            log(&format!(
+                "    dig-dns is downloaded at {}; re-run dig-installer elevated (Administrator/root) to register the service.",
+                dig_dns_path.display()
+            ));
+        }
+    }
+
+    if let Some(doctor) = &result.doctor {
+        log("    dig-dns doctor:");
+        for c in &doctor.checks {
+            log(&format!(
+                "      [{}] {}: {}",
+                c.status.to_uppercase(),
+                c.name,
+                c.detail
+            ));
+            if let Some(fix) = &c.fix {
+                log(&format!("            fix: {fix}"));
+            }
+        }
+    }
+    log(&format!(
+        "    live path(s): {}",
+        if result.paths_live.is_empty() {
+            "NONE".to_string()
+        } else {
+            result.paths_live.join(", ")
+        }
+    ));
+    if let Some(port) = result.bound_port {
+        log(&format!("    gateway bound port: {port}"));
+    }
+    if let Some(url) = &result.pac_url {
+        log(&format!("    PAC URL: {url}"));
+    }
+    if let Some(fallback) = &result.fallback_instruction {
+        log(&format!("    {fallback}"));
     }
 
     result
@@ -649,6 +774,14 @@ pub fn error_json(e: &InstallError) -> String {
     serde_json::to_string(&envelope).expect("error envelope serializes")
 }
 
+/// The structured envelope emitted to stdout under `--json` for
+/// `--uninstall-dig-dns`: `{"ok":true,"result":<DnsUninstallResult>}` (never
+/// `ok:false` — [`dns::uninstall`] cannot fail, only report `needs_elevation`).
+pub fn dns_uninstall_json(result: &dns::DnsUninstallResult) -> String {
+    let envelope = serde_json::json!({ "ok": true, "result": result });
+    serde_json::to_string(&envelope).expect("dns uninstall envelope serializes")
+}
+
 /// The full machine-readable invocation contract for `--help-json`: the
 /// component catalogue, supported targets, global/per-command flags, and the
 /// exit-code table. An agent introspects this instead of scraping `--help`.
@@ -664,11 +797,12 @@ pub fn help_json() -> String {
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": SCHEMA_VERSION,
         "description": "Universal DIG installer (thin shim): resolves + downloads the latest \
-    per-OS/arch release asset for the digstore CLI, dig-node service, and DIG Browser.",
+    per-OS/arch release asset for the digstore CLI, dig-node service, dig-dns service, and DIG Browser.",
         "components": [
             { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
+            { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": false, "flag": "--with-dig-dns", "kind": "raw_binary+service+split-dns+browser-policy" },
             { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
         ],
         "targets": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"],
@@ -691,7 +825,11 @@ pub fn help_json() -> String {
             { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced — the default node uses relay.dig.net)" },
             { "flag": "--relay-version", "value": "VERSION", "description": "pin dig-relay version (default: latest)" },
             { "flag": "--relay-port", "value": "PORT", "default": 9450, "description": "relay WebSocket port for the relay service" },
-            { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" }
+            { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" },
+            { "flag": "--with-dig-dns", "description": "install + register dig-dns as an OS service (local *.dig name resolution: DNS responder + HTTP gateway)" },
+            { "flag": "--dig-dns-version", "value": "VERSION", "description": "pin dig-dns version (default: latest)" },
+            { "flag": "--dig-dns-node", "value": "URL", "description": "dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node`); default: dig-dns's own ladder" },
+            { "flag": "--uninstall-dig-dns", "description": "uninstall the dig-dns OS service + OS wiring this installer created (idempotent, zero residue; does not touch pre-existing org policy)" }
         ],
         "exit_codes": exit_codes
     });
@@ -758,11 +896,18 @@ mod tests {
             "DIG-Browser-1.0.0-macos.dmg",
             "DIG-Browser-1.0.0-linux-x86_64.AppImage",
         ];
+        let dns: Vec<&'static str> = vec![
+            "dig-dns-0.6.0-windows-x64.exe",
+            "dig-dns-0.6.0-linux-x64",
+            "dig-dns-0.6.0-macos-arm64",
+            "dig-dns-0.6.0-macos-x64",
+        ];
         let mut m = HashMap::new();
         m.insert("digstore", ("v0.6.0", digstore));
         m.insert("dig-node", ("v0.2.0", node));
         m.insert("dig-relay", ("v0.1.0", relay));
         m.insert("DIG_Browser", ("v1.0.0", browser));
+        m.insert("dig-dns", ("v0.6.0", dns));
         m
     }
 
@@ -781,6 +926,9 @@ mod tests {
             with_relay: false,
             relay_version: None,
             relay_service: ServiceConfigRelay::default(),
+            with_dig_dns: false,
+            dig_dns_version: None,
+            dns_service: dns::DnsInstallConfig::default(),
             modify_path: false,
             dry_run: true,
         }
@@ -807,6 +955,7 @@ mod tests {
         assert!(report.path.is_none());
         assert!(report.service.is_none());
         assert!(report.relay.is_none());
+        assert!(report.dns.is_none());
         assert!(report.installed.is_empty());
     }
 
@@ -956,12 +1105,51 @@ mod tests {
     }
 
     #[test]
+    fn dig_dns_dry_run_reports_the_would_install_intent_without_touching_the_system() {
+        // Dry-run must never spawn a process, write a service, or need elevation —
+        // it just records what WOULD happen (mirrors dig-node/relay's dry-run contract).
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-dns resolves");
+        assert!(report.components.iter().any(|c| c.component == "dig-dns"));
+        let dns_result = report.dns.expect("dns result present");
+        assert!(!dns_result.installed);
+        assert!(!dns_result.needs_elevation);
+        assert!(
+            dns_result.note.contains("would"),
+            "got: {}",
+            dns_result.note
+        );
+        assert!(dns_result.doctor.is_none(), "dry-run never runs doctor");
+        assert!(dns_result.paths_live.is_empty());
+    }
+
+    #[test]
+    fn dig_dns_dry_run_forwards_a_node_override_and_puts_it_on_path() {
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        plan.dns_service.node = Some("http://localhost:9778".to_string());
+        plan.modify_path = true;
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        assert_eq!(
+            plan.dns_service.node.as_deref(),
+            Some("http://localhost:9778")
+        );
+        // dig-dns places a raw PATH binary, same as digstore/dig-node.
+        let path = report
+            .path
+            .expect("path result present with only dig-dns selected");
+        assert!(path.dir.contains("dig-installer-test-bin"));
+    }
+
+    #[test]
     fn full_plan_resolves_all_components_in_order() {
-        // digstore + dig-node + relay + browser, PATH on. All four components
-        // resolve, plus path/service/relay sections.
+        // digstore + dig-node + dig-dns + relay + browser, PATH on. All five
+        // components resolve, plus path/service/dns/relay sections.
         let mut plan = base_plan();
         plan.with_digstore = true;
         plan.with_dig_node = true;
+        plan.with_dig_dns = true;
         plan.with_relay = true;
         plan.with_browser = true;
         plan.modify_path = true;
@@ -973,10 +1161,17 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["digstore", "dig-node", "dig-relay", "DIG-Browser"]
+            vec![
+                "digstore",
+                "dig-node",
+                "dig-dns",
+                "dig-relay",
+                "DIG-Browser"
+            ]
         );
         assert!(report.path.is_some());
         assert!(report.service.is_some());
+        assert!(report.dns.is_some());
         assert!(report.relay.is_some());
     }
 
@@ -1025,6 +1220,7 @@ mod tests {
         let mut plan = base_plan();
         plan.with_digstore = true;
         plan.with_dig_node = true;
+        plan.with_dig_dns = true;
         plan.modify_path = true;
         let report = run_dry(&plan, all_releases()).expect("ok");
         let v: serde_json::Value = serde_json::to_value(&report).unwrap();
@@ -1037,6 +1233,7 @@ mod tests {
             "path",
             "service",
             "relay",
+            "dns",
             "installed",
         ] {
             assert!(v.get(key).is_some(), "report JSON missing key {key}");
@@ -1048,6 +1245,20 @@ mod tests {
         let svc = &v["service"];
         for key in ["installed", "started", "port", "note", "dig_local"] {
             assert!(svc.get(key).is_some(), "service JSON missing key {key}");
+        }
+        let dns_json = &v["dns"];
+        for key in [
+            "installed",
+            "started",
+            "needs_elevation",
+            "note",
+            "doctor",
+            "paths_live",
+            "bound_port",
+            "pac_url",
+            "fallback_instruction",
+        ] {
+            assert!(dns_json.get(key).is_some(), "dns JSON missing key {key}");
         }
     }
 
@@ -1086,7 +1297,7 @@ mod tests {
             .iter()
             .map(|c| c["id"].as_str().unwrap())
             .collect();
-        for id in ["digstore", "dig-node", "dig-relay", "browser"] {
+        for id in ["digstore", "dig-node", "dig-relay", "dig-dns", "browser"] {
             assert!(ids.contains(&id), "help-json missing component {id}");
         }
 
@@ -1124,5 +1335,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&error_json(&e)).unwrap();
         assert_eq!(v["error"]["code"], "IO");
         assert!(v["error"]["hint"].is_null());
+    }
+
+    #[test]
+    fn dns_uninstall_json_wraps_the_result_in_an_ok_envelope() {
+        let result = dns::DnsUninstallResult {
+            uninstalled: true,
+            needs_elevation: false,
+            note: "removed: Windows service \"net.dignetwork.dig-dns\"".to_string(),
+            residue_removed: vec!["Windows service \"net.dignetwork.dig-dns\"".to_string()],
+        };
+        let v: serde_json::Value = serde_json::from_str(&dns_uninstall_json(&result)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["uninstalled"], true);
+        assert_eq!(
+            v["result"]["residue_removed"][0],
+            "Windows service \"net.dignetwork.dig-dns\""
+        );
     }
 }
