@@ -151,6 +151,22 @@ mod tests {
         let mut perms = std::fs::metadata(&p).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&p, perms).unwrap();
+        // Unlike `service.rs`'s `stub_exit` (which dodges this by pointing at a
+        // pre-existing system binary), this helper needs CUSTOM stdout, so it must
+        // write a fresh script. A just-written, just-`chmod`'d file can transiently
+        // fail exec with ETXTBSY ("Text file busy", os error 26) on Linux — the
+        // kernel briefly refuses to exec a file that is/was open for writing (the
+        // exact regression documented in `service.rs`). Warm up the exec here
+        // (discarding the result, retrying only on ETXTBSY) so the race resolves
+        // before the real test invocation spawns it.
+        for _ in 0..50 {
+            match std::process::Command::new(&p).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         p
     }
 
