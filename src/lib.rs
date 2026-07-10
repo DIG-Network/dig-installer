@@ -37,6 +37,7 @@ pub mod asset;
 pub mod dns;
 pub mod download;
 pub mod error;
+pub mod health;
 pub mod hosts;
 pub mod paths;
 pub mod release;
@@ -163,6 +164,16 @@ pub struct ServiceResult {
     /// Human-readable detail behind [`Self::dig_local_resolves`] — never
     /// silent (CLAUDE.md task #140: "failures surface a clear message").
     pub dig_local_resolve_note: String,
+    /// The post-install RPC health check (task #223): was `rpc.discover`
+    /// actually attempted against the service's loopback port? `false` on
+    /// dry-run or when the service was never started (nothing to probe).
+    pub health_checked: bool,
+    /// Did the health check confirm the node is answering RPC? `false`
+    /// whenever `health_checked` is `false` — see [`Self::health_note`] for
+    /// why (never silent, same convention as `dig_local_resolve_note`).
+    pub health_ok: bool,
+    /// Human-readable detail behind [`Self::health_ok`].
+    pub health_note: String,
 }
 
 /// The result of uninstalling the dig-node service + removing the `dig.local`
@@ -700,6 +711,9 @@ fn register_dig_node(
         dig_local: String::new(),
         dig_local_resolves: false,
         dig_local_resolve_note: String::new(),
+        health_checked: false,
+        health_ok: false,
+        health_note: String::new(),
     };
 
     if plan.dry_run {
@@ -720,6 +734,7 @@ fn register_dig_node(
         );
         log(&format!("    ({})", result.dig_local));
         result.dig_local_resolve_note = "skipped (dry run)".to_string();
+        result.health_note = "skipped (dry run)".to_string();
         return result;
     }
 
@@ -777,8 +792,41 @@ fn register_dig_node(
     result.dig_local_resolves = resolved.resolves;
     result.dig_local_resolve_note = resolved.note;
 
+    // Post-install RPC health check (task #223): confirm the node is
+    // actually ANSWERING on its configured port — distinct from the
+    // dig.local resolve check above, which only proves DNS resolution.
+    // Skipped when the service was never started (nothing to probe): with
+    // `--no-service-start` the user explicitly deferred starting it, and if
+    // `install_service` itself failed, `result.started` is already `false`.
+    if result.started {
+        let health = health::wait_for_node_health(
+            plan.service.port,
+            HEALTH_CHECK_ATTEMPTS,
+            HEALTH_CHECK_INTERVAL,
+        );
+        if health.healthy {
+            log(&format!("    ✓ health check: {}", health.note));
+        } else {
+            log(&format!(
+                "    ! health check FAILED: {} — the service may not have started correctly.",
+                health.note
+            ));
+        }
+        result.health_checked = health.checked;
+        result.health_ok = health.healthy;
+        result.health_note = health.note;
+    } else {
+        result.health_note = "skipped (service not started)".to_string();
+    }
+
     result
 }
+
+/// Health-check retry budget for [`register_dig_node`]: up to 10 attempts,
+/// 500ms apart (5s worst case) — enough for a freshly-started service to
+/// bind its socket. Mirrors `dns::doctor::wait_for_doctor`'s own budget.
+const HEALTH_CHECK_ATTEMPTS: u32 = 10;
+const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Uninstall the dig-node OS service and remove the `dig.local` hosts entry
 /// this installer added (task #140) — the counterpart to [`register_dig_node`].
@@ -935,7 +983,7 @@ pub fn help_json() -> String {
     per-OS/arch release asset for the digstore CLI, dig-node service, dig-dns service, and DIG Browser.",
         "components": [
             { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
-            { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local" },
+            { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local+health-check" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": false, "flag": "--with-dig-dns", "kind": "raw_binary+service+split-dns+browser-policy" },
             { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
@@ -1161,6 +1209,10 @@ mod tests {
         // Dry-run never probes OS resolution (nothing was written to check).
         assert!(!svc.dig_local_resolves);
         assert_eq!(svc.dig_local_resolve_note, "skipped (dry run)");
+        // Dry-run never probes the node's RPC either (task #223).
+        assert!(!svc.health_checked);
+        assert!(!svc.health_ok);
+        assert_eq!(svc.health_note, "skipped (dry run)");
     }
 
     #[test]
@@ -1390,6 +1442,9 @@ mod tests {
             "dig_local",
             "dig_local_resolves",
             "dig_local_resolve_note",
+            "health_checked",
+            "health_ok",
+            "health_note",
         ] {
             assert!(svc.get(key).is_some(), "service JSON missing key {key}");
         }
