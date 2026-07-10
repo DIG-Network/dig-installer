@@ -434,6 +434,22 @@ fn run_report_with(
         log("Installing the dig-node local node:");
         let c = resolve_dig_node(resolve, &plan.dig_node_version, &target, &plan.bin_dir, log)?;
         log_component(log, &c);
+        // Task #232: stop a currently-running dig-node BEFORE overwriting its
+        // binary (Windows locks a running exe's file — overwriting it in
+        // place would fail with a sharing violation, or worse, corrupt a
+        // partial write). Skip-when-absent/not-serving is not an error; a
+        // stop FAILURE aborts this artifact's write entirely rather than risk
+        // a half-written binary underneath a still-running service.
+        if !plan.dry_run {
+            let dest = std::path::Path::new(&c.dest);
+            let stop =
+                service::stop_running_dig_node(dest).map_err(InstallError::service_stop_failed)?;
+            log(&format!(
+                "    {} {}",
+                if stop.attempted { "✓" } else { "·" },
+                stop.note
+            ));
+        }
         download_component(&c, plan.dry_run)?;
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
@@ -450,23 +466,52 @@ fn run_report_with(
     //    the `dns` module) and self-verifies with `dig-dns doctor` once started.
     if plan.with_dig_dns {
         log("Installing dig-dns (local *.dig name resolution):");
-        let c = resolve_component(
+        match resolve_component(
             resolve,
             &Repo::dig_dns(),
             &plan.dig_dns_version,
             &target,
             AssetKind::RawBinary,
             &plan.bin_dir,
-        )?;
-        log_component(log, &c);
-        download_component(&c, plan.dry_run)?;
-        if !plan.dry_run {
-            report.installed.push(c.dest.clone());
-        }
-        let dig_dns_path = PathBuf::from(c.dest.clone());
-        report.components.push(c);
+        ) {
+            Ok(c) => {
+                log_component(log, &c);
+                download_component(&c, plan.dry_run)?;
+                if !plan.dry_run {
+                    report.installed.push(c.dest.clone());
+                }
+                let dig_dns_path = PathBuf::from(c.dest.clone());
+                report.components.push(c);
 
-        report.dns = Some(register_dig_dns(&dig_dns_path, &target, plan, log));
+                report.dns = Some(register_dig_dns(&dig_dns_path, &target, plan, log));
+            }
+            // dig-dns is EPIC #174 and may ship no published release yet. Gate
+            // this ONE component gracefully instead of failing the whole plan
+            // (task #234): record a clear "not yet available" state and let
+            // every other selected component (dig-relay, browser, …) still
+            // install. A genuine transport failure (not "nothing published")
+            // still propagates like every other component.
+            Err(e) if e.code() == "ASSET_NOT_FOUND" => {
+                let note = format!(
+                    "dig-dns is not yet available ({e}) — it is EPIC #174 and has no matching \
+                     release yet; skipped, the rest of the install continues. Re-run once a \
+                     release is published."
+                );
+                log(&format!("    ! {note}"));
+                report.dns = Some(dns::DnsInstallResult {
+                    installed: false,
+                    started: false,
+                    needs_elevation: false,
+                    note,
+                    doctor: None,
+                    paths_live: Vec::new(),
+                    bound_port: None,
+                    pac_url: None,
+                    fallback_instruction: None,
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // 5. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
@@ -482,6 +527,19 @@ fn run_report_with(
             &plan.bin_dir,
         )?;
         log_component(log, &c);
+        // Task #232: stop a currently-running dig-relay before overwriting
+        // its binary — same skip-when-absent/not-serving, abort-on-stop-
+        // failure contract as dig-node above.
+        if !plan.dry_run {
+            let dest = std::path::Path::new(&c.dest);
+            let stop =
+                service::stop_running_dig_relay(dest).map_err(InstallError::service_stop_failed)?;
+            log(&format!(
+                "    {} {}",
+                if stop.attempted { "✓" } else { "·" },
+                stop.note
+            ));
+        }
         download_component(&c, plan.dry_run)?;
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
@@ -1313,6 +1371,49 @@ mod tests {
         );
         assert!(dns_result.doctor.is_none(), "dry-run never runs doctor");
         assert!(dns_result.paths_live.is_empty());
+    }
+
+    #[test]
+    fn dig_dns_missing_release_gates_gracefully_and_the_rest_of_the_plan_continues() {
+        // dig-dns is EPIC #174 and may ship no release yet (task #234). Selecting
+        // it must NOT abort the whole install: components resolved before AND
+        // after dig-dns in plan order must still install, and the dns section
+        // must record a clear "not yet available" state instead of an Err.
+        let mut releases = all_releases();
+        releases.remove("dig-dns");
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.with_dig_dns = true;
+        plan.with_relay = true; // ordered AFTER dig-dns — proves the plan continues
+        let report = run_dry(&plan, releases).expect("dig-dns gate must not fail the plan");
+
+        // digstore (before) and dig-relay (after) both still resolved.
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert!(ids.contains(&"digstore"));
+        assert!(ids.contains(&"dig-relay"));
+        assert!(
+            !ids.contains(&"dig-dns"),
+            "dig-dns never resolved, so it must not appear as a component"
+        );
+        assert!(
+            report.relay.is_some(),
+            "the plan must continue past the dig-dns gate"
+        );
+
+        // The dns section records a clear, non-fatal "not yet available" state.
+        let dns = report
+            .dns
+            .expect("dns section present even though unresolvable");
+        assert!(!dns.installed);
+        assert!(!dns.started);
+        assert!(!dns.needs_elevation);
+        assert!(dns.note.contains("not yet available"), "got: {}", dns.note);
+        assert!(dns.doctor.is_none());
+        assert!(dns.paths_live.is_empty());
     }
 
     #[test]

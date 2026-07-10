@@ -31,6 +31,15 @@ serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
 dirs = "5"
+# The universal DIG installer's own library (repo root `dig-installer` crate,
+# lib name `dig_installer`) — reused here so the GUI's "other DIG components"
+# phase (dig-node / dig-dns / dig-relay / DIG Browser, task #234) drives the
+# EXACT SAME tested release-resolution/download/service-lifecycle
+# orchestration as the CLI thin-shim (`run_report`), instead of a second,
+# divergent implementation. Path dependency: this crate stays its own
+# workspace root (see the `[workspace]` table above) so building the GUI
+# never pulls in the digstore crates under crates/.
+dig-installer = { path = "../../.." }
 
 [target.'cfg(windows)'.dependencies]
 # User-PATH update: read/write HKCU\Environment directly (no setx truncation,

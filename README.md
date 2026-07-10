@@ -288,6 +288,12 @@ reversible** by `--uninstall-dig-dns`. It **never** edits `/etc/hosts` (`dig.loc
 above is a separate, unrelated mechanism), never URL-rewrites, and never intercepts
 TLS — dig-dns serves plain `http://` on its own dedicated loopback IP.
 
+**Availability gate (task #234):** dig-dns is EPIC #174 and may ship no release
+for some period. If `--with-dig-dns` is given and no matching release/asset can
+be resolved, this component alone is skipped with a clear
+`"dig-dns is not yet available"` note — every other selected component still
+installs; the overall run does not fail. Re-run once a release is published.
+
 ### What gets installed per OS
 
 | OS | Service | DNS/proxy wiring | Browser policy |
@@ -371,10 +377,22 @@ pre-existing org DNS/browser policy.
   | 5 | `CHECKSUM_MISMATCH` | downloaded artifact failed its SHA-256 verification |
   | 6 | `PATH_UPDATE_FAILED` | could not update PATH (the binary was still placed) |
   | 7 | `SERVICE_NEEDS_ELEVATION` | dig-node service registration needs an elevated console |
-  | 8 | `SERVICE_START_FAILED` | the dig-node service failed to install or start |
+  | 8 | `SERVICE_START_FAILED` | the dig-node/dig-relay service failed to install or start |
   | 9 | `IO` | failed to write a downloaded binary to disk |
+  | 10 | `SERVICE_STOP_FAILED` | a running dig-node/dig-relay service failed to stop before its binary could be safely replaced |
 
   (Usage errors from argument parsing return clap's own exit code 2.)
+
+  **Stop-before-write, start-after-write (task #232):** before overwriting an
+  already-installed dig-node/dig-relay binary, the installer checks
+  `<bin> status --json` and, if it reports the service is currently serving,
+  runs `<bin> stop` first — skip-when-absent/not-serving (no error); a stop
+  FAILURE aborts that component's write (`SERVICE_STOP_FAILED`) rather than
+  risk a half-written binary underneath a still-running service. After the
+  binary is written, `install`+`start` run as before (an `install` failure
+  alone — e.g. "already registered" — is tolerated so `start` still gets a
+  chance to bring the new binary's service back up). See `SPEC.md` §2 for the
+  full contract.
 
 ---
 
@@ -396,31 +414,39 @@ Following the ecosystem's canonical branding (see the superproject's `SYSTEM.md`
 ## GUI installer (`gui/`)
 
 A Tauri-based desktop install **wizard** lives under `gui/` (migrated from
-`digstore`). It is the polished, brand-designed single-file installer
-(`DigStore-Setup-*.exe` / `*.dmg` / `*.AppImage`) that **embeds** a prebuilt
-`digstore` binary for an offline, no-network first install. The release workflow
-builds it on a tag by downloading the latest released `digstore` binary, staging
-it (`gui/app/scripts/stage-binary.mjs --src <path>`), and running `tauri build`.
+`digstore`), dark-themed by default (Welcome → License → **Components** →
+Install → Done). It **embeds** a prebuilt `digstore` binary for an offline,
+no-network first install of the CLI specifically. The release workflow builds
+it on a tag by downloading the latest released `digstore` binary, staging it
+(`gui/app/scripts/stage-binary.mjs --src <path>`), and running `tauri build`.
 
-The CLI (`dig-installer`) is the canonical universal entrypoint (it powers the
-one-liner above and supports `--with-dig-node`); the GUI is the friendly desktop
-experience for the digstore CLI specifically.
+The Components step lists the SAME catalogue as the CLI (digstore + dig-node +
+dig-dns + dig-relay + DIG Browser — see `SPEC.md` §1), every component
+pre-selected so "install all" is the one-click default path; deselect anything
+you don't want. digstore installs via the embedded payload above; every other
+selected component is installed by the wizard delegating to this repo's own
+`dig_installer::run_report` — the exact same release-resolution/download/
+service-lifecycle orchestration the CLI uses (see `SPEC.md` §2 for the
+stop-before-write/start-after-write service lifecycle both surfaces share).
+
+The CLI (`dig-installer`) remains the canonical universal entrypoint (it
+powers the one-liner above and every `--with-*` flag); the GUI is the
+brand-designed desktop wizard over the same underlying install engine.
 
 ---
 
 ## Releasing
 
-Tag-driven (mirrors digstore / dig-node). On a pushed `v*` tag, CI builds the
-`dig-installer` CLI for every OS/arch **and** the GUI installers, and attaches
-them all to one GitHub Release:
-
-```sh
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
+Tag-driven (mirrors digstore / dig-node) — **do not hand-push a tag**. On
+merge to `main`, `changelog-tag.yml` regenerates `CHANGELOG.md`, commits
+`chore(release): vX.Y.Z`, and pushes that commit + the matching `vX.Y.Z` tag
+(via `RELEASE_TOKEN`, so the push actually fires the tag-triggered workflow).
+The pushed tag runs `release.yml`, which builds the `dig-installer` CLI for
+every OS/arch **and** the GUI installers, and attaches them all to one GitHub
+Release. See `runbooks/deployment.md` for the full trigger/verify checklist.
 
 A push to `main` builds the CLI (no publish) so a broken build is caught before
-tagging.
+the release tag is even created.
 
 ## Building from source
 
