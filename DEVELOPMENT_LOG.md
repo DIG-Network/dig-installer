@@ -111,3 +111,59 @@ theme in direct disagreement** — flagged for the orchestrator to resolve
 (either add the installer GUI to the sanctioned-dark-exception list, or
 this reversion needs revisiting) rather than silently drift again. Whoever
 touches this theme next should check which way `SYSTEM.md` reads FIRST.
+
+## Closing the gui/app/src-tauri pre-merge CI gap (#238, dig_ecosystem)
+
+`gui/app/src-tauri` deliberately declares its own empty `[workspace]` table
+(isolating it from the root workspace so the CLI never drags in Tauri), which
+also meant no root-level `cargo` invocation in `ci.yml` ever touched it — it
+was only ever compiled by `release.yml`'s `build-gui` job, AFTER a version
+tag was already pushed. Added `gui-fmt`/`gui-clippy`/`gui-test`/
+`gui-build-os-matrix`/`gui-frontend` jobs scoped via `--manifest-path`.
+Findings from actually turning these on:
+
+- **The checked-in `Cargo.lock` for a path-dependency drifts silently when
+  nothing ever builds with `--locked`.** Both `Cargo.lock`s (root and GUI)
+  had the path-dep `dig-installer` entry pinned at a version *behind* the
+  live `Cargo.toml` (the GUI's lock still said `0.4.0`/`0.5.0` after a root
+  version bump nobody re-locked against). `cargo build --locked` doesn't
+  care about *this* drift normally — but it fails outright the moment the
+  lock's recorded version differs from what the path dep's own
+  `Cargo.toml` reports, because `--locked` forbids the resync. Direct,
+  reproducible proof of the exact gap #238 closes: this had clearly been
+  broken for at least one prior version bump and nothing caught it. Fix is
+  a 1-line hand-edit of the `version = "..."` field in the lock entry (path
+  deps carry no checksum/source to reconcile) — far more minimal than
+  `cargo update -p dig-installer`, which cascades into unrelated transitive
+  version churn (observed: several `windows-sys`/`getrandom`/`tempfile`
+  transitive versions shifted) because unlocking one package still lets the
+  resolver re-pick anything downstream of it.
+- **A `#[cfg(windows)]`-gated use site does NOT make an un-gated `const`
+  declaration warning-free cross-platform.** `install.rs`'s
+  `DIG_ICON_ICO` (an embedded `.ico` for the Windows ProgID icon) was a
+  plain top-level `const`, but its only reader was inside a
+  `#[cfg(windows)]` block — invisible on ubuntu-latest/macos-14, so
+  `-D warnings` (`dead_code`) failed there despite the crate being
+  perfectly clean on native Windows. This is the *exact* class of bug the
+  root crate's `build-os-matrix` job's own header comment warns about,
+  now caught in the GUI crate too. Fix: cfg-gate the const itself
+  (mirrors the pre-existing `DIG_ICON_PNG` sibling one line below it).
+- **The `ERROR_ELEVATION_REQUIRED` (Windows os error 740) quirk running
+  this crate's compiled test binary does NOT reproduce on GitHub's hosted
+  `windows-latest` runner** — reproduced locally on a non-elevated local
+  Windows console, but the experimental `gui-test-windows` CI job (added
+  non-blocking specifically to observe this) passed clean on the hosted
+  runner. Whatever local heuristic triggers it (binary name containing
+  "installer"?) either doesn't apply, or the hosted runner's default
+  console privilege context differs. `gui-test` still runs its required
+  copy on ubuntu-latest/macos-14 (this crate's only real test content is
+  OS-agnostic pure logic), but this is a useful data point if the elevation
+  question resurfaces — it is NOT a hosted-CI blocker.
+- Tauri/`wry` on Linux needs `libwebkit2gtk-4.1-dev libappindicator3-dev
+  librsvg2-dev patchelf` from apt just to **compile** (not just bundle) —
+  `gui-clippy`/`gui-test` on ubuntu-latest install these first, mirroring
+  `release.yml`'s `build-gui` Linux step. `cargo build`/`clippy`/`test`
+  against this crate do NOT require the frontend `dist/` to exist first —
+  `tauri.conf.json`'s `beforeBuildCommand` only fires under the `tauri`
+  CLI (`tauri build`/`tauri dev`), never under plain `cargo`; verified by
+  removing `dist/` and rebuilding clean.

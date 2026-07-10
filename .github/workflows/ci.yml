@@ -7,6 +7,17 @@
 #
 # Mirrors the gate commands already used by the release workflow's `check`
 # job, but fires pre-merge on the PR rather than post-tag.
+#
+# The jobs above only ever touch the ROOT `dig-installer` crate. The Tauri GUI
+# crate (`gui/app/src-tauri`, package `digstore-installer`) deliberately
+# declares its own empty `[workspace]` table so building the CLI never drags
+# in the Tauri dependency tree — but that isolation means no root-level
+# `cargo` invocation above ever compiles/lints/tests it. Historically it was
+# only ever built by `release.yml`'s `build-gui` job, which runs AFTER a
+# version tag is already pushed, so a GUI-only compile/lint/test regression
+# was caught post-release rather than pre-merge (task #238, dig_ecosystem
+# issue). The `gui-*` jobs below close that gap by scoping the same gate set
+# at `gui/app/src-tauri` via `--manifest-path`.
 name: CI
 
 on:
@@ -131,3 +142,174 @@ jobs:
           key: ${{ runner.os }}-installer-ci-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-installer-ci-build-
       - run: cargo build --all-targets --locked
+
+  # ---------------------------------------------------------------------------
+  # GUI crate (`gui/app/src-tauri`, package `digstore-installer`) gates.
+  # See the header comment: this crate is its own workspace root and was
+  # previously compiled/linted/tested nowhere pre-merge. Scoped via
+  # --manifest-path so the root-crate jobs above stay untouched.
+  # ---------------------------------------------------------------------------
+  gui-fmt:
+    name: gui rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + rustfmt)
+        run: |
+          rustup toolchain install stable --component rustfmt
+          rustup default stable
+          rustc --version
+      # No Tauri system deps needed: fmt only parses source, never compiles.
+      - run: cargo fmt --manifest-path gui/app/src-tauri/Cargo.toml --all -- --check
+
+  gui-clippy:
+    name: gui clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + clippy)
+        run: |
+          rustup toolchain install stable --component clippy
+          rustup default stable
+          rustc --version
+      # Tauri/wry on Linux links against webkit2gtk/appindicator/rsvg; without
+      # these the crate fails to even compile, not just to bundle. Mirrors
+      # release.yml's build-gui Linux step.
+      - name: Install Linux Tauri deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gui/app/src-tauri/target
+          key: ${{ runner.os }}-installer-ci-gui-clippy-${{ hashFiles('gui/app/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-gui-clippy-
+      - run: cargo clippy --manifest-path gui/app/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+  gui-test:
+    name: gui test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+      - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gui/app/src-tauri/target
+          key: ${{ runner.os }}-installer-ci-gui-test-${{ hashFiles('gui/app/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-gui-test-
+      # No coverage gate here (unlike the root crate's `test` job): this crate
+      # is a Tauri desktop app whose bulk is UI/command wiring, not the kind
+      # of pure logic the root crate's >=80% line gate targets. The one real
+      # test module (`plan_from_selection_tests` in src/install.rs) is
+      # OS-agnostic pure logic and runs on both matrix OSes; the separate
+      # `#[cfg(all(test, windows))]` module in the same file structurally
+      # cannot compile on ubuntu/macos, so it's naturally skipped here with no
+      # coverage loss (see the windows-only gui-test-windows job below).
+      - run: cargo test --manifest-path gui/app/src-tauri/Cargo.toml --locked
+
+  # Experimental, NON-blocking: observes whether `cargo test` on this crate
+  # reproduces the "requires elevation" (Windows os error 740) quirk seen
+  # running the compiled test-harness binary on a non-elevated local Windows
+  # console (task #238 dig_ecosystem issue) on GitHub's hosted windows-latest
+  # runner, which runs in a different privilege context. Not required: a
+  # flaky required check is worse than the narrower gui-test job above, which
+  # already covers this crate's only OS-agnostic test content on ubuntu/macos.
+  gui-test-windows:
+    name: gui test (windows-latest, experimental)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gui/app/src-tauri/target
+          key: ${{ runner.os }}-installer-ci-gui-test-${{ hashFiles('gui/app/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-gui-test-
+      - run: cargo test --manifest-path gui/app/src-tauri/Cargo.toml --locked
+
+  gui-build-os-matrix:
+    name: gui build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gui/app/src-tauri/target
+          key: ${{ runner.os }}-installer-ci-gui-build-${{ hashFiles('gui/app/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-ci-gui-build-
+      - run: cargo build --manifest-path gui/app/src-tauri/Cargo.toml --all-targets --locked
+
+  gui-frontend:
+    name: gui frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # No lint/test suite exists yet for gui/app (runbooks/local-running.md
+      # notes this explicitly) — standing up one is out of scope here; a
+      # green install + production build is the correctly-sized JS gate for
+      # this task (task #238 dig_ecosystem issue).
+      - name: Install frontend deps
+        working-directory: gui/app
+        run: npm ci || npm install
+      - name: Build frontend
+        working-directory: gui/app
+        run: npm run build

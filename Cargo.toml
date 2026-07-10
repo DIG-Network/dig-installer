@@ -18,7 +18,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.5.0"
+version = "0.5.1"
 description = "Universal DIG installer — installs the digstore CLI and (optionally) the dig-node and dig-dns services"
 authors = ["DIG Network"]
 edition = "2021"
