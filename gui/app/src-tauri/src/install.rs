@@ -43,6 +43,10 @@ const EMBEDDED_SHA256: &str = include_str!(concat!(env!("OUT_DIR"), "/digstore.s
 
 // The DIG brand icon, embedded so the .dig file-type association has an icon to
 // point at regardless of where the user runs the (single-file) installer.
+// Only referenced from the `#[cfg(windows)]` half of `register_dig_association`
+// (the ProgID DefaultIcon writes an .ico); cfg-gating the constant itself keeps
+// non-Windows builds free of an unused-embedded-icon dead-code warning.
+#[cfg(windows)]
 const DIG_ICON_ICO: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.ico"));
 #[cfg(all(unix, not(target_os = "macos")))]
 const DIG_ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.png"));
