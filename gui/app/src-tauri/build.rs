@@ -21,7 +21,6 @@ fn main() {
     // Let rustc know `embed_digstore` is an expected cfg (no warning when unset).
     println!("cargo:rustc-check-cfg=cfg(embed_digstore)");
 
-
     let bin_name = if cfg!(windows) {
         "digstore.exe"
     } else {
@@ -108,9 +107,8 @@ fn main() {
     </security>
   </trustInfo>
 </assembly>"#;
-    let attributes = tauri_build::Attributes::new().windows_attributes(
-        tauri_build::WindowsAttributes::new().app_manifest(manifest),
-    );
+    let attributes = tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(manifest));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
 

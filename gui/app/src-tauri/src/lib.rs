@@ -34,7 +34,10 @@ fn installer_meta(app: AppHandle) -> Meta {
     // Best-effort: ask the bundled binary for its version so the UI shows the
     // truth. Falls back to the spec's 1.0.0 if the binary can't be queried yet.
     let version = bundled_version(&app).unwrap_or_else(|| "1.0.0".to_string());
-    Meta { version, compiler: "1.0.0".to_string() }
+    Meta {
+        version,
+        compiler: "1.0.0".to_string(),
+    }
 }
 
 /// Returns the version of the **bundled `digstore` CLI** that this installer
@@ -76,7 +79,11 @@ fn default_install_path() -> String {
 }
 
 #[tauri::command]
-fn run_install(app: AppHandle, state: State<'_, InstallState>, opts: install::InstallOpts) -> Result<(), String> {
+fn run_install(
+    app: AppHandle,
+    state: State<'_, InstallState>,
+    opts: install::InstallOpts,
+) -> Result<(), String> {
     state.cancelled.store(false, Ordering::SeqCst);
     let cancelled = state.cancelled.clone();
     // Run on a worker thread; the pipeline emits its own events.
@@ -102,13 +109,23 @@ fn cancel_install(state: State<'_, InstallState>) {
 #[tauri::command]
 fn launch_terminal(install_path: String) -> Result<(), String> {
     let bin_dir = std::path::PathBuf::from(&install_path).join("bin");
-    let cwd = if bin_dir.exists() { bin_dir } else { std::path::PathBuf::from(&install_path) };
+    let cwd = if bin_dir.exists() {
+        bin_dir
+    } else {
+        std::path::PathBuf::from(&install_path)
+    };
 
     #[cfg(windows)]
     {
         // Open a new Command Prompt in the install dir.
         Command::new("cmd")
-            .args(["/C", "start", "cmd", "/K", "echo digstore installed. Try: digstore --version"])
+            .args([
+                "/C",
+                "start",
+                "cmd",
+                "/K",
+                "echo digstore installed. Try: digstore --version",
+            ])
             .current_dir(&cwd)
             .spawn()
             .map_err(|e| format!("launch terminal: {e}"))?;
@@ -129,7 +146,10 @@ fn launch_terminal(install_path: String) -> Result<(), String> {
             .find(|t| which(t));
         match term {
             Some(t) => {
-                Command::new(t).current_dir(&cwd).spawn().map_err(|e| format!("launch terminal: {e}"))?;
+                Command::new(t)
+                    .current_dir(&cwd)
+                    .spawn()
+                    .map_err(|e| format!("launch terminal: {e}"))?;
             }
             None => return Err("no terminal emulator found".into()),
         }
@@ -139,7 +159,11 @@ fn launch_terminal(install_path: String) -> Result<(), String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn which(bin: &str) -> bool {
-    Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -148,7 +172,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(InstallState { cancelled: Arc::new(AtomicBool::new(false)) })
+        .manage(InstallState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
         .invoke_handler(tauri::generate_handler![
             installer_meta,
             bundled_digstore_version,

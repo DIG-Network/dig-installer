@@ -54,6 +54,16 @@ pub fn uninstall_args() -> Vec<String> {
     vec!["uninstall".to_string()]
 }
 
+/// The subcommand to stop a running service (task #232 — stop-before-write).
+pub fn stop_args() -> Vec<String> {
+    vec!["stop".to_string()]
+}
+
+/// The subcommand to query service state (task #232).
+fn status_json_args() -> Vec<String> {
+    vec!["status".to_string(), "--json".to_string()]
+}
+
 /// Environment variables to pass to `dig-node install` so the registered
 /// service serves on the configured port. dig-node's `install` snapshots its
 /// effective config into the service definition, so setting the env here is what
@@ -73,16 +83,120 @@ pub fn install_env(cfg: &ServiceConfig) -> BTreeMap<String, String> {
 ///
 /// On Windows, installing a service needs an elevated console; dig-node detects
 /// this and returns a clear message, which we surface verbatim.
+///
+/// `install` is NOT idempotent (task #232): re-running it over an
+/// already-registered service hard-fails on Windows SCM / macOS launchd
+/// ("already exists"-style errors) even though the registration is still
+/// perfectly usable. Since the registration always points at the SAME on-disk
+/// path this installer writes to, a failed re-`install` does not prevent
+/// `start` from picking up the binary this run just wrote — so an `install`
+/// failure is tolerated (recorded in the note) and `start` is still attempted
+/// when `cfg.start` is set. Only a `start` failure is a hard error: that is
+/// the actual "the service isn't running" outcome the caller cares about.
 pub fn install_service(bin: &Path, cfg: &ServiceConfig) -> Result<String, String> {
-    run_dig_node(bin, &install_args(), &install_env(cfg))
-        .map_err(|e| format!("dig-node install failed: {e}"))?;
-    let mut note = String::from("dig-node installed as an OS service");
+    let mut note = match run_dig_node(bin, &install_args(), &install_env(cfg)) {
+        Ok(()) => String::from("dig-node installed as an OS service"),
+        Err(e) => format!(
+            "dig-node install did not complete cleanly ({e}); continuing since a service may \
+             already be registered at this path — the start attempt below is the real signal"
+        ),
+    };
     if cfg.start {
         run_dig_node(bin, &start_args(), &BTreeMap::new())
             .map_err(|e| format!("dig-node start failed: {e}"))?;
         note.push_str(" and started");
     }
     Ok(note)
+}
+
+/// The outcome of [`stop_running_dig_node`] (task #232 — stop a running
+/// service BEFORE this run overwrites its binary; Windows locks a running
+/// exe's file, so overwriting it in place fails with a sharing violation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopOutcome {
+    /// A binary already existed at the destination path — i.e. this is an
+    /// upgrade over a prior install, not a first install.
+    pub bin_existed: bool,
+    /// The service was found serving and a stop was attempted.
+    pub attempted: bool,
+    /// The attempted stop succeeded. Always `false` when `attempted` is
+    /// `false` (nothing to stop is not a stop failure).
+    pub stopped: bool,
+    /// Human-readable detail — never silent (mirrors the rest of this crate's
+    /// `note` convention).
+    pub note: String,
+}
+
+/// Parse a dig-node `status --json` response for its flat top-level
+/// `"serving"` boolean. Pure — unit-tested without spawning anything. `None`
+/// means "could not determine" (malformed/unexpected JSON, or the binary
+/// predates the `status` verb); callers treat that as "not serving", the
+/// safe default when there is no evidence otherwise.
+fn parse_dig_node_serving(status_stdout: &[u8]) -> Option<bool> {
+    serde_json::from_slice::<serde_json::Value>(status_stdout)
+        .ok()?
+        .get("serving")?
+        .as_bool()
+}
+
+/// Spawn `<bin> status --json` and read whether dig-node is currently
+/// serving. Never hard-fails: a spawn failure or unparseable output resolves
+/// to "not serving" (see [`parse_dig_node_serving`]).
+fn dig_node_is_serving(bin: &Path) -> bool {
+    Command::new(bin)
+        .args(status_json_args())
+        .output()
+        .ok()
+        .and_then(|out| parse_dig_node_serving(&out.stdout))
+        .unwrap_or(false)
+}
+
+/// Stop a currently-serving dig-node service before its binary is
+/// overwritten (task #232). Delegates to dig-node's own `stop` verb — never
+/// hand-rolls OS service control. Skip-when-absent (no error) when `bin`
+/// doesn't exist yet (first install) or `status` reports it isn't serving.
+/// If it IS serving and the stop attempt itself fails, this returns `Err` so
+/// the caller ABORTS this artifact's write rather than risk a half-written
+/// binary underneath a still-running service.
+pub fn stop_running_dig_node(bin: &Path) -> Result<StopOutcome, String> {
+    stop_running_dig_node_with(bin, dig_node_is_serving)
+}
+
+/// [`stop_running_dig_node`] with an injectable "is currently serving" check
+/// — production code passes [`dig_node_is_serving`] (a real `status --json`
+/// probe); tests inject a fixed answer so the skip-vs-attempt branching is
+/// exercised without a JSON-emitting stub process.
+fn stop_running_dig_node_with(
+    bin: &Path,
+    is_serving: impl Fn(&Path) -> bool,
+) -> Result<StopOutcome, String> {
+    if !bin.exists() {
+        return Ok(StopOutcome {
+            bin_existed: false,
+            attempted: false,
+            stopped: false,
+            note: "no existing dig-node binary — first install, nothing to stop".to_string(),
+        });
+    }
+    if !is_serving(bin) {
+        return Ok(StopOutcome {
+            bin_existed: true,
+            attempted: false,
+            stopped: false,
+            note: "existing dig-node service is not currently serving — nothing to stop"
+                .to_string(),
+        });
+    }
+    run_dig_node(bin, &stop_args(), &BTreeMap::new())
+        .map(|()| StopOutcome {
+            bin_existed: true,
+            attempted: true,
+            stopped: true,
+            note: "stopped the running dig-node service before replacing its binary".to_string(),
+        })
+        .map_err(|e| {
+            format!("could not stop the running dig-node service before replacing its binary: {e}")
+        })
 }
 
 /// Run `dig-node uninstall` (task #140) using the previously-installed binary
@@ -149,16 +263,93 @@ pub fn relay_install_env(cfg: &RelayServiceConfig) -> BTreeMap<String, String> {
 /// Run `dig-relay install` (and, if `cfg.start`, `dig-relay start`) using the downloaded binary at
 /// `bin`. Returns a human note. On Windows, installing a service needs an elevated console;
 /// dig-relay detects this and returns a clear message, surfaced verbatim.
+///
+/// Mirrors [`install_service`]'s tolerance (task #232): `install` is not
+/// idempotent (a re-install over an already-registered service can hard-fail
+/// on Windows/macOS), but the registration points at the same on-disk path
+/// this run just wrote, so a failed re-`install` does not block `start` from
+/// picking up the new binary. Only a `start` failure is a hard error.
 pub fn install_relay_service(bin: &Path, cfg: &RelayServiceConfig) -> Result<String, String> {
-    run_relay(bin, &install_args(), &relay_install_env(cfg))
-        .map_err(|e| format!("dig-relay install failed: {e}"))?;
-    let mut note = String::from("dig-relay installed as an OS service");
+    let mut note = match run_relay(bin, &install_args(), &relay_install_env(cfg)) {
+        Ok(()) => String::from("dig-relay installed as an OS service"),
+        Err(e) => format!(
+            "dig-relay install did not complete cleanly ({e}); continuing since a service may \
+             already be registered at this path — the start attempt below is the real signal"
+        ),
+    };
     if cfg.start {
         run_relay(bin, &start_args(), &BTreeMap::new())
             .map_err(|e| format!("dig-relay start failed: {e}"))?;
         note.push_str(" and started");
     }
     Ok(note)
+}
+
+/// Parse a dig-relay `status --json` response for its NESTED
+/// `result.serving` boolean (dig-relay's envelope shape differs from
+/// dig-node's flat `serving` — see [`parse_dig_node_serving`]). Pure —
+/// unit-tested without spawning anything.
+fn parse_dig_relay_serving(status_stdout: &[u8]) -> Option<bool> {
+    serde_json::from_slice::<serde_json::Value>(status_stdout)
+        .ok()?
+        .get("result")?
+        .get("serving")?
+        .as_bool()
+}
+
+/// Spawn `<bin> status --json` and read whether dig-relay is currently
+/// serving. Never hard-fails: a spawn failure or unparseable output resolves
+/// to "not serving".
+fn dig_relay_is_serving(bin: &Path) -> bool {
+    Command::new(bin)
+        .args(status_json_args())
+        .output()
+        .ok()
+        .and_then(|out| parse_dig_relay_serving(&out.stdout))
+        .unwrap_or(false)
+}
+
+/// Stop a currently-serving dig-relay service before its binary is
+/// overwritten (task #232) — the dig-relay counterpart to
+/// [`stop_running_dig_node`]; same skip-when-absent / skip-when-not-serving /
+/// abort-on-stop-failure contract.
+pub fn stop_running_dig_relay(bin: &Path) -> Result<StopOutcome, String> {
+    stop_running_dig_relay_with(bin, dig_relay_is_serving)
+}
+
+/// [`stop_running_dig_relay`] with an injectable "is currently serving" check
+/// (mirrors [`stop_running_dig_node_with`]).
+fn stop_running_dig_relay_with(
+    bin: &Path,
+    is_serving: impl Fn(&Path) -> bool,
+) -> Result<StopOutcome, String> {
+    if !bin.exists() {
+        return Ok(StopOutcome {
+            bin_existed: false,
+            attempted: false,
+            stopped: false,
+            note: "no existing dig-relay binary — first install, nothing to stop".to_string(),
+        });
+    }
+    if !is_serving(bin) {
+        return Ok(StopOutcome {
+            bin_existed: true,
+            attempted: false,
+            stopped: false,
+            note: "existing dig-relay service is not currently serving — nothing to stop"
+                .to_string(),
+        });
+    }
+    run_relay(bin, &stop_args(), &BTreeMap::new())
+        .map(|()| StopOutcome {
+            bin_existed: true,
+            attempted: true,
+            stopped: true,
+            note: "stopped the running dig-relay service before replacing its binary".to_string(),
+        })
+        .map_err(|e| {
+            format!("could not stop the running dig-relay service before replacing its binary: {e}")
+        })
 }
 
 /// Spawn the dig-relay binary with args + env, inheriting stdio (so the user sees the elevation
@@ -360,7 +551,12 @@ mod tests {
     }
 
     #[test]
-    fn install_service_surfaces_a_nonzero_install_exit() {
+    fn install_service_surfaces_a_nonzero_start_exit_when_install_and_start_both_fail() {
+        // task #232: install() failing no longer aborts before start() is
+        // attempted (a re-install over an already-registered service hard-fails
+        // on Windows/macOS even though the registration is fine) — so when
+        // EVERYTHING fails, the surfaced error is now attributed to the START
+        // attempt (the actual "is it running" signal), not the install step.
         let dir = tmp_subdir("node-fail");
         let bin = stub_exit(&dir, false);
         let err = install_service(
@@ -371,14 +567,35 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.contains("dig-node install failed"), "got: {err}");
+        assert!(err.contains("dig-node start failed"), "got: {err}");
+    }
+
+    #[test]
+    fn install_service_tolerates_an_install_failure_when_start_is_not_requested() {
+        // task #232: an install failure alone (e.g. "already registered") is no
+        // longer fatal — only a START failure is, and with start:false there is
+        // no start attempt at all, so this must succeed with an explanatory note.
+        let dir = tmp_subdir("node-install-fail-no-start");
+        let bin = stub_exit(&dir, false);
+        let note = install_service(
+            &bin,
+            &ServiceConfig {
+                port: 8080,
+                start: false,
+            },
+        )
+        .expect("install failure alone must not be fatal when start isn't requested");
+        assert!(note.contains("did not complete cleanly"), "got: {note}");
+        assert!(!note.contains("and started"));
     }
 
     #[test]
     fn install_service_errors_when_binary_is_missing() {
         let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-xyz");
         let err = install_service(&missing, &ServiceConfig::default()).unwrap_err();
-        assert!(err.contains("dig-node install failed"), "got: {err}");
+        // start:true (the default) is still attempted (and still fails) against
+        // the same missing binary, so the surfaced error is the start failure.
+        assert!(err.contains("dig-node start failed"), "got: {err}");
         assert!(err.contains("could not run"), "got: {err}");
     }
 
@@ -424,10 +641,161 @@ mod tests {
     }
 
     #[test]
-    fn install_relay_service_surfaces_a_nonzero_install_exit() {
+    fn install_relay_service_surfaces_a_nonzero_start_exit_when_install_and_start_both_fail() {
+        // Mirrors install_service's task #232 tolerance: install() failing alone
+        // is no longer fatal, so when everything fails the surfaced error is
+        // attributed to the start attempt.
         let dir = tmp_subdir("relay-fail");
         let bin = stub_exit(&dir, false);
         let err = install_relay_service(&bin, &RelayServiceConfig::default()).unwrap_err();
-        assert!(err.contains("dig-relay install failed"), "got: {err}");
+        assert!(err.contains("dig-relay start failed"), "got: {err}");
+    }
+
+    #[test]
+    fn install_relay_service_tolerates_an_install_failure_when_start_is_not_requested() {
+        let dir = tmp_subdir("relay-install-fail-no-start");
+        let bin = stub_exit(&dir, false);
+        let note = install_relay_service(
+            &bin,
+            &RelayServiceConfig {
+                port: 9450,
+                health_port: 9451,
+                start: false,
+            },
+        )
+        .expect("install failure alone must not be fatal when start isn't requested");
+        assert!(note.contains("did not complete cleanly"), "got: {note}");
+        assert!(!note.contains("and started"));
+    }
+
+    // -- task #232: stop-before-write --------------------------------------
+
+    #[test]
+    fn stop_args_is_the_stop_verb() {
+        assert_eq!(stop_args(), vec!["stop".to_string()]);
+    }
+
+    #[test]
+    fn parse_dig_node_serving_reads_the_flat_field() {
+        assert_eq!(
+            parse_dig_node_serving(br#"{"ok":true,"serving":true,"addr":"127.0.0.1:9778"}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_dig_node_serving(br#"{"ok":true,"serving":false}"#),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_dig_node_serving_is_none_on_malformed_or_missing_field() {
+        assert_eq!(parse_dig_node_serving(b"not json"), None);
+        assert_eq!(parse_dig_node_serving(b""), None);
+        assert_eq!(parse_dig_node_serving(br#"{"ok":true}"#), None);
+    }
+
+    #[test]
+    fn parse_dig_relay_serving_reads_the_nested_field() {
+        assert_eq!(
+            parse_dig_relay_serving(br#"{"ok":true,"result":{"serving":true,"health_url":"x"}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_dig_relay_serving(br#"{"ok":true,"result":{"serving":false}}"#),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_dig_relay_serving_is_none_on_malformed_or_missing_field() {
+        assert_eq!(parse_dig_relay_serving(b"not json"), None);
+        assert_eq!(parse_dig_relay_serving(br#"{"ok":true}"#), None);
+        // Flat "serving" (dig-node's shape) at the top level does NOT satisfy
+        // dig-relay's nested contract — proves the two parsers aren't
+        // accidentally interchangeable.
+        assert_eq!(parse_dig_relay_serving(br#"{"serving":true}"#), None);
+    }
+
+    #[test]
+    fn stop_running_dig_node_skips_when_binary_is_absent() {
+        // First install: no prior binary at this path, so there is nothing to
+        // stop — must succeed (not an error) with attempted:false.
+        let missing = std::env::temp_dir().join(format!(
+            "dig-installer-stop-node-absent-{}",
+            std::process::id()
+        ));
+        let outcome = stop_running_dig_node_with(&missing, |_| true).expect("skip is not an error");
+        assert!(!outcome.bin_existed);
+        assert!(!outcome.attempted);
+        assert!(!outcome.stopped);
+    }
+
+    #[test]
+    fn stop_running_dig_node_skips_when_not_serving() {
+        let dir = tmp_subdir("stop-node-not-serving");
+        let bin = stub_exit(&dir, true); // exists on disk; injected as not-serving
+        let outcome =
+            stop_running_dig_node_with(&bin, |_| false).expect("not serving is not an error");
+        assert!(outcome.bin_existed);
+        assert!(!outcome.attempted);
+        assert!(!outcome.stopped);
+    }
+
+    #[test]
+    fn stop_running_dig_node_stops_when_serving_and_stop_succeeds() {
+        let dir = tmp_subdir("stop-node-serving-ok");
+        let bin = stub_exit(&dir, true); // `stop` (any arg) exits 0 on this stub
+        let outcome = stop_running_dig_node_with(&bin, |_| true).expect("stop succeeds");
+        assert!(outcome.bin_existed);
+        assert!(outcome.attempted);
+        assert!(outcome.stopped);
+    }
+
+    #[test]
+    fn stop_running_dig_node_aborts_when_serving_and_stop_fails() {
+        let dir = tmp_subdir("stop-node-serving-fail");
+        let bin = stub_exit(&dir, false); // `stop` exits non-zero on this stub
+        let err = stop_running_dig_node_with(&bin, |_| true).unwrap_err();
+        assert!(err.contains("could not stop"), "got: {err}");
+    }
+
+    #[test]
+    fn stop_running_dig_relay_skips_when_binary_is_absent() {
+        let missing = std::env::temp_dir().join(format!(
+            "dig-installer-stop-relay-absent-{}",
+            std::process::id()
+        ));
+        let outcome =
+            stop_running_dig_relay_with(&missing, |_| true).expect("skip is not an error");
+        assert!(!outcome.bin_existed);
+        assert!(!outcome.attempted);
+    }
+
+    #[test]
+    fn stop_running_dig_relay_skips_when_not_serving() {
+        let dir = tmp_subdir("stop-relay-not-serving");
+        let bin = stub_exit(&dir, true);
+        let outcome =
+            stop_running_dig_relay_with(&bin, |_| false).expect("not serving is not an error");
+        assert!(outcome.bin_existed);
+        assert!(!outcome.attempted);
+    }
+
+    #[test]
+    fn stop_running_dig_relay_stops_when_serving_and_stop_succeeds() {
+        let dir = tmp_subdir("stop-relay-serving-ok");
+        let bin = stub_exit(&dir, true);
+        let outcome = stop_running_dig_relay_with(&bin, |_| true).expect("stop succeeds");
+        assert!(outcome.bin_existed);
+        assert!(outcome.attempted);
+        assert!(outcome.stopped);
+    }
+
+    #[test]
+    fn stop_running_dig_relay_aborts_when_serving_and_stop_fails() {
+        let dir = tmp_subdir("stop-relay-serving-fail");
+        let bin = stub_exit(&dir, false);
+        let err = stop_running_dig_relay_with(&bin, |_| true).unwrap_err();
+        assert!(err.contains("could not stop"), "got: {err}");
     }
 }

@@ -23,14 +23,43 @@ export const FEATURES = [
   },
 ];
 
-// Component sizes/descriptions match the prototype. `id` values map 1:1 to the
-// component identifiers the Rust install pipeline understands.
+// The REAL DIG component catalogue (task #234) — `id` values map 1:1 to the
+// component identifiers the Rust install pipeline understands (mirrors the
+// `dig-installer --help-json` "components" list: digstore, dig-node,
+// dig-relay, dig-dns, browser). Every optional component is pre-checked
+// (`on: true`) so "install all" is the default one-click path; digstore is
+// `req: true` — it is the CLI itself and is always installed.
 export const COMPONENTS = [
-  { id: "cli", name: "DigStore CLI", desc: "The digstore command — init, add, commit, log, clone.", size: "18.4 MB", req: true },
-  { id: "host", name: "Host Runtime", desc: "Sandboxed WASM host with attestation + session ABI.", size: "21.0 MB", on: true },
-  { id: "completions", name: "Shell completions", desc: "bash · zsh · fish tab-completion for digstore.", size: "0.3 MB", on: true },
-  { id: "path", name: "Add digstore to PATH", desc: "Symlink digstore into /usr/local/bin.", size: "—", on: true },
-  { id: "example", name: "Example store", desc: "A sample urn:dig store to clone and explore.", size: "6.1 MB", on: false },
+  {
+    id: "digstore",
+    name: "DigStore CLI",
+    desc: "The digstore command — init, add, commit, log, clone. Added to PATH.",
+    req: true,
+  },
+  {
+    id: "dig-node",
+    name: "dig-node",
+    desc: "Your local DIG node — installed as an OS service so store reads/writes hit your own machine first.",
+    on: true,
+  },
+  {
+    id: "dig-dns",
+    name: "dig-dns",
+    desc: "Local *.dig name resolution as an OS service, so a browser can open http://<store>.dig directly. Skipped automatically if not yet released.",
+    on: true,
+  },
+  {
+    id: "dig-relay",
+    name: "dig-relay (advanced)",
+    desc: "Run your own NAT-traversal relay. Optional — every node already uses the canonical relay.dig.net by default.",
+    on: true,
+  },
+  {
+    id: "browser",
+    name: "DIG Browser",
+    desc: "The DIG-native desktop browser — chia:// and dig:// links resolve natively. Downloads the native installer.",
+    on: true,
+  },
 ];
 
 // Files surfaced in the progress header "writing <file>" while the real

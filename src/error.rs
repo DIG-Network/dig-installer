@@ -41,6 +41,10 @@ pub enum ErrorKind {
     ServiceNeedsElevation,
     /// The dig-node service failed to install/start for a non-elevation reason.
     ServiceStartFailed,
+    /// A currently-running service failed to stop before this run could safely
+    /// replace its binary (task #232) — the write is aborted rather than risk
+    /// a half-written binary underneath a still-running process.
+    ServiceStopFailed,
     /// Writing a downloaded binary to disk failed.
     Io,
 }
@@ -57,6 +61,7 @@ impl ErrorKind {
             ErrorKind::PathUpdateFailed => "PATH_UPDATE_FAILED",
             ErrorKind::ServiceNeedsElevation => "SERVICE_NEEDS_ELEVATION",
             ErrorKind::ServiceStartFailed => "SERVICE_START_FAILED",
+            ErrorKind::ServiceStopFailed => "SERVICE_STOP_FAILED",
             ErrorKind::Io => "IO",
         }
     }
@@ -72,6 +77,7 @@ impl ErrorKind {
             ErrorKind::ServiceNeedsElevation => 7,
             ErrorKind::ServiceStartFailed => 8,
             ErrorKind::Io => 9,
+            ErrorKind::ServiceStopFailed => 10,
         }
     }
 
@@ -87,6 +93,9 @@ impl ErrorKind {
                 "dig-node service registration needs an elevated console (re-run elevated)"
             }
             ErrorKind::ServiceStartFailed => "the dig-node service failed to install or start",
+            ErrorKind::ServiceStopFailed => {
+                "a running service failed to stop before its binary could be safely replaced"
+            }
             ErrorKind::Io => "failed to write a downloaded binary to disk",
         }
     }
@@ -146,6 +155,9 @@ impl InstallError {
     pub fn service_start_failed(msg: impl Into<String>) -> InstallError {
         InstallError::new(ErrorKind::ServiceStartFailed, msg)
     }
+    pub fn service_stop_failed(msg: impl Into<String>) -> InstallError {
+        InstallError::new(ErrorKind::ServiceStopFailed, msg)
+    }
     pub fn io(msg: impl Into<String>) -> InstallError {
         InstallError::new(ErrorKind::Io, msg)
     }
@@ -199,6 +211,11 @@ pub const EXIT_CODES: &[(u8, &str, &str)] = &[
         "the dig-node service failed to install or start",
     ),
     (9, "IO", "failed to write a downloaded binary to disk"),
+    (
+        10,
+        "SERVICE_STOP_FAILED",
+        "a running service failed to stop before its binary could be safely replaced",
+    ),
 ];
 
 #[cfg(test)]
@@ -217,6 +234,7 @@ mod tests {
             "SERVICE_NEEDS_ELEVATION"
         );
         assert_eq!(ErrorKind::ServiceStartFailed.code(), "SERVICE_START_FAILED");
+        assert_eq!(ErrorKind::ServiceStopFailed.code(), "SERVICE_STOP_FAILED");
         assert_eq!(ErrorKind::Io.code(), "IO");
     }
 
@@ -230,6 +248,7 @@ mod tests {
             ErrorKind::PathUpdateFailed,
             ErrorKind::ServiceNeedsElevation,
             ErrorKind::ServiceStartFailed,
+            ErrorKind::ServiceStopFailed,
             ErrorKind::Io,
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -267,6 +286,7 @@ mod tests {
                 "PATH_UPDATE_FAILED" => ErrorKind::PathUpdateFailed,
                 "SERVICE_NEEDS_ELEVATION" => ErrorKind::ServiceNeedsElevation,
                 "SERVICE_START_FAILED" => ErrorKind::ServiceStartFailed,
+                "SERVICE_STOP_FAILED" => ErrorKind::ServiceStopFailed,
                 "IO" => ErrorKind::Io,
                 other => panic!("unknown EXIT_CODES row: {other}"),
             };
@@ -289,6 +309,7 @@ mod tests {
                 "PATH_UPDATE_FAILED" => ErrorKind::PathUpdateFailed,
                 "SERVICE_NEEDS_ELEVATION" => ErrorKind::ServiceNeedsElevation,
                 "SERVICE_START_FAILED" => ErrorKind::ServiceStartFailed,
+                "SERVICE_STOP_FAILED" => ErrorKind::ServiceStopFailed,
                 "IO" => ErrorKind::Io,
                 other => panic!("unknown EXIT_CODES row: {other}"),
             };

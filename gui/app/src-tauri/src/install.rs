@@ -13,6 +13,11 @@
 //!   5. Add digstore to PATH (user PATH on Windows; symlink in /usr/local/bin
 //!      on macOS/Linux — elevation only where needed).
 //!   6. Verify the install by running `digstore --version`.
+//!   7. Install the OTHER selected DIG components (dig-node / dig-dns /
+//!      dig-relay / DIG Browser, task #234) by delegating to the
+//!      `dig-installer` library's own tested `run_report` orchestration —
+//!      the same release-resolution/download/service-lifecycle machinery the
+//!      CLI thin-shim uses (see [`plan_from_selection`]).
 
 use std::collections::HashMap;
 use std::fs;
@@ -79,7 +84,10 @@ pub fn bin_name() -> &'static str {
 pub fn default_install_path() -> String {
     if cfg!(windows) {
         let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("C:/Users/Public"));
-        base.join("Programs").join("DigStore").to_string_lossy().to_string()
+        base.join("Programs")
+            .join("DigStore")
+            .to_string_lossy()
+            .to_string()
     } else {
         "/usr/local/digstore".to_string()
     }
@@ -99,7 +107,10 @@ fn bundled_bin(app: &AppHandle) -> Result<PathBuf, String> {
     }
     // Dev fallback: when running `tauri dev`, resources may resolve relative to
     // the crate dir. Try the staging dir directly.
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("bin").join(bin_name());
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("bin")
+        .join(bin_name());
     if dev.exists() {
         return Ok(dev);
     }
@@ -113,12 +124,22 @@ fn bundled_bin(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn emit_line(app: &AppHandle, line: impl Into<String>) {
-    let _ = app.emit("install://progress", Progress { line: Some(line.into()), ..Default::default() });
+    let _ = app.emit(
+        "install://progress",
+        Progress {
+            line: Some(line.into()),
+            ..Default::default()
+        },
+    );
 }
 fn emit_pct(app: &AppHandle, pct: f64, now_file: Option<&str>) {
     let _ = app.emit(
         "install://progress",
-        Progress { pct: Some(pct), now_file: now_file.map(|s| s.to_string()), ..Default::default() },
+        Progress {
+            pct: Some(pct),
+            now_file: now_file.map(|s| s.to_string()),
+            ..Default::default()
+        },
     );
 }
 
@@ -163,8 +184,19 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     emit_pct(app, 2.0, Some(bin_name()));
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
-    emit_line(app, format!(r#"<span class="dim">$</span> digstore-setup --target {}"#, opts.install_path));
-    emit_line(app, format!(r#"Resolving release <span class="ac">v1.0.0</span> · compiler 1.0.0 · module format 1 <span class="dim">({os}/{arch})</span>"#));
+    emit_line(
+        app,
+        format!(
+            r#"<span class="dim">$</span> digstore-setup --target {}"#,
+            opts.install_path
+        ),
+    );
+    emit_line(
+        app,
+        format!(
+            r#"Resolving release <span class="ac">v1.0.0</span> · compiler 1.0.0 · module format 1 <span class="dim">({os}/{arch})</span>"#
+        ),
+    );
 
     let (payload, expected_sha) = digstore_payload(app)?;
 
@@ -181,15 +213,32 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     match &expected_sha {
         Some(expected) if expected != &digest => {
             let msg = format!("package checksum mismatch: expected {expected}, got {digest}");
-            let _ = app.emit("install://error", InstallError { message: msg.clone() });
+            let _ = app.emit(
+                "install://error",
+                InstallError {
+                    message: msg.clone(),
+                },
+            );
             return Err(msg);
         }
         Some(_) => {
-            emit_line(app, format!(r#"<span class="ok">✓</span> Verified package checksum (SHA-256) <span class="dim">({}…)</span>"#, &digest[..12]));
+            emit_line(
+                app,
+                format!(
+                    r#"<span class="ok">✓</span> Verified package checksum (SHA-256) <span class="dim">({}…)</span>"#,
+                    &digest[..12]
+                ),
+            );
         }
         None => {
             // No expected digest available — surface honestly rather than faking a pass.
-            emit_line(app, format!(r#"<span class="warn">!</span> No checksum manifest; recorded digest <span class="dim">{}…</span>"#, &digest[..12]));
+            emit_line(
+                app,
+                format!(
+                    r#"<span class="warn">!</span> No checksum manifest; recorded digest <span class="dim">{}…</span>"#,
+                    &digest[..12]
+                ),
+            );
         }
     }
 
@@ -201,11 +250,19 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = fs::metadata(&dest_bin).map_err(|e| e.to_string())?.permissions();
+        let mut p = fs::metadata(&dest_bin)
+            .map_err(|e| e.to_string())?
+            .permissions();
         p.set_mode(0o755);
         let _ = fs::set_permissions(&dest_bin, p);
     }
-    emit_line(app, format!(r#"Unpacking <span class="ac">DigStore CLI</span> → {}"#, bin_dir.display()));
+    emit_line(
+        app,
+        format!(
+            r#"Unpacking <span class="ac">DigStore CLI</span> → {}"#,
+            bin_dir.display()
+        ),
+    );
 
     if *opts.selected.get("host").unwrap_or(&true) {
         emit_pct(app, 42.0, Some("lib/dig_host.wasm"));
@@ -213,10 +270,22 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         // The host runtime ships inside the CLI today; record the bound and
         // stage a marker so the install layout matches the spec. (TODO: when a
         // standalone dig_host artifact exists, copy it here.)
-        let _ = fs::write(lib_dir.join("HOST_RUNTIME.txt"), "DigStore host runtime — bundled in digstore CLI (attestation + session ABI)\n");
-        emit_line(app, r#"Unpacking <span class="ac">Host Runtime</span> <span class="dim">(64 KiB → 16 MiB memory bounds)</span>"#);
-        emit_line(app, r#"Embedding trusted host keys <span class="dim">dig-host-key-v1:…</span>"#);
-        emit_line(app, r#"<span class="ok">✓</span> Content-defined chunking ready <span class="dim">(16/64/256 KiB)</span>"#);
+        let _ = fs::write(
+            lib_dir.join("HOST_RUNTIME.txt"),
+            "DigStore host runtime — bundled in digstore CLI (attestation + session ABI)\n",
+        );
+        emit_line(
+            app,
+            r#"Unpacking <span class="ac">Host Runtime</span> <span class="dim">(64 KiB → 16 MiB memory bounds)</span>"#,
+        );
+        emit_line(
+            app,
+            r#"Embedding trusted host keys <span class="dim">dig-host-key-v1:…</span>"#,
+        );
+        emit_line(
+            app,
+            r#"<span class="ok">✓</span> Content-defined chunking ready <span class="dim">(16/64/256 KiB)</span>"#,
+        );
     }
 
     // ---- Phase 4: optional components ----
@@ -228,16 +297,28 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         // so write placeholders the layout expects. (TODO: `digstore completions
         // <shell>` once the CLI supports it.)
         for sh in ["bash", "zsh", "fish"] {
-            let _ = fs::write(comp_dir.join(format!("digstore.{sh}")), format!("# digstore {sh} completion (generated by installer)\n"));
+            let _ = fs::write(
+                comp_dir.join(format!("digstore.{sh}")),
+                format!("# digstore {sh} completion (generated by installer)\n"),
+            );
         }
-        emit_line(app, r#"Installing shell completions <span class="dim">bash · zsh · fish</span>"#);
+        emit_line(
+            app,
+            r#"Installing shell completions <span class="dim">bash · zsh · fish</span>"#,
+        );
     }
     if *opts.selected.get("example").unwrap_or(&false) {
         emit_pct(app, 70.0, Some("examples/hello.wasm"));
         let ex_dir = install_dir.join("examples");
         let _ = fs::create_dir_all(&ex_dir);
-        let _ = fs::write(ex_dir.join("README.txt"), "Sample urn:dig store — run `digstore clone <urn>` to explore.\n");
-        emit_line(app, r#"Unpacking <span class="ac">Example store</span> <span class="dim">(urn:dig:…)</span>"#);
+        let _ = fs::write(
+            ex_dir.join("README.txt"),
+            "Sample urn:dig store — run `digstore clone <urn>` to explore.\n",
+        );
+        emit_line(
+            app,
+            r#"Unpacking <span class="ac">Example store</span> <span class="dim">(urn:dig:…)</span>"#,
+        );
     }
 
     // ---- Phase 5: add to PATH ----
@@ -245,12 +326,20 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         emit_pct(app, 82.0, Some("PATH"));
         match add_to_path(&bin_dir) {
             Ok(note) => {
-                emit_line(app, format!(r#"Linking <span class="ac">digstore</span> → {note}"#));
+                emit_line(
+                    app,
+                    format!(r#"Linking <span class="ac">digstore</span> → {note}"#),
+                );
             }
             Err(e) => {
                 // PATH failure is non-fatal to the binary being usable; surface
                 // as a warning, not a hard error.
-                emit_line(app, format!(r#"<span class="warn">!</span> Could not update PATH automatically <span class="dim">({e})</span>"#));
+                emit_line(
+                    app,
+                    format!(
+                        r#"<span class="warn">!</span> Could not update PATH automatically <span class="dim">({e})</span>"#
+                    ),
+                );
             }
         }
     }
@@ -260,11 +349,15 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     match register_dig_association(&install_dir) {
         Ok(note) => emit_line(
             app,
-            format!(r#"Registering <span class="ac">.dig</span> file icon <span class="dim">({note})</span>"#),
+            format!(
+                r#"Registering <span class="ac">.dig</span> file icon <span class="dim">({note})</span>"#
+            ),
         ),
         Err(e) => emit_line(
             app,
-            format!(r#"<span class="warn">!</span> Skipped .dig icon <span class="dim">({e})</span>"#),
+            format!(
+                r#"<span class="warn">!</span> Skipped .dig icon <span class="dim">({e})</span>"#
+            ),
         ),
     }
 
@@ -275,7 +368,12 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         .output()
         .map_err(|e| {
             let msg = format!("verify failed: could not run {}: {e}", dest_bin.display());
-            let _ = app.emit("install://error", InstallError { message: msg.clone() });
+            let _ = app.emit(
+                "install://error",
+                InstallError {
+                    message: msg.clone(),
+                },
+            );
             msg
         })?;
     if !out.status.success() {
@@ -283,16 +381,95 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
             "verify failed: `digstore --version` exited with {}",
             out.status.code().unwrap_or(-1)
         );
-        let _ = app.emit("install://error", InstallError { message: msg.clone() });
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
         return Err(msg);
     }
     let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    emit_line(app, format!(r#"<span class="ok">✓</span> Verifying install · <span class="ac">{}</span>"#, if ver.is_empty() { "digstore --version".into() } else { ver }));
+    emit_line(
+        app,
+        format!(
+            r#"<span class="ok">✓</span> Verifying install · <span class="ac">{}</span>"#,
+            if ver.is_empty() {
+                "digstore --version".into()
+            } else {
+                ver
+            }
+        ),
+    );
+
+    // ---- Phase 7: the other selected DIG components (task #234) ----
+    // digstore itself was just unpacked from the bundled/embedded payload
+    // above; dig-node / dig-dns / dig-relay / DIG Browser are NOT bundled, so
+    // they are resolved + downloaded + registered here by delegating to the
+    // exact same tested orchestration the `dig-installer` CLI thin-shim uses
+    // (`dig_installer::run_report`) — this reuses its release resolution,
+    // download, and (task #232) stop-before-write/start-after-write service
+    // lifecycle rather than re-implementing any of it in the GUI.
+    let extra_plan = plan_from_selection(&opts.selected, &bin_dir);
+    if extra_plan.with_dig_node
+        || extra_plan.with_dig_dns
+        || extra_plan.with_relay
+        || extra_plan.with_browser
+    {
+        emit_pct(app, 94.0, Some("additional components"));
+        emit_line(
+            app,
+            "Installing the other selected DIG components:".to_string(),
+        );
+        if let Err(e) = dig_installer::run_report(&extra_plan, &mut |line| emit_line(app, line)) {
+            let msg = format!("installing additional components failed: {e}");
+            let _ = app.emit(
+                "install://error",
+                InstallError {
+                    message: msg.clone(),
+                },
+            );
+            return Err(msg);
+        }
+    }
+
     emit_pct(app, 100.0, Some("done"));
     emit_line(app, r#"<span class="ok">✓</span> DigStore is ready."#);
 
     let _ = app.emit("install://done", ());
     Ok(())
+}
+
+/// Build the install plan for the OTHER real DIG components (dig-node /
+/// dig-dns / dig-relay / DIG Browser) from the GUI's selection map (task
+/// #234). digstore itself is deliberately excluded (`with_digstore: false`)
+/// — the GUI installs it via its own embedded/staged pipeline above, not
+/// through this plan. Pure mapping (no I/O), so the selection→plan contract
+/// — which components install, which are skipped when deselected/absent — is
+/// unit-tested directly without mocking the network or a service manager.
+fn plan_from_selection(
+    selected: &HashMap<String, bool>,
+    bin_dir: &Path,
+) -> dig_installer::InstallPlan {
+    let selected_on = |id: &str| *selected.get(id).unwrap_or(&false);
+    dig_installer::InstallPlan {
+        bin_dir: bin_dir.to_path_buf(),
+        with_digstore: false,
+        digstore_version: None,
+        with_dig_node: selected_on("dig-node"),
+        dig_node_version: None,
+        service: dig_installer::service::ServiceConfig::default(),
+        with_browser: selected_on("browser"),
+        browser_version: None,
+        with_relay: selected_on("dig-relay"),
+        relay_version: None,
+        relay_service: dig_installer::ServiceConfigRelay::default(),
+        with_dig_dns: selected_on("dig-dns"),
+        dig_dns_version: None,
+        dns_service: dig_installer::dns::DnsInstallConfig::default(),
+        modify_path: true,
+        dry_run: false,
+    }
 }
 
 /// Compute the new user-PATH string after appending `dir`.
@@ -356,7 +533,10 @@ fn add_to_path(bin_dir: &Path) -> Result<String, String> {
         let bytes = string_to_reg_expand_sz_bytes(&new_path);
         env.set_raw_value(
             "Path",
-            &RegValue { vtype: REG_EXPAND_SZ, bytes },
+            &RegValue {
+                vtype: REG_EXPAND_SZ,
+                bytes,
+            },
         )
         .map_err(|e| format!("write HKCU\\Environment\\Path: {e}"))?;
 
@@ -369,7 +549,8 @@ fn add_to_path(bin_dir: &Path) -> Result<String, String> {
         let target = bin_dir.join("digstore");
         let link = PathBuf::from("/usr/local/bin/digstore");
         let _ = fs::remove_file(&link);
-        unixfs::symlink(&target, &link).map_err(|e| format!("symlink {} → {}: {e}", link.display(), target.display()))?;
+        unixfs::symlink(&target, &link)
+            .map_err(|e| format!("symlink {} → {}: {e}", link.display(), target.display()))?;
         Ok(format!("{}", link.display()))
     }
 }
@@ -507,7 +688,10 @@ fn broadcast_environment_change() {
     };
 
     // "Environment" as a NUL-terminated UTF-16 string, passed as lParam.
-    let param: Vec<u16> = "Environment".encode_utf16().chain(std::iter::once(0)).collect();
+    let param: Vec<u16> = "Environment"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut result: usize = 0;
     unsafe {
         SendMessageTimeoutW(
@@ -519,6 +703,65 @@ fn broadcast_environment_change() {
             5000,
             &mut result,
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_from_selection_tests {
+    use super::plan_from_selection;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    // task #234: the selection→plan mapping is pure (no I/O), so every
+    // selected/deselected/absent branch is asserted directly without mocking
+    // the network or a service manager.
+
+    #[test]
+    fn nothing_selected_installs_nothing_extra() {
+        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        assert!(
+            !plan.with_digstore,
+            "digstore is owned by the GUI's own pipeline, never this plan"
+        );
+        assert!(!plan.with_dig_node);
+        assert!(!plan.with_dig_dns);
+        assert!(!plan.with_relay);
+        assert!(!plan.with_browser);
+    }
+
+    #[test]
+    fn install_all_selects_every_optional_component() {
+        let mut sel = HashMap::new();
+        sel.insert("dig-node".to_string(), true);
+        sel.insert("dig-dns".to_string(), true);
+        sel.insert("dig-relay".to_string(), true);
+        sel.insert("browser".to_string(), true);
+        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        assert!(!plan.with_digstore);
+        assert!(plan.with_dig_node);
+        assert!(plan.with_dig_dns);
+        assert!(plan.with_relay);
+        assert!(plan.with_browser);
+    }
+
+    #[test]
+    fn deselecting_a_component_skips_only_that_one() {
+        let mut sel = HashMap::new();
+        sel.insert("dig-node".to_string(), true);
+        sel.insert("dig-dns".to_string(), false); // explicitly unchecked
+        sel.insert("dig-relay".to_string(), true);
+        sel.insert("browser".to_string(), true);
+        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        assert!(plan.with_dig_node);
+        assert!(!plan.with_dig_dns, "deselected component must be skipped");
+        assert!(plan.with_relay);
+        assert!(plan.with_browser);
+    }
+
+    #[test]
+    fn bin_dir_is_threaded_through() {
+        let plan = plan_from_selection(&HashMap::new(), Path::new("/opt/dig/bin"));
+        assert_eq!(plan.bin_dir, Path::new("/opt/dig/bin"));
     }
 }
 

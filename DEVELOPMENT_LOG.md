@@ -62,3 +62,52 @@ actual per-backend source for the pinned version (docs.rs/the crate's own docs
 don't spell this out; `ServiceInstallCtx`'s fields are the same across OSes,
 but the *manager's own* config struct, which this installer/dig-node-service
 never touch, is what carries the OS-specific default).
+
+## dig-node/dig-relay's service verbs are NOT idempotent; `status` is the only safe probe (task #232)
+
+Before adding the stop-before-write/start-after-write install lifecycle,
+audited dig-node-service's and dig-relay's actual `install`/`uninstall`/
+`start`/`stop`/`status` implementations (both just thinly shell out to the
+`service-manager` crate's `sc`/`systemd`/`launchd` backends via `?` — no
+"already installed"/"already running" pre-checks of their own):
+
+- **`install` on an already-registered service hard-fails** on Windows SCM
+  ("already exists") and (typically) macOS launchd; systemd tends to
+  succeed as a no-op. So a plain re-`install` during an upgrade is NOT safe
+  to treat as fatal — the installer now tolerates an `install` failure and
+  still attempts `start` (the registration still points at the same on-disk
+  path this run just wrote, so `start` picks up the new binary regardless of
+  whether `install` itself succeeded).
+- **`start`/`stop` are also not idempotent** — `start` on an already-running
+  service and `stop` on a stopped one both commonly hard-fail on Windows/
+  macOS (systemd tends to tolerate both). Never assume any of these four
+  verbs no-ops safely; only `status` is safe to call unconditionally.
+- **`status --json`'s envelope shape differs between the two binaries**:
+  dig-node returns a FLAT `{"serving": bool, ...}`; dig-relay returns a
+  NESTED `{"result": {"serving": bool, ...}}`. `status` never hard-fails
+  (always `Ok`, exit 0 when serving / 1 when not) but **cannot distinguish
+  "not installed" from "installed but stopped"** — both read as
+  `serving: false`. Neither binary exposes an "is it registered" verb, so
+  the installer's stop-before-write step treats "binary absent at the
+  destination path" (not "service not registered") as its "first install,
+  nothing to stop" signal instead.
+- No OS-tool error string ("already exists", "not loaded", …) is a literal
+  constant in dig-node/dig-relay's own source — it's whatever `sc.exe`/
+  `systemctl`/`launchctl` printed, passed through verbatim. Don't
+  string-match those messages from a caller; branch on `status`'s
+  `serving` boolean and treat everything else as an opaque, best-effort
+  outcome recorded in a note.
+
+## The installer GUI's theme has flipped dark→white→dark twice (#233)
+
+`bd4860a` (2026-06-29) deliberately re-skinned the GUI from its original dark
+cosmic surface to the clean white DIG product theme, citing `SYSTEM.md` →
+"Canonical terminology & branding", which (as of this writing) still lists
+"the installer GUI" among the product surfaces using the white theme
+(`dig.net`/`docs.dig.net` are the only stated dark exceptions). Task #233
+reverted it back to dark per an explicit user bug report. **This leaves
+`SYSTEM.md`'s canonical-branding text and the installer's actual shipped
+theme in direct disagreement** — flagged for the orchestrator to resolve
+(either add the installer GUI to the sanctioned-dark-exception list, or
+this reversion needs revisiting) rather than silently drift again. Whoever
+touches this theme next should check which way `SYSTEM.md` reads FIRST.

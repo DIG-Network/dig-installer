@@ -1,16 +1,21 @@
 import { Ic } from "../icons.jsx";
 import { COMPONENTS } from "../data.jsx";
 
-// Totals recompute live from selection, exactly as the prototype does:
-// total download = sum of selected sizes; disk after install = total × 1.4.
+// The full DIG component catalogue (task #234): every component is listed and
+// PRE-SELECTED by default ("install all" is the one-click default path); the
+// user may deselect any optional one before installing. Each component's
+// actual release/asset is resolved from GitHub at install time, so — unlike
+// the old bundled-digstore prototype — sizes aren't known ahead of time and
+// are intentionally not shown here (no invented numbers).
 export function Components({ sel, toggle, path, onChange }) {
-  const total = COMPONENTS.filter((c) => c.req || sel[c.id]).reduce((s, c) => s + (parseFloat(c.size) || 0), 0);
+  const selectedCount = COMPONENTS.filter((c) => c.req || sel[c.id]).length;
   return (
     <div className="fade-key">
       <div className="eyebrow">Step 03 — Setup</div>
       <h2>Choose Components</h2>
       <p className="lead" style={{ marginBottom: 28 }}>
-        Pick what to install and where. The CLI is required; everything else is optional.
+        Every component is pre-selected — installing all is the default, one-click path. Deselect
+        anything you don't want; the CLI is required.
       </p>
       <p className="field-label">Install location</p>
       <div className="path-row">
@@ -34,18 +39,16 @@ export function Components({ sel, toggle, path, onChange }) {
               <div className="ci">{c.name}</div>
               <div className="cd">{c.desc}</div>
             </div>
-            {c.req ? <span className="pill-req">REQUIRED</span> : <span className="size">{c.size}</span>}
+            {c.req && <span className="pill-req">REQUIRED</span>}
           </div>
         );
       })}
       <div className="meta-chips" style={{ marginTop: 22 }}>
         <span className="chip">
-          <span className="k">total download</span>
-          <b>~{total.toFixed(1)} MB</b>
-        </span>
-        <span className="chip">
-          <span className="k">disk after install</span>
-          <b>~{(total * 1.4).toFixed(0)} MB</b>
+          <span className="k">selected</span>
+          <b>
+            {selectedCount} of {COMPONENTS.length}
+          </b>
         </span>
       </div>
     </div>

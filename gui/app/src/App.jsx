@@ -44,7 +44,9 @@ export function App() {
   // Always start at Welcome — the installer never resumes a prior run's step.
   const [step, setStep] = useState(0);
   const [agreed, setAgreed] = useState(false);
-  const [sel, setSel] = useState({ host: true, completions: true, path: true, example: false });
+  // Every optional component pre-selected by default (task #234) — "install
+  // all" is the one-click default path; the user can deselect any of them.
+  const [sel, setSel] = useState({ "dig-node": true, "dig-dns": true, "dig-relay": true, browser: true });
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
   const [pct, setPct] = useState(0);
   const [lines, setLines] = useState([]);
@@ -102,7 +104,7 @@ export function App() {
     setNowFile(NOW_FILES[0]);
 
     await runInstall(
-      { installPath: installPathRef.current, selected: { cli: true, ...selRef.current } },
+      { installPath: installPathRef.current, selected: { digstore: true, ...selRef.current } },
       {
         onProgress: (p) => {
           if (token !== installToken.current) return;
@@ -311,7 +313,7 @@ function openLog(lines) {
     const w = window.open("", "_blank", "width=720,height=520");
     if (w) {
       w.document.title = "DigStore install log";
-      w.document.body.style.cssText = "background:#ffffff;color:#45417A;font:12.5px ui-monospace,monospace;padding:18px;white-space:pre-wrap;";
+      w.document.body.style.cssText = "background:#0A0A20;color:#C5C1E0;font:12.5px ui-monospace,monospace;padding:18px;white-space:pre-wrap;";
       w.document.body.textContent = text;
     }
   } catch {
