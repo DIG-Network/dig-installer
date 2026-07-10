@@ -180,14 +180,16 @@ Default install location (`--bin-dir`):
    `WM_SETTINGCHANGE` broadcast; a profile `export PATH` line on unix). Idempotent.
 5. **dig-node** *(with `--with-dig-node`)* — downloads the `dig-node` binary the
    same way, then **delegates to dig-node's own `install` (+ `start`)**
-   subcommands to register it as an OS service (Windows SCM / systemd / launchd —
-   the installer does not reimplement it), best-effort writes the `dig.local`
-   hosts entry, then runs a **post-install resolve check** confirming the OS
-   actually maps `dig.local` → `127.0.0.2` now (see below). On Windows, service
-   registration needs an elevated console — if you aren't elevated the
-   installer surfaces a clear message and the digstore install still succeeds.
-   `--uninstall-dig-node` reverses it: removes the OS service (delegating to
-   dig-node's own `uninstall`) and the hosts entry.
+   subcommands to register it as an auto-start, auto-restarting OS service
+   (Windows SCM / systemd / launchd — the installer does not reimplement it),
+   best-effort writes the `dig.local` hosts entry, runs a **post-install
+   resolve check** confirming the OS actually maps `dig.local` → `127.0.0.2`
+   now, and finally a **post-install RPC health check** confirming the service
+   is actually answering `rpc.discover` on its configured port (see below for
+   both). On Windows, service registration needs an elevated console — if you
+   aren't elevated the installer surfaces a clear message and the digstore
+   install still succeeds. `--uninstall-dig-node` reverses it: removes the OS
+   service (delegating to dig-node's own `uninstall`) and the hosts entry.
 6. **dig-dns** *(with `--with-dig-dns`)* — downloads the `dig-dns` binary, then
    **owns the full per-OS service + DNS/browser wiring itself** (unlike
    dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of its
@@ -233,6 +235,17 @@ entry so consumers (the DIG Browser, the extension) can reach your local node
   (stale DNS-client cache, a hosts write that landed in the wrong file, …).
   Under `--json` this is `service.dig_local_resolves` (bool) +
   `service.dig_local_resolve_note` (detail).
+- **Post-install health check** — once the service is started, the installer
+  sends a JSON-RPC `rpc.discover` request (the standard OpenRPC
+  self-description method every dig-node build answers) to
+  `http://127.0.0.1:<port>/` and retries for up to ~5s (a freshly-started
+  service needs a moment to bind its socket) before judging it not up. This
+  proves the node is actually **answering RPC**, not just that the service
+  registered and `dig.local` resolves. Prints `health check: …` (pass) or a
+  clear `FAILED` line with the reason. Skipped (never a hard failure) on
+  dry-run, with `--no-service-start`, or if the service failed to install.
+  Under `--json` this is `service.health_checked` / `service.health_ok`
+  (bools) + `service.health_note` (detail).
 
 ```sh
 dig-installer --with-dig-node
@@ -240,6 +253,7 @@ dig-installer --with-dig-node
 #     ✓ dig-node installed as an OS service and started
 #     ✓ dig.local: 127.0.0.2 dig.local → /etc/hosts
 #     ✓ dig.local resolve check: dig.local → 127.0.0.2
+#     ✓ health check: rpc.discover on http://127.0.0.1:9778/ answered
 
 dig-installer --uninstall-dig-node
 #   Uninstalling the dig-node OS service:
@@ -251,7 +265,14 @@ dig-installer --uninstall-dig-node
 > The dig-node *dual-listener* that makes `dig.local` actually resolve to the
 > node (`127.0.0.2:80` + `localhost:<port>` + a Host allowlist) is dig-node's
 > own behaviour; this installer writes the hosts entry, registers/uninstalls
-> the service, and runs the resolve check.
+> the service, and runs the resolve + health checks.
+>
+> **Auto-start + auto-restart:** the registered service starts on boot on all
+> three OSes (Windows SCM autostart / systemd `WantedBy=` enable / launchd
+> `RunAtLoad`), and Linux (systemd `Restart=on-failure`) + macOS (launchd
+> `KeepAlive`) already restart it if it crashes. Windows SCM restart-on-crash
+> (recovery actions) is a known gap tracked upstream in dig-node-service — see
+> [DIG-Network/dig_ecosystem#224](https://github.com/DIG-Network/dig_ecosystem/issues/224).
 
 ---
 
@@ -323,9 +344,12 @@ pre-existing org DNS/browser policy.
   goes to **stderr**, no prompts/spinners). On success:
   `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,relay,dns,installed:[…]}}`
   — `service` (present with `--with-dig-node`) carries
-  `{installed,started,port,note,dig_local,dig_local_resolves,dig_local_resolve_note}` —
-  the last two are the task-#140 post-install resolve check (whether the OS
-  resolver actually maps `dig.local` → `127.0.0.2` right now). `dns` (present
+  `{installed,started,port,note,dig_local,dig_local_resolves,dig_local_resolve_note,health_checked,health_ok,health_note}` —
+  `dig_local_resolves`/`dig_local_resolve_note` are the task-#140 post-install
+  resolve check (whether the OS resolver actually maps `dig.local` →
+  `127.0.0.2` right now); `health_checked`/`health_ok`/`health_note` are the
+  task-#223 post-install RPC health check (whether `rpc.discover` actually
+  answered on the service's loopback port). `dns` (present
   with `--with-dig-dns`) carries `{installed,started,needs_elevation,note,doctor,paths_live,bound_port,pac_url,fallback_instruction}`.
   On failure: `{"ok":false,"error":{"code","exit_code","message","hint"}}`.
   `--uninstall-dig-dns --json` emits `{"ok":true,"result":{uninstalled,needs_elevation,note,residue_removed:[…]}}`

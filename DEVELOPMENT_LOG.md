@@ -33,3 +33,32 @@ some networks. The real `dig.local` resolution itself is only exercised as a
 manual/integration check post-install (mirrors how `write_dig_local()`'s actual
 system-hosts-file write was never unit-tested either — see `hosts.rs`'s
 `_at`-suffixed pure-path variants for the testable core).
+
+## `service-manager` 0.7.1's restart-on-crash defaults differ silently per OS (task #223)
+
+Both dig-node-service and this installer's own dig-dns wiring register OS
+services via the `service-manager` crate pinned at `0.7.1`, with
+`ServiceInstallCtx.contents: None` (letting the crate generate the systemd
+unit / launchd plist / SCM entry) and no explicit restart config. Checked the
+crate source at tag `v0.7.1` (GitHub API, since it isn't vendored locally) to
+learn what that actually produces:
+
+- **systemd** — `SystemdConfig::default().restart` is
+  `SystemdServiceRestartType::OnFailure`; the generated unit gets
+  `Restart=on-failure` automatically. Auto-restart-on-crash "just works" on Linux.
+- **launchd** — `LaunchdInstallConfig::default().keep_alive` is `true`; the
+  generated plist gets `KeepAlive: true` (+ `RunAtLoad: true` from
+  `ServiceInstallCtx.autostart`). Auto-restart-on-crash "just works" on macOS too.
+- **Windows (SCM)** — `src/sc.rs`'s `install()` only shells `sc create …`; it
+  never calls `sc failure`/`ChangeServiceConfig2` to set recovery actions.
+  Windows services do **NOT** restart on crash by default — this is a REAL gap,
+  not a documentation gap. Filed as
+  [DIG-Network/dig_ecosystem#224](https://github.com/DIG-Network/dig_ecosystem/issues/224)
+  (in `dig-node-service`, out of scope for this repo).
+
+Lesson: "delegates to the `service-manager` crate" is not one behavior — its
+per-OS default differs, and the only way to know which is to read that crate's
+actual per-backend source for the pinned version (docs.rs/the crate's own docs
+don't spell this out; `ServiceInstallCtx`'s fields are the same across OSes,
+but the *manager's own* config struct, which this installer/dig-node-service
+never touch, is what carries the OS-specific default).
