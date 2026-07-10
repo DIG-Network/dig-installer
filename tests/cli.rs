@@ -128,6 +128,7 @@ fn help_lists_the_selectable_component_flags() {
         "--dig-dns-version",
         "--dig-dns-node",
         "--uninstall-dig-dns",
+        "--uninstall-dig-node",
         "--json",
         "--dry-run",
     ] {
@@ -159,6 +160,25 @@ fn uninstall_dig_dns_dry_run_is_side_effect_free_and_succeeds() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+/// `--uninstall-dig-node --dry-run` must be network-free, side-effect-free, and
+/// always succeed (task #140: a missing binary/elevation issue is reported via
+/// the result `note`, never a process failure) — safe to run in CI on every OS.
+#[test]
+fn uninstall_dig_node_dry_run_is_side_effect_free_and_succeeds() {
+    let out = bin()
+        .arg("--uninstall-dig-node")
+        .arg("--dry-run")
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["uninstalled"], false);
+    assert_eq!(v["result"]["dig_local_removed"], false);
+    assert!(v["result"]["note"].as_str().unwrap().contains("would run"));
 }
 
 /// Regression guard (license-correctness bug): every license-bearing surface in

@@ -155,6 +155,29 @@ pub struct ServiceResult {
     pub note: String,
     /// dig.local hosts registration (best-effort; never fails the install).
     pub dig_local: String,
+    /// The post-install verification (task #140): does the OS resolver
+    /// actually map `dig.local` → `127.0.0.2` right now? `false` on dry-run
+    /// (nothing was written to check) or if the hosts write/OS resolution
+    /// didn't converge — see `dig_local_resolve_note` for why.
+    pub dig_local_resolves: bool,
+    /// Human-readable detail behind [`Self::dig_local_resolves`] — never
+    /// silent (CLAUDE.md task #140: "failures surface a clear message").
+    pub dig_local_resolve_note: String,
+}
+
+/// The result of uninstalling the dig-node service + removing the `dig.local`
+/// hosts entry (task #140) — the counterpart to [`ServiceResult`]. Standalone
+/// action (mirrors `--uninstall-dig-dns`'s [`dns::DnsUninstallResult`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServiceUninstallResult {
+    /// The dig-node OS service was removed (or, on dry-run, would be).
+    pub uninstalled: bool,
+    /// The `dig.local` hosts entry this installer added was removed (or, on
+    /// dry-run, would be). `false` if there was nothing tagged to remove
+    /// (idempotent no-op) or the removal needs elevation.
+    pub dig_local_removed: bool,
+    /// Human-readable detail — never silent.
+    pub note: String,
 }
 
 /// The full structured install result emitted under `--json`.
@@ -675,6 +698,8 @@ fn register_dig_node(
         port: plan.service.port,
         note: String::new(),
         dig_local: String::new(),
+        dig_local_resolves: false,
+        dig_local_resolve_note: String::new(),
     };
 
     if plan.dry_run {
@@ -694,6 +719,7 @@ fn register_dig_node(
             hosts::hosts_path().display()
         );
         log(&format!("    ({})", result.dig_local));
+        result.dig_local_resolve_note = "skipped (dry run)".to_string();
         return result;
     }
 
@@ -735,7 +761,107 @@ fn register_dig_node(
         }
     }
 
+    // Post-install resolve check (task #140): confirm the OS resolver actually
+    // maps dig.local -> 127.0.0.2 now, regardless of whether THIS run wrote
+    // the entry or found it already present — proves the write took effect,
+    // never silent either way.
+    let resolved = hosts::resolve_dig_local();
+    if resolved.resolves {
+        log(&format!("    ✓ dig.local resolve check: {}", resolved.note));
+    } else {
+        log(&format!(
+            "    ! dig.local resolve check FAILED: {} — consumers fall back to localhost until this resolves.",
+            resolved.note
+        ));
+    }
+    result.dig_local_resolves = resolved.resolves;
+    result.dig_local_resolve_note = resolved.note;
+
     result
+}
+
+/// Uninstall the dig-node OS service and remove the `dig.local` hosts entry
+/// this installer added (task #140) — the counterpart to [`register_dig_node`].
+/// A standalone action (mirrors `--uninstall-dig-dns` / [`dns::uninstall`]):
+/// it locates the dig-node binary a prior `--with-dig-node` install placed at
+/// `bin_dir` (by the same [`Target::exe_name`] convention `register_dig_node`
+/// uses) and runs its own `uninstall` subcommand, then removes the hosts
+/// entry. Never touches the digstore/browser/relay/dig-dns installs. Never
+/// panics/aborts — a failure (missing binary, needs elevation) is recorded in
+/// the result, always with a clear `note` (never silent).
+pub fn uninstall_dig_node(
+    bin_dir: &std::path::Path,
+    dry_run: bool,
+    log: &mut dyn FnMut(&str),
+) -> ServiceUninstallResult {
+    let target = match Target::current() {
+        Ok(t) => t,
+        Err(e) => {
+            let note = format!("could not detect the current OS/arch target: {e}");
+            log(&format!("! {note}"));
+            return ServiceUninstallResult {
+                uninstalled: false,
+                dig_local_removed: false,
+                note,
+            };
+        }
+    };
+    let bin = bin_dir.join(target.exe_name("dig-node"));
+
+    if dry_run {
+        let note = format!(
+            "would run `{} uninstall` and remove the dig.local hosts entry",
+            bin.display()
+        );
+        log(&format!("({note})"));
+        return ServiceUninstallResult {
+            uninstalled: false,
+            dig_local_removed: false,
+            note,
+        };
+    }
+
+    log("Uninstalling the dig-node OS service:");
+    let mut notes: Vec<String> = Vec::new();
+    let uninstalled = match service::uninstall_service(&bin) {
+        Ok(n) => {
+            log(&format!("    ✓ {n}"));
+            notes.push(n);
+            true
+        }
+        Err(e) => {
+            log(&format!("    ! {e}"));
+            notes.push(e);
+            false
+        }
+    };
+
+    log("Removing the dig.local hosts entry:");
+    let dig_local_removed = match hosts::remove_dig_local() {
+        Ok(Some(n)) => {
+            log(&format!("    ✓ {n}"));
+            notes.push(n);
+            true
+        }
+        Ok(None) => {
+            let n = "dig.local: already absent (nothing to remove)".to_string();
+            log(&format!("    ✓ {n}"));
+            notes.push(n);
+            false
+        }
+        Err(e) => {
+            let n = format!("could not remove the dig.local hosts entry ({e}); re-run elevated");
+            log(&format!("    ! {n}"));
+            notes.push(n);
+            false
+        }
+    };
+
+    ServiceUninstallResult {
+        uninstalled,
+        dig_local_removed,
+        note: notes.join("; "),
+    }
 }
 
 /// Log a resolved component's source + dest in the pretty format.
@@ -782,6 +908,15 @@ pub fn dns_uninstall_json(result: &dns::DnsUninstallResult) -> String {
     serde_json::to_string(&envelope).expect("dns uninstall envelope serializes")
 }
 
+/// The structured envelope emitted to stdout under `--json` for
+/// `--uninstall-dig-node`: `{"ok":true,"result":<ServiceUninstallResult>}`
+/// (mirrors [`dns_uninstall_json`]; [`uninstall_dig_node`] never returns an
+/// `Err` — a failure is recorded in the result's `note`, not raised).
+pub fn service_uninstall_json(result: &ServiceUninstallResult) -> String {
+    let envelope = serde_json::json!({ "ok": true, "result": result });
+    serde_json::to_string(&envelope).expect("service uninstall envelope serializes")
+}
+
 /// The full machine-readable invocation contract for `--help-json`: the
 /// component catalogue, supported targets, global/per-command flags, and the
 /// exit-code table. An agent introspects this instead of scraping `--help`.
@@ -818,8 +953,9 @@ pub fn help_json() -> String {
             { "flag": "--digstore-version", "value": "VERSION", "description": "pin digstore version (default: latest)" },
             { "flag": "--with-dig-node", "alias": "--service", "description": "install + start the dig-node service" },
             { "flag": "--dig-node-version", "value": "VERSION", "description": "pin dig-node version (default: latest)" },
-            { "flag": "--dig-node-port", "value": "PORT", "default": 8080, "description": "loopback port for the dig-node service" },
+            { "flag": "--dig-node-port", "value": "PORT", "default": 9778, "description": "loopback port for the dig-node service" },
             { "flag": "--no-service-start", "description": "install the service but do not start it" },
+            { "flag": "--uninstall-dig-node", "description": "uninstall the dig-node OS service + remove the dig.local hosts entry this installer created (idempotent; does not touch the digstore/browser/relay/dig-dns installs)" },
             { "flag": "--with-browser", "description": "download the DIG Browser native installer" },
             { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
             { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced — the default node uses relay.dig.net)" },
@@ -1022,6 +1158,9 @@ mod tests {
         assert!(svc.note.contains("would run `dig-node install`"));
         assert!(svc.note.contains("`dig-node start`"));
         assert!(svc.dig_local.contains("dig.local"));
+        // Dry-run never probes OS resolution (nothing was written to check).
+        assert!(!svc.dig_local_resolves);
+        assert_eq!(svc.dig_local_resolve_note, "skipped (dry run)");
     }
 
     #[test]
@@ -1243,7 +1382,15 @@ mod tests {
             assert!(c.get(key).is_some(), "component JSON missing key {key}");
         }
         let svc = &v["service"];
-        for key in ["installed", "started", "port", "note", "dig_local"] {
+        for key in [
+            "installed",
+            "started",
+            "port",
+            "note",
+            "dig_local",
+            "dig_local_resolves",
+            "dig_local_resolve_note",
+        ] {
             assert!(svc.get(key).is_some(), "service JSON missing key {key}");
         }
         let dns_json = &v["dns"];
@@ -1335,6 +1482,48 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&error_json(&e)).unwrap();
         assert_eq!(v["error"]["code"], "IO");
         assert!(v["error"]["hint"].is_null());
+    }
+
+    // -- dig-node uninstall (task #140) --------------------------------------
+
+    #[test]
+    fn uninstall_dig_node_dry_run_reports_intent_without_touching_the_system() {
+        let bin_dir = std::env::temp_dir().join("dig-installer-test-uninstall-bin");
+        let mut lines: Vec<String> = Vec::new();
+        let result = uninstall_dig_node(&bin_dir, true, &mut |l| lines.push(l.to_string()));
+        assert!(!result.uninstalled);
+        assert!(!result.dig_local_removed);
+        assert!(result.note.contains("would run"), "got: {}", result.note);
+        assert!(result.note.contains("uninstall"), "got: {}", result.note);
+        assert!(result.note.contains("dig.local"), "got: {}", result.note);
+        assert!(lines.iter().any(|l| l.contains("would run")));
+    }
+
+    #[test]
+    fn uninstall_dig_node_surfaces_a_missing_binary_without_panicking() {
+        // No `--with-dig-node` was ever run against this bin_dir, so the
+        // binary is missing — the failure must be recorded, not panic/abort,
+        // and the note must be non-empty (never silent, task #140).
+        let bin_dir = std::env::temp_dir().join(format!(
+            "dig-installer-test-no-node-bin-{}",
+            std::process::id()
+        ));
+        let result = uninstall_dig_node(&bin_dir, false, &mut |_| {});
+        assert!(!result.uninstalled);
+        assert!(!result.note.is_empty());
+    }
+
+    #[test]
+    fn service_uninstall_json_wraps_the_result_in_an_ok_envelope() {
+        let result = ServiceUninstallResult {
+            uninstalled: true,
+            dig_local_removed: true,
+            note: "dig-node service uninstalled; removed dig.local from /etc/hosts".to_string(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&service_uninstall_json(&result)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["uninstalled"], true);
+        assert_eq!(v["result"]["dig_local_removed"], true);
     }
 
     #[test]
