@@ -17,7 +17,7 @@ use std::process::Command;
 /// Configuration for the dig-node service the installer will register.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceConfig {
-    /// Loopback port dig-node should serve on (default 8080, per dig-node).
+    /// Loopback port dig-node should serve on (default 9778, per dig-node).
     pub port: u16,
     /// Start the service immediately after installing it.
     pub start: bool,
@@ -25,9 +25,13 @@ pub struct ServiceConfig {
 
 impl Default for ServiceConfig {
     fn default() -> Self {
-        // 8080 matches dig-node's own default (config.rs DIG_NODE_PORT).
+        // 9778 matches dig-node's own default (config.rs DEFAULT_PORT) — an
+        // uncommon high port deliberately clear of the collision-prone
+        // common-dev ports (80/443/3000/5000/8000/8080/8888/9000), the sibling
+        // of the dig-wallet HTTP API's 9777 (task #132). `dig.local` on
+        // `127.0.0.2:80` is unaffected — only this localhost port moves.
         ServiceConfig {
-            port: 8080,
+            port: 9778,
             start: true,
         }
     }
@@ -41,6 +45,13 @@ pub fn install_args() -> Vec<String> {
 /// The subcommand to start the installed service.
 pub fn start_args() -> Vec<String> {
     vec!["start".to_string()]
+}
+
+/// The subcommand to remove the installed service (task #140). dig-node's own
+/// `uninstall` best-effort stops the service first, so this installer only
+/// needs to invoke the one subcommand.
+pub fn uninstall_args() -> Vec<String> {
+    vec!["uninstall".to_string()]
 }
 
 /// Environment variables to pass to `dig-node install` so the registered
@@ -72,6 +83,18 @@ pub fn install_service(bin: &Path, cfg: &ServiceConfig) -> Result<String, String
         note.push_str(" and started");
     }
     Ok(note)
+}
+
+/// Run `dig-node uninstall` (task #140) using the previously-installed binary
+/// at `bin`, removing the OS service registration. dig-node's own `uninstall`
+/// best-effort stops the service first (see its README/service.rs), so this is
+/// a single subcommand invocation — the counterpart to [`install_service`].
+/// Returns a human note on success; the caller pairs this with removing the
+/// `dig.local` hosts entry ([`crate::hosts::remove_dig_local`]).
+pub fn uninstall_service(bin: &Path) -> Result<String, String> {
+    run_dig_node(bin, &uninstall_args(), &BTreeMap::new())
+        .map_err(|e| format!("dig-node uninstall failed: {e}"))?;
+    Ok(String::from("dig-node service uninstalled"))
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +213,10 @@ mod tests {
     #[test]
     fn default_service_config() {
         let c = ServiceConfig::default();
-        assert_eq!(c.port, 8080);
+        // #132: the installer's default localhost port must match dig-node's
+        // own uncommon-high-port default (9778), not the stale collision-prone
+        // 8080.
+        assert_eq!(c.port, 9778);
         assert!(c.start);
     }
 
@@ -198,6 +224,7 @@ mod tests {
     fn subcommands_are_dig_node_verbs() {
         assert_eq!(install_args(), vec!["install".to_string()]);
         assert_eq!(start_args(), vec!["start".to_string()]);
+        assert_eq!(uninstall_args(), vec!["uninstall".to_string()]);
     }
 
     #[test]
@@ -214,7 +241,7 @@ mod tests {
     #[test]
     fn install_env_default_port() {
         let env = install_env(&ServiceConfig::default());
-        assert_eq!(env.get("DIG_NODE_PORT").map(String::as_str), Some("8080"));
+        assert_eq!(env.get("DIG_NODE_PORT").map(String::as_str), Some("9778"));
     }
 
     #[test]
@@ -352,6 +379,30 @@ mod tests {
         let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-xyz");
         let err = install_service(&missing, &ServiceConfig::default()).unwrap_err();
         assert!(err.contains("dig-node install failed"), "got: {err}");
+        assert!(err.contains("could not run"), "got: {err}");
+    }
+
+    #[test]
+    fn uninstall_service_succeeds_when_dig_node_exits_zero() {
+        let dir = tmp_subdir("node-uninstall-ok");
+        let bin = stub_exit(&dir, true);
+        let note = uninstall_service(&bin).expect("stub exits 0 → ok");
+        assert!(note.contains("uninstalled"), "got: {note}");
+    }
+
+    #[test]
+    fn uninstall_service_surfaces_a_nonzero_exit() {
+        let dir = tmp_subdir("node-uninstall-fail");
+        let bin = stub_exit(&dir, false);
+        let err = uninstall_service(&bin).unwrap_err();
+        assert!(err.contains("dig-node uninstall failed"), "got: {err}");
+    }
+
+    #[test]
+    fn uninstall_service_errors_when_binary_is_missing() {
+        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-abc");
+        let err = uninstall_service(&missing).unwrap_err();
+        assert!(err.contains("dig-node uninstall failed"), "got: {err}");
         assert!(err.contains("could not run"), "got: {err}");
     }
 

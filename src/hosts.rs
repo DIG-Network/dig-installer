@@ -23,6 +23,7 @@
 //! The pure edit logic here is unit-tested; the elevated file I/O is in
 //! [`write_dig_local`] / [`remove_dig_local`].
 
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 
 /// The loopback IP `dig.local` resolves to. Distinct from `127.0.0.1` so the
@@ -174,6 +175,67 @@ pub(crate) fn remove_dig_local_at(path: &std::path::Path) -> Result<Option<Strin
                 path.display()
             )))
         }
+    }
+}
+
+/// The result of the post-install verification that `dig.local` actually
+/// resolves to [`DIG_LOCAL_IP`] (task #140) — distinct from a successful hosts
+/// *write* (see [`write_dig_local`]): it proves the OS resolver picked up the
+/// change, catching drift a raw file write can't (a stale Windows DNS-client
+/// cache, an `nsswitch.conf` ordering that skips `files`, a hosts write that
+/// silently landed in the wrong file, …).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResolveResult {
+    /// `true` iff resolving [`DIG_LOCAL_HOST`] returned [`DIG_LOCAL_IP`] among
+    /// its addresses.
+    pub resolves: bool,
+    /// Human-readable detail: what resolved (or the error), for the CLI/JSON
+    /// output — never silent (task #140's "failures surface a clear message").
+    pub note: String,
+}
+
+/// Best-effort, real post-install check: does the OS resolver actually map
+/// `dig.local` → `127.0.0.2` right now? Uses [`std::net::ToSocketAddrs`],
+/// which resolves a hostname the same way the rest of the OS does
+/// (`getaddrinfo`/the Windows equivalent — reads the hosts file the installer
+/// wrote, honouring `nsswitch.conf` ordering on Unix), so this is a genuine
+/// resolution probe, not a re-parse of our own write.
+pub fn resolve_dig_local() -> ResolveResult {
+    resolve_host(DIG_LOCAL_HOST)
+}
+
+/// [`resolve_dig_local`] against an arbitrary `host` string — the pure/
+/// testable core. Accepts either a hostname (real OS resolution, needs the
+/// system hosts file / DNS) or a bare IP literal (parsed directly, no I/O —
+/// what the unit tests below drive to stay deterministic and environment-
+/// independent).
+pub(crate) fn resolve_host(host: &str) -> ResolveResult {
+    match (host, 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+            if ips.iter().any(|ip| ip == DIG_LOCAL_IP) {
+                ResolveResult {
+                    resolves: true,
+                    note: format!("{host} → {DIG_LOCAL_IP}"),
+                }
+            } else {
+                ResolveResult {
+                    resolves: false,
+                    note: format!(
+                        "{host} resolved but not to {DIG_LOCAL_IP} (got {})",
+                        if ips.is_empty() {
+                            "no addresses".to_string()
+                        } else {
+                            ips.join(", ")
+                        }
+                    ),
+                }
+            }
+        }
+        Err(e) => ResolveResult {
+            resolves: false,
+            note: format!("{host} did not resolve: {e}"),
+        },
     }
 }
 
@@ -331,5 +393,48 @@ mod tests {
     fn remove_dig_local_at_missing_file_is_ok_none() {
         let path = std::env::temp_dir().join("dig-installer-hosts-does-not-exist-xyz/hosts");
         assert_eq!(remove_dig_local_at(&path).expect("missing file ok"), None);
+    }
+
+    // -- Post-install resolve check (task #140) ------------------------------
+    //
+    // `resolve_host` is exercised against IP LITERALS (no DNS/hosts-file I/O —
+    // `ToSocketAddrs` parses a literal directly) so these stay deterministic
+    // and environment-independent, unlike the real `resolve_dig_local()`
+    // (which depends on the live system hosts file and is only exercisable as
+    // a manual/integration check post-install).
+
+    #[test]
+    fn resolve_host_reports_success_when_ip_matches() {
+        // A bare IP literal equal to DIG_LOCAL_IP "resolves" to itself (no I/O).
+        let r = resolve_host(DIG_LOCAL_IP);
+        assert!(r.resolves, "note: {}", r.note);
+        assert!(r.note.contains(DIG_LOCAL_IP));
+    }
+
+    #[test]
+    fn resolve_host_reports_failure_when_resolved_to_a_different_ip() {
+        // 127.0.0.1 resolves (it's a valid literal) but not to DIG_LOCAL_IP —
+        // the mismatch must be reported, not swallowed as success.
+        let r = resolve_host("127.0.0.1");
+        assert!(!r.resolves);
+        assert!(r.note.contains("127.0.0.1"), "got: {}", r.note);
+        assert!(r.note.contains(DIG_LOCAL_IP), "got: {}", r.note);
+    }
+
+    #[test]
+    fn resolve_host_reports_failure_when_host_does_not_resolve() {
+        // `.invalid` is a reserved TLD (RFC 2606) guaranteed to never resolve —
+        // exercises the "did not resolve" branch deterministically, no network.
+        let r = resolve_host("definitely-not-a-real-host.invalid");
+        assert!(!r.resolves);
+        assert!(r.note.contains("did not resolve"), "got: {}", r.note);
+    }
+
+    #[test]
+    fn resolve_result_serializes_with_resolves_and_note() {
+        let r = resolve_host(DIG_LOCAL_IP);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["resolves"], true);
+        assert!(v["note"].is_string());
     }
 }

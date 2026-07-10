@@ -59,13 +59,20 @@ struct Cli {
     dig_node_version: Option<String>,
 
     /// Loopback port the dig-node service serves on (with --with-dig-node).
-    #[arg(long, value_name = "PORT", default_value_t = 8080)]
+    #[arg(long, value_name = "PORT", default_value_t = 9778)]
     dig_node_port: u16,
 
     /// With --with-dig-node, install the service but do NOT start it.
     /// (By default the service is started immediately.)
     #[arg(long = "no-service-start")]
     no_service_start: bool,
+
+    /// Uninstall the dig-node OS service + remove the `dig.local` hosts entry
+    /// this installer created (idempotent; does not touch the digstore/
+    /// browser/relay/dig-dns installs). Runs standalone — ignores every other
+    /// install flag except --bin-dir/--dry-run/--json.
+    #[arg(long = "uninstall-dig-node")]
+    uninstall_dig_node: bool,
 
     /// Also download the DIG Browser native installer for this OS.
     #[arg(long)]
@@ -167,6 +174,11 @@ fn main() -> std::process::ExitCode {
         return run_uninstall_dig_dns(cli.dry_run, cli.json);
     }
 
+    if cli.uninstall_dig_node {
+        let bin_dir = cli.bin_dir.clone().unwrap_or_else(paths::default_bin_dir);
+        return run_uninstall_dig_node(&bin_dir, cli.dry_run, cli.json);
+    }
+
     // digstore is installed by default; --no-digstore opts out, --with-digstore
     // is the explicit (redundant) opt-in. --no-digstore wins if both are given.
     let with_digstore = cli.with_digstore || !cli.no_digstore;
@@ -255,6 +267,29 @@ fn run_uninstall_dig_dns(dry_run: bool, json: bool) -> std::process::ExitCode {
         for artifact in &result.residue_removed {
             println!("  removed: {artifact}");
         }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `--uninstall-dig-node`: tear down the dig-node OS service + the `dig.local`
+/// hosts entry this installer created (task #140). Standalone action —
+/// [`dig_installer::uninstall_dig_node`] never fails outright (a missing
+/// binary or elevation issue is reported via `note`, not an `Err`), so this
+/// always exits success; the caller re-runs elevated if prompted.
+fn run_uninstall_dig_node(
+    bin_dir: &std::path::Path,
+    dry_run: bool,
+    json: bool,
+) -> std::process::ExitCode {
+    let result = if json {
+        dig_installer::uninstall_dig_node(bin_dir, dry_run, &mut |line| eprintln!("{line}"))
+    } else {
+        dig_installer::uninstall_dig_node(bin_dir, dry_run, &mut |line| println!("{line}"))
+    };
+    if json {
+        println!("{}", dig_installer::service_uninstall_json(&result));
+    } else {
+        println!("dig-node uninstall: {}", result.note);
     }
     std::process::ExitCode::SUCCESS
 }
