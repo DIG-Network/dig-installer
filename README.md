@@ -126,6 +126,7 @@ dig-installer --with-browser       # ALSO download the DIG Browser installer
 dig-installer --dry-run            # show exactly what would happen, change nothing
 dig-installer --dry-run --json     # the same, as a machine-readable plan
 dig-installer --uninstall-dig-dns  # remove the dig-dns service + OS wiring this installer created
+dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local hosts entry
 ```
 
 ### Flags
@@ -137,8 +138,9 @@ dig-installer --uninstall-dig-dns  # remove the dig-dns service + OS wiring this
 | `--digstore-version <VER>` | latest | Install a specific digstore version (e.g. `0.6.0`). |
 | `--with-dig-node` (alias `--service`) | off | Also install the `dig-node` local node + register it as an OS service + write the `dig.local` hosts entry. |
 | `--no-service-start` | off | Install the dig-node service but don't start it. |
-| `--dig-node-port <PORT>` | `8080` | Loopback port the dig-node service serves on. |
+| `--dig-node-port <PORT>` | `9778` | Loopback port the dig-node service serves on (matches dig-node's own uncommon-high-port default — the sibling of the dig-wallet HTTP API's `9777`; `dig.local` stays on `127.0.0.2:80` regardless). |
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
+| `--uninstall-dig-node` | — | Remove the dig-node OS service + the `dig.local` hosts entry this installer created. Idempotent; does not touch the digstore/browser/relay/dig-dns installs. Standalone action — ignores every other flag except `--bin-dir`/`--dry-run`/`--json`. |
 | `--with-browser` | off | Also download the DIG Browser native installer for this OS. |
 | `--browser-version <VER>` | latest | Install a specific DIG Browser version. |
 | `--with-relay` | off | **Advanced.** Also install the `dig-relay` NAT-traversal relay + register it as an OS service (run your own relay). Most users don't need this — nodes use `relay.dig.net` by default. |
@@ -179,10 +181,13 @@ Default install location (`--bin-dir`):
 5. **dig-node** *(with `--with-dig-node`)* — downloads the `dig-node` binary the
    same way, then **delegates to dig-node's own `install` (+ `start`)**
    subcommands to register it as an OS service (Windows SCM / systemd / launchd —
-   the installer does not reimplement it), and best-effort writes the `dig.local`
-   hosts entry (see below). On Windows, service registration needs an elevated
-   console — if you aren't elevated the installer surfaces a clear message and
-   the digstore install still succeeds.
+   the installer does not reimplement it), best-effort writes the `dig.local`
+   hosts entry, then runs a **post-install resolve check** confirming the OS
+   actually maps `dig.local` → `127.0.0.2` now (see below). On Windows, service
+   registration needs an elevated console — if you aren't elevated the
+   installer surfaces a clear message and the digstore install still succeeds.
+   `--uninstall-dig-node` reverses it: removes the OS service (delegating to
+   dig-node's own `uninstall`) and the hosts entry.
 6. **dig-dns** *(with `--with-dig-dns`)* — downloads the `dig-dns` binary, then
    **owns the full per-OS service + DNS/browser wiring itself** (unlike
    dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of its
@@ -213,16 +218,40 @@ entry so consumers (the DIG Browser, the extension) can reach your local node
 
 - It uses `127.0.0.2` (not `127.0.0.1`) so `dig.local` has its own loopback IP
   and never collides with anything else you run on `localhost`.
-- The write is **idempotent** (skipped if a `dig.local` mapping already exists),
-  **reversible** (an uninstall removes only the line this installer tagged), and
-  **best-effort** — it needs elevation, and if it can't be written the install
-  is **never aborted**: the node stays reachable at `localhost` and you can
-  re-run elevated to add it.
+- The write is **idempotent** (skipped if a `dig.local` mapping already exists,
+  on install OR re-install/upgrade — never duplicated), **reversible**
+  (`--uninstall-dig-node` removes only the line this installer tagged, and the
+  OS service itself), and **best-effort** — it needs elevation, and if it can't
+  be written the install is **never aborted**: the node stays reachable at
+  `localhost`, the failure is printed with a clear reason (never silent), and
+  you can re-run elevated to add it.
 - Hosts file: `%SystemRoot%\System32\drivers\etc\hosts` (Windows) / `/etc/hosts`.
+- **Post-install resolve check** — after writing (or confirming) the entry,
+  the installer asks the OS resolver whether `dig.local` actually maps to
+  `127.0.0.2` right now (not just a re-read of its own write) and prints
+  `dig.local resolve check: …` (pass) or a clear `FAILED` line with the reason
+  (stale DNS-client cache, a hosts write that landed in the wrong file, …).
+  Under `--json` this is `service.dig_local_resolves` (bool) +
+  `service.dig_local_resolve_note` (detail).
+
+```sh
+dig-installer --with-dig-node
+#   Registering dig-node as an OS service (port 9778):
+#     ✓ dig-node installed as an OS service and started
+#     ✓ dig.local: 127.0.0.2 dig.local → /etc/hosts
+#     ✓ dig.local resolve check: dig.local → 127.0.0.2
+
+dig-installer --uninstall-dig-node
+#   Uninstalling the dig-node OS service:
+#     ✓ dig-node service uninstalled
+#   Removing the dig.local hosts entry:
+#     ✓ removed dig.local from /etc/hosts
+```
 
 > The dig-node *dual-listener* that makes `dig.local` actually resolve to the
-> node (`127.0.0.2:80` + `localhost:<port>` + a Host allowlist) is a separate
-> dig-node change; this installer only writes the hosts entry.
+> node (`127.0.0.2:80` + `localhost:<port>` + a Host allowlist) is dig-node's
+> own behaviour; this installer writes the hosts entry, registers/uninstalls
+> the service, and runs the resolve check.
 
 ---
 
@@ -293,10 +322,16 @@ pre-existing org DNS/browser policy.
 - **`--json`** — emits a single structured object to **stdout** (all human prose
   goes to **stderr**, no prompts/spinners). On success:
   `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,relay,dns,installed:[…]}}`
-  — `dns` (present with `--with-dig-dns`) carries `{installed,started,needs_elevation,note,doctor,paths_live,bound_port,pac_url,fallback_instruction}`.
+  — `service` (present with `--with-dig-node`) carries
+  `{installed,started,port,note,dig_local,dig_local_resolves,dig_local_resolve_note}` —
+  the last two are the task-#140 post-install resolve check (whether the OS
+  resolver actually maps `dig.local` → `127.0.0.2` right now). `dns` (present
+  with `--with-dig-dns`) carries `{installed,started,needs_elevation,note,doctor,paths_live,bound_port,pac_url,fallback_instruction}`.
   On failure: `{"ok":false,"error":{"code","exit_code","message","hint"}}`.
   `--uninstall-dig-dns --json` emits `{"ok":true,"result":{uninstalled,needs_elevation,note,residue_removed:[…]}}`
   standalone (it never touches the other components).
+  `--uninstall-dig-node --json` emits `{"ok":true,"result":{uninstalled,dig_local_removed,note}}`
+  standalone (never touches the digstore/browser/relay/dig-dns installs).
 - **`--help-json`** — prints the full invocation contract (components, flags,
   supported targets, and the exit-code table) as JSON.
 - **Stable error codes + exit codes** — every failure carries an `UPPER_SNAKE`
