@@ -123,6 +123,9 @@ fn help_lists_the_selectable_component_flags() {
         "--with-relay",
         "--relay-port",
         "--no-digstore",
+        // #301 opt-out flags for the two components now installed by default.
+        "--no-dig-node",
+        "--no-dig-dns",
         "--dig-node-port",
         "--with-dig-dns",
         "--dig-dns-version",
@@ -134,6 +137,118 @@ fn help_lists_the_selectable_component_flags() {
     ] {
         assert!(stdout.contains(flag), "--help is missing {flag}");
     }
+}
+
+/// #301: the machine contract must advertise the universal-installer default —
+/// digstore, dig-node AND dig-dns as `default: true` — so an agent driving the
+/// installer knows a bare run installs all three. dig-relay + browser stay
+/// `default: false` (opt-in). Drives the real built binary.
+#[test]
+fn help_json_advertises_all_three_core_components_as_default() {
+    let out = bin().arg("--help-json").assert().success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let default_of = |id: &str| -> bool {
+        v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("component {id} present"))["default"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(default_of("digstore"), "digstore default: true");
+    assert!(default_of("dig-node"), "dig-node default: true (#301)");
+    assert!(default_of("dig-dns"), "dig-dns default: true (#301)");
+    assert!(!default_of("dig-relay"), "dig-relay stays opt-in");
+    assert!(!default_of("browser"), "browser stays opt-in");
+}
+
+/// #301: `--help` prose must frame the installer as installing the full stack by
+/// default with per-component opt-outs (not the old "digstore only" framing).
+#[test]
+fn help_prose_frames_the_universal_all_three_default() {
+    let out = bin().arg("--help").assert().success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let low = stdout.to_lowercase();
+    assert!(low.contains("by default"), "--help must state the default");
+    assert!(low.contains("dig-node"), "--help mentions dig-node");
+    assert!(low.contains("dig-dns"), "--help mentions dig-dns");
+    // The stale "only the digstore CLI is installed" framing must be gone.
+    assert!(
+        !low.contains("only the digstore cli is installed"),
+        "--help must not say only digstore is installed by default"
+    );
+}
+
+/// #301: opting out of ALL THREE components is a valid, network-free, side-
+/// effect-free run — proving the `--no-<component>` opt-outs parse and fully
+/// disable the default stack (nothing to resolve, so no HTTP call is made).
+#[test]
+fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
+    let out = bin()
+        .args([
+            "--no-digstore",
+            "--no-dig-node",
+            "--no-dig-dns",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert!(
+        v["result"]["components"].as_array().unwrap().is_empty(),
+        "opting out of all three must resolve/install nothing"
+    );
+}
+
+/// #301 rebrand regression guard (the user's complaint): the shipped GUI must
+/// name itself "DIG Installer", never "DigStore Installer". Reads the actual
+/// user-facing identity surfaces (Tauri config, HTML title, the on-screen title
+/// bar) so the stale brand can never silently return. (The `digstore`/`DigStore`
+/// CLI *component* name is untouched — this guards the INSTALLER's own name.)
+#[test]
+fn installer_is_branded_dig_installer_not_digstore_installer() {
+    use std::fs;
+    use std::path::Path;
+
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let read = |rel: &str| -> String {
+        fs::read_to_string(Path::new(dir).join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+
+    // No user-visible surface may contain the old installer name.
+    for rel in [
+        "gui/app/src-tauri/tauri.conf.json",
+        "gui/app/index.html",
+        "gui/app/src/TitleBar.jsx",
+    ] {
+        assert!(
+            !read(rel).contains("DigStore Installer"),
+            "{rel} still contains the stale 'DigStore Installer' brand"
+        );
+    }
+
+    // The Tauri config names the app "DIG Installer" with the rebranded identifier.
+    let conf: Value = serde_json::from_str(&read("gui/app/src-tauri/tauri.conf.json"))
+        .expect("tauri.conf.json is valid JSON");
+    assert_eq!(conf["productName"], "DIG Installer");
+    assert_eq!(conf["app"]["windows"][0]["title"], "DIG Installer");
+    assert_eq!(conf["identifier"], "net.dig.installer");
+
+    // The on-screen title bar reads "DIG Installer".
+    assert!(
+        read("gui/app/src/TitleBar.jsx").contains("DIG Installer"),
+        "TitleBar.jsx must render 'DIG Installer'"
+    );
+    assert!(
+        read("gui/app/index.html").contains("<title>DIG Installer</title>"),
+        "index.html <title> must be 'DIG Installer'"
+    );
 }
 
 #[test]

@@ -253,7 +253,9 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         username: None,
         working_directory: None,
         environment: None,
-        autostart: true,
+        // Boot-start (#301): launchd loads it at boot (paired with the plist's
+        // RunAtLoad) — the service comes up on every boot.
+        autostart: plan::DNS_SERVICE_AUTOSTART,
     }) {
         Ok(()) => {
             notes.push(format!(

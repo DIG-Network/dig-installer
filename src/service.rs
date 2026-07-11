@@ -38,6 +38,12 @@ impl Default for ServiceConfig {
 }
 
 /// The subcommand passed to the dig-node binary (`dig-node <subcommand>`).
+///
+/// Plain `install` — dig-node's own `install` verb registers a **boot-start**
+/// OS service (`autostart: true` in dig-node-service's `service::install`, i.e.
+/// Windows SCM `start= auto` / systemd `enable` / launchd `RunAtLoad`), so the
+/// node comes up on every boot (#301). We deliberately pass NO manual-start
+/// variant here; boot-start is the intended, tested default.
 pub fn install_args() -> Vec<String> {
     vec!["install".to_string()]
 }
@@ -673,6 +679,25 @@ mod tests {
     #[test]
     fn stop_args_is_the_stop_verb() {
         assert_eq!(stop_args(), vec!["stop".to_string()]);
+    }
+
+    /// #301 boot-start guarantee (dig-node). The installer registers dig-node by
+    /// delegating to its own `install` verb, which registers a boot-start
+    /// (auto-start-on-boot) service. This locks that we invoke plain `install`
+    /// (the boot-start path) and `start` — never a manual-start variant — so a
+    /// regression to manual registration fails here.
+    #[test]
+    fn dig_node_is_registered_boot_start_via_the_install_verb() {
+        assert_eq!(
+            install_args(),
+            vec!["install".to_string()],
+            "dig-node must be registered via its boot-start `install` verb (#301)"
+        );
+        assert_eq!(start_args(), vec!["start".to_string()]);
+        // No manual/no-boot token is ever forwarded to the install verb.
+        assert!(!install_args()
+            .iter()
+            .any(|a| a.contains("manual") || a.contains("no-boot") || a.contains("no-autostart")));
     }
 
     #[test]

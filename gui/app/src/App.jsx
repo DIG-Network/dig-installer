@@ -170,7 +170,7 @@ export function App() {
 
   const primaryLabel =
     step === 0
-      ? "Install DigStore"
+      ? "Install DIG"
       : step === 2
       ? "Install"
       : step === 3
@@ -208,10 +208,10 @@ export function App() {
             <div className="bigD">
               <img src={glowD} alt="DIG" />
             </div>
-            <h1>DigStore</h1>
-            <div className="tagline">The content-addressable WASM store format, by DIG Network.</div>
+            <h1>DIG</h1>
+            <div className="tagline">Everything you need for the DIG Network — the digstore CLI, your dig-node, and .dig name resolution.</div>
             <div className="ver-pill">
-              <span className="dot"></span>DigStore v{digstoreVersion}
+              <span className="dot"></span>digstore v{digstoreVersion}
             </div>
           </div>
           <div className="steps">

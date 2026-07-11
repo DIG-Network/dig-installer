@@ -1,8 +1,10 @@
-# DigStore Installer (Tauri 2)
+# DIG Installer (Tauri 2)
 
-A real, cross-platform desktop installer for the DigStore CLI + host runtime,
-built to `installer/assets/README.md` (the authoritative spec) and the hi-fi
-prototype in `installer/assets/design/`.
+A real, cross-platform desktop installer for the DIG Network stack — the
+digstore CLI plus the dig-node and dig-dns services — built to
+`installer/assets/README.md` (the authoritative spec) and the hi-fi prototype in
+`installer/assets/design/`. The digstore CLI ships embedded (installed offline);
+the other components are resolved + downloaded at install time (see `SPEC.md` §6).
 
 - **Stack:** Tauri 2 — Rust backend (`src-tauri/`) + bundled Vite + React 18
   frontend (`src/`). The frontend ports the prototype's HTML/CSS/JSX at high

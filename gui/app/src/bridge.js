@@ -202,7 +202,7 @@ const SIM_LOG = [
   { t: 3050, html: 'Linking <span class="ac">digstore</span> → PATH' },
   { t: 3450, html: 'Installing shell completions <span class="dim">bash · zsh · fish</span>' },
   { t: 3850, html: '<span class="ok">✓</span> Verifying install · digstore --version' },
-  { t: 4150, html: '<span class="ok">✓</span> DigStore is ready.' },
+  { t: 4150, html: '<span class="ok">✓</span> DIG is ready.' },
 ];
 const SIM_FILES = ["bin/digstore", "lib/dig_host.wasm", "lib/compiler.wasm", "share/completions/_digstore", "trusted/host-keys.toml", "examples/hello.wasm"];
 

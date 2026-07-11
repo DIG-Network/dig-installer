@@ -8,11 +8,11 @@ export function Finish({ path, onCopy, copied, meta }) {
         {Ic.check}
       </div>
       <h2>
-        DigStore is <span className="gt">installed</span>
+        The DIG stack is <span className="gt">installed</span>
       </h2>
       <p className="lead">
-        The CLI and host runtime are ready. Initialize your first store, then commit a <b>capsule</b>
-        (<code>storeId:rootHash</code> — one immutable generation) and push it to <b>DIGHUb</b>.
+        The <b>DigStore</b> CLI, your <b>dig-node</b>, and <b>dig-dns</b> are ready. Initialize your first store, then
+        commit a <b>capsule</b> (<code>storeId:rootHash</code> — one immutable generation) and push it to <b>DIGHUb</b>.
       </p>
       <div className="recap">
         <span className="chip">

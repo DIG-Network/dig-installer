@@ -210,7 +210,8 @@ pub fn install(
         username: None,
         working_directory: None,
         environment: None,
-        autostart: true,
+        // Boot-start (#301): SCM `start= auto` — the service comes up on every boot.
+        autostart: plan::DNS_SERVICE_AUTOSTART,
     }) {
         return failed(format!("dig-dns service registration failed: {e}"));
     }

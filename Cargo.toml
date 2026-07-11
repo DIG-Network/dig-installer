@@ -1,16 +1,19 @@
 # The universal DIG installer.
 #
-# `dig-installer` downloads the released `digstore` CLI binary (and, optionally,
-# the `dig-node` local-node binary) for the current OS/arch from the canonical
-# DIG-Network GitHub releases, places `digstore` on PATH, and — when asked —
-# installs + starts `dig-node` as an OS service by delegating to dig-node's own
-# `install`/`start` subcommands (it is the standalone-server twin of the native
-# DIG Browser's in-process dig-node; see SYSTEM.md → dig-companion/dig-node).
-# It also installs `dig-dns` (local `*.dig` name resolution, #177/#174) as an
-# OS service — Windows Service / macOS LaunchDaemon / Linux systemd — but,
-# unlike dig-node/dig-relay, dig-dns ships no service subcommands of its own,
-# so this installer owns the full per-OS service + split-DNS/NRPT +
-# browser-policy wiring directly (`src/dns/`).
+# By DEFAULT `dig-installer` installs the full DIG stack for the current OS/arch,
+# from the canonical DIG-Network GitHub releases, in one run (#301):
+#   * the `digstore` CLI binary, placed on PATH;
+#   * the `dig-node` local-node binary, installed + started as a boot-start OS
+#     service by delegating to dig-node's own `install`/`start` subcommands (it
+#     is the standalone-server twin of the native DIG Browser's in-process
+#     dig-node; see SYSTEM.md → dig-companion/dig-node); and
+#   * `dig-dns` (local `*.dig` name resolution, #177/#174), installed + started
+#     as a boot-start OS service — Windows Service / macOS LaunchDaemon / Linux
+#     systemd — but, unlike dig-node/dig-relay, dig-dns ships no service
+#     subcommands of its own, so this installer owns the full per-OS service +
+#     split-DNS/NRPT + browser-policy wiring directly (`src/dns/`).
+# Any of the three can be opted OUT with `--no-<component>`; `dig-relay` and the
+# DIG Browser stay opt-in (`--with-relay`/`--with-browser`).
 #
 # It does NOT build either binary itself: digstore still `cargo`-builds and
 # publishes the `digstore` binary from its own repo; dig-installer only CONSUMES
@@ -18,8 +21,8 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.5.1"
-description = "Universal DIG installer — installs the digstore CLI and (optionally) the dig-node and dig-dns services"
+version = "0.6.0"
+description = "Universal DIG installer — installs the digstore CLI, the dig-node service, and the dig-dns service by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
 license = "GPL-2.0-only"

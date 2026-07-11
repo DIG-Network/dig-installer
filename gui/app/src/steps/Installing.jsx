@@ -15,7 +15,7 @@ export function Installing({ pct, lines, nowFile, error }) {
   return (
     <div className="fade-key">
       <div className="eyebrow">Step 04 — Installing</div>
-      <h2>{error ? "Install failed" : done ? "Install complete" : "Installing DigStore"}</h2>
+      <h2>{error ? "Install failed" : done ? "Install complete" : "Installing DIG"}</h2>
       <div className="prog-wrap">
         <div className="prog-head">
           <span className="pct">{Math.floor(pct)}%</span>

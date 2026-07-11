@@ -3,14 +3,15 @@ import { FEATURES } from "../data.jsx";
 export function Welcome({ meta }) {
   return (
     <div className="fade-key">
-      <div className="eyebrow">DIG Network · DigStore CLI · Host Runtime</div>
+      <div className="eyebrow">DIG Network · digstore · dig-node · dig-dns</div>
       <h2>
-        Install <span className="gt">DigStore</span>
+        Install <span className="gt">DIG</span>
       </h2>
       <p className="lead">
-        Your front door to the DIG Network. <b>DigStore</b> turns content into a portable, encrypted, self-defending
-        WASM module: each commit is a <b>capsule</b> you publish to <b>DIGHUb</b> (the blind host) and serve through a
-        local <b>dig-node</b>. Publishing a capsule costs a small amount of <b>$DIG</b>; reading is free.
+        Your front door to the DIG Network. This installer sets up the full stack in one step — the <b>DigStore</b> CLI,
+        your local <b>dig-node</b>, and <b>dig-dns</b> name resolution. DigStore turns content into a portable, encrypted,
+        self-defending WASM module: each commit is a <b>capsule</b> you publish to <b>DIGHUb</b> (the blind host) and serve
+        through your dig-node. Publishing a capsule costs a small amount of <b>$DIG</b>; reading is free.
       </p>
       <div className="feats">
         {FEATURES.map((f, i) => (
