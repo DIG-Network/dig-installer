@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.1] - 2026-07-11
+
+### Bug Fixes
+- Rename GUI setup bundle DigStore-Setup to DIG-Installer-Setup (#10)
+
 ## [0.6.0] - 2026-07-11
 
 ### Features
