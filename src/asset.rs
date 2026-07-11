@@ -4,7 +4,8 @@
 //! Why this exists (thin-shim resilience): the producing repos do not all use
 //! the same asset-naming convention, and a convention can change between
 //! releases. digstore's CLI release publishes `digstore-<ver>-<os_arch>[.exe]`,
-//! but an older/GUI release exposes `DigStore-Setup-<ver>-<os>.{exe,dmg,
+//! while this repo's own GUI installer (migrated from digstore, built by
+//! `release.yml`) publishes `DIG-Installer-Setup-<ver>-<os>.{exe,dmg,
 //! AppImage}`; the DIG Browser publishes a native installer per OS
 //! (`.exe`/`.dmg`/`.AppImage`). Rather than re-encode a single brittle template
 //! (which 404s the moment a name varies), the installer fetches the release's
@@ -161,7 +162,7 @@ fn looks_like_it_has_a_file_extension(name_lc: &str) -> bool {
 }
 
 /// Substrings that mark an asset as a GUI/desktop *installer* package, never a
-/// raw CLI binary — so the RawBinary matcher never grabs a `DigStore-Setup-*`
+/// raw CLI binary — so the RawBinary matcher never grabs a `DIG-Installer-Setup-*`
 /// GUI exe and places it on PATH as the CLI.
 const INSTALLER_NAME_MARKERS: &[&str] = &["setup", "installer", "-gui"];
 
@@ -292,7 +293,7 @@ mod tests {
     fn raw_binary_on_unix_rejects_installer_extensions() {
         // A `.AppImage`/`.dmg` is NOT a raw CLI binary even if the OS token matches.
         let names = vec![
-            "DigStore-Setup-0.6.0-linux-x86_64.AppImage".to_string(),
+            "DIG-Installer-Setup-0.6.1-linux-x86_64.AppImage".to_string(),
             "digstore-0.6.0-linux-x64".to_string(),
         ];
         assert_eq!(
@@ -308,14 +309,15 @@ mod tests {
 
     #[test]
     fn raw_binary_never_picks_a_gui_setup_exe() {
-        // Regression: digstore's existing v0.6.0 release shipped ONLY the GUI
-        // installer (`DigStore-Setup-*.exe`) and no raw CLI binary. The RawBinary
-        // matcher must NOT place that GUI exe on PATH as `digstore` — it returns
-        // None (→ ASSET_NOT_FOUND) until the real CLI binary is published.
+        // Regression: dig-installer's own GUI setup bundle (`DIG-Installer-Setup-
+        // *.exe`) is published alongside the raw CLI binary in the same release.
+        // The RawBinary matcher must NOT place that GUI exe on PATH as `digstore`
+        // — it returns None (→ ASSET_NOT_FOUND) until the real CLI binary is
+        // published.
         let names = vec![
-            "DigStore-Setup-0.6.0-windows-x64.exe".to_string(),
-            "DigStore-Setup-0.6.0-macos.dmg".to_string(),
-            "DigStore-Setup-0.6.0-linux-x86_64.AppImage".to_string(),
+            "DIG-Installer-Setup-0.6.1-windows-x64.exe".to_string(),
+            "DIG-Installer-Setup-0.6.1-macos.dmg".to_string(),
+            "DIG-Installer-Setup-0.6.1-linux-x86_64.AppImage".to_string(),
         ];
         assert_eq!(
             select_asset(
@@ -380,16 +382,17 @@ mod tests {
     #[test]
     fn installer_accepts_a_gui_setup_package() {
         // The Installer kind (unlike RawBinary) WELCOMES a `*-Setup-*` name — it's
-        // exactly what a desktop installer is.
-        let names = vec!["DigStore-Setup-0.6.0-windows-x64.exe".to_string()];
+        // exactly what a desktop installer is. `DIG-Installer-Setup-*` is this
+        // repo's own GUI bundle naming (release.yml).
+        let names = vec!["DIG-Installer-Setup-0.6.1-windows-x64.exe".to_string()];
         assert_eq!(
             select_asset(
                 &names,
                 &t(Os::Windows, Arch::X64),
                 AssetKind::Installer,
-                "digstore"
+                "dig-installer"
             ),
-            Some("DigStore-Setup-0.6.0-windows-x64.exe".to_string())
+            Some("DIG-Installer-Setup-0.6.1-windows-x64.exe".to_string())
         );
     }
 
@@ -397,24 +400,24 @@ mod tests {
     fn installer_falls_back_to_bare_macos_dmg_without_arch() {
         // macOS .dmg often omits the arch ("...-macos.dmg") — the "macos" token
         // (least specific) still matches for both arm64 and x64.
-        let names = vec!["DigStore-Setup-0.6.0-macos.dmg".to_string()];
+        let names = vec!["DIG-Installer-Setup-0.6.1-macos.dmg".to_string()];
         assert_eq!(
             select_asset(
                 &names,
                 &t(Os::MacOs, Arch::X64),
                 AssetKind::Installer,
-                "digstore"
+                "dig-installer"
             ),
-            Some("DigStore-Setup-0.6.0-macos.dmg".to_string())
+            Some("DIG-Installer-Setup-0.6.1-macos.dmg".to_string())
         );
         assert_eq!(
             select_asset(
                 &names,
                 &t(Os::MacOs, Arch::Arm64),
                 AssetKind::Installer,
-                "digstore"
+                "dig-installer"
             ),
-            Some("DigStore-Setup-0.6.0-macos.dmg".to_string())
+            Some("DIG-Installer-Setup-0.6.1-macos.dmg".to_string())
         );
     }
 

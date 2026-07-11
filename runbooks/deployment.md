@@ -22,7 +22,7 @@ the version from `Cargo.toml`, regenerates `CHANGELOG.md` with git-cliff, commit
 - **Universal CLI** (`dig-installer`) for `windows-x64` / `linux-x64` / `macos-arm64` /
   `macos-x64` → attached to the GitHub Release as `dig-installer-<ver>-<os_arch>[.exe]`. This is
   the artifact `install.sh`/`install.ps1` download.
-- **GUI installer** (Tauri, embeds the released `digstore` binary) → `DigStore-Setup-<ver>-
+- **GUI installer** (Tauri, embeds the released `digstore` binary) → `DIG-Installer-Setup-<ver>-
   windows-x64.exe` (raw exe) / `-macos.dmg` / `-linux-x86_64.AppImage`, also attached to the same
   GitHub Release.
 

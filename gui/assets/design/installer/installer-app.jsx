@@ -28,7 +28,7 @@ const COMPONENTS = [
 ];
 
 const INSTALL_LOG = [
-  { t: 240, html: '<span class="dim">$</span> digstore-setup --target /usr/local/digstore' },
+  { t: 240, html: '<span class="dim">$</span> dig-installer --target /usr/local/digstore' },
   { t: 520, html: 'Resolving release <span class="ac">v1.0.0</span> · compiler 1.0.0 · module format 1' },
   { t: 900, html: '<span class="ok">✓</span> Verified package signature <span class="dim">(BLS · 96 bytes)</span>' },
   { t: 1300, html: 'Unpacking <span class="ac">DigStore CLI</span> → /usr/local/digstore/bin' },

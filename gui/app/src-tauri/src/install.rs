@@ -191,7 +191,7 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     emit_line(
         app,
         format!(
-            r#"<span class="dim">$</span> digstore-setup --target {}"#,
+            r#"<span class="dim">$</span> dig-installer --target {}"#,
             opts.install_path
         ),
     );
