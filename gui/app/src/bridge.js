@@ -192,7 +192,7 @@ export async function cancelInstall() {
 
 /* ---- browser-only simulation (parity with the prototype timings) ---- */
 const SIM_LOG = [
-  { t: 240, html: '<span class="dim">$</span> digstore-setup --target {PATH}' },
+  { t: 240, html: '<span class="dim">$</span> dig-installer --target {PATH}' },
   { t: 520, html: 'Resolving release <span class="ac">v1.0.0</span> · compiler 1.0.0 · module format 1' },
   { t: 900, html: '<span class="ok">✓</span> Verified package checksum <span class="dim">(SHA-256 manifest)</span>' },
   { t: 1300, html: 'Unpacking <span class="ac">DigStore CLI</span> → {PATH}/bin' },

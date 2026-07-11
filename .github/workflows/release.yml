@@ -12,9 +12,9 @@ name: Release dig-installer
 #   * macos-x64    → dig-installer-<ver>-macos-x64
 #
 # GUI installer (migrated from digstore; embeds the released digstore binary):
-#   * windows → DigStore-Setup-<ver>-windows-x64.exe   (raw Tauri exe)
-#   * macos   → DigStore-Setup-<ver>-macos.dmg
-#   * linux   → DigStore-Setup-<ver>-linux-x86_64.AppImage
+#   * windows → DIG-Installer-Setup-<ver>-windows-x64.exe   (raw Tauri exe)
+#   * macos   → DIG-Installer-Setup-<ver>-macos.dmg
+#   * linux   → DIG-Installer-Setup-<ver>-linux-x86_64.AppImage
 #
 # A push to main also builds the CLI (no publish) so a broken build is caught
 # before tagging.
@@ -261,7 +261,7 @@ jobs:
           mkdir -p ../../dist-gui
           artifact="$(ls -1 ${{ matrix.artifact_glob }} | head -n1)"
           [ -n "$artifact" ] || { echo "no artifact matched ${{ matrix.artifact_glob }}"; exit 1; }
-          cp "$artifact" "../../dist-gui/DigStore-Setup-${VERSION}-${{ matrix.out_name }}"
+          cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
           ls -la ../../dist-gui
       - name: Upload GUI installer artifact
         uses: actions/upload-artifact@v4

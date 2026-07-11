@@ -237,7 +237,7 @@ Pane padding `44px 56px` (density-dependent).
   in progress. Log lines (prototype timings shown for reference; in the real app emit
   these as each phase completes):
   ```
-  $ digstore-setup --target /usr/local/digstore
+  $ dig-installer --target /usr/local/digstore
   Resolving release v1.0.0 · compiler 1.0.0 · module format 1
   ✓ Verified package signature (BLS · 96 bytes)
   Unpacking DigStore CLI → /usr/local/digstore/bin
