@@ -1,4 +1,4 @@
-//! Build script for the DigStore installer.
+//! Build script for the DIG Installer.
 //!
 //! In addition to the normal `tauri_build::build()`, this **embeds the prebuilt
 //! `digstore` binary directly into the installer executable** so the shipped

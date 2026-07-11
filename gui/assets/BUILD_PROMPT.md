@@ -1,4 +1,4 @@
-# Build Prompt — DigStore Installer
+# Build Prompt — DIG Installer
 
 Paste the text below to an LLM coding agent (e.g. Claude Code) that has this
 `design_handoff_digstore_installer/` folder available in its workspace.
@@ -12,7 +12,7 @@ design + spec package is in this folder. **Read it before writing code:**
 - `README.md` — the authoritative spec. Window/rail/footer layout, all 5 wizard steps
   (exact copy, sizes, colors, type), the navigation state machine, design tokens, the
   **real install pipeline** to implement, and per-OS details. Build to this.
-- `design/DigStore Installer.html` + `design/installer/installer-app.jsx` — a runnable,
+- `design/DIG Installer.html` + `design/installer/installer-app.jsx` — a runnable,
   hi-fidelity HTML/React prototype. This is the visual + motion ground truth: match it.
   Serve `design/` statically and open the HTML to see it. The install in the prototype
   is **simulated** (a timed animation) — you must replace it with real work.

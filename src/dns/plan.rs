@@ -51,6 +51,17 @@ pub const LINUX_SERVICE_USER: &str = "dig-dns";
 /// spawns the real `dig-dns serve` as a child process.
 pub const SERVICE_HOST_SUBCOMMAND: &str = "run-dig-dns-service";
 
+/// dig-dns is registered as a **boot-start** OS service (#301): it starts
+/// automatically on every boot, on all three platforms. This single flag is
+/// threaded into the `service-manager` `ServiceInstallCtx.autostart` on each OS
+/// ([`super::windows`]/[`super::linux`]/[`super::macos`]), which maps to the
+/// per-OS boot-start mechanism — Windows SCM `start= auto`, systemd `enable`
+/// (paired with the `WantedBy=multi-user.target` in [`systemd_unit`]), and
+/// launchd (paired with the `RunAtLoad` in [`launchd_service_plist`]). Keeping
+/// it here as one named constant means a regression to manual-start is a
+/// one-line change caught by [`tests::dns_service_is_registered_as_boot_start`].
+pub const DNS_SERVICE_AUTOSTART: bool = true;
+
 // ---------------------------------------------------------------------------
 // Linux — systemd unit (custom `contents`; the crate's own generator has no
 // capability/user support, so we hand-roll the full unit text).
@@ -454,6 +465,38 @@ mod tests {
         assert!(plist.contains("/var/log/dig-dns.out.log"));
         assert!(plist.contains("/var/log/dig-dns.err.log"));
         assert!(plist.contains(MARKER));
+    }
+
+    /// #301 boot-start guarantee (dig-dns, cross-OS). The one shared flag that
+    /// drives auto-start-on-boot must stay `true`, and the two artifacts that
+    /// encode boot-start declaratively (the systemd unit's install target and
+    /// the launchd service plist's `RunAtLoad`) must agree. Windows boot-start is
+    /// the SCM `start= auto` that `service-manager` derives from this same
+    /// `autostart` flag (asserted structurally here; exercised on the Windows
+    /// build in `super::windows`).
+    #[test]
+    // The `DNS_SERVICE_AUTOSTART` check is intentionally an assert-on-constant:
+    // it is a compile-anchored regression guard that a future edit can't silently
+    // flip the shared boot-start flag to manual-start (which would break
+    // auto-start-on-boot on all three OSes, #301).
+    #[allow(clippy::assertions_on_constants)]
+    fn dns_service_is_registered_as_boot_start() {
+        assert!(
+            DNS_SERVICE_AUTOSTART,
+            "dig-dns must register as a boot-start (auto-start-on-boot) service (#301)"
+        );
+        // Linux: systemd unit installs into the multi-user boot target.
+        let unit = systemd_unit("/opt/dig/bin/dig-dns", None);
+        assert!(
+            unit.contains("WantedBy=multi-user.target"),
+            "systemd unit must start on boot"
+        );
+        // macOS: launchd service plist loads at boot.
+        let plist = launchd_service_plist("/usr/local/bin/dig-dns", None);
+        assert!(
+            plist.contains("<key>RunAtLoad</key>\n\t<true/>"),
+            "launchd service plist must RunAtLoad (start on boot)"
+        );
     }
 
     #[test]

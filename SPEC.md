@@ -13,11 +13,18 @@ resolved against the LATEST GitHub release for its OS/arch (or a pinned `--<comp
 selecting the matching asset from the release's actual asset list (`src/asset.rs`), never a
 guessed filename.
 
+**The default install is the full DIG stack in one run** — the `digstore` CLI, the `dig-node`
+service, and the `dig-dns` service are ALL installed by default (a bare `dig-installer` with no
+flags installs all three; `InstallPlan::default()` encodes this). `dig-node` and `dig-dns` are
+registered as **boot-start** OS services (§2.1). Opt out of any of the three with the matching
+`--no-<component>` flag. `dig-relay` (advanced, run-your-own-relay) and the DIG Browser stay
+opt-in.
+
 | id         | repo                          | kind                              | CLI flag(s)                          | Selected in the GUI wizard by default |
 |------------|-------------------------------|------------------------------------|---------------------------------------|----------------------------------------|
 | `digstore` | `DIG-Network/digstore`        | raw binary, added to PATH          | on by default; `--no-digstore` opts out; `--with-digstore` (redundant, symmetry) | always (required, no checkbox) |
-| `dig-node` | `DIG-Network/dig-node`        | raw binary + OS service + `dig.local` hosts entry | `--with-dig-node` (alias `--service`) | yes |
-| `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + OS service + split-DNS/NRPT + browser DoH policy | `--with-dig-dns` | yes |
+| `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
+| `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
 | `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | yes |
 | `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | yes |
 
@@ -84,6 +91,30 @@ runs it or overwrites the installed application itself.
 Every managed component is driven through its OWN CLI verbs / OS service manager (`service-manager`
 crate for dig-dns, since it ships no verbs of its own — see `src/dns/`); this installer never
 hand-rolls a parallel service controller.
+
+### 2.1 Boot-start (auto-start-on-boot) services
+
+Both service components register to **start automatically on every boot**, on all three OSes:
+
+- **dig-node** — registered via its own `dig-node install` verb, which sets `autostart: true`
+  (dig-node-service's `service::install`). The installer invokes plain `install` (never a
+  manual-start variant), so boot-start is the delegated default.
+- **dig-dns** — registered by this installer directly (dig-dns ships no service verbs). The shared
+  flag `dns::plan::DNS_SERVICE_AUTOSTART` (always `true`) is threaded into the `service-manager`
+  `ServiceInstallCtx.autostart` on each OS.
+
+Per-OS boot-start mechanism (the same for both components):
+
+| OS      | Boot-start mechanism |
+|---------|----------------------|
+| Windows | SCM `start= auto` (the service comes up at boot) |
+| Linux   | systemd `enable` + the unit's `[Install] WantedBy=multi-user.target` |
+| macOS   | launchd LaunchDaemon with `RunAtLoad` |
+
+`--no-service-start` installs a service but does not start it *this run* — it is still registered
+boot-start, so it comes up on the next boot. This boot-start contract is regression-guarded by
+`dns::plan::tests::dns_service_is_registered_as_boot_start` and
+`service::tests::dig_node_is_registered_boot_start_via_the_install_verb`.
 
 ## 3. `InstallReport` (the `--json` payload)
 

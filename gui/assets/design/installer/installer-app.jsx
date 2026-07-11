@@ -1,4 +1,4 @@
-/* DigStore Installer — clickable wizard. Vanilla-React via Babel. */
+/* DIG Installer — clickable wizard. Vanilla-React via Babel. */
 const { useState, useEffect, useRef, useCallback } = React;
 
 /* ---------- icons ---------- */
@@ -47,7 +47,7 @@ function TitleBar({ chrome }) {
   const title = (
     <div className="tb-title">
       <span className="tdot"><svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round"><path d="M5 12h14"/></svg></span>
-      DigStore Installer
+      DIG Installer
     </div>
   );
   if (chrome === "mac") {

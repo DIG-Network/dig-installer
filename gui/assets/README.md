@@ -1,4 +1,4 @@
-# Handoff: DigStore Installer (DIG Network)
+# Handoff: DIG Installer (DIG Network)
 
 ## Overview
 
@@ -42,7 +42,7 @@ animation) with **real** install steps wired to the host process (see *Interacti
 Behavior → Real install pipeline*).
 
 Run the prototype as-is by serving `design/` over any static server and opening
-`DigStore Installer.html` (it needs the sibling `installer/` folder for scripts,
+`DIG Installer.html` (it needs the sibling `installer/` folder for scripts,
 fonts and images).
 
 ## Fidelity
@@ -77,7 +77,7 @@ Three horizontal bands inside the window, top to bottom:
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ ● DigStore Installer                              ○ ○ ●     │  title bar (46px)
+│ ● DIG Installer                              ○ ○ ●     │  title bar (46px)
 ├──────────────────┬────────────────────────────────────────┤
 │  [glow D]         │  EYEBROW                                │
 │  DigStore         │  Step Title (gradient word)            │
@@ -102,7 +102,7 @@ Three horizontal bands inside the window, top to bottom:
   `linear-gradient(180deg, rgba(255,255,255,.04), transparent)`.
 - **Title** (center for mac chrome, left otherwise): a `15×15` rounded square with the
   brand gradient fill containing a tiny white horizontal-bar glyph, then the text
-  **"DigStore Installer"** in Space Grotesk 600, `13.5px`, color `#C5C1E0`.
+  **"DIG Installer"** in Space Grotesk 600, `13.5px`, color `#C5C1E0`.
 - **Window controls** — switchable by the `chrome` tweak:
   - `frameless` (default): three `12px` dots on the right; first two
     `rgba(255,255,255,.16)`, the close (last) filled with the brand gradient.
@@ -414,7 +414,7 @@ app, not the developer tooling.
 ## Files
 
 In this bundle:
-- `design/DigStore Installer.html` — entry point; loads React 18.3.1 + Babel + the two
+- `design/DIG Installer.html` — entry point; loads React 18.3.1 + Babel + the two
   scripts below. Inline `<style>` holds all tokens, the window/rail/footer chrome, and
   every step's CSS.
 - `design/installer/installer-app.jsx` — the whole wizard: `App` (state machine +

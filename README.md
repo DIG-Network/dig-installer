@@ -37,9 +37,12 @@ downloads it. Sources:
   eventual rebrand to `dig-browser_*` asset names needs no matcher change —
   only the token/extension pattern is checked, not the product-name prefix.
 
-By default only the digstore CLI is installed; add `--with-dig-node` /
-`--with-dig-dns` / `--with-browser` (and `--service`) to select more. This is
-the canonical home of the DIG installer, migrated out of `digstore`.
+**By default it installs the full DIG stack in one run** — the digstore CLI, the
+dig-node service, and the dig-dns service (the last two as **boot-start** OS
+services that come up automatically on every boot). Opt out of any of them with
+`--no-digstore` / `--no-dig-node` / `--no-dig-dns`. The dig-relay *(advanced)*
+and the DIG Browser stay opt-in (`--with-relay` / `--with-browser`). This is the
+canonical home of the DIG installer, migrated out of `digstore`.
 
 ---
 
@@ -57,49 +60,45 @@ curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/inst
 irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1 | iex
 ```
 
-Then open a **new** terminal and check it works:
+This one command installs the **full DIG stack** — the digstore CLI, the
+dig-node local node (a boot-start OS service + a `127.0.0.2 dig.local` hosts
+entry), and the dig-dns `*.dig` name resolver (a boot-start OS service + the OS
+DNS/proxy wiring). Then open a **new** terminal and check it works:
 
 ```sh
 digstore --version
 ```
 
-### Also run a local DIG node
+> **Registering the two services needs elevation** (Administrator on Windows,
+> `sudo` on macOS/Linux). Run the one-liner from an elevated console for the full
+> install; without elevation the digstore CLI still installs and the services are
+> skipped best-effort with a clear message (re-run elevated to finish). On
+> Windows, run PowerShell as Administrator before the `irm … | iex` line; on
+> macOS/Linux, `curl -fsSL … | sudo sh`.
 
-Add `--with-dig-node` to install the `dig-node` local node and register it as an
-OS service (Windows service / systemd / launchd), started automatically. This
-also best-effort writes a `127.0.0.2 dig.local` hosts entry so consumers reach
-the node port-free at `http://dig.local` (falling back to `localhost`):
+### Install only some components
+
+Every component installs by default; opt out of any with its `--no-<component>`
+flag (the flags pass straight through the bootstrap scripts after `--`):
 
 ```sh
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh -s -- --with-dig-node
+# macOS / Linux — just the digstore CLI, nothing else
+curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh -s -- --no-dig-node --no-dig-dns
 ```
 
 ```powershell
-# Windows — registering a service (and writing the hosts entry) needs an elevated console
+# Windows — the full stack minus dig-dns
 $s = irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1
-& ([scriptblock]::Create($s)) --with-dig-node
+& ([scriptblock]::Create($s)) --no-dig-dns
 ```
 
-### Also resolve `.dig` names in your browser
-
-Add `--with-dig-dns` to install `dig-dns` and register it as an OS service (Windows
-Service / macOS LaunchDaemon / Linux systemd), started automatically, with the OS
-DNS/proxy wiring so `http://<storeId>.dig/…` loads directly in a browser. See
-[dig-dns](#dig-dns-local-dig-name-resolution) below for what gets installed per OS:
-
-```sh
-# macOS / Linux — elevation (sudo) needed to register the service + wire split-DNS
-curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh -s -- --with-dig-dns
-```
-
-```powershell
-# Windows — registering the service + NRPT rule needs an elevated console
-$s = irm https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.ps1
-& ([scriptblock]::Create($s)) --with-dig-dns
-```
+See [dig-dns](#dig-dns-local-dig-name-resolution) below for what the dig-dns
+service wires up per OS.
 
 ### Also install the DIG Browser
+
+The DIG Browser is a separate opt-in (it is a full desktop app, not part of the
+default stack).
 
 Add `--with-browser` to download the DIG Browser native installer for your OS:
 
@@ -119,9 +118,10 @@ Download the `dig-installer` binary for your OS/arch from the
 [releases](https://github.com/DIG-Network/dig-installer/releases) and run it:
 
 ```sh
-dig-installer                      # install latest digstore CLI + add to PATH
-dig-installer --with-dig-node      # ALSO install + start the dig-node service (+ dig.local)
-dig-installer --with-dig-dns       # ALSO install + start dig-dns (local *.dig name resolution)
+dig-installer                      # install the FULL DIG stack: digstore + dig-node + dig-dns
+dig-installer --no-dig-node        # skip dig-node (still installs digstore + dig-dns)
+dig-installer --no-dig-dns         # skip dig-dns (still installs digstore + dig-node)
+dig-installer --no-dig-node --no-dig-dns   # just the digstore CLI
 dig-installer --with-browser       # ALSO download the DIG Browser installer
 dig-installer --dry-run            # show exactly what would happen, change nothing
 dig-installer --dry-run --json     # the same, as a machine-readable plan
@@ -133,24 +133,26 @@ dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--with-digstore` | on | Install the digstore CLI (default; explicit form of the always-on behaviour). |
-| `--no-digstore` | off | Skip installing the digstore CLI. |
+| `--no-digstore` | off | Skip installing the digstore CLI (installed by default). |
+| `--with-digstore` | on | Redundant explicit opt-in — digstore installs by default. |
 | `--digstore-version <VER>` | latest | Install a specific digstore version (e.g. `0.6.0`). |
-| `--with-dig-node` (alias `--service`) | off | Also install the `dig-node` local node + register it as an OS service + write the `dig.local` hosts entry. |
-| `--no-service-start` | off | Install the dig-node service but don't start it. |
+| `--no-dig-node` | off | Skip the `dig-node` local node + service (installed by default). |
+| `--with-dig-node` (alias `--service`) | on | Redundant explicit opt-in — dig-node installs + registers as a **boot-start** OS service (+ the `dig.local` hosts entry) by default. |
+| `--no-service-start` | off | Install the service(s) but don't start them this run (still registered boot-start, so they come up on next boot). |
 | `--dig-node-port <PORT>` | `9778` | Loopback port the dig-node service serves on (matches dig-node's own uncommon-high-port default — the sibling of the dig-wallet HTTP API's `9777`; `dig.local` stays on `127.0.0.2:80` regardless). |
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
 | `--uninstall-dig-node` | — | Remove the dig-node OS service + the `dig.local` hosts entry this installer created. Idempotent; does not touch the digstore/browser/relay/dig-dns installs. Standalone action — ignores every other flag except `--bin-dir`/`--dry-run`/`--json`. |
-| `--with-browser` | off | Also download the DIG Browser native installer for this OS. |
-| `--browser-version <VER>` | latest | Install a specific DIG Browser version. |
-| `--with-relay` | off | **Advanced.** Also install the `dig-relay` NAT-traversal relay + register it as an OS service (run your own relay). Most users don't need this — nodes use `relay.dig.net` by default. |
-| `--relay-port <PORT>` | `9450` | Relay WebSocket port the relay service serves on. |
-| `--relay-health-port <PORT>` | `9451` | Relay HTTP `/health` port the relay service serves on. |
-| `--relay-version <VER>` | latest | Install a specific dig-relay version. |
-| `--with-dig-dns` | off | Also install `dig-dns` + register it as an OS service (local `*.dig` name resolution) + wire OS split-DNS/NRPT + the Chrome/Edge DoH policy. |
+| `--no-dig-dns` | off | Skip `dig-dns` + its service (installed by default). |
+| `--with-dig-dns` | on | Redundant explicit opt-in — dig-dns installs + registers as a **boot-start** OS service (local `*.dig` name resolution) + wires OS split-DNS/NRPT + the Chrome/Edge DoH policy, by default. |
 | `--dig-dns-version <VER>` | latest | Install a specific dig-dns version. |
 | `--dig-dns-node <URL>` | dig-dns's own ladder | Explicit dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node <URL>`). |
 | `--uninstall-dig-dns` | — | Remove the dig-dns service + every OS artifact (service, split-DNS/NRPT rule, browser policy key) THIS installer created; leaves zero residue. Standalone action — ignores every other flag except `--dry-run`/`--json`. |
+| `--with-browser` | off | Also download the DIG Browser native installer for this OS (opt-in). |
+| `--browser-version <VER>` | latest | Install a specific DIG Browser version. |
+| `--with-relay` | off | **Advanced (opt-in).** Also install the `dig-relay` NAT-traversal relay + register it as an OS service (run your own relay). Most users don't need this — nodes use `relay.dig.net` by default. |
+| `--relay-port <PORT>` | `9450` | Relay WebSocket port the relay service serves on. |
+| `--relay-health-port <PORT>` | `9451` | Relay HTTP `/health` port the relay service serves on. |
+| `--relay-version <VER>` | latest | Install a specific dig-relay version. |
 | `--bin-dir <DIR>` | per-user DIG bin dir | Where to place the binaries. |
 | `--no-path` | off | Don't modify `PATH` (just place the binaries). |
 | `--dry-run` | off | Print/resolve actions without downloading or changing anything. |
@@ -178,10 +180,11 @@ Default install location (`--bin-dir`):
    dir (executable bit set on unix).
 4. **PATH** — adds the bin dir to your user `PATH` (HKCU on Windows with a
    `WM_SETTINGCHANGE` broadcast; a profile `export PATH` line on unix). Idempotent.
-5. **dig-node** *(with `--with-dig-node`)* — downloads the `dig-node` binary the
-   same way, then **delegates to dig-node's own `install` (+ `start`)**
-   subcommands to register it as an auto-start, auto-restarting OS service
-   (Windows SCM / systemd / launchd — the installer does not reimplement it),
+5. **dig-node** *(by default; `--no-dig-node` to skip)* — downloads the
+   `dig-node` binary the same way, then **delegates to dig-node's own `install`
+   (+ `start`)** subcommands to register it as a **boot-start** (auto-start-on-
+   boot), auto-restarting OS service (Windows SCM `start= auto` / systemd
+   `enable` / launchd `RunAtLoad` — the installer does not reimplement it),
    best-effort writes the `dig.local` hosts entry, runs a **post-install
    resolve check** confirming the OS actually maps `dig.local` → `127.0.0.2`
    now, and finally a **post-install RPC health check** confirming the service
@@ -190,17 +193,19 @@ Default install location (`--bin-dir`):
    aren't elevated the installer surfaces a clear message and the digstore
    install still succeeds. `--uninstall-dig-node` reverses it: removes the OS
    service (delegating to dig-node's own `uninstall`) and the hosts entry.
-6. **dig-dns** *(with `--with-dig-dns`)* — downloads the `dig-dns` binary, then
-   **owns the full per-OS service + DNS/browser wiring itself** (unlike
-   dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of its
-   own): registers + starts the OS service, wires OS split-DNS/NRPT, applies the
-   Chrome/Edge DoH policy (never clobbering an existing org policy), then
-   self-verifies with `dig-dns doctor` + `dig-dns pac` and prints the report —
-   which resolution path(s) are live, the bound gateway port, the PAC URL, and a
-   browser-fallback instruction. See [dig-dns](#dig-dns-local-dig-name-resolution)
-   below for the full per-OS contract.
-7. **DIG Browser** *(with `--with-browser`)* — downloads the native installer
-   for your OS into the bin dir; run it to finish.
+6. **dig-dns** *(by default; `--no-dig-dns` to skip)* — downloads the `dig-dns`
+   binary, then **owns the full per-OS service + DNS/browser wiring itself**
+   (unlike dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of
+   its own): registers + starts it as a **boot-start** OS service (Windows SCM
+   `start= auto` / systemd `enable` + `WantedBy=multi-user.target` / launchd
+   `RunAtLoad`), wires OS split-DNS/NRPT, applies the Chrome/Edge DoH policy
+   (never clobbering an existing org policy), then self-verifies with `dig-dns
+   doctor` + `dig-dns pac` and prints the report — which resolution path(s) are
+   live, the bound gateway port, the PAC URL, and a browser-fallback
+   instruction. See [dig-dns](#dig-dns-local-dig-name-resolution) below for the
+   full per-OS contract.
+7. **DIG Browser** *(opt-in, with `--with-browser`)* — downloads the native
+   installer for your OS into the bin dir; run it to finish.
 
 Every download is integrity-checkable (SHA-256). `--dry-run` resolves and prints
 every asset, URL, destination, and service command without touching the system

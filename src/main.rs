@@ -20,16 +20,19 @@ use dig_installer::{error_json, help_json, paths, InstallPlan};
 #[command(
     name = "dig-installer",
     version,
-    about = "Universal DIG installer — installs the digstore CLI, the dig-node service, and the DIG Browser",
+    about = "Universal DIG installer — installs the digstore CLI, the dig-node service, and the dig-dns service by default",
     long_about = "Resolves and downloads the latest per-OS/arch release asset for the selected \
-components from the DIG-Network GitHub releases (it bundles nothing):\n  \
+components from the DIG-Network GitHub releases (it bundles nothing).\n\n\
+By DEFAULT it installs the full DIG stack in one run:\n  \
 * the digstore CLI (added to PATH),\n  \
-* the dig-node local node (installed + started as an OS service, with a best-effort \
+* the dig-node local node (installed + started as a boot-start OS service, with a best-effort \
 127.0.0.2 dig.local hosts entry), and\n  \
-* the DIG Browser native installer.\n\n\
-Components are selectable (--with-digstore / --with-dig-node / --with-browser / --service); \
-by default only the digstore CLI is installed. Use --json for machine-readable output and \
---help-json for the full invocation contract (incl. the exit-code table)."
+* the dig-dns local *.dig name resolver (installed + started as a boot-start OS service, with \
+the OS split-DNS/NRPT + browser DoH wiring).\n\n\
+Opt OUT of any of the three with --no-digstore / --no-dig-node / --no-dig-dns. The dig-relay \
+(advanced, run-your-own-relay) and the DIG Browser stay OPT-IN (--with-relay / --with-browser). \
+Use --json for machine-readable output and --help-json for the full invocation contract (incl. \
+the exit-code table)."
 )]
 struct Cli {
     /// Directory to install the binaries into (default: per-user DIG bin dir).
@@ -37,11 +40,11 @@ struct Cli {
     bin_dir: Option<std::path::PathBuf>,
 
     /// Explicitly select the digstore CLI (it is installed by default anyway;
-    /// this flag exists for symmetry/clarity with --with-dig-node/--with-browser).
+    /// this flag exists for symmetry/clarity with the --with-* opt-ins).
     #[arg(long)]
     with_digstore: bool,
 
-    /// Skip installing the digstore CLI.
+    /// Opt OUT of the digstore CLI (installed by default).
     #[arg(long = "no-digstore")]
     no_digstore: bool,
 
@@ -49,10 +52,15 @@ struct Cli {
     #[arg(long, value_name = "VERSION")]
     digstore_version: Option<String>,
 
-    /// Also install the dig-node local node and register it as an OS service.
-    /// `--service` is an alias for the same behaviour.
+    /// Explicitly select the dig-node local node + boot-start OS service (it is
+    /// installed by default anyway; this flag / its `--service` alias exist for
+    /// symmetry/clarity and backwards compatibility).
     #[arg(long, alias = "service")]
     with_dig_node: bool,
+
+    /// Opt OUT of the dig-node local node + service (installed by default).
+    #[arg(long = "no-dig-node")]
+    no_dig_node: bool,
 
     /// dig-node version to install (e.g. 0.2.0); default: latest released.
     #[arg(long, value_name = "VERSION")]
@@ -87,11 +95,16 @@ struct Cli {
     #[arg(long)]
     with_relay: bool,
 
-    /// Also install dig-dns and register it as an OS service (Windows Service / macOS
-    /// LaunchDaemon / Linux systemd): local `*.dig` name resolution (a DNS responder + HTTP
-    /// gateway), split-DNS/NRPT wiring, and the Chrome/Edge DoH policy.
+    /// Explicitly select dig-dns + its boot-start OS service (Windows Service /
+    /// macOS LaunchDaemon / Linux systemd): local `*.dig` name resolution (a DNS
+    /// responder + HTTP gateway), split-DNS/NRPT wiring, and the Chrome/Edge DoH
+    /// policy. Installed by default; this flag is the redundant explicit opt-in.
     #[arg(long)]
     with_dig_dns: bool,
+
+    /// Opt OUT of dig-dns + its service (installed by default).
+    #[arg(long = "no-dig-dns")]
+    no_dig_dns: bool,
 
     /// dig-dns version to install (e.g. 0.6.0); default: latest released.
     #[arg(long, value_name = "VERSION")]
@@ -179,15 +192,20 @@ fn main() -> std::process::ExitCode {
         return run_uninstall_dig_node(&bin_dir, cli.dry_run, cli.json);
     }
 
-    // digstore is installed by default; --no-digstore opts out, --with-digstore
-    // is the explicit (redundant) opt-in. --no-digstore wins if both are given.
+    // #301 — universal installer: digstore + dig-node + dig-dns ALL install by
+    // default (the full DIG stack in one run). Each has a `--no-<component>`
+    // opt-out; the `--with-<component>` flags remain accepted as redundant,
+    // explicit opt-ins (backwards compat + symmetry). `--no-*` wins if both are
+    // given. dig-relay and DIG Browser stay opt-in (`--with-relay`/`--with-browser`).
     let with_digstore = cli.with_digstore || !cli.no_digstore;
+    let with_dig_node = cli.with_dig_node || !cli.no_dig_node;
+    let with_dig_dns = cli.with_dig_dns || !cli.no_dig_dns;
 
     let plan = InstallPlan {
         bin_dir: cli.bin_dir.unwrap_or_else(paths::default_bin_dir),
         with_digstore,
         digstore_version: cli.digstore_version,
-        with_dig_node: cli.with_dig_node,
+        with_dig_node,
         dig_node_version: cli.dig_node_version,
         service: ServiceConfig {
             port: cli.dig_node_port,
@@ -202,7 +220,7 @@ fn main() -> std::process::ExitCode {
             health_port: cli.relay_health_port,
             start: !cli.no_service_start,
         },
-        with_dig_dns: cli.with_dig_dns,
+        with_dig_dns,
         dig_dns_version: cli.dig_dns_version,
         dns_service: dig_installer::dns::DnsInstallConfig {
             start: !cli.no_service_start,

@@ -1,4 +1,4 @@
-//! DigStore Installer — Tauri backend.
+//! DIG Installer — Tauri backend.
 //!
 //! Exposes the commands the frontend (src/bridge.js) calls:
 //!   - installer_meta        → { version, compiler }
@@ -184,5 +184,5 @@ pub fn run() {
             launch_terminal
         ])
         .run(tauri::generate_context!())
-        .expect("error while running DigStore Installer");
+        .expect("error while running DIG Installer");
 }

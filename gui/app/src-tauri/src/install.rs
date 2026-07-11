@@ -438,7 +438,7 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     }
 
     emit_pct(app, 100.0, Some("done"));
-    emit_line(app, r#"<span class="ok">✓</span> DigStore is ready."#);
+    emit_line(app, r#"<span class="ok">✓</span> DIG is ready."#);
 
     let _ = app.emit("install://done", ());
     Ok(())

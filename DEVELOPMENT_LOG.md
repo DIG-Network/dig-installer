@@ -3,6 +3,43 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## The installer's DEFAULT is the full 3-component stack, and boot-start is delegated vs owned (task #301)
+
+`dig-installer` installs digstore + dig-node + dig-dns by default (opt out with
+`--no-<component>`); dig-relay + DIG Browser stay opt-in. The default lives in
+ONE place — `InstallPlan::default()` in `src/lib.rs` — and `main.rs` just maps
+`--no-*`/`--with-*` onto it (`with_x = cli.with_x || !cli.no_x`, so the `--with-*`
+flags are redundant-but-accepted). `help_json()`'s `components[].default` mirrors
+this and is the machine-readable contract an agent reads.
+
+**Boot-start is registered two different ways, and that split matters:**
+- **dig-node** owns its own service lifecycle, so the installer just runs
+  `dig-node install` — which itself sets `autostart: true` (dig-node-service's
+  `service::install`). We must NOT invent a manual-start variant; boot-start is
+  the delegated default. The installer-side contract is only "invoke plain
+  `install`" (`service::install_args() == ["install"]`).
+- **dig-dns** ships NO service verbs, so the installer registers it directly via
+  the `service-manager` crate. Boot-start is the single shared flag
+  `dns::plan::DNS_SERVICE_AUTOSTART` (`true`) threaded into `ServiceInstallCtx.autostart`
+  on all three OS modules — which maps to Windows SCM `start= auto`, systemd
+  `enable`, launchd load. The declarative systemd `WantedBy=multi-user.target`
+  and launchd `RunAtLoad` in the hand-rolled unit/plist bodies (`dns::plan`) are
+  the belt to that suspenders. One named const keeps a manual-start regression a
+  one-line, test-caught change.
+
+## The GUI installer NAME ≠ the digstore CLI component name (task #301 rebrand)
+
+The user-facing installer is "**DIG Installer**" (Tauri `productName`, window
+title, `TitleBar.jsx`, identifier `net.dig.installer`) — but "**DigStore**" /
+`digstore` legitimately stays as the CLI *component* it installs. A blanket
+find-replace of "DigStore" would be wrong (and would break
+`tests::gui_copy_uses_canonical_ecosystem_vocabulary`, which asserts "DigStore"
+still appears in the wizard copy). The rebrand target is the two-word phrase
+"DigStore Installer" only; the internal crate/lib identifiers
+(`digstore-installer`, `digstore_installer_lib`) are deliberately left as-is
+(not user-visible). `tests::installer_is_branded_dig_installer_not_digstore_installer`
+guards the identity surfaces.
+
 ## Defaults drift silently when they're duplicated across repos (task #140)
 
 `--dig-node-port` defaulted to `8080` here (`src/main.rs`, `src/service.rs`) long

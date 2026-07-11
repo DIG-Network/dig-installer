@@ -57,11 +57,13 @@ use target::Target;
 pub struct InstallPlan {
     /// Directory to place the downloaded binaries in.
     pub bin_dir: PathBuf,
-    /// Install the digstore CLI (default true).
+    /// Install the digstore CLI (default true — part of the universal 3-component
+    /// stack, #301).
     pub with_digstore: bool,
     /// digstore version/tag to install: `None` ⇒ latest released.
     pub digstore_version: Option<String>,
-    /// Also install + register dig-node as a service.
+    /// Install + register dig-node as a boot-start OS service (default true —
+    /// part of the universal 3-component stack, #301).
     pub with_dig_node: bool,
     /// dig-node version/tag to install: `None` ⇒ latest released.
     pub dig_node_version: Option<String>,
@@ -78,8 +80,9 @@ pub struct InstallPlan {
     pub relay_version: Option<String>,
     /// Relay service configuration when `with_relay` is set.
     pub relay_service: ServiceConfigRelay,
-    /// Also install dig-dns and register it as an OS service (local `*.dig`
-    /// name resolution: a DNS responder + HTTP gateway).
+    /// Install dig-dns and register it as a boot-start OS service (local `*.dig`
+    /// name resolution: a DNS responder + HTTP gateway). Default true — part of
+    /// the universal 3-component stack, #301.
     pub with_dig_dns: bool,
     /// dig-dns version/tag to install: `None` ⇒ latest released.
     pub dig_dns_version: Option<String>,
@@ -96,12 +99,16 @@ pub struct InstallPlan {
 pub use service::RelayServiceConfig as ServiceConfigRelay;
 
 impl Default for InstallPlan {
+    /// The universal-installer default (#301): install the full DIG stack —
+    /// digstore + dig-node + dig-dns — in one run, adding the bin dir to PATH.
+    /// dig-relay (advanced) and the DIG Browser are NOT in the default plan; they
+    /// are explicit opt-ins.
     fn default() -> Self {
         InstallPlan {
             bin_dir: paths::default_bin_dir(),
             with_digstore: true,
             digstore_version: None,
-            with_dig_node: false,
+            with_dig_node: true,
             dig_node_version: None,
             service: ServiceConfig::default(),
             with_browser: false,
@@ -109,7 +116,7 @@ impl Default for InstallPlan {
             with_relay: false,
             relay_version: None,
             relay_service: ServiceConfigRelay::default(),
-            with_dig_dns: false,
+            with_dig_dns: true,
             dig_dns_version: None,
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: true,
@@ -1037,13 +1044,15 @@ pub fn help_json() -> String {
         "name": "dig-installer",
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": SCHEMA_VERSION,
-        "description": "Universal DIG installer (thin shim): resolves + downloads the latest \
-    per-OS/arch release asset for the digstore CLI, dig-node service, dig-dns service, and DIG Browser.",
+        "description": "Universal DIG installer: by default installs the full DIG stack (the \
+    digstore CLI + the dig-node boot-start service + the dig-dns boot-start service) in one run, \
+    resolving + downloading the latest per-OS/arch release asset for each. dig-relay and the DIG \
+    Browser are opt-in.",
         "components": [
             { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
-            { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": false, "flag": "--with-dig-node | --service", "kind": "raw_binary+service+dig.local+health-check" },
+            { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
-            { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": false, "flag": "--with-dig-dns", "kind": "raw_binary+service+split-dns+browser-policy" },
+            { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": true, "flag": "--no-dig-dns disables; --with-dig-dns redundant", "kind": "raw_binary+boot-start-service+split-dns+browser-policy" },
             { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
         ],
         "targets": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"],
@@ -1055,20 +1064,23 @@ pub fn help_json() -> String {
         ],
         "flags": [
             { "flag": "--bin-dir", "value": "DIR", "description": "where to place binaries" },
-            { "flag": "--no-digstore", "description": "skip the digstore CLI" },
+            { "flag": "--no-digstore", "description": "opt out of the digstore CLI (installed by default)" },
+            { "flag": "--with-digstore", "description": "explicit (redundant) opt-in — digstore installs by default" },
             { "flag": "--digstore-version", "value": "VERSION", "description": "pin digstore version (default: latest)" },
-            { "flag": "--with-dig-node", "alias": "--service", "description": "install + start the dig-node service" },
+            { "flag": "--no-dig-node", "description": "opt out of the dig-node local node + service (installed by default)" },
+            { "flag": "--with-dig-node", "alias": "--service", "description": "explicit (redundant) opt-in — dig-node installs + starts as a boot-start service by default" },
             { "flag": "--dig-node-version", "value": "VERSION", "description": "pin dig-node version (default: latest)" },
             { "flag": "--dig-node-port", "value": "PORT", "default": 9778, "description": "loopback port for the dig-node service" },
-            { "flag": "--no-service-start", "description": "install the service but do not start it" },
+            { "flag": "--no-service-start", "description": "install the service(s) but do not start them (still registered boot-start)" },
             { "flag": "--uninstall-dig-node", "description": "uninstall the dig-node OS service + remove the dig.local hosts entry this installer created (idempotent; does not touch the digstore/browser/relay/dig-dns installs)" },
-            { "flag": "--with-browser", "description": "download the DIG Browser native installer" },
+            { "flag": "--with-browser", "description": "download the DIG Browser native installer (opt-in)" },
             { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
-            { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced — the default node uses relay.dig.net)" },
+            { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced, opt-in — the default node uses relay.dig.net)" },
             { "flag": "--relay-version", "value": "VERSION", "description": "pin dig-relay version (default: latest)" },
             { "flag": "--relay-port", "value": "PORT", "default": 9450, "description": "relay WebSocket port for the relay service" },
             { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" },
-            { "flag": "--with-dig-dns", "description": "install + register dig-dns as an OS service (local *.dig name resolution: DNS responder + HTTP gateway)" },
+            { "flag": "--no-dig-dns", "description": "opt out of dig-dns + its service (installed by default)" },
+            { "flag": "--with-dig-dns", "description": "explicit (redundant) opt-in — dig-dns installs + registers as a boot-start OS service by default (local *.dig name resolution: DNS responder + HTTP gateway)" },
             { "flag": "--dig-dns-version", "value": "VERSION", "description": "pin dig-dns version (default: latest)" },
             { "flag": "--dig-dns-node", "value": "URL", "description": "dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node`); default: dig-dns's own ladder" },
             { "flag": "--uninstall-dig-dns", "description": "uninstall the dig-dns OS service + OS wiring this installer created (idempotent, zero residue; does not touch pre-existing org policy)" }
@@ -1182,6 +1194,83 @@ mod tests {
     ) -> Result<InstallReport, InstallError> {
         let resolve = resolver_from(releases);
         run_report_with(plan, &resolve, &mut |_| {})
+    }
+
+    /// #301 (universal installer): a bare install with no opt-out flags installs
+    /// the FULL DIG stack — the digstore CLI, the dig-node service, AND the
+    /// dig-dns service — in one run. `InstallPlan::default()` is the single
+    /// source of truth for that default; `main.rs` maps the `--no-<component>`
+    /// opt-outs onto it. dig-relay (advanced) and the DIG Browser stay opt-in.
+    #[test]
+    fn default_plan_installs_the_full_dig_stack() {
+        let plan = InstallPlan::default();
+        assert!(plan.with_digstore, "digstore is installed by default");
+        assert!(
+            plan.with_dig_node,
+            "dig-node is installed by default (#301 universal installer)"
+        );
+        assert!(
+            plan.with_dig_dns,
+            "dig-dns is installed by default (#301 universal installer)"
+        );
+        assert!(!plan.with_relay, "dig-relay stays opt-in (advanced)");
+        assert!(!plan.with_browser, "DIG Browser stays a separate opt-in");
+        assert!(plan.modify_path, "the bin dir is added to PATH by default");
+    }
+
+    /// #301: driving the DEFAULT plan through the orchestration resolves all
+    /// three core components (digstore + dig-node + dig-dns) and neither of the
+    /// opt-in ones (dig-relay / browser) — proving the default is a genuine
+    /// one-shot 3-component install end to end, not just a struct flag.
+    #[test]
+    fn default_plan_resolves_all_three_core_components() {
+        let plan = InstallPlan {
+            bin_dir: std::env::temp_dir().join("dig-installer-test-default"),
+            modify_path: false,
+            dry_run: true,
+            ..InstallPlan::default()
+        };
+        let report = run_dry(&plan, all_releases()).expect("default plan resolves");
+        let names: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert!(names.contains(&"digstore"), "digstore in default plan");
+        assert!(names.contains(&"dig-node"), "dig-node in default plan");
+        assert!(names.contains(&"dig-dns"), "dig-dns in default plan");
+        assert!(
+            !names.contains(&"dig-relay"),
+            "dig-relay is opt-in, not in the default plan"
+        );
+        assert!(
+            !names.contains(&"DIG-Browser"),
+            "DIG Browser is opt-in, not in the default plan"
+        );
+    }
+
+    /// #301: `--help-json` must advertise dig-node AND dig-dns as `default: true`
+    /// (alongside digstore) so an agent reads the universal-installer default off
+    /// the machine contract. dig-relay + browser remain `default: false`.
+    #[test]
+    fn help_json_advertises_the_full_stack_as_default() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&help_json()).expect("help_json is valid JSON");
+        let by_id = |id: &str| -> bool {
+            doc["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap_or_else(|| panic!("component {id} present"))["default"]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(by_id("digstore"), "digstore default: true");
+        assert!(by_id("dig-node"), "dig-node default: true (#301)");
+        assert!(by_id("dig-dns"), "dig-dns default: true (#301)");
+        assert!(!by_id("dig-relay"), "dig-relay stays opt-in");
+        assert!(!by_id("browser"), "browser stays opt-in");
     }
 
     #[test]

@@ -289,7 +289,9 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         username: None,
         working_directory: None,
         environment: None,
-        autostart: true,
+        // Boot-start (#301): `systemctl enable` (paired with the unit's
+        // WantedBy=multi-user.target) — the service comes up on every boot.
+        autostart: plan::DNS_SERVICE_AUTOSTART,
     }) {
         Ok(()) => {
             notes.push(format!(

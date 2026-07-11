@@ -22,7 +22,7 @@ export function TitleBar({ chrome }) {
           <path d="M5 12h14" />
         </svg>
       </span>
-      DigStore Installer
+      DIG Installer
     </div>
   );
 

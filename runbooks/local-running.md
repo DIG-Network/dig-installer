@@ -6,7 +6,9 @@ Prereqs: a stable Rust toolchain (`rustup toolchain install stable`).
 
 ```sh
 cargo build                       # builds target/debug/dig-installer[.exe]
-cargo run -- --dry-run --with-dig-node --with-dig-dns --json   # exercise the full plan, no writes
+cargo run -- --dry-run --json     # exercise the DEFAULT plan (digstore + dig-node + dig-dns), no writes
+cargo run -- --dry-run --with-relay --with-browser --json   # + the opt-in components
+cargo run -- --dry-run --no-dig-node --no-dig-dns --json    # opt out to just the digstore CLI
 cargo test                        # unit + e2e CLI-contract tests (network-free)
 cargo fmt --all -- --check        # release gate
 cargo clippy --all-targets --all-features -- -D warnings   # release gate
