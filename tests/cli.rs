@@ -34,6 +34,7 @@ fn help_json_emits_the_full_contract() {
         .map(|c| c["id"].as_str().unwrap())
         .collect();
     assert!(ids.contains(&"digstore"));
+    assert!(ids.contains(&"digs"));
     assert!(ids.contains(&"dig-node"));
     assert!(ids.contains(&"dig-relay"));
     assert!(ids.contains(&"dig-dns"));

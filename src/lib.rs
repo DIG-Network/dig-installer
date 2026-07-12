@@ -3,7 +3,10 @@
 //! It bundles nothing. At install time it resolves, per host OS/arch, the LATEST
 //! GitHub release asset for each selected component and downloads it:
 //!
-//! * the **digstore CLI** (`DIG-Network/digstore`) → placed on PATH,
+//! * the **digstore CLI** (`DIG-Network/digstore`) → placed on PATH, along with
+//!   its **`digs` alias binary** (issue #434) — published in the SAME digstore
+//!   release under a separate asset stem, installed alongside digstore in the
+//!   same bin dir (no separate flag or PATH entry),
 //! * the **dig-node** local node (`DIG-Network/dig-node`) → installed + started
 //!   as an OS service (Windows service / systemd / launchd) by delegating to
 //!   dig-node's own `install`/`start` subcommands, and (best-effort) a
@@ -58,9 +61,11 @@ pub struct InstallPlan {
     /// Directory to place the downloaded binaries in.
     pub bin_dir: PathBuf,
     /// Install the digstore CLI (default true — part of the universal 3-component
-    /// stack, #301).
+    /// stack, #301). Also gates the `digs` alias binary (issue #434), which has
+    /// no flag of its own and installs/uninstalls alongside digstore.
     pub with_digstore: bool,
-    /// digstore version/tag to install: `None` ⇒ latest released.
+    /// digstore version/tag to install: `None` ⇒ latest released. Also threads
+    /// through to the `digs` alias resolution (published in the same release).
     pub digstore_version: Option<String>,
     /// Install + register dig-node as a boot-start OS service (default true —
     /// part of the universal 3-component stack, #301).
@@ -132,7 +137,8 @@ impl Default for InstallPlan {
 /// One installed/resolved component in the result.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ComponentResult {
-    /// Component id: `digstore` | `dig-node` | `browser`.
+    /// Component id: `digstore` | `digs` | `dig-node` | `dig-dns` | `dig-relay`
+    /// | `DIG-Browser`.
     pub component: String,
     /// Resolved version (bare semver, e.g. `0.6.0`).
     pub version: String,
@@ -382,7 +388,12 @@ fn run_report_with(
         installed: Vec::new(),
     };
 
-    // 1. digstore CLI.
+    // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
+    //    published in the SAME digstore release under its own asset stem
+    //    (`digs-<ver>-<os_arch>[.exe]`) and behaves identically to `digstore`;
+    //    it is resolved/downloaded exactly like digstore — same version pin,
+    //    same bin dir (so no separate PATH entry is needed) — and follows the
+    //    same `with_digstore`/`digstore_version` flags (it has none of its own).
     if plan.with_digstore {
         log("Installing the digstore CLI:");
         let c = resolve_component(
@@ -399,6 +410,22 @@ fn run_report_with(
             report.installed.push(c.dest.clone());
         }
         report.components.push(c);
+
+        log("Installing the digs alias (same digstore CLI, published as a separate binary):");
+        let digs = resolve_component(
+            resolve,
+            &Repo::digs(),
+            &plan.digstore_version,
+            &target,
+            AssetKind::RawBinary,
+            &plan.bin_dir,
+        )?;
+        log_component(log, &digs);
+        download_component(&digs, plan.dry_run)?;
+        if !plan.dry_run {
+            report.installed.push(digs.dest.clone());
+        }
+        report.components.push(digs);
     }
 
     // 2. PATH (only meaningful if we placed a PATH binary).
@@ -1050,6 +1077,7 @@ pub fn help_json() -> String {
     Browser are opt-in.",
         "components": [
             { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
+            { "id": "digs", "repo": "DIG-Network/digstore", "default": true, "flag": "alias of digstore — no separate flag; follows --no-digstore/--with-digstore/--digstore-version", "kind": "raw_binary_alias" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": true, "flag": "--no-dig-dns disables; --with-dig-dns redundant", "kind": "raw_binary+boot-start-service+split-dns+browser-policy" },
@@ -1132,6 +1160,12 @@ mod tests {
             "digstore-0.6.0-linux-x64",
             "digstore-0.6.0-macos-arm64",
             "digstore-0.6.0-macos-x64",
+            // `digs` (issue #434) is published in the SAME digstore release,
+            // under its own stem — see digstore's release.yml.
+            "digs-0.6.0-windows-x64.exe",
+            "digs-0.6.0-linux-x64",
+            "digs-0.6.0-macos-arm64",
+            "digs-0.6.0-macos-x64",
         ];
         let node: Vec<&'static str> = vec![
             "dig-node-0.2.0-windows-x64.exe",
@@ -1292,10 +1326,13 @@ mod tests {
 
     #[test]
     fn digstore_only_resolves_the_cli_component() {
+        // With no other component selected, digstore resolves alongside its
+        // `digs` alias (issue #434 — see digs_alias_installs_alongside_digstore_
+        // from_the_same_release for the digs-specific assertions).
         let mut plan = base_plan();
         plan.with_digstore = true;
         let report = run_dry(&plan, all_releases()).expect("digstore resolves");
-        assert_eq!(report.components.len(), 1);
+        assert_eq!(report.components.len(), 2);
         let c = &report.components[0];
         assert_eq!(c.component, "digstore");
         assert_eq!(c.version, "0.6.0");
@@ -1306,6 +1343,75 @@ mod tests {
             .contains("github.com/DIG-Network/digstore/releases/download/v0.6.0/"));
         // dry-run installs nothing on disk.
         assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn digs_alias_installs_alongside_digstore_from_the_same_release() {
+        // Issue #434: `digs` is a first-class alias binary published in the SAME
+        // digstore release (digstore#16), under its own asset stem. Selecting
+        // digstore must resolve + place BOTH binaries, sharing the bin dir (so
+        // no separate PATH entry is needed) and the digstore version pin.
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        let report = run_dry(&plan, all_releases()).expect("digstore + digs resolve");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["digstore", "digs"],
+            "digs installs right after digstore"
+        );
+
+        let digstore = &report.components[0];
+        let digs = report
+            .components
+            .iter()
+            .find(|c| c.component == "digs")
+            .expect("digs component present");
+        assert_eq!(digs.version, "0.6.0");
+        assert_eq!(digs.tag, "v0.6.0");
+        assert!(digs.asset.starts_with("digs-0.6.0-"));
+        assert!(digs
+            .url
+            .contains("github.com/DIG-Network/digstore/releases/download/v0.6.0/"));
+
+        // Same bin dir as digstore — no separate PATH entry is needed.
+        let digstore_dir = std::path::Path::new(&digstore.dest).parent().unwrap();
+        let digs_dir = std::path::Path::new(&digs.dest).parent().unwrap();
+        assert_eq!(digstore_dir, digs_dir);
+        assert_ne!(
+            digstore.dest, digs.dest,
+            "digstore and digs are distinct files"
+        );
+        // dry-run installs nothing on disk.
+        assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn digs_alias_honors_the_pinned_digstore_version() {
+        // A pinned --digstore-version threads through to the digs resolution
+        // too, since digs is published in the same digstore release.
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.digstore_version = Some("0.6.0".to_string());
+        let report = run_dry(&plan, all_releases()).expect("pinned resolves");
+        let digs = report
+            .components
+            .iter()
+            .find(|c| c.component == "digs")
+            .expect("digs component present");
+        assert_eq!(digs.tag, "v0.6.0");
+    }
+
+    #[test]
+    fn digs_is_not_installed_when_digstore_is_opted_out() {
+        // digs has no separate flag: opting out of digstore opts out of digs too.
+        let plan = base_plan(); // with_digstore defaults false in base_plan()
+        let report = run_dry(&plan, all_releases()).expect("empty plan ok");
+        assert!(!report.components.iter().any(|c| c.component == "digs"));
     }
 
     #[test]
@@ -1525,8 +1631,8 @@ mod tests {
 
     #[test]
     fn full_plan_resolves_all_components_in_order() {
-        // digstore + dig-node + dig-dns + relay + browser, PATH on. All five
-        // components resolve, plus path/service/dns/relay sections.
+        // digstore + digs + dig-node + dig-dns + relay + browser, PATH on. All
+        // six components resolve, plus path/service/dns/relay sections.
         let mut plan = base_plan();
         plan.with_digstore = true;
         plan.with_dig_node = true;
@@ -1544,6 +1650,7 @@ mod tests {
             ids,
             vec![
                 "digstore",
+                "digs",
                 "dig-node",
                 "dig-dns",
                 "dig-relay",
@@ -1664,12 +1771,15 @@ mod tests {
         let resolve = resolver_from(all_releases());
         let report =
             run_report_with(&plan, &resolve, &mut |l| lines.push(l.to_string())).expect("ok");
-        assert_eq!(report.components.len(), 1);
+        assert_eq!(report.components.len(), 2);
         assert!(lines.iter().any(|l| l.contains("DIG installer — target")));
         assert!(lines.iter().any(|l| l.contains("dry run")));
         assert!(lines
             .iter()
             .any(|l| l.contains("Installing the digstore CLI")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Installing the digs alias")));
         assert!(lines.iter().any(|l| l == "Done."));
     }
 
@@ -1689,7 +1799,14 @@ mod tests {
             .iter()
             .map(|c| c["id"].as_str().unwrap())
             .collect();
-        for id in ["digstore", "dig-node", "dig-relay", "dig-dns", "browser"] {
+        for id in [
+            "digstore",
+            "digs",
+            "dig-node",
+            "dig-relay",
+            "dig-dns",
+            "browser",
+        ] {
             assert!(ids.contains(&id), "help-json missing component {id}");
         }
 

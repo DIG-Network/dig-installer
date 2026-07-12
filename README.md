@@ -3,7 +3,10 @@
 **The universal DIG installer — a thin shim.** One command resolves and installs
 the latest DIG components for your OS/arch:
 
-- the **digstore CLI** (the $DIG content tooling) — added to your `PATH`,
+- the **digstore CLI** (the $DIG content tooling) — added to your `PATH`, along
+  with its **`digs` alias binary** (`digs <args>` behaves identically to
+  `digstore <args>`; published in the same release, installed alongside it —
+  no separate flag or PATH entry needed),
 - the **dig-node** local node — installed + started as an OS service (Windows
   service / systemd / launchd), with a best-effort `127.0.0.2 dig.local` hosts
   entry so apps and the DIG Browser can reach it port-free at `http://dig.local`,
@@ -22,7 +25,7 @@ component's GitHub release for its **actual asset list** and picks the right
 artifact for your OS/arch (resilient to naming differences across repos), then
 downloads it. Sources:
 
-- the **digstore CLI** from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
+- the **digstore CLI** (and its `digs` alias) from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
 - the **dig-node** local node from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
 - the **dig-dns** local resolver from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
@@ -136,6 +139,7 @@ dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local
 | `--no-digstore` | off | Skip installing the digstore CLI (installed by default). |
 | `--with-digstore` | on | Redundant explicit opt-in — digstore installs by default. |
 | `--digstore-version <VER>` | latest | Install a specific digstore version (e.g. `0.6.0`). |
+| _(no flag)_ | — | The **`digs`** alias binary (`digs <args>` ≡ `digstore <args>`) installs/uninstalls alongside `digstore` automatically — it follows the `--*-digstore*` flags above and has none of its own. |
 | `--no-dig-node` | off | Skip the `dig-node` local node + service (installed by default). |
 | `--with-dig-node` (alias `--service`) | on | Redundant explicit opt-in — dig-node installs + registers as a **boot-start** OS service (+ the `dig.local` hosts entry) by default. |
 | `--no-service-start` | off | Install the service(s) but don't start them this run (still registered boot-start, so they come up on next boot). |
@@ -176,8 +180,13 @@ Default install location (`--bin-dir`):
    OS/arch tokens + the accepted file extension (raw binary for the CLI/node,
    `.exe`/`.dmg`/`.AppImage` for the browser). No single guessed filename, so a
    naming change in a producing repo doesn't break the installer.
-3. **digstore CLI** — downloads the resolved raw binary and writes it to the bin
-   dir (executable bit set on unix).
+3. **digstore CLI (+ its `digs` alias)** — downloads the resolved raw binary and
+   writes it to the bin dir (executable bit set on unix), then does the same for
+   `digs` — a real binary published in the SAME digstore release under its own
+   asset stem (`digs-<ver>-<os_arch>[.exe]`) that behaves identically to
+   `digstore`. `digs` has no flag of its own: it follows `--no-digstore`/
+   `--with-digstore`/`--digstore-version` and shares digstore's bin dir, so no
+   extra PATH entry is needed.
 4. **PATH** — adds the bin dir to your user `PATH` (HKCU on Windows with a
    `WM_SETTINGCHANGE` broadcast; a profile `export PATH` line on unix). Idempotent.
 5. **dig-node** *(by default; `--no-dig-node` to skip)* — downloads the

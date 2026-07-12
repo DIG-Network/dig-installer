@@ -24,7 +24,7 @@ use dig_installer::{error_json, help_json, paths, InstallPlan};
     long_about = "Resolves and downloads the latest per-OS/arch release asset for the selected \
 components from the DIG-Network GitHub releases (it bundles nothing).\n\n\
 By DEFAULT it installs the full DIG stack in one run:\n  \
-* the digstore CLI (added to PATH),\n  \
+* the digstore CLI (added to PATH, along with its `digs` alias binary),\n  \
 * the dig-node local node (installed + started as a boot-start OS service, with a best-effort \
 127.0.0.2 dig.local hosts entry), and\n  \
 * the dig-dns local *.dig name resolver (installed + started as a boot-start OS service, with \
@@ -40,15 +40,19 @@ struct Cli {
     bin_dir: Option<std::path::PathBuf>,
 
     /// Explicitly select the digstore CLI (it is installed by default anyway;
-    /// this flag exists for symmetry/clarity with the --with-* opt-ins).
+    /// this flag exists for symmetry/clarity with the --with-* opt-ins). Also
+    /// controls the `digs` alias binary (issue #434), which has no flag of its
+    /// own and always installs alongside digstore.
     #[arg(long)]
     with_digstore: bool,
 
-    /// Opt OUT of the digstore CLI (installed by default).
+    /// Opt OUT of the digstore CLI (installed by default). Also skips its
+    /// `digs` alias binary.
     #[arg(long = "no-digstore")]
     no_digstore: bool,
 
     /// digstore version to install (e.g. 0.6.0); default: latest released.
+    /// Also pins the `digs` alias, published in the same release.
     #[arg(long, value_name = "VERSION")]
     digstore_version: Option<String>,
 
