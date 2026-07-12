@@ -23,6 +23,7 @@ opt-in.
 | id         | repo                          | kind                              | CLI flag(s)                          | Selected in the GUI wizard by default |
 |------------|-------------------------------|------------------------------------|---------------------------------------|----------------------------------------|
 | `digstore` | `DIG-Network/digstore`        | raw binary, added to PATH          | on by default; `--no-digstore` opts out; `--with-digstore` (redundant, symmetry) | always (required, no checkbox) |
+| `digs`     | `DIG-Network/digstore` (alias, issue #434) | raw binary, added to PATH (same bin dir as `digstore`) | NO separate flag — follows `digstore`'s `--no-digstore`/`--with-digstore`/`--digstore-version` | follows `digstore` |
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
 | `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | yes |
@@ -34,7 +35,21 @@ all" is the one-click default path; the user may deselect any component except `
 `REQUIRED`, no checkbox). Deselecting a component removes it from the install plan entirely (its
 artifact is neither downloaded nor registered).
 
-### 1.1 dig-dns availability gate
+### 1.1 `digs` — a first-class alias of `digstore`
+
+`digs` (issue #434) is a real installed binary, not a shell alias: `digs <args>` behaves
+IDENTICALLY to `digstore <args>` (same subcommands/flags/`--json`/help — see digstore's `SPEC.md`
+§ "CLI binaries"). It is published in the **SAME** `DIG-Network/digstore` GitHub release as
+`digstore`, under its own asset stem (`digs-<ver>-<os_arch>[.exe]`, byte-for-byte the same shape as
+`digstore-<ver>-<os_arch>[.exe]`) — resolved via the identical asset matcher
+(`src/asset.rs::select_asset`), parameterized on stem `"digs"` instead of `"digstore"`.
+
+`digs` has **no CLI flag of its own**: it installs/uninstalls exactly when `digstore` does, pinned
+to the SAME version (`--digstore-version` threads through to both), and is written to the SAME bin
+dir — so no separate PATH entry is needed. Resolution order in `run_report_with`: `digstore` is
+resolved and downloaded first, then `digs`, both gated by `with_digstore`.
+
+### 1.2 dig-dns availability gate
 
 `dig-dns` (EPIC #174) may have no published release at all. If `with_dig_dns` is selected and no
 release/matching asset can be resolved for it (an `ASSET_NOT_FOUND`-classified lookup — "nothing
@@ -44,7 +59,7 @@ published" as opposed to a network/transport failure), the installer:
 - records `InstallReport.dns` with `installed: false`, `started: false`,
   `needs_elevation: false`, and a `note` explicitly stating dig-dns is "not yet available" and
   naming EPIC #174;
-- continues installing every other selected component (order preserved: digstore → dig-node →
+- continues installing every other selected component (order preserved: digstore → digs → dig-node →
   dig-dns[gated] → dig-relay → browser).
 
 A genuine transport/network failure resolving dig-dns (not "no release exists") is NOT gated —

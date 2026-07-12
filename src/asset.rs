@@ -274,6 +274,70 @@ mod tests {
     }
 
     #[test]
+    fn matches_canonical_digs_cli_asset() {
+        // digs (issue #434) is published in the SAME digstore release, alongside
+        // digstore, under its own asset stem: digs-<ver>-<os_arch>[.exe]. The
+        // RawBinary matcher must resolve it with ZERO new matcher logic — the
+        // same `select_asset` parameterized on stem "digs" instead of "digstore".
+        //
+        // This is a genuine edge case worth locking down: "digs" is a STRING
+        // PREFIX of "digstore", so both names satisfy the stem_rank tie
+        // ("digstore-...".starts_with("digs") is true too) — the tie is broken
+        // by shortest-name, and "digs-<ver>-<slug>" is always exactly 4 bytes
+        // shorter than "digstore-<ver>-<slug>", so it deterministically wins
+        // when the caller asks for stem "digs".
+        let names = vec![
+            "digstore-0.6.0-windows-x64.exe".to_string(),
+            "digs-0.6.0-windows-x64.exe".to_string(),
+            "digstore-0.6.0-linux-x64".to_string(),
+            "digs-0.6.0-linux-x64".to_string(),
+            "digstore-0.6.0-macos-arm64".to_string(),
+            "digs-0.6.0-macos-arm64".to_string(),
+            "digstore-0.6.0-macos-x64".to_string(),
+            "digs-0.6.0-macos-x64".to_string(),
+        ];
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "digs"
+            ),
+            Some("digs-0.6.0-linux-x64".to_string())
+        );
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Windows, Arch::X64),
+                AssetKind::RawBinary,
+                "digs"
+            ),
+            Some("digs-0.6.0-windows-x64.exe".to_string())
+        );
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::MacOs, Arch::Arm64),
+                AssetKind::RawBinary,
+                "digs"
+            ),
+            Some("digs-0.6.0-macos-arm64".to_string())
+        );
+        // And resolving stem "digstore" against the SAME name list still gets
+        // the digstore binary, never the digs alias (stem_rank prefers the
+        // exact-prefix match over the tie-break-by-length path).
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "digstore"
+            ),
+            Some("digstore-0.6.0-linux-x64".to_string())
+        );
+    }
+
+    #[test]
     fn macos_arm64_does_not_match_x64_asset() {
         // The x64 token must NOT satisfy an arm64 request (and vice-versa) — a
         // wrong-arch binary would crash at runtime.
