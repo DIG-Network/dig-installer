@@ -108,7 +108,7 @@ jobs:
       # paths require the network; all agent-facing logic lives in the library
       # and is unit-tested there. Repo currently measures ~87% lines.
       - name: Test with coverage (gate >=80% lines, nextest retries flaky failures)
-        run: cargo llvm-cov nextest --workspace --all-features --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' -- --retries 2
+        run: cargo llvm-cov nextest --workspace --all-features --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' --retries 2
 
   # Per-OS compile verification (task #177). fmt/clippy/test above run ONLY on
   # ubuntu-latest, so `#[cfg(windows)]`/`#[cfg(target_os = "macos")]` modules
