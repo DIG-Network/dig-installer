@@ -89,6 +89,8 @@ jobs:
           rustc --version
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - uses: actions/cache@v4
         with:
           path: |
@@ -98,12 +100,15 @@ jobs:
             target
           key: ${{ runner.os }}-installer-ci-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-installer-ci-test-
-      # Unit + integration tests with line coverage, gated at >=80%. main.rs is
-      # excluded: it is thin binary glue (arg-parse -> run_report -> stdout/exit)
-      # whose only paths require the network; all agent-facing logic lives in the
-      # library and is unit-tested there. Repo currently measures ~87% lines.
-      - name: Test with coverage (gate >=80% lines)
-        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'
+      # Unit + integration tests with line coverage, gated at >=80%, run under
+      # nextest with retries so a genuinely flaky test (fails then passes on
+      # rerun) is retried + surfaced as FLAKY in the run output rather than
+      # failing the whole CI job outright (#489). main.rs is excluded: it is
+      # thin binary glue (arg-parse -> run_report -> stdout/exit) whose only
+      # paths require the network; all agent-facing logic lives in the library
+      # and is unit-tested there. Repo currently measures ~87% lines.
+      - name: Test with coverage (gate >=80% lines, nextest retries flaky failures)
+        run: cargo llvm-cov nextest --workspace --all-features --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' --retries 2
 
   # Per-OS compile verification (task #177). fmt/clippy/test above run ONLY on
   # ubuntu-latest, so `#[cfg(windows)]`/`#[cfg(target_os = "macos")]` modules
@@ -215,6 +220,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - uses: actions/cache@v4
         with:
           path: |
@@ -231,8 +238,10 @@ jobs:
       # OS-agnostic pure logic and runs on both matrix OSes; the separate
       # `#[cfg(all(test, windows))]` module in the same file structurally
       # cannot compile on ubuntu/macos, so it's naturally skipped here with no
-      # coverage loss (see the windows-only gui-test-windows job below).
-      - run: cargo test --manifest-path gui/app/src-tauri/Cargo.toml --locked
+      # coverage loss (see the windows-only gui-test-windows job below). Run
+      # under nextest with retries so a flaky test is retried + reported
+      # rather than failing the job outright (#489).
+      - run: cargo nextest run --manifest-path gui/app/src-tauri/Cargo.toml --locked --retries 2
 
   # Experimental, NON-blocking: observes whether `cargo test` on this crate
   # reproduces the "requires elevation" (Windows os error 740) quirk seen
@@ -254,6 +263,8 @@ jobs:
           rustup toolchain install stable
           rustup default stable
           rustc --version
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - uses: actions/cache@v4
         with:
           path: |
@@ -263,7 +274,7 @@ jobs:
             gui/app/src-tauri/target
           key: ${{ runner.os }}-installer-ci-gui-test-${{ hashFiles('gui/app/src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-installer-ci-gui-test-
-      - run: cargo test --manifest-path gui/app/src-tauri/Cargo.toml --locked
+      - run: cargo nextest run --manifest-path gui/app/src-tauri/Cargo.toml --locked --retries 2
 
   gui-build-os-matrix:
     name: gui build (${{ matrix.os }})
