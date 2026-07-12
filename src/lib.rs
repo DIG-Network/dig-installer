@@ -39,12 +39,15 @@
 pub mod asset;
 pub mod dns;
 pub mod download;
+pub mod elevation;
 pub mod error;
 pub mod health;
 pub mod hosts;
 pub mod paths;
+pub mod pathcheck;
 pub mod release;
 pub mod service;
+pub mod svc;
 pub mod target;
 
 use std::path::PathBuf;
@@ -102,6 +105,19 @@ pub struct InstallPlan {
 
 /// Re-export alias so `InstallPlan` reads cleanly (`service::RelayServiceConfig`).
 pub use service::RelayServiceConfig as ServiceConfigRelay;
+
+impl InstallPlan {
+    /// Whether running this plan requires OS elevation (Administrator/root).
+    ///
+    /// Registering an OS service (dig-node, dig-dns, dig-relay) or writing the
+    /// `dig.local` hosts entry needs elevation; a `--dry-run` changes nothing
+    /// so never does. This gates the pre-install elevation check (#492) — a
+    /// digstore-only install to a per-user dir does not force elevation, but the
+    /// default full-stack install (which registers services) does.
+    pub fn requires_elevation(&self) -> bool {
+        !self.dry_run && (self.with_dig_node || self.with_dig_dns || self.with_relay)
+    }
+}
 
 impl Default for InstallPlan {
     /// The universal-installer default (#301): install the full DIG stack —
@@ -220,6 +236,20 @@ pub struct InstallReport {
     pub dns: Option<dns::DnsInstallResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
+    /// Per-CLI PATH-resolution checks (#496): confirms each required DIG CLI
+    /// (digstore / dig-node / dig-dns) resolves by bare name from a fresh shell
+    /// so the user can run it immediately. Empty on dry-run. A `resolved: false`
+    /// entry makes the install NOT ready.
+    pub cli_path_checks: Vec<pathcheck::CliPathCheck>,
+    /// The AGGREGATE verdict (#493): `true` iff EVERY selected component
+    /// installed AND its service is verified RUNNING. Only when this is `true`
+    /// may a caller print "✓ DIG is ready". Always `true` on a dry-run (nothing
+    /// was installed, so nothing failed).
+    pub ready: bool,
+    /// The per-component failure reasons behind `ready == false` (empty when
+    /// ready). Each entry names the component + why it is not ready + the
+    /// remedy — never silent (#493).
+    pub failures: Vec<String>,
 }
 
 /// The dig-relay service result (run-your-own-relay).
@@ -366,6 +396,20 @@ fn run_report_with(
     resolve: &ReleaseResolver<'_>,
     log: &mut dyn FnMut(&str),
 ) -> Result<InstallReport, InstallError> {
+    run_report_gated(plan, resolve, &elevation::is_elevated, log)
+}
+
+/// [`run_report_with`] with an injectable elevation probe (the second I/O
+/// boundary, after the release resolver). Production passes
+/// [`elevation::is_elevated`]; tests pass a fixed answer so the pre-install
+/// elevation gate (#492) — and that it fails FAST, before any download/write —
+/// is exercised deterministically.
+fn run_report_gated(
+    plan: &InstallPlan,
+    resolve: &ReleaseResolver<'_>,
+    is_elevated: &dyn Fn() -> bool,
+    log: &mut dyn FnMut(&str),
+) -> Result<InstallReport, InstallError> {
     let target = Target::current().map_err(|e| {
         InstallError::unsupported_target(e)
             .with_hint("DIG releases target windows-x64, linux-x64, macos-arm64, macos-x64")
@@ -373,6 +417,15 @@ fn run_report_with(
     log(&format!("DIG installer — target {target}"));
     if plan.dry_run {
         log("(dry run — no changes will be made)");
+    }
+
+    // Pre-install elevation gate (#492): FIRST, before resolving/downloading/
+    // writing anything, so an un-elevated run fails fast and clean with NO
+    // partial state. Only enforced when the plan actually needs elevation
+    // (registers a service / writes hosts); a dry-run or digstore-only run does
+    // not trip it.
+    if plan.requires_elevation() {
+        elevation::gate(is_elevated(), &target)?;
     }
 
     let mut report = InstallReport {
@@ -386,6 +439,9 @@ fn run_report_with(
         relay: None,
         dns: None,
         installed: Vec::new(),
+        cli_path_checks: Vec::new(),
+        ready: true,
+        failures: Vec::new(),
     };
 
     // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
@@ -604,8 +660,169 @@ fn run_report_with(
         report.components.push(c);
     }
 
-    log("Done.");
+    // PATH verification (#496): confirm each required DIG CLI resolves by bare
+    // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
+    // immediately. Non-dry-run only (dry-run installs nothing to resolve).
+    if !plan.dry_run {
+        verify_clis_on_path(&target, &mut report, log);
+    }
+
+    // Aggregate readiness verdict (#493 + @mt-dev firm directive): "if
+    // installation of ANY component failed, DIG is NOT ready." Never print a
+    // green success line when a selected component didn't install or its
+    // service isn't running.
+    report.failures = evaluate_readiness(plan, &report);
+    report.ready = report.failures.is_empty();
+    log_readiness_verdict(&report, log);
     Ok(report)
+}
+
+/// The user-facing DIG CLIs that MUST be runnable by bare name after install
+/// (#496): the digstore CLI + the two node/dns CLIs a user drives directly
+/// (e.g. `dig-node pair approve <id>`). dig-relay is a background service (no
+/// user CLI surface required); the DIG Browser is a GUI installer.
+const REQUIRED_CLIS: &[&str] = &["digstore", "dig-node", "dig-dns"];
+
+/// Verify each installed required CLI resolves by bare name on the post-install
+/// PATH (#496) and record the result into `report.cli_path_checks`. Only checks
+/// CLIs actually placed this run (present in `report.components`). Logs each
+/// check; a failure is folded into the readiness verdict by
+/// [`evaluate_readiness`].
+fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dyn FnMut(&str)) {
+    let installed_clis: Vec<String> = report
+        .components
+        .iter()
+        .map(|c| c.component.clone())
+        .filter(|id| REQUIRED_CLIS.contains(&id.as_str()))
+        .collect();
+    if installed_clis.is_empty() {
+        return;
+    }
+    log("Verifying the DIG CLIs resolve on PATH:");
+    for cli in installed_clis {
+        let exe = target.exe_name(&cli);
+        let bin_dir = report
+            .components
+            .iter()
+            .find(|c| c.component == cli)
+            .and_then(|c| std::path::Path::new(&c.dest).parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(paths::default_bin_dir);
+        let check = match pathcheck::cli_resolves(&bin_dir, &exe) {
+            Ok(version) => {
+                let note = format!("`{cli} --version` resolved on PATH ({version})");
+                log(&format!("    ✓ {note}"));
+                pathcheck::CliPathCheck {
+                    cli: cli.clone(),
+                    resolved: true,
+                    note,
+                }
+            }
+            Err(e) => {
+                log(&format!(
+                    "    ! {cli} is NOT resolvable on PATH: {e} — open a NEW terminal, or re-run elevated so the PATH change takes effect."
+                ));
+                pathcheck::CliPathCheck {
+                    cli: cli.clone(),
+                    resolved: false,
+                    note: e,
+                }
+            }
+        };
+        report.cli_path_checks.push(check);
+    }
+}
+
+/// Compute the per-component failure reasons for the aggregate readiness
+/// verdict (#493). Pure — reads the assembled [`InstallReport`] so it is
+/// unit-tested directly. A dry-run installs nothing, so it never "fails".
+///
+/// A selected service component is READY only when it installed AND (if a start
+/// was requested) its service is verified RUNNING — a bare port listener or a
+/// clean-looking log line is NOT sufficient (the false-success bug). dig-node
+/// readiness hinges on the real service-manager `RUNNING` check
+/// ([`ServiceResult::health_ok`], set from [`svc::is_service_running`]); dig-dns
+/// on a live resolution path; dig-relay on a successful registration.
+fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String> {
+    let mut failures = Vec::new();
+    if plan.dry_run {
+        return failures;
+    }
+
+    if plan.with_dig_node {
+        match &report.service {
+            None => failures.push("dig-node: the node service was not installed".to_string()),
+            Some(s) if !s.installed => failures.push(format!(
+                "dig-node: the OS service did not register ({}); re-run elevated",
+                s.note
+            )),
+            Some(s) if plan.service.start && !s.health_ok => failures.push(format!(
+                "dig-node: the '{}' service is not running ({}); re-run elevated",
+                svc::DIG_NODE_SERVICE_ID,
+                s.health_note
+            )),
+            Some(_) => {}
+        }
+    }
+
+    if plan.with_dig_dns {
+        match &report.dns {
+            None => failures.push("dig-dns: the resolver service was not installed".to_string()),
+            Some(d) if !d.installed => failures.push(format!(
+                "dig-dns: the OS service did not register ({}); re-run elevated",
+                d.note
+            )),
+            Some(d) if plan.dns_service.start && d.paths_live.is_empty() => failures.push(format!(
+                "dig-dns: installed but no live resolution path — the service is not serving ({})",
+                d.note
+            )),
+            Some(_) => {}
+        }
+    }
+
+    if plan.with_relay {
+        match &report.relay {
+            None => failures.push("dig-relay: the relay service was not installed".to_string()),
+            Some(r) if !r.installed => failures.push(format!(
+                "dig-relay: the OS service did not register ({}); re-run elevated",
+                r.note
+            )),
+            Some(_) => {}
+        }
+    }
+
+    // PATH resolution (#496): any required CLI that does not resolve by bare
+    // name from a fresh shell makes the install NOT ready — the user could not
+    // run `dig-node …` / `dig-dns …` otherwise.
+    for check in &report.cli_path_checks {
+        if !check.resolved {
+            failures.push(format!(
+                "{}: the CLI is not runnable from a fresh shell ({}); open a new terminal or re-run elevated",
+                check.cli, check.note
+            ));
+        }
+    }
+
+    failures
+}
+
+/// Log the final, explicit readiness verdict (#493) — a green "✓ DIG is ready"
+/// ONLY when every selected component is ready; otherwise an unmistakable
+/// "✗ DIG is NOT ready" with each failure + the remedy. This is the last line
+/// the CLI prints; `main` maps `report.ready` onto the process exit code.
+fn log_readiness_verdict(report: &InstallReport, log: &mut dyn FnMut(&str)) {
+    if report.dry_run {
+        log("Done (dry run — nothing was installed).");
+        return;
+    }
+    if report.ready {
+        log("✓ DIG is ready.");
+    } else {
+        log("✗ DIG is NOT ready — the following component(s) failed:");
+        for f in &report.failures {
+            log(&format!("    - {f}"));
+        }
+        log("Fix the above (re-run as Administrator/root if elevation is the cause) and run the installer again.");
+    }
 }
 
 /// Register dig-relay as an OS service by delegating to its own `install`/`start` subcommands.
@@ -884,29 +1101,49 @@ fn register_dig_node(
     result.dig_local_resolves = resolved.resolves;
     result.dig_local_resolve_note = resolved.note;
 
-    // Post-install RPC health check (task #223): confirm the node is
-    // actually ANSWERING on its configured port — distinct from the
-    // dig.local resolve check above, which only proves DNS resolution.
-    // Skipped when the service was never started (nothing to probe): with
-    // `--no-service-start` the user explicitly deferred starting it, and if
-    // `install_service` itself failed, `result.started` is already `false`.
+    // Post-install SERVICE health check (#493/#223): confirm the ACTUAL OS
+    // service THIS run registered — identified by its canonical id
+    // (`net.dignetwork.dig-node`, #494) — is RUNNING per the service manager.
+    // This REPLACES the old bare-port probe as the authoritative signal: a
+    // dig-node started by SOMETHING ELSE answering on port 9778 must NOT
+    // green-light a non-install (the false-success bug). The RPC probe is kept
+    // only as secondary confirmation detail in the note. Skipped when the
+    // service was never started (`--no-service-start`, or install failed).
     if result.started {
-        let health = health::wait_for_node_health(
-            plan.service.port,
+        let state = svc::wait_for_service_running(
+            svc::DIG_NODE_SERVICE_ID,
             HEALTH_CHECK_ATTEMPTS,
             HEALTH_CHECK_INTERVAL,
         );
-        if health.healthy {
-            log(&format!("    ✓ health check: {}", health.note));
+        let running = state == svc::ServiceRunState::Running;
+        let mut note = state.describe(svc::DIG_NODE_SERVICE_ID);
+        // Secondary confirmation only — never gates readiness (a slow socket
+        // bind must not fail a genuinely-running service).
+        if running {
+            let rpc = health::wait_for_node_health(
+                plan.service.port,
+                HEALTH_CHECK_ATTEMPTS,
+                HEALTH_CHECK_INTERVAL,
+            );
+            if rpc.healthy {
+                note.push_str(&format!("; RPC answered on port {}", plan.service.port));
+            } else {
+                note.push_str(&format!(
+                    "; note: RPC on port {} not yet answering ({})",
+                    plan.service.port, rpc.note
+                ));
+            }
+        }
+        if running {
+            log(&format!("    ✓ health check: {note}"));
         } else {
             log(&format!(
-                "    ! health check FAILED: {} — the service may not have started correctly.",
-                health.note
+                "    ! health check FAILED: {note} — re-run elevated so the service registers and starts."
             ));
         }
-        result.health_checked = health.checked;
-        result.health_ok = health.healthy;
-        result.health_note = health.note;
+        result.health_checked = true;
+        result.health_ok = running;
+        result.health_note = note;
     } else {
         result.health_note = "skipped (service not started)".to_string();
     }
@@ -1723,9 +1960,14 @@ mod tests {
             "relay",
             "dns",
             "installed",
+            "ready",
+            "failures",
         ] {
             assert!(v.get(key).is_some(), "report JSON missing key {key}");
         }
+        // A dry-run installs nothing, so it is trivially "ready" with no failures.
+        assert_eq!(v["ready"], true);
+        assert!(v["failures"].as_array().unwrap().is_empty());
         let c = &v["components"][0];
         for key in ["component", "version", "tag", "asset", "url", "dest"] {
             assert!(c.get(key).is_some(), "component JSON missing key {key}");
@@ -1780,7 +2022,10 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("Installing the digs alias")));
-        assert!(lines.iter().any(|l| l == "Done."));
+        // The final line is the readiness verdict (dry-run variant).
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Done (dry run")));
     }
 
     // -- Agent-facing JSON surfaces -----------------------------------------

@@ -242,9 +242,28 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Pretty mode: human progress to stdout, typed error to stderr with its code.
+///
+/// Fail-loud (#493): a completed run that is NOT ready (a selected component
+/// failed to install or its service isn't running) exits NON-ZERO with an
+/// explicit "DIG is NOT ready" summary — never a silent success. The per-line
+/// verdict was already streamed by `run_report`; here we surface the aggregate
+/// + set the exit code.
 fn run_pretty(plan: &InstallPlan) -> std::process::ExitCode {
     match dig_installer::run_report(plan, &mut |line| println!("{line}")) {
-        Ok(_) => std::process::ExitCode::SUCCESS,
+        Ok(report) if report.ready => std::process::ExitCode::SUCCESS,
+        Ok(report) => {
+            eprintln!(
+                "DIG is NOT ready — {} component(s) failed:",
+                report.failures.len()
+            );
+            for f in &report.failures {
+                eprintln!("  - {f}");
+            }
+            eprintln!("re-run elevated (Administrator/root) if elevation is the cause, then run the installer again");
+            std::process::ExitCode::from(
+                dig_installer::error::ErrorKind::InstallIncomplete.exit_code(),
+            )
+        }
         Err(e) => {
             eprintln!("error [{}]: {}", e.code(), e);
             if let Some(hint) = e.hint() {
@@ -256,14 +275,23 @@ fn run_pretty(plan: &InstallPlan) -> std::process::ExitCode {
 }
 
 /// JSON mode: progress prose to stderr; a single structured object to stdout.
-/// Success → the InstallReport with `ok:true`; failure → `{ok:false,error:{…}}`.
+/// Success → the InstallReport with `ok:true`; a NOT-ready completion →
+/// `ok:false` with the full report (so an agent sees exactly what failed) +
+/// exit `INSTALL_INCOMPLETE`; a hard failure → `{ok:false,error:{…}}`.
 fn run_json(plan: &InstallPlan) -> std::process::ExitCode {
     let result = dig_installer::run_report(plan, &mut |line| eprintln!("{line}"));
     match result {
         Ok(report) => {
-            let envelope = serde_json::json!({ "ok": true, "result": report });
+            let ready = report.ready;
+            let envelope = serde_json::json!({ "ok": ready, "result": report });
             println!("{}", serde_json::to_string(&envelope).unwrap());
-            std::process::ExitCode::SUCCESS
+            if ready {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::from(
+                    dig_installer::error::ErrorKind::InstallIncomplete.exit_code(),
+                )
+            }
         }
         Err(e) => {
             println!("{}", error_json(&e));
