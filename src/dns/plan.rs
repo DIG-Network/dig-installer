@@ -13,6 +13,16 @@
 //! dig-node/dig-relay, which register THEMSELVES via `service-manager`
 //! internally and expose `install`/`start`. dig-installer therefore owns the
 //! full per-OS service-registration contract for dig-dns directly.
+//!
+//! **Canonical service identity + clean-reinstall (task #494).** The service
+//! NAME (id) is the stable reverse-DNS [`SERVICE_LABEL`]; on Windows the
+//! human-friendly Services-panel DISPLAY name is separately set to
+//! [`SERVICE_DISPLAY_NAME`] (`super::windows::set_display_name`). On every OS,
+//! `install` performs a CLEAN reinstall when the service is already
+//! registered — stop, deregister, THEN recreate — rather than reconfiguring
+//! in place; this fixes the Windows `CreateService 1073` ("already exists")
+//! failure on a second install run (`super::windows`/`super::macos`/
+//! `super::linux`).
 
 use serde::Serialize;
 
@@ -20,6 +30,15 @@ use serde::Serialize;
 /// service name (Windows), the launchd label (macOS), and the systemd unit
 /// script name (Linux, via [`SERVICE_SCRIPT_NAME`]).
 pub const SERVICE_LABEL: &str = "net.dignetwork.dig-dns";
+
+/// The human-friendly Windows Service DISPLAY name (task #494), shown in
+/// `services.msc`/Task Manager's Services tab. The SCM service NAME stays the
+/// stable reverse-DNS [`SERVICE_LABEL`] id — only the display name is
+/// user-facing. `service-manager`'s `ScServiceManager::install` always sets
+/// `displayname=` to the qualified service name at create time (there is no
+/// `ServiceInstallCtx` field for it), so this is applied as a follow-up
+/// `sc config` call (see `super::windows::set_display_name`).
+pub const SERVICE_DISPLAY_NAME: &str = "DIG NETWORK: DNS";
 
 /// The systemd unit / script name derived from [`SERVICE_LABEL`] (dashed, no
 /// dots) — `dig-dns.service`.
@@ -263,6 +282,31 @@ pub const POLICY_BUILTIN_RESOLVER_NAME: &str = "BuiltInDnsClientEnabled";
 /// it" (in which case the installer must never have written here at all —
 /// this marker is a belt-and-braces uninstall safety check).
 pub const POLICY_MARKER_NAME: &str = "DigInstallerManaged";
+
+/// Windows error 1060 (`ERROR_SERVICE_DOES_NOT_EXIST`) — the `sc query <name>`
+/// exit code meaning the service is NOT currently registered with the SCM.
+/// Any other exit code (`0` = exists in some state; any other non-zero = some
+/// other query failure) is treated conservatively as "exists", so a
+/// clean-reinstall attempt is never skipped on an ambiguous query result.
+/// Pure so the clean-reinstall decision (task #494) is unit-tested without
+/// spawning `sc.exe` (see `super::windows::service_exists`).
+pub fn sc_query_means_not_registered(exit_code: Option<i32>) -> bool {
+    exit_code == Some(1060)
+}
+
+/// The `sc config <name> displayname= "<display>"` argv (excluding the `sc`
+/// executable itself) used to set the human-friendly Windows Service display
+/// name AFTER `service-manager`'s create (which always sets `displayname=` to
+/// the qualified service name — task #494). Pure so the exact argv is
+/// unit-tested without spawning `sc.exe`.
+pub fn sc_set_display_name_args(service_name: &str, display_name: &str) -> Vec<String> {
+    vec![
+        "config".to_string(),
+        service_name.to_string(),
+        "displayname=".to_string(),
+        display_name.to_string(),
+    ]
+}
 
 /// Build the launch arguments dig-installer registers as the Windows service's
 /// `binPath` arguments (after its own program path): the hidden
@@ -678,5 +722,41 @@ mod tests {
     fn service_label_and_script_name_are_stable() {
         assert_eq!(SERVICE_LABEL, "net.dignetwork.dig-dns");
         assert_eq!(SERVICE_SCRIPT_NAME, "dig-dns");
+    }
+
+    /// #494: the canonical Windows Service display name, exactly as specced.
+    #[test]
+    fn service_display_name_is_stable() {
+        assert_eq!(SERVICE_DISPLAY_NAME, "DIG NETWORK: DNS");
+    }
+
+    #[test]
+    fn sc_query_1060_means_not_registered() {
+        assert!(sc_query_means_not_registered(Some(1060)));
+    }
+
+    #[test]
+    fn sc_query_other_codes_mean_registered_or_ambiguous() {
+        // 0 = a real, registered service (running or stopped).
+        assert!(!sc_query_means_not_registered(Some(0)));
+        // Any other non-zero (e.g. an access-denied or transient failure) is
+        // treated conservatively as "exists" — never skip a clean-reinstall
+        // attempt on an ambiguous result.
+        assert!(!sc_query_means_not_registered(Some(5)));
+        assert!(!sc_query_means_not_registered(None));
+    }
+
+    #[test]
+    fn sc_set_display_name_args_are_well_formed() {
+        let args = sc_set_display_name_args("net.dignetwork.dig-dns", "DIG NETWORK: DNS");
+        assert_eq!(
+            args,
+            vec![
+                "config".to_string(),
+                "net.dignetwork.dig-dns".to_string(),
+                "displayname=".to_string(),
+                "DIG NETWORK: DNS".to_string(),
+            ]
+        );
     }
 }

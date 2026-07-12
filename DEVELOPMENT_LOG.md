@@ -3,6 +3,21 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## dig-dns has NO service code of its own — dig-installer owns its entire OS-service contract (task #494)
+
+A directive naming "the dig-dns half" of a service-identity task can be misleading: `dig-dns`
+(`DIG-Network/dig-dns`) ships no `install`/`start`/service-registration code at all — its `serve`
+subcommand just blocks in the foreground. Unlike dig-node/dig-relay (which register THEMSELVES via
+`service-manager` internally and expose `install`/`start` verbs), **this installer's `src/dns/`
+module is the only place dig-dns's SCM service name, Windows display name, launchd label, and
+systemd unit exist** (`dns::plan::SERVICE_LABEL`/`SERVICE_DISPLAY_NAME`; see `SPEC.md` §2.2). A
+task phrased as "change dig-dns's SERVICE_NAME" must be implemented here, not in the `dig-dns` repo.
+
+Also: `service-manager` v0.7's `ScServiceManager::install` (Windows) ALWAYS sets `displayname=` to
+the qualified service name at create time — `ServiceInstallCtx` has no field to override it. A
+custom human-friendly display name (e.g. "DIG NETWORK: DNS") must be applied as a follow-up
+`sc config <name> displayname= "<display>"` call after `install` succeeds.
+
 ## The installer's DEFAULT is the full 3-component stack, and boot-start is delegated vs owned (task #301)
 
 `dig-installer` installs digstore + dig-node + dig-dns by default (opt out with

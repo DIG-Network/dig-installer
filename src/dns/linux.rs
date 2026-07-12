@@ -29,6 +29,41 @@ fn service_label() -> ServiceLabel {
         .expect("SERVICE_LABEL is a valid ServiceLabel")
 }
 
+/// The directory `service-manager`'s `SystemdServiceManager::system()` writes
+/// unit files to (not part of its public API — mirrored here so existence can
+/// be probed without an extra `systemctl` spawn).
+const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
+
+/// Is a systemd unit named `script_name` registered under `dir` (its
+/// `.service` file present)? Pure given the directory, so the real check
+/// ([`unit_registered`]) is unit-tested against a temp dir instead of
+/// requiring root to touch [`SYSTEMD_UNIT_DIR`].
+fn unit_file_exists_under(dir: &Path, script_name: &str) -> bool {
+    dir.join(format!("{script_name}.service")).exists()
+}
+
+/// Is the dig-dns systemd unit currently registered (its unit file present in
+/// [`SYSTEMD_UNIT_DIR`])? A plain file-existence check is sufficient and
+/// avoids spawning `systemctl` just to answer "is this registered at all".
+fn unit_registered(script_name: &str) -> bool {
+    unit_file_exists_under(Path::new(SYSTEMD_UNIT_DIR), script_name)
+}
+
+/// Cleanly remove a pre-existing dig-dns systemd unit: `systemctl stop` +
+/// `systemctl disable` (via the crate's `stop`/`uninstall`, which also
+/// deletes the unit file) — so a subsequent install always creates fresh
+/// rather than reconfiguring in place (task #494). Best-effort: an
+/// already-absent unit is a no-op (errors are ignored).
+fn clean_remove_existing_unit() {
+    let mgr = service_manager::SystemdServiceManager::system();
+    let _ = mgr.stop(ServiceStopCtx {
+        label: service_label(),
+    });
+    let _ = mgr.uninstall(ServiceUninstallCtx {
+        label: service_label(),
+    });
+}
+
 /// Is this process running as root? Creating the dedicated service user,
 /// writing the systemd unit, and wiring split-DNS all require it.
 pub fn is_root() -> bool {
@@ -250,8 +285,9 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     if dry_run {
         return DnsInstallResult {
             note: format!(
-                "would create the {} user, register the dig-dns systemd unit for {}, wire \
-                 split-DNS for the detected resolver, and write the Chrome/Chromium policy",
+                "would create the {} user, ensure a clean reinstall (stop + disable any \
+                 pre-existing unit), register the dig-dns systemd unit for {}, wire split-DNS \
+                 for the detected resolver, and write the Chrome/Chromium policy",
                 plan::LINUX_SERVICE_USER,
                 dig_dns_bin.display()
             ),
@@ -266,6 +302,16 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     }
 
     let mut notes = Vec::new();
+
+    // Clean reinstall (task #494): a pre-existing unit is stopped + disabled
+    // (and its unit file removed) BEFORE reinstalling — never reconfigured in
+    // place.
+    if unit_registered(plan::SERVICE_SCRIPT_NAME) {
+        clean_remove_existing_unit();
+        notes.push(
+            "removed the pre-existing dig-dns systemd unit for a clean reinstall".to_string(),
+        );
+    }
 
     match ensure_service_user(plan::LINUX_SERVICE_USER) {
         Ok(true) => notes.push(format!(
@@ -505,5 +551,23 @@ mod tests {
     #[test]
     fn service_label_parses() {
         assert_eq!(service_label().application, "dig-dns");
+    }
+
+    /// #494: clean-reinstall detection is a plain file-presence check,
+    /// parameterized so it's tested against a temp dir (never touching the
+    /// real `/etc/systemd/system`, which the test process may not own).
+    #[test]
+    fn unit_file_exists_under_detects_presence_and_absence() {
+        let dir = tmp_subdir("unit-exists");
+        assert!(!unit_file_exists_under(&dir, "dig-dns"));
+        std::fs::write(dir.join("dig-dns.service"), "fake unit\n").unwrap();
+        assert!(unit_file_exists_under(&dir, "dig-dns"));
+    }
+
+    #[test]
+    fn unit_registered_is_false_in_a_test_environment() {
+        // No CI/dev container has a real dig-dns unit registered under the
+        // canonical path.
+        assert!(!unit_registered("dig-dns-test-definitely-not-real"));
     }
 }

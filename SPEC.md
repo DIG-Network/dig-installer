@@ -131,6 +131,38 @@ boot-start, so it comes up on the next boot. This boot-start contract is regress
 `dns::plan::tests::dns_service_is_registered_as_boot_start` and
 `service::tests::dig_node_is_registered_boot_start_via_the_install_verb`.
 
+### 2.2 dig-dns service identity + clean reinstall (task #494)
+
+dig-dns's OS service identity is canonical and stable across releases:
+
+| | value |
+|---|---|
+| Service NAME (id) | `net.dignetwork.dig-dns` (`dns::plan::SERVICE_LABEL`) — the reverse-DNS SCM service name (Windows), launchd label (macOS), systemd unit/script name (Linux, `dns::plan::SERVICE_SCRIPT_NAME` = `dig-dns`) |
+| Windows DISPLAY name | `DIG NETWORK: DNS` (`dns::plan::SERVICE_DISPLAY_NAME`) — the human-friendly name shown in `services.msc`/Task Manager's Services tab |
+
+The service NAME is the stable id every OS query/health-check targets; the DISPLAY name is
+user-facing only and Windows-specific (macOS/Linux have no separate display-name concept —
+`launchctl`/`systemctl` are addressed by the same label/unit name a human sees). Because
+`service-manager`'s `ScServiceManager::install` unconditionally sets `displayname=` to the
+qualified service name at create time (its `ServiceInstallCtx` has no display-name field),
+`dns::windows::install` applies the display name as a follow-up `sc config <name> displayname=
+"<display>"` call (`dns::plan::sc_set_display_name_args`).
+
+**Clean reinstall, on every OS.** `install` never reconfigures an already-registered dig-dns
+service in place — it always stops + deregisters a pre-existing registration FIRST, then
+recreates fresh. This fixes the Windows `CreateService` error 1073 ("already exists") that a
+plain re-`install` produced on a second run:
+
+| OS | detect | remove | recreate |
+|----|--------|--------|----------|
+| Windows | `sc query <name>` exit code (`dns::plan::sc_query_means_not_registered`: 1060 = not registered, anything else = treated as existing) | `sc stop` (best-effort) + `sc delete`, then poll `sc query` up to 5s for the removal to land (`dns::windows::wait_for_removal`) | `sc create` (`ScServiceManager::install`) + re-apply the display name |
+| macOS | `launchctl print system/<label>` exit code (`dns::macos::service_registered`) | `launchctl bootout system/<label>` (the modern replacement for `unload`) + delete the `/Library/LaunchDaemons/<label>.plist` file (`dns::macos::clean_remove_existing`) | write a fresh plist + `launchctl load` (`ServiceInstallCtx.autostart`) |
+| Linux | the unit file's presence under `/etc/systemd/system/<script>.service` (`dns::linux::unit_registered`) | `systemctl stop` + `systemctl disable` (removes the unit file too, via `SystemdServiceManager::uninstall`) (`dns::linux::clean_remove_existing_unit`) | write a fresh unit file + `systemctl enable` |
+
+An absent registration is a no-op at the detect step (nothing to remove); the removal itself is
+best-effort (errors are noted but never abort the install — the subsequent create attempt is the
+authoritative outcome).
+
 ## 3. `InstallReport` (the `--json` payload)
 
 Stable, versioned (`schema_version`) JSON shape emitted by `--json` on success:

@@ -16,7 +16,7 @@
 //! instead").
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use service_manager::{
@@ -45,6 +45,34 @@ fn service_label() -> ServiceLabel {
     plan::SERVICE_LABEL
         .parse()
         .expect("SERVICE_LABEL is a valid ServiceLabel")
+}
+
+/// Is the dig-dns LaunchDaemon currently registered with launchd (loaded in
+/// the SYSTEM domain, running or not)? Probed via `launchctl print`, which
+/// exits non-zero when the label is not bootstrapped.
+fn service_registered(label: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", &format!("system/{label}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Cleanly remove a pre-existing dig-dns LaunchDaemon registration: `launchctl
+/// bootout` (the modern replacement for `unload`) then delete its plist file
+/// — so a subsequent install always creates fresh rather than reconfiguring
+/// in place (task #494). Best-effort: an already-absent registration is a
+/// no-op (the commands' errors are ignored — there is nothing to remove).
+fn clean_remove_existing(label: &str) {
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("system/{label}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ =
+        std::fs::remove_file(Path::new("/Library/LaunchDaemons").join(format!("{label}.plist")));
 }
 
 /// Is this process running as root? Writing `/etc/resolver/dig`, a
@@ -192,7 +220,8 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     if dry_run {
         return DnsInstallResult {
             note: format!(
-                "would alias {} on lo0 (boot-persistent), write {RESOLVER_PATH}, register the \
+                "would alias {} on lo0 (boot-persistent), write {RESOLVER_PATH}, ensure a clean \
+                 reinstall (bootout + remove any pre-existing LaunchDaemon), register the \
                  dig-dns LaunchDaemon for {}, and set the Chrome managed DoH policy",
                 plan::LOOPBACK_IP,
                 dig_dns_bin.display()
@@ -208,6 +237,16 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     }
 
     let mut notes = Vec::new();
+
+    // Clean reinstall (task #494): a pre-existing LaunchDaemon registration is
+    // booted out + its plist removed BEFORE reinstalling — never reconfigured
+    // in place.
+    if service_registered(plan::SERVICE_LABEL) {
+        clean_remove_existing(plan::SERVICE_LABEL);
+        notes.push(
+            "removed the pre-existing dig-dns LaunchDaemon for a clean reinstall".to_string(),
+        );
+    }
 
     match ensure_lo0_alias_now(plan::LOOPBACK_IP) {
         Ok(true) => notes.push(format!("aliased {} on lo0", plan::LOOPBACK_IP)),
@@ -464,5 +503,21 @@ mod tests {
     fn labels_parse() {
         assert_eq!(service_label().application, "dig-dns");
         assert_eq!(lo0_label().application, "dig-dns-lo0");
+    }
+
+    /// A label that certainly is not bootstrapped on any test host (task #494).
+    const NONEXISTENT_LABEL: &str = "net.dignetwork.dig-dns-test-definitely-not-a-real-service";
+
+    #[test]
+    fn service_registered_is_false_for_an_unregistered_label() {
+        assert!(!service_registered(NONEXISTENT_LABEL));
+    }
+
+    #[test]
+    fn clean_remove_existing_never_panics_when_absent() {
+        // Best-effort teardown of something that was never there: must not
+        // panic or error out (the caller only invokes this after confirming
+        // `service_registered`, but the function itself stays a safe no-op).
+        clean_remove_existing(NONEXISTENT_LABEL);
     }
 }
