@@ -41,10 +41,19 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Gate: fmt + clippy + tests once. A tag that doesn't pass never publishes.
-  # ---------------------------------------------------------------------------
+  # Gate: fmt + clippy + tests once, on a plain push to main only (i.e. BEFORE
+  # a version tag is cut) so a broken build/regression is caught pre-tag. This
+  # job deliberately does NOT run on the tag push itself: the PR's own CI
+  # gates (ci.yml) already ran this full fmt+clippy+test+coverage suite
+  # against this exact merged tree before it was allowed to merge, so
+  # re-running the whole suite again at tag/deploy time is redundant and is
+  # pure flake-exposure surface on the release path with no new signal (#489,
+  # dig_ecosystem #488 — a flaky re-run at deploy time blocked a release).
+  # The tag-triggered deploy path (build-cli/build-gui/publish below) is
+  # build + package + publish only.
   check:
     name: fmt + clippy + test + coverage
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +66,8 @@ jobs:
           rustc --version
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - uses: actions/cache@v4
         with:
           path: |
@@ -68,21 +79,28 @@ jobs:
           restore-keys: ${{ runner.os }}-installer-check-
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # Unit + integration tests WITH coverage, gated at >=80% lines. main.rs is
-      # excluded: it is thin binary glue (arg-parse -> run_report -> stdout/exit
-      # code) whose only paths require the network; all agent-facing logic
-      # (help_json/error_json) was moved into the library and is unit-tested
-      # there. The pure logic + the run_report orchestration (via an injected
-      # release resolver) + the file/service I/O wrappers are all covered.
-      - name: Test with coverage (gate >=80% lines)
-        run: cargo llvm-cov --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'
+      # Unit + integration tests WITH coverage, gated at >=80% lines, run under
+      # nextest with retries so a flaky test is retried + surfaced rather than
+      # failing the job outright (#489). main.rs is excluded: it is thin
+      # binary glue (arg-parse -> run_report -> stdout/exit code) whose only
+      # paths require the network; all agent-facing logic (help_json/
+      # error_json) was moved into the library and is unit-tested there. The
+      # pure logic + the run_report orchestration (via an injected release
+      # resolver) + the file/service I/O wrappers are all covered.
+      - name: Test with coverage (gate >=80% lines, nextest retries flaky failures)
+        run: cargo llvm-cov nextest --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' -- --retries 2
 
   # ---------------------------------------------------------------------------
-  # Build the universal CLI installer binary per OS/arch.
+  # Build the universal CLI installer binary per OS/arch. Runs on both a plain
+  # main push (gated behind `check` above) and a version-tag push (deploy path
+  # — no test re-run, see `check`'s `if` above; `always()` + the result check
+  # lets this job proceed when `check` was skipped because this run IS the tag
+  # push, while still blocking on an actual `check` failure on a main push).
   # ---------------------------------------------------------------------------
   build-cli:
     name: build cli (${{ matrix.out_name }})
     needs: check
+    if: always() && (needs.check.result == 'success' || needs.check.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +187,7 @@ jobs:
   build-gui:
     name: build gui (${{ matrix.os }})
     needs: check
-    if: github.ref_type == 'tag'
+    if: always() && github.ref_type == 'tag' && (needs.check.result == 'success' || needs.check.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
