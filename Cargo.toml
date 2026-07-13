@@ -72,15 +72,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Windows Service Control Protocol. `service-manager` only REGISTERS the
-# service in the SCM; the binary the SCM launches must itself speak the
-# service protocol (StartServiceCtrlDispatcher -> report RUNNING/STOPPED) or
-# the SCM kills it with error 1053. dig-dns has no such entrypoint of its own
-# (it is a plain blocking CLI), so dig-installer's OWN persisted binary hosts
-# the service (the hidden `run-dig-dns-service` entrypoint) and spawns the
-# real `dig-dns serve` as a child process. Mirrors dig-node-service's
-# win_service.rs pattern (see DEVELOPMENT_LOG.md).
-windows-service = "0.7"
+# NOTE: the `windows-service` crate (the SCM service-protocol dispatcher) was
+# removed with the host-shim (#499): the dig-dns Windows service now runs
+# `dig-dns.exe run-service` DIRECTLY — dig-dns owns its own SCM entrypoint — so
+# the installer no longer hosts the service and needs no dispatcher of its own.
 
 [profile.release]
 overflow-checks = true

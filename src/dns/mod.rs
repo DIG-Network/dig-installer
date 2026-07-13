@@ -1,10 +1,14 @@
 //! dig-dns OS-service installation (task #177 — Component B of the dig-dns
 //! brief, #174).
 //!
-//! Unlike dig-node/dig-relay (which register THEMSELVES as an OS service via
-//! their own `install`/`start` subcommands — see [`crate::service`]), dig-dns
-//! ships no such subcommand: it is a plain CLI whose `serve` blocks in the
-//! foreground. This module owns the full per-OS wiring instead:
+//! dig-dns (v0.9.0+) exposes its OWN Windows Service Control Protocol
+//! entrypoint, `dig-dns run-service`, which reports `SERVICE_RUNNING` to the
+//! SCM before any slow startup work — so the installer registers the SCM
+//! service to run that binary+arg **directly** (never re-launching an installer
+//! host-shim, the #499 `1053` root cause). Unlike dig-node/dig-relay (which
+//! register THEMSELVES via their own `install`/`start` subcommands — see
+//! [`crate::service`]), the installer still owns the surrounding per-OS wiring
+//! (split-DNS/NRPT, the browser DoH policy, `doctor` self-verification):
 //!
 //! * **[`plan`]** — pure content builders (systemd unit, launchd plists, NRPT
 //!   commands, policy JSON/plist/registry values, doctor/pac JSON parsing) —
@@ -28,7 +32,6 @@ pub mod doctor;
 pub mod linux;
 pub mod macos;
 pub mod plan;
-pub mod service_host;
 pub mod windows;
 
 use std::path::Path;
@@ -40,8 +43,9 @@ use serde::Serialize;
 pub struct DnsInstallConfig {
     /// Start the service immediately after registering it.
     pub start: bool,
-    /// An explicit dig-node endpoint override forwarded to `dig-dns serve
-    /// --node <url>` (highest §5.3 precedence). `None` ⇒ dig-dns's own ladder.
+    /// An explicit dig-node endpoint override baked into the service
+    /// environment as `DIG_NODE_URL` for `dig-dns run-service` (highest §5.3
+    /// precedence). `None` ⇒ dig-dns resolves its own ladder.
     pub node: Option<String>,
 }
 
@@ -99,24 +103,14 @@ pub struct DnsUninstallResult {
 /// policy), then self-verify with `dig-dns doctor` + `dig-dns pac` and surface
 /// the live path(s), the bound port, and the PAC URL.
 ///
-/// `dig_dns_bin` is the path to the just-downloaded `dig-dns` binary;
-/// `persist_bin` is the path THIS installer's own executable should be copied
-/// to so it survives as the Windows service's host process (unused on
-/// macOS/Linux, where the service execs `dig_dns_bin` directly — see
-/// [`windows`]).
-pub fn install(
-    dig_dns_bin: &Path,
-    persist_bin: &Path,
-    cfg: &DnsInstallConfig,
-    dry_run: bool,
-) -> DnsInstallResult {
-    // `persist_bin` is used only by the Windows branch (see the doc comment
-    // above); this no-op reference keeps it from being flagged as unused on
-    // macOS/Linux, where the reference itself (Copy) is still available below.
-    let _ = persist_bin;
+/// `dig_dns_bin` is the path to the just-downloaded `dig-dns` binary; on every
+/// OS the registered service runs THAT binary directly (`dig-dns run-service`
+/// on Windows, `dig-dns serve` on macOS/Linux — see [`windows`]) — there is no
+/// installer host-shim to persist.
+pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> DnsInstallResult {
     #[cfg(windows)]
     {
-        windows::install(dig_dns_bin, persist_bin, cfg, dry_run)
+        windows::install(dig_dns_bin, cfg, dry_run)
     }
     #[cfg(target_os = "macos")]
     {
@@ -128,7 +122,7 @@ pub fn install(
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
-        let _ = (dig_dns_bin, persist_bin, cfg, dry_run);
+        let _ = (dig_dns_bin, cfg, dry_run);
         DnsInstallResult {
             installed: false,
             started: false,

@@ -5,13 +5,14 @@
 //! policy — NEVER editing the hosts file, NEVER a URL rewrite, NEVER TLS
 //! interception.
 //!
-//! dig-dns has no Windows-service-protocol entrypoint of its own (`serve` is
-//! a plain blocking CLI loop), so the SCM is registered to run THIS
-//! installer's own persisted binary with the hidden `run-dig-dns-service`
-//! entrypoint ([`super::service_host`]), which speaks
-//! `StartServiceCtrlDispatcher` and spawns the real `dig-dns.exe serve` as a
-//! supervised child process — mirroring dig-node-service's `win_service.rs`
-//! pattern (see the ecosystem `DEVELOPMENT_LOG.md`).
+//! The SCM service is registered to run `dig-dns.exe run-service` **directly**
+//! — dig-dns's OWN Windows Service Control Protocol entrypoint (v0.9.0+), which
+//! reports `SERVICE_RUNNING` to the SCM before any slow startup work. There is
+//! NO re-launching installer host-shim: the previous shim (the installer's own
+//! binary child-spawning `dig-dns serve`) added an indirection that missed the
+//! SCM start-timeout, producing the field `1053` error (#499); running dig-dns
+//! directly removes it. Any dig-node endpoint override is baked into the
+//! service ENVIRONMENT (`DIG_NODE_URL`), which `run-service` reads.
 
 use std::path::Path;
 use std::time::Duration;
@@ -118,37 +119,6 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
     }
 }
 
-/// Copy the currently-running dig-installer executable to `dest` so it
-/// survives as the Windows service's host process after the (often
-/// transient, `install.ps1`-downloaded) invoking copy is deleted. Idempotent:
-/// a no-op when `dest` already has identical bytes.
-pub fn persist_self_at(current: &Path, dest: &Path) -> Result<(), String> {
-    if current == dest {
-        return Ok(());
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    if files_identical(current, dest) {
-        return Ok(());
-    }
-    std::fs::copy(current, dest)
-        .map(|_| ())
-        .map_err(|e| format!("copy {} -> {}: {e}", current.display(), dest.display()))
-}
-
-fn files_identical(a: &Path, b: &Path) -> bool {
-    match (std::fs::read(a), std::fs::read(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    }
-}
-
-fn persist_self(dest: &Path) -> Result<(), String> {
-    let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    persist_self_at(&current, dest)
-}
-
 /// Run a PowerShell command line, discarding its stdout (used for `Add-`/`Remove-DnsClientNrptRule`,
 /// which report their own errors on stderr). `Ok(())` iff PowerShell exits 0.
 fn run_ps(command: &str) -> Result<(), String> {
@@ -217,24 +187,19 @@ fn remove_browser_policy(key_path: &str) -> Result<bool, String> {
     remove_policy_under(&RegKey::predef(HKEY_LOCAL_MACHINE), key_path)
 }
 
-/// Install dig-dns as a Windows Service: persist the installer's own binary
-/// (the service host), register + start the SCM service, add the `.dig` NRPT
-/// rule, apply the Chrome/Edge DoH policy, then self-verify with
+/// Install dig-dns as a Windows Service: register + start the SCM service
+/// pointing at `dig-dns.exe run-service` DIRECTLY (dig-dns's own SCM
+/// entrypoint — no installer host-shim, the #499 `1053` fix), add the `.dig`
+/// NRPT rule, apply the Chrome/Edge DoH policy, then self-verify with
 /// `dig-dns doctor` + `dig-dns pac`.
-pub fn install(
-    dig_dns_bin: &Path,
-    persist_bin: &Path,
-    cfg: &DnsInstallConfig,
-    dry_run: bool,
-) -> DnsInstallResult {
+pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> DnsInstallResult {
     if dry_run {
         return DnsInstallResult {
             note: format!(
                 "would ensure a clean reinstall (stop + delete any pre-existing service), \
-                 register the Windows service \"{}\" (host {}, target {}) with display name \
-                 \"{}\", add the .dig NRPT rule, and set the Chrome/Edge DoH policy",
+                 register the Windows service \"{}\" to run \"{} run-service\" directly with \
+                 display name \"{}\", add the .dig NRPT rule, and set the Chrome/Edge DoH policy",
                 plan::SERVICE_LABEL,
-                persist_bin.display(),
                 dig_dns_bin.display(),
                 plan::SERVICE_DISPLAY_NAME,
             ),
@@ -253,14 +218,11 @@ pub fn install(
         };
     }
 
-    if let Err(e) = persist_self(persist_bin) {
-        return failed(format!(
-            "could not persist dig-installer as the service host: {e}"
-        ));
-    }
-
     let mgr = service_manager::ScServiceManager::system();
-    let args = plan::service_host_launch_args(&dig_dns_bin.to_string_lossy(), cfg.node.as_deref());
+    // Register `dig-dns run-service` directly; bake an explicit dig-node
+    // override into the service environment (dig-dns reads DIG_NODE_URL).
+    let args = plan::run_service_args();
+    let environment = plan::service_node_env(cfg.node.as_deref());
 
     let mut notes = Vec::new();
 
@@ -281,13 +243,19 @@ pub fn install(
 
     if let Err(e) = mgr.install(ServiceInstallCtx {
         label: label(),
-        program: persist_bin.to_path_buf(),
+        program: dig_dns_bin.to_path_buf(),
         args: args.into_iter().map(std::ffi::OsString::from).collect(),
         contents: None,
         // No `username` → LocalSystem, required to bind :53/:80 on the dedicated loopback IP.
         username: None,
         working_directory: None,
-        environment: None,
+        // Bake DIG_NODE_URL when an explicit node override was given (else the
+        // service resolves dig-dns's own §5.3 ladder).
+        environment: if environment.is_empty() {
+            None
+        } else {
+            Some(environment)
+        },
         // Boot-start (#301): SCM `start= auto` — the service comes up on every boot.
         autostart: plan::DNS_SERVICE_AUTOSTART,
     }) {
@@ -452,57 +420,6 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
 mod tests {
     use super::*;
     use winreg::enums::HKEY_CURRENT_USER;
-
-    fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "dig-installer-dns-win-{tag}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn persist_self_copies_when_dest_absent() {
-        let dir = tmp_subdir("persist-new");
-        let src = dir.join("source.exe");
-        std::fs::write(&src, b"fake-binary-bytes").unwrap();
-        let dest = dir.join("nested").join("dig-installer.exe");
-        persist_self_at(&src, &dest).expect("copies");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"fake-binary-bytes");
-    }
-
-    #[test]
-    fn persist_self_is_idempotent_when_identical() {
-        let dir = tmp_subdir("persist-idem");
-        let src = dir.join("source.exe");
-        std::fs::write(&src, b"same-bytes").unwrap();
-        let dest = dir.join("dig-installer.exe");
-        persist_self_at(&src, &dest).expect("first copy");
-        // Modify the destination's mtime marker is irrelevant; re-run must still succeed
-        // (content-equal short-circuit) without erroring.
-        persist_self_at(&src, &dest).expect("second run is a no-op, not an error");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"same-bytes");
-    }
-
-    #[test]
-    fn persist_self_overwrites_when_content_differs() {
-        let dir = tmp_subdir("persist-diff");
-        let src = dir.join("source.exe");
-        let dest = dir.join("dig-installer.exe");
-        std::fs::write(&dest, b"old-bytes").unwrap();
-        std::fs::write(&src, b"new-bytes").unwrap();
-        persist_self_at(&src, &dest).expect("overwrites");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new-bytes");
-    }
-
-    #[test]
-    fn persist_self_is_a_noop_when_source_equals_dest() {
-        let dir = tmp_subdir("persist-same-path");
-        let p = dir.join("dig-installer.exe");
-        std::fs::write(&p, b"bytes").unwrap();
-        persist_self_at(&p, &p).expect("same path is a no-op");
-    }
 
     #[test]
     fn run_ps_succeeds_on_a_harmless_command() {

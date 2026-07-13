@@ -158,26 +158,11 @@ struct Cli {
 }
 
 fn main() -> std::process::ExitCode {
-    // The Windows Service Control Manager launches THIS binary with the hidden
-    // `run-dig-dns-service` subcommand (task #177 — dig-dns has no service-protocol
-    // entrypoint of its own; see `dig_installer::dns::service_host`). It carries no public
-    // `--help` surface, so it must be sniffed BEFORE handing argv to clap (clap would reject
-    // it as an unrecognised argument — the `Cli` struct below defines no subcommands).
-    #[cfg(windows)]
-    {
-        let argv: Vec<String> = std::env::args().collect();
-        if let Some(rest) = dig_installer::dns::service_host::matches_service_host_invocation(&argv)
-        {
-            return match dig_installer::dns::service_host::run(&rest) {
-                Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("dig-dns service host error: {e}");
-                    std::process::ExitCode::FAILURE
-                }
-            };
-        }
-    }
-
+    // The Windows dig-dns service now runs `dig-dns.exe run-service` DIRECTLY
+    // (dig-dns's own SCM entrypoint) — the installer no longer hosts the service
+    // via a hidden re-launch subcommand (#499: that indirection missed the SCM
+    // start-timeout, causing `1053`). So there is nothing to intercept before
+    // clap here.
     let cli = Cli::parse();
 
     if cli.help_json {

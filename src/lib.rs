@@ -591,7 +591,7 @@ fn run_report_gated(
                 let dig_dns_path = PathBuf::from(c.dest.clone());
                 report.components.push(c);
 
-                report.dns = Some(register_dig_dns(&dig_dns_path, &target, plan, log));
+                report.dns = Some(register_dig_dns(&dig_dns_path, plan, log));
             }
             // dig-dns is EPIC #174 and may ship no published release yet. Gate
             // this ONE component gracefully instead of failing the whole plan
@@ -914,20 +914,14 @@ fn register_relay(
 /// (task #177).
 fn register_dig_dns(
     dig_dns_path: &std::path::Path,
-    target: &Target,
     plan: &InstallPlan,
     log: &mut dyn FnMut(&str),
 ) -> dns::DnsInstallResult {
     log("Registering dig-dns as an OS service (DNS responder + HTTP gateway):");
-    // The Windows Service Control Manager needs a binary that itself speaks the
-    // service protocol; dig-dns's `serve` is a plain blocking CLI loop, so the
-    // SCM is pointed at THIS installer's own binary (persisted here) running
-    // the hidden `run-dig-dns-service` entrypoint, which spawns the real
-    // `dig-dns serve` as a supervised child (see `dns::windows`). Unused on
-    // macOS/Linux, where the service execs `dig_dns_path` directly.
-    let persist_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
-
-    let result = dns::install(dig_dns_path, &persist_bin, &plan.dns_service, plan.dry_run);
+    // The OS service runs the dig-dns binary directly (`dig-dns run-service` on
+    // Windows — dig-dns's own SCM entrypoint — `dig-dns serve` on macOS/Linux):
+    // no installer host-shim to persist (the #499 `1053` fix, see `dns::windows`).
+    let mut result = dns::install(dig_dns_path, &plan.dns_service, plan.dry_run);
 
     if plan.dry_run {
         log(&format!("    ({})", result.note));
@@ -976,6 +970,39 @@ fn register_dig_dns(
     }
     if let Some(fallback) = &result.fallback_instruction {
         log(&format!("    {fallback}"));
+    }
+
+    // Post-install SERVICE health check (#493/#499/#502): when a start was
+    // requested, confirm the dig-dns service THIS run registered — identified by
+    // its canonical id (`net.dignetwork.dig-dns`) — actually reached RUNNING per
+    // the OS service manager (Windows `sc query` / Linux `systemctl is-active` /
+    // macOS `launchctl print`, all via `svc`). A Windows 1053 start-timeout, a
+    // failed systemd unit, or an unloaded launchd label surfaces here fail-loud
+    // instead of a false success. The authoritative readiness gate stays the
+    // live doctor path(s) below (a served `.dig` is the strongest signal); this
+    // adds the explicit cross-OS "reached RUNNING" confirmation to the note.
+    if result.installed && plan.dns_service.start {
+        let state = svc::wait_for_service_running(
+            svc::DIG_DNS_SERVICE_ID,
+            HEALTH_CHECK_ATTEMPTS,
+            HEALTH_CHECK_INTERVAL,
+        );
+        if state == svc::ServiceRunState::Running {
+            log(&format!(
+                "    ✓ service health: {}",
+                state.describe(svc::DIG_DNS_SERVICE_ID)
+            ));
+            result.note.push_str("; service reached RUNNING");
+        } else {
+            log(&format!(
+                "    ! service health: {} — the resolver may not be serving; re-run elevated if it did not start.",
+                state.describe(svc::DIG_DNS_SERVICE_ID)
+            ));
+            result.note.push_str(&format!(
+                "; NOT running ({})",
+                state.describe(svc::DIG_DNS_SERVICE_ID)
+            ));
+        }
     }
 
     result
