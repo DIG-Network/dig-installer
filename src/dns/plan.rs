@@ -25,10 +25,11 @@
 //! `super::linux`).
 
 use serde::Serialize;
+use service_manager::ServiceLabel;
 
 /// The reverse-DNS service label (matches dig-node's convention): the SCM
 /// service name (Windows), the launchd label (macOS), and the systemd unit
-/// script name (Linux, via [`SERVICE_SCRIPT_NAME`]).
+/// script name (Linux, via [`service_script_name`]).
 pub const SERVICE_LABEL: &str = "net.dignetwork.dig-dns";
 
 /// The human-friendly Windows Service DISPLAY name (task #494), shown in
@@ -40,9 +41,27 @@ pub const SERVICE_LABEL: &str = "net.dignetwork.dig-dns";
 /// `sc config` call (see `super::windows::set_display_name`).
 pub const SERVICE_DISPLAY_NAME: &str = "DIG NETWORK: DNS";
 
-/// The systemd unit / script name derived from [`SERVICE_LABEL`] (dashed, no
-/// dots) — `dig-dns.service`.
-pub const SERVICE_SCRIPT_NAME: &str = "dig-dns";
+/// The systemd unit name dig-dns is ACTUALLY registered under on Linux,
+/// derived the SAME way `super::linux::install` registers it — by parsing
+/// [`SERVICE_LABEL`] through `service-manager`'s own [`ServiceLabel`] and
+/// calling `to_script_name()` — rather than a hand-maintained duplicate.
+///
+/// This used to be a hardcoded constant (`"dig-dns"`), which LOOKED like the
+/// obvious dashed form of [`SERVICE_LABEL`] but was never actually what got
+/// registered: `ServiceLabel::to_script_name()` drops the reverse-DNS
+/// qualifier ("net") and hyphen-joins `{organization}-{application}`, so
+/// `net.dignetwork.dig-dns` registers as `dignetwork-dig-dns` — confirmed
+/// against a REAL install (dig_ecosystem#502/#524), where the stale constant
+/// made every existence/uninstall check silently query a unit name that was
+/// never actually written. Deriving it here — the SAME transformation
+/// `super::linux`'s own registration applies — makes the two structurally
+/// unable to drift apart again.
+pub fn service_script_name() -> String {
+    SERVICE_LABEL
+        .parse::<ServiceLabel>()
+        .expect("SERVICE_LABEL is a valid ServiceLabel")
+        .to_script_name()
+}
 
 /// Tag embedded (as a comment/marker value) in every artifact this installer
 /// creates, so idempotent re-runs and a clean uninstall can recognise —
@@ -729,7 +748,12 @@ mod tests {
     #[test]
     fn service_label_and_script_name_are_stable() {
         assert_eq!(SERVICE_LABEL, "net.dignetwork.dig-dns");
-        assert_eq!(SERVICE_SCRIPT_NAME, "dig-dns");
+        // The REAL systemd unit name (dig_ecosystem#502/#524) — NOT the
+        // naive dashed guess ("dig-dns") this used to hardcode. Locks the
+        // derivation's OUTPUT so a future `service-manager` upgrade that
+        // changes `to_script_name()`'s algorithm fails this test loudly
+        // rather than silently re-drifting from the real registered name.
+        assert_eq!(service_script_name(), "dignetwork-dig-dns");
     }
 
     /// #494: the canonical Windows Service display name, exactly as specced.

@@ -360,46 +360,65 @@ fn stop_running_dig_relay_with(
         })
 }
 
-/// Spawn the dig-relay binary with args + env, inheriting stdio (so the user sees the elevation
-/// hint on Windows). Errors if it can't be launched or exits non-zero.
+/// Spawn the dig-relay binary with args + env, CAPTURING its stdio (never
+/// inheriting — see [`run_dig_node`] for why). Errors if it can't be
+/// launched or exits non-zero, folding the captured output into the error.
 fn run_relay(bin: &Path, args: &[String], env: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut cmd = Command::new(bin);
-    cmd.args(args);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
-    if !status.success() {
-        return Err(format!(
-            "{} {} exited with {}",
-            bin.display(),
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(())
+    run_capturing(bin, args, env)
 }
 
-/// Spawn the dig-node binary with args + env, inheriting stdio so the user sees
-/// dig-node's own messages (e.g. the elevation hint on Windows). Errors if the
-/// process can't be launched or exits non-zero.
+/// Spawn the dig-node binary with args + env, CAPTURING its stdio rather
+/// than inheriting it. Errors if the process can't be launched or exits
+/// non-zero, folding the captured output (e.g. an elevation hint dig-node
+/// itself printed) into the error message so it's still surfaced — via
+/// dig-installer's OWN reporting, in EITHER pretty or `--json` mode.
+///
+/// Earlier this inherited stdio directly so a human running the pretty CLI
+/// saw dig-node's own prose live. That silently broke the `--json` contract
+/// (dig_ecosystem#502/#524 finding, via the 3-OS installer e2e job): a
+/// child's stdout writes bypass this crate's `log`/`println!` plumbing
+/// entirely, landing raw on the SAME stdout fd `--json` mode reserves for
+/// exactly one structured line — corrupting it for any consumer (`jq`, an
+/// agent) expecting well-formed JSON. Capturing instead is correct in BOTH
+/// modes: a success no longer needs dig-node's own duplicate confirmation
+/// (dig-installer already logs its own "✓ …" line for the same event), and a
+/// failure keeps every diagnostic detail, just relayed through the error
+/// string instead of a raw, un-capturable stdio pass-through.
 fn run_dig_node(bin: &Path, args: &[String], env: &BTreeMap<String, String>) -> Result<(), String> {
+    run_capturing(bin, args, env)
+}
+
+/// Spawn `bin args env`, capturing combined stdout+stderr. `Ok(())` on a
+/// zero exit (the captured output is discarded — nothing useful is lost, see
+/// [`run_dig_node`]); `Err` on a spawn failure or non-zero exit, with the
+/// captured output (trimmed, or "(no output)") folded into the message.
+fn run_capturing(
+    bin: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
-    if !status.success() {
+    if !output.status.success() {
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        let combined = combined.trim();
+        let detail = if combined.is_empty() {
+            "(no output)".to_string()
+        } else {
+            combined.to_string()
+        };
         return Err(format!(
-            "{} {} exited with {}",
+            "{} {} exited with {}: {detail}",
             bin.display(),
             args.join(" "),
-            status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         ));
     }
     Ok(())
@@ -824,5 +843,56 @@ mod tests {
         let bin = stub_exit(&dir, false);
         let err = stop_running_dig_relay_with(&bin, |_| true).unwrap_err();
         assert!(err.contains("could not stop"), "got: {err}");
+    }
+
+    // -- run_capturing: stdio is CAPTURED, never inherited (dig_ecosystem#502/#524) --
+    //
+    // Regression: run_dig_node/run_relay used to `.status()` the child, INHERITING
+    // its stdio — a child's own prose then landed raw on THIS process's stdout,
+    // corrupting `--json` mode's "exactly one JSON line on stdout" contract the
+    // moment a real (non-dry-run) install/uninstall/start actually ran the binary
+    // (found via the 3-OS installer e2e job, #502). Drives a pre-existing shell
+    // interpreter with an inline `-c`/`/C` command (never a freshly-written script
+    // file — dodges the `ETXTBSY` write-then-exec race `stub_exit`'s own doc
+    // comment already flags) so these are exec-race-free on every CI runner.
+
+    #[cfg(unix)]
+    fn shell_stub(inline: &str) -> (std::path::PathBuf, Vec<String>) {
+        (
+            std::path::PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), inline.to_string()],
+        )
+    }
+    #[cfg(windows)]
+    fn shell_stub(inline: &str) -> (std::path::PathBuf, Vec<String>) {
+        (
+            std::path::PathBuf::from("cmd"),
+            vec!["/C".to_string(), inline.to_string()],
+        )
+    }
+
+    #[test]
+    fn run_capturing_folds_the_childs_own_output_into_the_error_on_failure() {
+        let (bin, args) = shell_stub(if cfg!(windows) {
+            "echo DIG_NODE_MARKER & exit /b 3"
+        } else {
+            "echo DIG_NODE_MARKER; exit 3"
+        });
+        let err = run_capturing(&bin, &args, &BTreeMap::new()).unwrap_err();
+        assert!(err.contains("DIG_NODE_MARKER"), "got: {err}");
+        assert!(err.contains("exited with 3"), "got: {err}");
+    }
+
+    #[test]
+    fn run_capturing_succeeds_on_a_zero_exit_regardless_of_what_the_child_printed() {
+        let (bin, args) = shell_stub(if cfg!(windows) {
+            "echo NOISE_ON_SUCCESS & exit /b 0"
+        } else {
+            "echo NOISE_ON_SUCCESS; exit 0"
+        });
+        // `Command::output()` (used by run_capturing) always captures — never
+        // inherits — so nothing the child prints ever reaches OUR stdout; a
+        // zero exit is Ok regardless of what it printed.
+        run_capturing(&bin, &args, &BTreeMap::new()).expect("zero exit is Ok");
     }
 }

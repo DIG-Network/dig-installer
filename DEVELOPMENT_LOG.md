@@ -307,3 +307,102 @@ Findings from actually turning these on:
   install bin dir, so it proves name-resolution the way the user's next shell
   will see it. On Windows the PATH write is followed by a `WM_SETTINGCHANGE`
   broadcast so new shells pick it up without a reboot.
+
+## `--dry-run` still hits the network — a "network-free" test is a claim, not a default (#524)
+
+- **`run_report`'s release RESOLUTION always runs; only the DOWNLOAD/WRITE is
+  gated on `--dry-run`.** `resolve_component`/`resolve_dig_node` call the
+  injected `ReleaseResolver` unconditionally; `download_component(&c,
+  plan.dry_run)` is the only dry-run check. So a `--dry-run` invocation that
+  leaves a component SELECTED (dig-node/dig-dns default ON, #301) still makes
+  a real GitHub API call to resolve its "latest" release — `--dry-run` means
+  "don't write", not "don't touch the network". Two `tests/cli.rs` e2e cases
+  (the firewall-intent tests) learned this the hard way: passing no
+  `--dig-node-version` left them racing `/releases/latest` on dig-node's own
+  release timeline, reddening dig-installer's CI during ANY dig-node
+  release-in-progress window (dig_ecosystem#524, surfaced by U7/#309's PR).
+  Fix: PIN `--dig-node-version` to a specific, permanently-published tag in
+  any e2e test/CI job that leaves a tracked component selected under
+  `--dry-run` — a tagged release's asset list never changes shape after
+  publish, so `release_by_tag` is deterministic where `/releases/latest`
+  is not. Applies equally to the 3-OS installer e2e job (#502): its
+  `DIG_NODE_VERSION`/`DIG_DNS_VERSION` are pinned constants, never "latest".
+- **Running the installer as a real end user does (elevated) needs `sudo -E`,
+  not bare `sudo`, on Linux/macOS.** `daemon_dir.rs`'s Unix ACL step reads
+  `SUDO_USER` (which `sudo` always exports regardless) to grant the real
+  interactive account read access to the machine-wide state dir, but `-E`
+  additionally keeps `$HOME` pointed at the invoking user rather than root's
+  — matching what a real UAC-elevated-as-yourself Windows run does
+  (`elevation.rs` explicitly refuses a SYSTEM-token run for the identical
+  reason, #499). Use `sudo -E` when scripting a real (non `--dry-run`)
+  install/uninstall in CI or locally.
+- **dig-dns's default gateway loopback IP (127.0.0.5) has no macOS alias out
+  of the box.** Unlike Linux/Windows (which accept the whole 127.0.0.0/8
+  range on the loopback interface), macOS only aliases 127.0.0.1 on `lo0` by
+  default — without `sudo ifconfig lo0 alias 127.0.0.5 up` first, dig-dns's
+  gateway can't bind either its primary or fallback port, so
+  `dns.paths_live` stays empty and the aggregate `ready` verdict false even
+  though the service process itself is registered/running fine (mirrors the
+  same gotcha dig-dns's own CI already documents).
+
+## A REAL install run (not dry-run, not a mock) surfaces bugs no unit/mock test can (#502)
+
+Running the actual `dig-installer` binary end-to-end for the first time — the whole point of the
+3-OS installer-e2e job — found THREE real, previously-invisible bugs in one pass, none catchable by
+the existing mocked-resolver/mocked-service-backend unit suite:
+
+- **A delegated subcommand's INHERITED stdio corrupts `--json` mode.** `service::run_dig_node`/
+  `run_relay` used `.status()` (inheriting the child's stdio "so the user sees dig-node's own
+  messages"). That's fine in PRETTY mode, but in `--json` mode dig-installer's OWN progress goes to
+  STDERR (`eprintln!`) so ONLY its final JSON line reaches stdout — except the child's inherited
+  stdio bypasses that routing entirely, writing its own prose directly onto the SAME stdout fd,
+  ahead of the JSON line. Every existing `--json` e2e test happened to be `--dry-run` (which never
+  spawns the subprocess), so this was invisible until a REAL install ran for the first time. Fixed:
+  `run_capturing` (`Command::output()`, never `.status()`) captures unconditionally; a failure folds
+  the captured text into the `Err` (nothing lost) and a success just discards it (dig-installer's
+  own confirmation line already covers the event). Lesson: an inherited-stdio child process is
+  incompatible with ANY "stdout is machine-readable" contract — capture always, surface via your OWN
+  reporting layer instead.
+- **Linux service-health check was scope-blind.** `svc::service_run_state_on(Os::Linux, ...)` ran a
+  bare `systemctl is-active <id>` (system scope only) — but dig-node's own `install` unconditionally
+  prefers a USER-level unit (`PREFERS_USER_LEVEL` in dig-node-service, a deliberate no-elevation
+  design), while dig-installer's dig-dns wiring is machine-wide. A single system-scoped query could
+  NEVER see a genuinely-running dig-node, permanently reporting "registered but NOT running" even on
+  a perfectly healthy install. Fixed: query BOTH `systemctl --user is-active` and `systemctl
+  is-active`, Running wins if either says so (`combine_systemctl_states`) — scope-agnostic rather
+  than hardcoding which service registers where.
+- **The canonical reverse-DNS id is NOT the real systemd unit name, on Linux only — for BOTH
+  services.** Even after fixing the scope-blindness above, dig-node STILL read "registered but NOT
+  running" — a direct `systemctl --user status net.dignetwork.dig-node` diagnostic step (added to
+  the e2e job specifically to chase this) revealed the REAL unit was `dignetwork-dig-node.service`,
+  not `net.dignetwork.dig-node.service`. Root cause: the `service-manager` crate (v0.7.1) names
+  Linux units via `ServiceLabel::to_script_name()`, which DROPS the reverse-DNS qualifier ("net")
+  and hyphen-joins `{organization}-{application}` — `net.dignetwork.dig-node` → `dignetwork-dig-node`.
+  Windows (`sc.rs`) and macOS (`launchd.rs`) both use `to_qualified_name()` instead (dots preserved
+  verbatim), so ONLY Linux drifts from the canonical id — an easy thing to miss since the id LOOKS
+  platform-neutral. **This bit dig-dns too, and worse:** dig-installer's OWN `dns/linux.rs` ALSO
+  registers dig-dns through this SAME `ServiceLabel` machinery (`net.dignetwork.dig-dns` parsed +
+  installed via `service-manager`), yet a SEPARATE hardcoded constant
+  (`dns::plan::SERVICE_SCRIPT_NAME = "dig-dns"`) — which LOOKED like the obvious dashed form —
+  was used everywhere ELSE (existence checks, uninstall, notes) to refer to it. The REAL registered
+  name is `dignetwork-dig-dns`, so `unit_registered()`'s clean-reinstall detection had ALSO been
+  silently checking a unit that was never actually written, this whole time, entirely independent
+  of the health-check bug. Fixed BOTH: `dns::plan::service_script_name()` now DERIVES the name (same
+  transformation dig-dns's own registration applies, so the two can't drift apart again), and
+  `svc::linux_unit_name` generically parses ANY canonical id through the same `ServiceLabel` +
+  `to_script_name()` rather than hardcoding either result. Lesson: when a health check OR an
+  existence check crosses a THIRD-PARTY library's own naming transformation, verify it against a
+  REAL running instance on EVERY platform it claims to support, and DERIVE shared identifiers from
+  ONE source rather than hand-copying a name that "looks right" into a second constant — a
+  mock/unit test that supplies the parser with hand-written "active\n" text, or asserts a hardcoded
+  constant equals itself, can never catch "we're asking systemctl about a unit that was never
+  registered under that name in the first place."
+- **Root has no systemd `--user`/D-Bus session by default (Linux, NOT yet fixed — dig_ecosystem#526).**
+  Because dig-installer's elevation gate runs the WHOLE process as root whenever dig-node/dig-dns
+  are selected, and dig-node's `install` always targets `--user` scope, a real `sudo dig-installer`
+  run genuinely CANNOT register dig-node on Linux today (`systemctl --user` fails with "Failed to
+  connect to bus: Operation not permitted" — root has no session unless one is explicitly
+  provisioned, e.g. `loginctl enable-linger root` + `XDG_RUNTIME_DIR=/run/user/0`, the workaround the
+  e2e CI job itself now applies). This is a genuine cross-repo design gap (dig-installer + dig-node),
+  not merely a CI artifact — filed as dig_ecosystem#526 rather than silently worked around in
+  production code.

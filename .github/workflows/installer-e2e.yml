@@ -1,0 +1,298 @@
+# The 3-OS installer end-to-end contract test (dig_ecosystem#502).
+#
+# Every other CI job here (ci.yml) proves the installer's PURE logic (asset
+# selection, the update decision, the JSON contract) with mocked resolvers and
+# service backends. Neither dig-node's nor dig-dns's OWN "service-smoke" CI
+# (their repos) covers what a real END USER actually runs: the `dig-installer`
+# BINARY, installing BOTH services in one pass and reporting its own aggregate
+# "DIG is ready" verdict (#493). This job drives exactly that, against the
+# REAL OS service manager, on all three OSes DIG ships for:
+#
+#   build dig-installer -> run it (installing pinned dig-node + dig-dns
+#   releases) -> assert the #493 fail-loud readiness verdict sees BOTH
+#   services registered + RUNNING by their canonical id, the Windows SCM
+#   display names read back correctly (#494), and `dig.local` resolves (#140)
+#   -> run --uninstall-dig-node/--uninstall-dig-dns -> assert both services
+#   are deregistered and the hosts entry is gone.
+#
+# dig_ecosystem#524: the dig-node/dig-dns versions below are PINNED to a
+# specific released tag (never "latest"), so this job — like the two
+# `tests/cli.rs` cases it mirrors — stays deterministic across either repo's
+# release-in-progress window instead of racing GitHub's `/releases/latest`.
+# Bump these deliberately when validating against a newer release.
+# DIG_DNS_VERSION is pinned to 0.9.1, NOT the newer 0.10.x tags: dig-dns's own
+# release pipeline has been failing to publish a GitHub Release for those (its
+# native-package smoke test breaks post-#494's DIG_NODE_PORT/service-identity
+# changes — tracked separately as dig_ecosystem#525); 0.9.1 is the last tag
+# with real, downloadable assets.
+name: Installer e2e (install -> health -> uninstall)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/installer-e2e.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DIG_NODE_VERSION: "0.29.0"
+  DIG_DNS_VERSION: "0.9.1"
+  # Authenticates the installer's GitHub release-API lookups (never the asset
+  # download itself) so this job doesn't race the unauthenticated 60/hour
+  # per-IP cap GitHub Actions' shared runner pool routinely exhausts — see
+  # `download::get_text_with_token` / SPEC.md §1's "Optional GitHub API
+  # authentication" note.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  e2e:
+    name: install -> health -> uninstall (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-e2e-
+
+      # dig-dns's default gateway loopback IP (127.0.0.5, SPEC S5) has no
+      # alias on lo0 out of the box on macOS (unlike Linux/Windows, which
+      # accept the whole 127.0.0.0/8 range) — without it the gateway can't
+      # bind either its primary or fallback port, so dig-dns never reaches a
+      # live resolution path (mirrors dig-dns's own service-smoke setup).
+      - name: Alias the dig-dns loopback IP on lo0 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.5 up
+
+      - name: Build dig-installer (release)
+        run: cargo build --release --locked --bin dig-installer
+
+      - name: Resolve the built binary + a stable, HOME-independent bin dir
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "INSTALLER=$(pwd)/target/release/dig-installer.exe" >> "$GITHUB_ENV"
+          else
+            echo "INSTALLER=$(pwd)/target/release/dig-installer" >> "$GITHUB_ENV"
+          fi
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # dig-dns's Linux systemd unit runs as a DEDICATED, unprivileged
+            # service account (CAP_NET_BIND_SERVICE only, dns/linux.rs) —
+            # `${{ runner.temp }}` lives under `/home/runner`, whose default
+            # 0750 permissions that account cannot traverse (systemd reports
+            # this as `status=203/EXEC`, a bare exec failure — found via this
+            # job). `/opt` is world-traversable, matching what a real Linux
+            # package (`.deb`) would install into.
+            sudo mkdir -p /opt/dig-bin && sudo chmod 755 /opt/dig-bin
+            echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
+          else
+            echo "BIN_DIR=${{ runner.temp }}/dig-bin" >> "$GITHUB_ENV"
+          fi
+
+      # The installer registers OS services and writes the hosts file — the
+      # SAME Administrator/root requirement a real end-user install needs
+      # (elevation.rs's pre-install guard, #492). GitHub's hosted Windows
+      # runner already executes as Administrator (mirrors dig-node's/
+      # dig-dns's own service-smoke jobs, which need no elevation dance
+      # either); Linux/macOS need `sudo` (passwordless on hosted runners).
+      # `-E` preserves the invoking user's HOME/USER so daemon_dir's
+      # SUDO_USER-scoped read ACL (#501) resolves the real interactive
+      # account rather than root's.
+      - name: Elevate on Linux/macOS
+        if: runner.os != 'Windows'
+        run: echo "SUDO=sudo -E" >> "$GITHUB_ENV"
+
+      # dig-node's own `install` prefers a USER-level systemd unit on Linux
+      # regardless of privilege (dig-node's service.rs `PREFERS_USER_LEVEL`,
+      # a deliberate no-elevation-needed design) — but the elevated run above
+      # makes dig-node's subprocess execute AS ROOT (uid 0), which has no
+      # systemd/D-Bus user session of its own by default, so `systemctl
+      # --user` fails ("Failed to connect to bus: Operation not permitted",
+      # dig_ecosystem#524 finding). Fix: give root its OWN lingering user
+      # session (mirrors dig-node's own service-smoke.yml, which does the
+      # same for its unprivileged runner-user run) and point every later
+      # step's `XDG_RUNTIME_DIR` at it so both the elevated install AND this
+      # job's own verification/uninstall queries can reach it.
+      - name: (Linux) bring up a systemd/D-Bus user session for root
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger root
+          sudo systemctl start user@0.service
+          for _ in $(seq 1 10); do
+            [ -S "/run/user/0/bus" ] && break
+            sleep 1
+          done
+          echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
+
+      # digstore is out of THIS contract's scope (it has its own installed-
+      # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
+      # run focused on the dig-node + dig-dns service contract #502 tracks.
+      - name: Install (dig-node + dig-dns, pinned versions)
+        run: |
+          $SUDO "$INSTALLER" \
+            --no-digstore \
+            --dig-node-version "$DIG_NODE_VERSION" \
+            --dig-dns-version "$DIG_DNS_VERSION" \
+            --bin-dir "$BIN_DIR" \
+            --json | tee install.json
+
+      # Diagnostics only — never gates the job (`if: always()`). Surfaces the
+      # REAL systemd-level reason if dig-node's `--user` unit reports
+      # anything other than active, since svc.rs's health check only sees
+      # is-active's one-word verdict, not WHY. Queries the REAL unit name
+      # (`dignetwork-dig-node`, see `svc::linux_unit_name` — the
+      # `service-manager` crate drops the "net" qualifier on Linux, #524),
+      # never the canonical `net.dignetwork.dig-node` id Windows/macOS use.
+      - name: (Linux) diagnose the dig-node --user unit's real systemd state
+        if: always() && runner.os == 'Linux'
+        run: |
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+          sudo -E systemctl --user status dignetwork-dig-node --no-pager -l || true
+          sudo -E systemctl --user list-units --all --no-pager | grep -i dig || true
+          sudo -E journalctl --user -u dignetwork-dig-node --no-pager -n 60 || true
+
+      - name: (Linux) diagnose the dig-dns system unit's real systemd state
+        if: always() && runner.os == 'Linux'
+        run: |
+          sudo systemctl status dignetwork-dig-dns --no-pager -l || true
+          sudo journalctl -u dignetwork-dig-dns --no-pager -n 60 || true
+          sudo ss -ltnp 2>/dev/null | grep -i ':80\|:8053' || true
+
+      - name: Assert the #493 fail-loud readiness verdict — both components ready
+        run: |
+          jq -e '.ok == true' install.json
+          jq -e '.result.ready == true' install.json
+          jq -e '.result.failures == []' install.json
+
+      - name: Assert dig-node registered + RUNNING by canonical id, dig.local resolves
+        run: |
+          jq -e '.result.service.installed == true' install.json
+          jq -e '.result.service.health_checked == true' install.json
+          jq -e '.result.service.health_ok == true' install.json
+          jq -e '.result.service.dig_local_resolves == true' install.json
+
+      - name: Assert dig-dns registered + RUNNING by canonical id, with a live resolution path
+        run: |
+          jq -e '.result.dns.installed == true' install.json
+          jq -e '.result.dns.service_running == true' install.json
+          jq -e '(.result.dns.paths_live | length) > 0' install.json
+
+      - name: Windows — verify the SCM display names via `sc qc` (#494)
+        if: runner.os == 'Windows'
+        run: |
+          NODE_QC="$(sc.exe qc net.dignetwork.dig-node)"
+          echo "$NODE_QC"
+          echo "$NODE_QC" | grep -q "DIG NETWORK: NODE"
+          DNS_QC="$(sc.exe qc net.dignetwork.dig-dns)"
+          echo "$DNS_QC"
+          echo "$DNS_QC" | grep -q "DIG NETWORK: DNS"
+
+      - name: Windows — both services RUNNING per `sc query` (belt-and-braces)
+        if: runner.os == 'Windows'
+        run: |
+          sc.exe query net.dignetwork.dig-node | grep -q "RUNNING"
+          sc.exe query net.dignetwork.dig-dns | grep -q "RUNNING"
+
+      - name: Linux — both units active per `systemctl` (belt-and-braces)
+        if: runner.os == 'Linux'
+        run: |
+          # Real Linux unit names, NOT the canonical dotted id (svc::linux_unit_name /
+          # dns::plan::service_script_name, #524): the "net" qualifier is dropped and
+          # {organization}-{application} hyphen-joined for BOTH services (the
+          # service-manager crate's ServiceLabel::to_script_name(), which every
+          # dig-node/dig-dns Linux registration in this workspace goes through) --
+          # dig-node -> dignetwork-dig-node, dig-dns -> dignetwork-dig-dns. dig-node is
+          # USER-level under root's own session (see the "bring up a systemd/D-Bus
+          # user session for root" step above); dig-dns is machine-wide (#494). `-E`
+          # carries this job's XDG_RUNTIME_DIR override to root's shell.
+          sudo -E systemctl --user is-active dignetwork-dig-node
+          systemctl is-active dignetwork-dig-dns
+
+      - name: macOS — both jobs running per `launchctl` (belt-and-braces)
+        if: runner.os == 'macOS'
+        run: |
+          sudo launchctl print system/net.dignetwork.dig-node | grep -q "state = running"
+          sudo launchctl print system/net.dignetwork.dig-dns | grep -q "state = running"
+
+      - name: Uninstall dig-node via the installer flag + assert deregistered
+        run: |
+          $SUDO "$INSTALLER" --uninstall-dig-node --bin-dir "$BIN_DIR" --json | tee uninstall-node.json
+          jq -e '.result.uninstalled == true' uninstall-node.json
+          jq -e '.result.dig_local_removed == true' uninstall-node.json
+
+      - name: Uninstall dig-dns via the installer flag + assert deregistered
+        run: |
+          $SUDO "$INSTALLER" --uninstall-dig-dns --json | tee uninstall-dns.json
+          jq -e '.result.uninstalled == true' uninstall-dns.json
+
+      - name: Windows — both services gone per `sc query`
+        if: runner.os == 'Windows'
+        run: |
+          ! sc.exe query net.dignetwork.dig-node
+          ! sc.exe query net.dignetwork.dig-dns
+
+      - name: Linux — both units gone per `systemctl`
+        if: runner.os == 'Linux'
+        run: |
+          ! sudo -E systemctl --user cat dignetwork-dig-node.service
+          ! systemctl cat dignetwork-dig-dns.service
+
+      - name: macOS — both jobs gone per `launchctl`
+        if: runner.os == 'macOS'
+        run: |
+          ! sudo launchctl print system/net.dignetwork.dig-node
+          ! sudo launchctl print system/net.dignetwork.dig-dns
+
+      - name: Assert the dig.local hosts entry is gone
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            HOSTS_FILE="/c/Windows/System32/drivers/etc/hosts"
+          else
+            HOSTS_FILE="/etc/hosts"
+          fi
+          ! grep -q "dig.local" "$HOSTS_FILE"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-e2e-${{ matrix.os }}
+          path: |
+            install.json
+            uninstall-node.json
+            uninstall-dns.json
+          if-no-files-found: ignore

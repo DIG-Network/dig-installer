@@ -39,6 +39,17 @@ AND each CLI (digstore/dig-node/dig-dns) resolves on PATH; otherwise it exits `I
 (exit 12) listing what failed (#493/#496). After a real install, verify from a **new** shell:
 `dig-node --version` / `dig-dns --version` / `digstore --version` all resolve.
 
+**Cross-OS install -> health -> uninstall e2e (#502).** `.github/workflows/installer-e2e.yml` runs
+this exact real, elevated install/uninstall cycle for both dig-node + dig-dns on
+`windows-latest`/`macos-14`/`ubuntu-latest` on every PR touching `src/**`/`tests/**`, and can be
+triggered manually via `gh workflow run installer-e2e.yml --repo DIG-Network/dig-installer`. It pins
+`--dig-node-version`/`--dig-dns-version` to a known-good released tag (dig_ecosystem#524) rather than
+"latest", so it stays deterministic across either repo's own release-in-progress window — bump the
+`DIG_NODE_VERSION`/`DIG_DNS_VERSION` env values at the top of that workflow when validating a newer
+release. To reproduce it locally on Linux/macOS: `sudo -E dig-installer --no-digstore --dig-node-version
+<ver> --dig-dns-version <ver> --bin-dir /tmp/dig-bin --json` (Windows: run from an Administrator
+console, no `sudo` needed).
+
 ## GUI (`gui/app`, Tauri 2)
 
 Prereqs: Node 18+, the Rust stable toolchain, and the Tauri CLI prereqs for your OS

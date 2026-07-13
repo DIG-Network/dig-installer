@@ -13,8 +13,19 @@
 //! binaries (`dig-node install` / `dig-dns install`) register under; this
 //! installer queries by exactly those ids. Per-OS query:
 //!   * **Windows:** `sc query <id>` → `STATE : 4  RUNNING`.
-//!   * **Linux:** `systemctl is-active <id>` → `active`.
+//!   * **Linux:** `systemctl [--user] is-active <id>` → `active` (see below).
 //!   * **macOS:** `launchctl print system/<id>` → `state = running`.
+//!
+//! **Linux checks BOTH systemd scopes** (dig_ecosystem#502/#524 finding):
+//! dig-node's own `install` always prefers a USER-level unit regardless of
+//! privilege (its `PREFERS_USER_LEVEL`, a deliberate no-elevation-needed
+//! design), while dig-installer registers dig-dns machine-wide (`dns/
+//! linux.rs`, #494) — so a single system-scoped `systemctl is-active` can
+//! never see a genuinely-running dig-node, permanently reporting "registered
+//! but NOT running" even on a healthy install. [`service_run_state_on`]
+//! queries `--user` THEN system scope and combines them ([`combine_systemctl_states`]):
+//! Running wins if EITHER scope reports it, keeping this agnostic to whichever
+//! scope a given service id actually registers at.
 //!
 //! Layering: the per-OS output PARSERS are pure + unit-tested; the spawns live
 //! in [`service_run_state`].
@@ -208,11 +219,10 @@ fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
             }
         }
         Os::Linux => {
-            let out = Command::new("systemctl").arg("is-active").arg(id).output();
-            match out {
-                Ok(o) => parse_systemctl_is_active(&String::from_utf8_lossy(&o.stdout)),
-                Err(_) => ServiceRunState::Unknown,
-            }
+            let unit = linux_unit_name(id);
+            let user = query_systemctl_is_active(&["--user", "is-active", &unit]);
+            let system = query_systemctl_is_active(&["is-active", &unit]);
+            combine_systemctl_states(user, system)
         }
         Os::MacOs => {
             let out = Command::new("launchctl")
@@ -271,6 +281,78 @@ pub fn parse_systemctl_is_active(text: &str) -> ServiceRunState {
         "unknown" | "" => ServiceRunState::NotFound,
         _ => ServiceRunState::Unknown,
     }
+}
+
+/// Map a canonical reverse-DNS service id to the systemd unit name it is
+/// ACTUALLY registered under on Linux (dig_ecosystem#502/#524 finding).
+///
+/// Windows (`sc`) and macOS (`launchctl`) both address a service by the FULL
+/// canonical id verbatim — confirmed by [`parse_sc_query`]/
+/// [`parse_launchctl_print`]'s own tests and the 3-OS installer-e2e job.
+/// Linux does not: EVERY dig-node/dig-dns systemd registration in this
+/// workspace goes through the `service-manager` crate's [`ServiceLabel`]
+/// (dig-node's own `install`, and this installer's OWN `dns::plan`/
+/// `dns::linux` for dig-dns), whose systemd backend names the unit via
+/// `ServiceLabel::to_script_name()` — which DROPS the reverse-DNS qualifier
+/// and hyphen-joins `{organization}-{application}`, so
+/// `net.dignetwork.dig-node` registers as `dignetwork-dig-node` and
+/// `net.dignetwork.dig-dns` as `dignetwork-dig-dns` (verified directly
+/// against a real install — the "registered but NOT running" false-negative
+/// this fixes; `dns::plan::service_script_name` derives the identical value
+/// for dig-dns's own registration, so the two can't drift apart).
+///
+/// Applying the SAME parse+derive here (rather than hardcoding either
+/// result) means this needs no per-service knowledge at all, and stays
+/// correct even if a THIRD service adopts the same reverse-DNS convention.
+/// A canonical id that fails to parse (never expected — [`DIG_NODE_SERVICE_ID`]/
+/// [`DIG_DNS_SERVICE_ID`] are both fixed, valid `owner.org.app` strings) is
+/// returned unchanged rather than panicking.
+fn linux_unit_name(id: &str) -> String {
+    id.parse::<service_manager::ServiceLabel>()
+        .map(|label| label.to_script_name())
+        .unwrap_or_else(|_| id.to_string())
+}
+
+/// Spawn `systemctl <extra_args>` (e.g. `["--user", "is-active", id]` or
+/// `["is-active", id]`) and parse the result. A spawn failure — including
+/// `--user` finding no reachable systemd/D-Bus session (the exact state a
+/// process with no user-session, like a bare `sudo` shell, is in) — resolves
+/// to [`ServiceRunState::Unknown`], never a panic; [`combine_systemctl_states`]
+/// treats that as "uninformative" and defers to the other scope's result.
+fn query_systemctl_is_active(extra_args: &[&str]) -> ServiceRunState {
+    match std::process::Command::new("systemctl")
+        .args(extra_args)
+        .output()
+    {
+        Ok(o) => parse_systemctl_is_active(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => ServiceRunState::Unknown,
+    }
+}
+
+/// Combine a Linux service id's `--user`-scope and system-scope
+/// `systemctl is-active` results into one verdict (dig_ecosystem#502/#524):
+/// a given id might be registered USER-level (dig-node's own `install`,
+/// unconditionally) or machine-wide (dig-installer's own dig-dns wiring,
+/// #494) — this stays agnostic to which, rather than hardcoding a
+/// per-service assumption that would break the moment either side's
+/// registration model changes. Pure — the two spawns live in
+/// [`service_run_state_on`].
+///
+/// **Running wins** if EITHER scope reports it (the service genuinely is up,
+/// wherever it's registered). Otherwise prefer the more INFORMATIVE result:
+/// `Stopped` (a real registration exists there, just not running) beats
+/// `NotFound` (nothing registered at that scope) beats `Unknown` (the scope
+/// couldn't even be queried, e.g. no user-session available).
+fn combine_systemctl_states(user: ServiceRunState, system: ServiceRunState) -> ServiceRunState {
+    if user == ServiceRunState::Running || system == ServiceRunState::Running {
+        return ServiceRunState::Running;
+    }
+    for candidate in [ServiceRunState::Stopped, ServiceRunState::NotFound] {
+        if user == candidate || system == candidate {
+            return candidate;
+        }
+    }
+    ServiceRunState::Unknown
 }
 
 /// Parse macOS `launchctl print system/<id>` output for the daemon state.
@@ -363,6 +445,97 @@ mod tests {
             parse_systemctl_is_active("reloading\n"),
             ServiceRunState::Stopped
         );
+    }
+
+    // -- combine_systemctl_states: Running wins from EITHER scope (#502/#524) --
+
+    #[test]
+    fn combine_reports_running_when_only_the_user_scope_is() {
+        // The exact #524 regression: dig-node registers `--user`-scope only;
+        // a system-scope-only query alone would report NotFound/Stopped and
+        // permanently mask a genuinely-running service.
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::Running, ServiceRunState::NotFound),
+            ServiceRunState::Running
+        );
+    }
+
+    #[test]
+    fn combine_reports_running_when_only_the_system_scope_is() {
+        // dig-dns's mirror case: machine-wide (system-scope) only.
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::NotFound, ServiceRunState::Running),
+            ServiceRunState::Running
+        );
+    }
+
+    #[test]
+    fn combine_reports_running_when_both_scopes_are() {
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::Running, ServiceRunState::Running),
+            ServiceRunState::Running
+        );
+    }
+
+    #[test]
+    fn combine_prefers_stopped_over_not_found_when_neither_is_running() {
+        // Stopped is more informative (a registration genuinely exists there)
+        // than NotFound (nothing registered at that scope) — surface it.
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::Stopped, ServiceRunState::NotFound),
+            ServiceRunState::Stopped
+        );
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::NotFound, ServiceRunState::Stopped),
+            ServiceRunState::Stopped
+        );
+    }
+
+    #[test]
+    fn combine_reports_not_found_when_neither_scope_has_a_registration() {
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::NotFound, ServiceRunState::NotFound),
+            ServiceRunState::NotFound
+        );
+    }
+
+    #[test]
+    fn combine_falls_back_to_unknown_when_both_scopes_are_unqueryable() {
+        // e.g. neither a user D-Bus session nor the system manager could be
+        // reached at all — genuinely indeterminate, never a false Running/Stopped.
+        assert_eq!(
+            combine_systemctl_states(ServiceRunState::Unknown, ServiceRunState::Unknown),
+            ServiceRunState::Unknown
+        );
+    }
+
+    // -- linux_unit_name: the REAL systemd unit name per canonical id (#502/#524) --
+
+    #[test]
+    fn linux_unit_name_maps_dig_node_to_the_service_manager_crates_script_name() {
+        // The exact #524 regression: service-manager 0.7.1's systemd backend
+        // drops the "net" qualifier and hyphen-joins the rest.
+        assert_eq!(linux_unit_name(DIG_NODE_SERVICE_ID), "dignetwork-dig-node");
+    }
+
+    #[test]
+    fn linux_unit_name_maps_dig_dns_to_the_same_derived_script_name_it_registers_under() {
+        // dig-installer registers dig-dns through the SAME ServiceLabel
+        // machinery (`dns::plan::service_script_name`) — this must derive the
+        // identical value, by construction, not a separately-hardcoded guess.
+        assert_eq!(
+            linux_unit_name(DIG_DNS_SERVICE_ID),
+            crate::dns::plan::service_script_name()
+        );
+        assert_eq!(linux_unit_name(DIG_DNS_SERVICE_ID), "dignetwork-dig-dns");
+    }
+
+    #[test]
+    fn linux_unit_name_passes_through_a_single_token_id_unchanged() {
+        // A label with no organization/qualifier (a single token, no dots)
+        // has nothing to strip or hyphen-join, so it comes back verbatim —
+        // the one case `to_script_name()` is genuinely a no-op passthrough.
+        assert_eq!(linux_unit_name("standalone"), "standalone");
     }
 
     #[test]

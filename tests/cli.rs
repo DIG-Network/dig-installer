@@ -2,15 +2,30 @@
 //!
 //! These drive the real binary (via `assert_cmd`) and lock the agent-facing
 //! surface — `--help-json`, `--help`, and the structured error envelope — so a
-//! regression in the invocation contract fails CI. They are network-free: every
-//! case here either introspects the contract or fails before any HTTP call.
+//! regression in the invocation contract fails CI. Most cases here are
+//! network-free: they either introspect the contract or fail before any HTTP
+//! call (`--dry-run` opting OUT of every component, `--help`/`--help-json`,
+//! the standalone `--uninstall-dig-*` actions).
 //!
-//! (Network-dependent resolution — actually hitting the GitHub releases API — is
-//! intentionally NOT exercised here so the suite is deterministic in CI; the
-//! pure asset/release/error logic is unit-tested in the library.)
+//! Two cases are the deliberate exception (dig_ecosystem#524): a `--dry-run`
+//! that leaves dig-node selected (the #301 default) still resolves its
+//! release over the real GitHub API — `run_report`'s release resolution runs
+//! regardless of `--dry-run`, only the download/write is skipped — so those
+//! two tests PIN `--dig-node-version` to [`PINNED_DIG_NODE_VERSION`] rather
+//! than the network-hostile "latest": a specific tagged release never
+//! changes shape mid-run, so the test stays deterministic across dig-node's
+//! own release-in-progress windows (unlike `/releases/latest`, which briefly
+//! points at a not-yet-fully-published tag while a release is landing).
+//! (The pure asset/release/error logic is additionally unit-tested,
+//! network-free, in the library.)
 
 use assert_cmd::Command;
 use serde_json::Value;
+
+/// A dig-node release known to be permanently published (tags are never
+/// deleted) — see the module doc's dig_ecosystem#524 note. Bump only if this
+/// specific tag is ever removed upstream, not to "chase latest".
+const PINNED_DIG_NODE_VERSION: &str = "0.29.0";
 
 fn bin() -> Command {
     Command::cargo_bin("dig-installer").expect("dig-installer binary built")
@@ -179,12 +194,21 @@ fn help_json_advertises_the_update_policy_and_force_flag() {
 }
 
 /// #424: a dry-run dig-node-only install reports the firewall-rule intent
-/// (opened by default) in the `--json` payload — network-free (dry-run never
-/// resolves a release).
+/// (opened by default) in the `--json` payload. Pins `--dig-node-version`
+/// (dig_ecosystem#524, see the module doc) — dig-node stays selected (the
+/// #301 default), so this still resolves a real release over the network
+/// even though nothing is downloaded/written.
 #[test]
 fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
     let out = bin()
-        .args(["--no-digstore", "--no-dig-dns", "--dry-run", "--json"])
+        .args([
+            "--no-digstore",
+            "--no-dig-dns",
+            "--dig-node-version",
+            PINNED_DIG_NODE_VERSION,
+            "--dry-run",
+            "--json",
+        ])
         .assert()
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
@@ -199,7 +223,8 @@ fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
 
 /// `--no-open-firewall` must leave the report's `firewall` field entirely
 /// absent (`null`), not merely an unapplied result — proving the opt-out
-/// actually reaches `InstallPlan` from the CLI flag.
+/// actually reaches `InstallPlan` from the CLI flag. Pins `--dig-node-version`
+/// for the same reason as the sibling test above (dig_ecosystem#524).
 #[test]
 fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
     let out = bin()
@@ -207,6 +232,8 @@ fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
             "--no-digstore",
             "--no-dig-dns",
             "--no-open-firewall",
+            "--dig-node-version",
+            PINNED_DIG_NODE_VERSION,
             "--dry-run",
             "--json",
         ])
