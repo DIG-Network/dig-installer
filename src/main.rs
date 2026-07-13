@@ -170,6 +170,12 @@ struct Cli {
     #[arg(long = "open-firewall")]
     open_firewall: bool,
 
+    /// Force a fresh reinstall of digstore/dig-node/dig-dns even when the
+    /// version-aware updater (#309) would otherwise skip a component that's
+    /// already up to date.
+    #[arg(long = "force-reinstall")]
+    force_reinstall: bool,
+
     /// Print what would be done without downloading or changing anything.
     #[arg(long)]
     dry_run: bool,
@@ -284,6 +290,7 @@ fn main() -> std::process::ExitCode {
         // `--no-open-firewall` opts out (`--open-firewall` is the redundant
         // explicit opt-in) — same "`--no-*` wins" pattern as register_scheme.
         open_firewall: cli.open_firewall || !cli.no_open_firewall,
+        force_reinstall: cli.force_reinstall,
         dry_run: cli.dry_run,
     };
 

@@ -52,6 +52,7 @@ pub mod scheme;
 pub mod service;
 pub mod svc;
 pub mod target;
+pub mod update;
 
 use std::path::PathBuf;
 
@@ -115,6 +116,13 @@ pub struct InstallPlan {
     /// is set; needs the same elevation the dig-node service registration
     /// already requires.
     pub open_firewall: bool,
+    /// Force a fresh reinstall of every selected tracked component (digstore /
+    /// dig-node / dig-dns) even when [`update::decide`] would otherwise call
+    /// it up to date (issue #309). Default false: a bare re-run is a version-
+    /// aware update that skips what's already current. Has no effect on a
+    /// component that was already going to Install or Update — those already
+    /// replace the artifact.
+    pub force_reinstall: bool,
     /// Print actions without performing them.
     pub dry_run: bool,
 }
@@ -159,6 +167,7 @@ impl Default for InstallPlan {
             modify_path: true,
             register_scheme: true,
             open_firewall: true,
+            force_reinstall: false,
             dry_run: false,
         }
     }
@@ -184,6 +193,18 @@ pub struct ComponentResult {
     pub url: String,
     /// Where the artifact was written (or would be, on dry-run).
     pub dest: String,
+    /// Version-aware update decision for this component (issue #309): whether
+    /// this run installed it fresh, replaced an outdated/unreadable install,
+    /// or skipped one that was already current. Only `digstore`/`dig-node`/
+    /// `dig-dns` (see `update::tracked_components`) are actually detected;
+    /// every other component (`digs`, `dig-relay`, the DIG Browser) defaults
+    /// to `Install`, matching their existing always-fresh-download behavior.
+    pub update_action: update::UpdateAction,
+    /// The version detected at this component's destination before this run
+    /// (`None` when it was absent). Mirrors
+    /// [`update::UpdateDecision::installed_version`]; `None` for the
+    /// untracked components above.
+    pub previous_version: Option<String>,
 }
 
 /// The PATH change applied (or that would be).
@@ -385,7 +406,34 @@ fn resolve_component(
         asset,
         url,
         dest: dest.to_string_lossy().into_owned(),
+        // The tracked call sites (digstore/dig-node/dig-dns in `run_report_gated`)
+        // overwrite these with a real `update::decide` verdict; every other
+        // caller (digs, dig-relay, the DIG Browser) keeps this default, which
+        // matches their existing always-fresh-download behavior.
+        update_action: update::UpdateAction::Install,
+        previous_version: None,
     })
+}
+
+/// Detect what's already at a resolved component's destination, decide
+/// Install/Update/Skip against the version just resolved (issue #309), log
+/// the decision, and record it onto the [`ComponentResult`] (`update_action`/
+/// `previous_version`) so the caller — the digstore/dig-node/dig-dns sections
+/// of [`run_report_gated`] — can gate the rest of its lifecycle (the
+/// download, the #232 stop/replace/restart) on one source of truth. Detection
+/// is read-only (`update::detect_installed_version`), so this is safe to call
+/// under `--dry-run` for an accurate preview.
+fn apply_update_decision(
+    c: &mut ComponentResult,
+    force_reinstall: bool,
+    log: &mut dyn FnMut(&str),
+) -> update::UpdateDecision {
+    let detected = update::detect_installed_version(std::path::Path::new(&c.dest));
+    let decision = update::decide_with_force(&detected, &c.version, force_reinstall);
+    log(&format!("    {}", decision.summary));
+    c.update_action = decision.action;
+    c.previous_version = decision.installed_version.clone();
+    decision
 }
 
 /// Download a resolved component to its dest (no-op on dry-run).
@@ -500,7 +548,7 @@ fn run_report_gated(
     //    same `with_digstore`/`digstore_version` flags (it has none of its own).
     if plan.with_digstore {
         log("Installing the digstore CLI:");
-        let c = resolve_component(
+        let mut c = resolve_component(
             resolve,
             &Repo::digstore(),
             &plan.digstore_version,
@@ -509,7 +557,15 @@ fn run_report_gated(
             &plan.bin_dir,
         )?;
         log_component(log, &c);
-        download_component(&c, plan.dry_run)?;
+        // #309 version-aware updater: detect what's already at this
+        // destination — a read-only check, safe under `--dry-run` — and
+        // decide Install/Update/Skip against the version just resolved above.
+        let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+        if decision.action != update::UpdateAction::Skip {
+            download_component(&c, plan.dry_run)?;
+        } else {
+            log("    · already up to date — skipping the download");
+        }
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
         }
@@ -570,32 +626,41 @@ fn run_report_gated(
     // 3. dig-node service (optional) + dig.local hosts entry.
     if plan.with_dig_node {
         log("Installing the dig-node local node:");
-        let c = resolve_dig_node(resolve, &plan.dig_node_version, &target, &plan.bin_dir, log)?;
+        let mut c = resolve_dig_node(resolve, &plan.dig_node_version, &target, &plan.bin_dir, log)?;
         log_component(log, &c);
-        // Task #232: stop a currently-running dig-node BEFORE overwriting its
-        // binary (Windows locks a running exe's file — overwriting it in
-        // place would fail with a sharing violation, or worse, corrupt a
-        // partial write). Skip-when-absent/not-serving is not an error; a
-        // stop FAILURE aborts this artifact's write entirely rather than risk
-        // a half-written binary underneath a still-running service.
-        if !plan.dry_run {
-            let dest = std::path::Path::new(&c.dest);
-            let stop =
-                service::stop_running_dig_node(dest).map_err(InstallError::service_stop_failed)?;
-            log(&format!(
-                "    {} {}",
-                if stop.attempted { "✓" } else { "·" },
-                stop.note
-            ));
+        // #309 version-aware updater: decide Install/Update/Skip BEFORE
+        // touching anything. Only Install/Update proceed to the #232
+        // stop-before-write lifecycle below; Skip leaves the running service
+        // and its binary untouched (`register_dig_node` re-verifies it below
+        // rather than reinstalling it).
+        let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+        if decision.action != update::UpdateAction::Skip {
+            // Task #232: stop a currently-running dig-node BEFORE overwriting
+            // its binary (Windows locks a running exe's file — overwriting it
+            // in place would fail with a sharing violation, or worse, corrupt
+            // a partial write). Skip-when-absent/not-serving is not an error;
+            // a stop FAILURE aborts this artifact's write entirely rather
+            // than risk a half-written binary underneath a still-running
+            // service.
+            if !plan.dry_run {
+                let dest = std::path::Path::new(&c.dest);
+                let stop = service::stop_running_dig_node(dest)
+                    .map_err(InstallError::service_stop_failed)?;
+                log(&format!(
+                    "    {} {}",
+                    if stop.attempted { "✓" } else { "·" },
+                    stop.note
+                ));
+            }
+            download_component(&c, plan.dry_run)?;
         }
-        download_component(&c, plan.dry_run)?;
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
         }
         let dig_node_path = PathBuf::from(c.dest.clone());
         report.components.push(c);
 
-        report.service = Some(register_dig_node(&dig_node_path, plan, log));
+        report.service = Some(register_dig_node(&dig_node_path, plan, &decision, log));
 
         // 3b. App-scoped firewall rule for dig-node's peer-RPC listener
         //     (#424) — default-on, toggleable, best-effort (never aborts the
@@ -627,16 +692,23 @@ fn run_report_gated(
             AssetKind::RawBinary,
             &plan.bin_dir,
         ) {
-            Ok(c) => {
+            Ok(mut c) => {
                 log_component(log, &c);
-                download_component(&c, plan.dry_run)?;
+                // #309 version-aware updater — same decide-before-touch
+                // convention as digstore/dig-node above. `register_dig_dns`
+                // reuses `dns::verify_existing` (a read-only re-check) rather
+                // than the full clean-reinstall path when Skip.
+                let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+                if decision.action != update::UpdateAction::Skip {
+                    download_component(&c, plan.dry_run)?;
+                }
                 if !plan.dry_run {
                     report.installed.push(c.dest.clone());
                 }
                 let dig_dns_path = PathBuf::from(c.dest.clone());
                 report.components.push(c);
 
-                report.dns = Some(register_dig_dns(&dig_dns_path, plan, log));
+                report.dns = Some(register_dig_dns(&dig_dns_path, plan, &decision, log));
             }
             // dig-dns is EPIC #174 and may ship no published release yet. Gate
             // this ONE component gracefully instead of failing the whole plan
@@ -1034,16 +1106,29 @@ fn register_relay(
 /// self-verification report, the live path(s), the bound gateway port, the
 /// PAC URL, and the browser-fallback instruction once the service starts
 /// (task #177).
+///
+/// `decision` is the #309 update verdict for this run: when it is
+/// [`update::UpdateAction::Skip`] this calls [`dns::verify_existing`] instead
+/// of [`dns::install`] — a read-only re-check via the SAME `doctor`/`pac`
+/// probes an install ends with, rather than the full per-OS clean-reinstall
+/// (task #494) an unconditional re-`install` would otherwise perform on
+/// every up-to-date run.
 fn register_dig_dns(
     dig_dns_path: &std::path::Path,
     plan: &InstallPlan,
+    decision: &update::UpdateDecision,
     log: &mut dyn FnMut(&str),
 ) -> dns::DnsInstallResult {
     log("Registering dig-dns as an OS service (DNS responder + HTTP gateway):");
     // The OS service runs the dig-dns binary directly (`dig-dns run-service` on
     // Windows — dig-dns's own SCM entrypoint — `dig-dns serve` on macOS/Linux):
     // no installer host-shim to persist (the #499 `1053` fix, see `dns::windows`).
-    let mut result = dns::install(dig_dns_path, &plan.dns_service, plan.dry_run);
+    let mut result = if !plan.dry_run && decision.action == update::UpdateAction::Skip {
+        log("    · already up to date — re-verifying the existing service instead of reinstalling it");
+        dns::verify_existing(dig_dns_path)
+    } else {
+        dns::install(dig_dns_path, &plan.dns_service, plan.dry_run)
+    };
 
     if plan.dry_run {
         log(&format!("    ({})", result.note));
@@ -1178,9 +1263,18 @@ fn resolve_dig_node(
 /// Register dig-node as an OS service and best-effort write the dig.local hosts
 /// entry. Never returns `Err` — a service/hosts failure is recorded in the
 /// result, not propagated (the binary is already placed).
+///
+/// `decision` is the #309 update verdict computed for this run: when it is
+/// [`update::UpdateAction::Skip`] the binary was NOT replaced, so this skips
+/// re-running `dig-node install`/`start` (which would needlessly bounce an
+/// already-current, already-running service) and instead treats the service
+/// as already registered — the health check below still independently
+/// verifies it is genuinely RUNNING, so a skip can never silently paper over
+/// a service that died on its own.
 fn register_dig_node(
     dig_node_path: &std::path::Path,
     plan: &InstallPlan,
+    decision: &update::UpdateDecision,
     log: &mut dyn FnMut(&str),
 ) -> ServiceResult {
     log(&format!(
@@ -1222,22 +1316,36 @@ fn register_dig_node(
         return result;
     }
 
-    match service::install_service(dig_node_path, &plan.service) {
-        Ok(note) => {
-            log(&format!("    ✓ {note}"));
-            result.installed = true;
-            result.started = plan.service.start;
-            result.note = note;
-        }
-        Err(e) => {
-            // Service install can need elevation (Windows SCM). Best-effort:
-            // surface it, do NOT fail the install — the binary is placed.
-            log(&format!("    ! {e}"));
-            log(&format!(
-                "    dig-node is installed at {}; run `dig-node install` from an elevated console to register the service.",
-                dig_node_path.display()
-            ));
-            result.note = e;
+    if decision.action == update::UpdateAction::Skip {
+        // Already up to date: leave the registered service exactly as it is
+        // rather than bouncing it via a needless `install`/`start`. The
+        // health check below still independently confirms it is genuinely
+        // RUNNING before this is trusted.
+        result.installed = true;
+        result.started = plan.service.start;
+        result.note = format!(
+            "already up to date ({}) — left the running service as-is",
+            decision.latest_version
+        );
+        log(&format!("    · {}", result.note));
+    } else {
+        match service::install_service(dig_node_path, &plan.service) {
+            Ok(note) => {
+                log(&format!("    ✓ {note}"));
+                result.installed = true;
+                result.started = plan.service.start;
+                result.note = note;
+            }
+            Err(e) => {
+                // Service install can need elevation (Windows SCM). Best-effort:
+                // surface it, do NOT fail the install — the binary is placed.
+                log(&format!("    ! {e}"));
+                log(&format!(
+                    "    dig-node is installed at {}; run `dig-node install` from an elevated console to register the service.",
+                    dig_node_path.display()
+                ));
+                result.note = e;
+            }
         }
     }
 
@@ -1558,8 +1666,15 @@ pub fn help_json() -> String {
             { "flag": "--register-scheme", "description": "explicit (redundant) opt-in — the chia:// URL-scheme handler is registered by default" },
             { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" },
             { "flag": "--no-open-firewall", "description": "opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; #424)" },
-            { "flag": "--open-firewall", "description": "explicit (redundant) opt-in — the firewall rule is opened by default" }
+            { "flag": "--open-firewall", "description": "explicit (redundant) opt-in — the firewall rule is opened by default" },
+            { "flag": "--force-reinstall", "description": "reinstall digstore/dig-node/dig-dns even if `update_policy` would otherwise skip them as already up to date (#309)" }
         ],
+        "update_policy": {
+            "description": "Every run detects what's already installed for digstore/dig-node/dig-dns (`<bin> --version`), compares it to the release just resolved, and decides per component: absent -> install, an older or unreadable installed version -> update (replace it, reusing the §2 stop/replace/restart lifecycle for the service components), already current (or newer than the latest release) -> skip. A bare re-run is therefore idempotent: it updates only what's outdated and leaves the rest untouched. `--force-reinstall` overrides a skip decision back to update.",
+            "components": ["digstore", "dig-node", "dig-dns"],
+            "actions": ["install", "update", "skip"],
+            "force_flag": "--force-reinstall"
+        },
         "url_scheme_handler": {
             "schemes": ["chia", "urn"],
             "default": true,
@@ -1684,6 +1799,7 @@ mod tests {
             modify_path: false,
             register_scheme: false,
             open_firewall: false,
+            force_reinstall: false,
             dry_run: true,
         }
     }
@@ -2302,7 +2418,16 @@ mod tests {
         assert_eq!(v["ready"], true);
         assert!(v["failures"].as_array().unwrap().is_empty());
         let c = &v["components"][0];
-        for key in ["component", "version", "tag", "asset", "url", "dest"] {
+        for key in [
+            "component",
+            "version",
+            "tag",
+            "asset",
+            "url",
+            "dest",
+            "update_action",
+            "previous_version",
+        ] {
             assert!(c.get(key).is_some(), "component JSON missing key {key}");
         }
         let svc = &v["service"];
@@ -2766,5 +2891,201 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("✗ DIG is NOT ready")));
         assert!(lines.iter().any(|l| l.contains("dig-node: not running")));
         assert!(!lines.iter().any(|l| l.contains("✓ DIG is ready")));
+    }
+
+    // -- #309 version-aware updater: end-to-end wiring through run_report ----
+    //
+    // `update::decide`'s full matrix is unit-tested directly in `update.rs`
+    // (pure, no I/O). These tests instead prove the WIRING: that
+    // `run_report_gated` actually detects the real file at each tracked
+    // component's real computed destination and records the right
+    // `update_action`/`previous_version` on its `ComponentResult`. A "Skip"
+    // end-to-end run needs a binary that both EXISTS at the exact OS-specific
+    // dest name (`digstore.exe` on Windows) AND runs successfully reporting a
+    // matching version — not reproducible portably without a compiled stub,
+    // so the full matrix's Skip/Update-by-version-compare cells stay covered
+    // by `update.rs`'s pure tests; what's tested here is real, cross-platform,
+    // and still meaningful: absent → Install, and present-but-unreadable (a
+    // plain file that can't be executed, on every OS) → Update.
+
+    /// A plain, non-executable file at `path` — exists on disk but fails to
+    /// run as `<path> --version` on every OS (not a valid executable format),
+    /// landing in `update::decide`'s "installed version unreadable" cell.
+    fn write_unrunnable_file(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"not a real binary").unwrap();
+    }
+
+    fn wiring_test_bin_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dig-installer-update-wiring-{tag}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn digstore_wiring_installs_when_absent_and_updates_when_present_but_unreadable() {
+        let bin_dir = wiring_test_bin_dir("digstore");
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.bin_dir = bin_dir.clone();
+
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        let digstore = report
+            .components
+            .iter()
+            .find(|c| c.component == "digstore")
+            .expect("digstore present");
+        assert_eq!(digstore.update_action, update::UpdateAction::Install);
+        assert_eq!(digstore.previous_version, None);
+
+        let target = Target::current().unwrap();
+        write_unrunnable_file(&bin_dir.join(target.exe_name("digstore")));
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        let digstore = report
+            .components
+            .iter()
+            .find(|c| c.component == "digstore")
+            .expect("digstore present");
+        assert_eq!(digstore.update_action, update::UpdateAction::Update);
+        assert!(digstore.previous_version.is_some());
+
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn dig_node_wiring_installs_when_absent_and_updates_when_present_but_unreadable() {
+        let bin_dir = wiring_test_bin_dir("dig-node");
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.bin_dir = bin_dir.clone();
+
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        let node = report
+            .components
+            .iter()
+            .find(|c| c.component == "dig-node")
+            .expect("dig-node present");
+        assert_eq!(node.update_action, update::UpdateAction::Install);
+
+        let target = Target::current().unwrap();
+        write_unrunnable_file(&bin_dir.join(target.exe_name("dig-node")));
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        let node = report
+            .components
+            .iter()
+            .find(|c| c.component == "dig-node")
+            .expect("dig-node present");
+        assert_eq!(node.update_action, update::UpdateAction::Update);
+        assert!(node.previous_version.is_some());
+
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn dig_dns_wiring_installs_when_absent_and_updates_when_present_but_unreadable() {
+        let bin_dir = wiring_test_bin_dir("dig-dns");
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        plan.bin_dir = bin_dir.clone();
+
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        let dns_component = report
+            .components
+            .iter()
+            .find(|c| c.component == "dig-dns")
+            .expect("dig-dns present");
+        assert_eq!(dns_component.update_action, update::UpdateAction::Install);
+
+        let target = Target::current().unwrap();
+        write_unrunnable_file(&bin_dir.join(target.exe_name("dig-dns")));
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        let dns_component = report
+            .components
+            .iter()
+            .find(|c| c.component == "dig-dns")
+            .expect("dig-dns present");
+        assert_eq!(dns_component.update_action, update::UpdateAction::Update);
+        assert!(dns_component.previous_version.is_some());
+
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn untracked_components_always_default_to_install() {
+        // digs/dig-relay/the DIG Browser never run through `apply_update_decision`
+        // — they keep the existing always-fresh-download behavior regardless of
+        // what's on disk at their destination.
+        let bin_dir = wiring_test_bin_dir("untracked");
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let mut plan = base_plan();
+        plan.with_digstore = true; // brings in `digs` alongside it
+        plan.with_relay = true;
+        plan.bin_dir = bin_dir.clone();
+
+        let target = Target::current().unwrap();
+        write_unrunnable_file(&bin_dir.join(target.exe_name("digs")));
+        write_unrunnable_file(&bin_dir.join(target.exe_name("dig-relay")));
+
+        let report = run_dry(&plan, all_releases()).expect("resolves");
+        for id in ["digs", "dig-relay"] {
+            let c = report
+                .components
+                .iter()
+                .find(|c| c.component == id)
+                .unwrap_or_else(|| panic!("{id} present"));
+            assert_eq!(
+                c.update_action,
+                update::UpdateAction::Install,
+                "{id} is not update-tracked (#309 scope: digstore/dig-node/dig-dns only)"
+            );
+            assert_eq!(c.previous_version, None);
+        }
+
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn force_reinstall_defaults_off_and_threads_through_the_plan() {
+        assert!(
+            !InstallPlan::default().force_reinstall,
+            "force_reinstall defaults off — a bare run is version-aware, not a blanket reinstall"
+        );
+    }
+
+    #[test]
+    fn update_decision_summary_appears_in_the_cli_run_summary() {
+        // The CLI/`--json` "run summary" requirement (#309): the decision's
+        // human-readable line must actually reach the log stream a caller
+        // sees, not just live on the struct.
+        let bin_dir = wiring_test_bin_dir("summary-log");
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.bin_dir = bin_dir.clone();
+        let resolve = resolver_from(all_releases());
+
+        let mut lines = Vec::new();
+        run_report_with(&plan, &resolve, &mut |l| lines.push(l.to_string())).expect("resolves");
+        assert!(
+            lines.iter().any(|l| l.contains("install v")),
+            "first run (nothing on disk) logs an install decision: {lines:?}"
+        );
+
+        let target = Target::current().unwrap();
+        write_unrunnable_file(&bin_dir.join(target.exe_name("digstore")));
+        let mut lines = Vec::new();
+        run_report_with(&plan, &resolve, &mut |l| lines.push(l.to_string())).expect("resolves");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("update") && l.contains("unreadable")),
+            "second run (unreadable file present) logs a reinstall-as-update decision: {lines:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&bin_dir);
     }
 }

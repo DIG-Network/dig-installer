@@ -19,6 +19,7 @@ import {
   copyText,
   getMeta,
   bundledDigstoreVersion,
+  componentUpdateStatus,
 } from "./bridge.js";
 
 const DEFAULT_META = { version: "1.0.0", compiler: "1.0.0" };
@@ -57,6 +58,10 @@ export function App() {
     "open-firewall": true,
   });
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
+  // Per-component Install/Update/Skip preview (#309) for the Components
+  // screen — `null` while unchecked/loading, so the screen can distinguish
+  // "haven't checked yet" from "checked, nothing tracked".
+  const [componentStatus, setComponentStatus] = useState(null);
   const [pct, setPct] = useState(0);
   const [lines, setLines] = useState([]);
   const [nowFile, setNowFile] = useState(NOW_FILES[0]);
@@ -103,6 +108,22 @@ export function App() {
       alive = false;
     };
   }, []);
+
+  // Re-check per-component Install/Update/Skip status (#309) each time the
+  // Components screen is shown, against whatever install path is current —
+  // a fresh check per visit rather than a stale one from an earlier path.
+  useEffect(() => {
+    if (step !== 2) return;
+    let alive = true;
+    setComponentStatus(null);
+    (async () => {
+      const status = await componentUpdateStatus(installPath);
+      if (alive) setComponentStatus(status);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [step, installPath]);
 
   // ---- the real install (replaces the prototype's rAF animation) ----
   const startInstall = useCallback(async () => {
@@ -256,7 +277,9 @@ export function App() {
           <div className="pane" key={step}>
             {step === 0 && <Welcome meta={digstoreMeta} />}
             {step === 1 && <License agreed={agreed} setAgreed={setAgreed} />}
-            {step === 2 && <Components sel={sel} toggle={toggle} path={installPath} onChange={onChangeFolder} />}
+            {step === 2 && (
+              <Components sel={sel} toggle={toggle} path={installPath} onChange={onChangeFolder} status={componentStatus} />
+            )}
             {step === 3 && <Installing pct={pct} lines={lines} nowFile={nowFile} error={error} />}
             {step === 4 && <Finish path={installPath} onCopy={copyCmds} copied={copied} meta={digstoreMeta} />}
           </div>
