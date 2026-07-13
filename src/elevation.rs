@@ -95,6 +95,35 @@ pub fn remedy(os: Os) -> &'static str {
 /// tests: a fixed value), so the decision + messaging are unit-tested without a
 /// real privilege probe and without spawning anything.
 pub fn gate(elevated: bool, target: &Target) -> Result<(), InstallError> {
+    guard(elevated, false, target)
+}
+
+/// The full pre-install privilege guard (#492 + #499). Rejects TWO bad states,
+/// in order, before any download/write:
+///
+/// 1. **Running as LocalSystem/SYSTEM** (`is_system`, Windows) → `RUN_AS_SYSTEM`.
+///    A SYSTEM token breaks the GUI (WebView2 writes to `…\systemprofile\…`) and
+///    lands per-user state in the wrong profile. Elevation must be a UAC
+///    elevation of the SAME interactive user — never a service/scheduled-task
+///    relaunch that yields SYSTEM. Refuse with a clear "run as yourself" remedy.
+/// 2. **Not elevated at all** (`!elevated`) → `NOT_ELEVATED` (re-run elevated).
+///
+/// Pure: the caller supplies both bits (production: [`is_elevated`]/[`is_system`];
+/// tests: fixed values), so the decision + messaging are unit-tested directly.
+pub fn guard(elevated: bool, is_system: bool, target: &Target) -> Result<(), InstallError> {
+    if is_system {
+        return Err(InstallError::run_as_system(
+            "the installer is running as LocalSystem/SYSTEM, not your user account. A SYSTEM \
+             token cannot run the installer UI and writes settings to the wrong profile. Run the \
+             installer as your OWN user and approve the Administrator (UAC) prompt — do NOT launch \
+             it via a service, scheduled task, or psexec -s."
+                .to_string(),
+        )
+        .with_hint(
+            "close this, then re-launch the installer normally as your user (it will prompt for \
+             Administrator via UAC, elevating YOUR account — not SYSTEM)",
+        ));
+    }
     if elevated {
         return Ok(());
     }
@@ -109,6 +138,36 @@ pub fn gate(elevated: bool, target: &Target) -> Result<(), InstallError> {
         reason()
     ))
     .with_hint(remedy(target.os)))
+}
+
+/// Is this process running as Windows **LocalSystem/SYSTEM** (well-known SID
+/// `S-1-5-18`)? A SYSTEM token is over-elevated in the wrong way for an
+/// interactive installer (#499). Probed via `whoami /user`. Always `false` on
+/// non-Windows (SYSTEM is a Windows concept; root on Unix is the intended
+/// elevated identity).
+pub fn is_system() -> bool {
+    #[cfg(windows)]
+    {
+        match std::process::Command::new("whoami").arg("/user").output() {
+            Ok(o) if o.status.success() => parse_whoami_is_system(&o.stdout),
+            // FAIL CLOSED: if the identity cannot be determined (whoami failed to
+            // spawn or exited non-zero) we must NOT proceed as an interactive user
+            // — treat the indeterminate result as SYSTEM so `guard` aborts. A
+            // mis-detected interactive SYSTEM install is the bug this guards (#499);
+            // failing open here would let it through on any transient whoami error.
+            _ => true,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Does `whoami /user` output show the LocalSystem SID `S-1-5-18`? Pure — the
+/// SYSTEM decision is unit-tested without spawning `whoami`.
+pub fn parse_whoami_is_system(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).contains("S-1-5-18")
 }
 
 #[cfg(test)]
@@ -190,6 +249,69 @@ mod tests {
         assert!(r.contains("services"));
         assert!(r.contains("dig.local"));
         assert!(r.contains("URL-scheme"));
+    }
+
+    #[test]
+    fn guard_rejects_running_as_system() {
+        // #499 core regression: running as LocalSystem/SYSTEM is refused — even
+        // though a SYSTEM token IS "elevated", it breaks the GUI/profile — with
+        // its own distinct code + a "run as yourself" remedy (never a silent OK).
+        let e = guard(true, true, &win()).unwrap_err();
+        assert_eq!(e.code(), "RUN_AS_SYSTEM");
+        assert_eq!(e.exit_code(), 13);
+        assert!(
+            e.message().contains("SYSTEM"),
+            "must name the SYSTEM token: {}",
+            e.message()
+        );
+        assert!(
+            e.hint().unwrap().to_lowercase().contains("uac")
+                || e.hint().unwrap().contains("your user"),
+            "remedy must tell the user to run as themselves via UAC: {:?}",
+            e.hint()
+        );
+    }
+
+    #[test]
+    fn guard_system_check_precedes_elevation_check() {
+        // A SYSTEM process is refused as RUN_AS_SYSTEM regardless of the elevated
+        // bit — the SYSTEM state is the more specific, more dangerous one.
+        assert_eq!(
+            guard(false, true, &win()).unwrap_err().code(),
+            "RUN_AS_SYSTEM"
+        );
+    }
+
+    #[test]
+    fn guard_passes_for_an_elevated_non_system_user() {
+        // The intended state: an elevated (UAC) interactive user, not SYSTEM.
+        assert!(guard(true, false, &win()).is_ok());
+    }
+
+    #[test]
+    fn guard_falls_through_to_not_elevated_when_unprivileged_and_not_system() {
+        assert_eq!(
+            guard(false, false, &win()).unwrap_err().code(),
+            "NOT_ELEVATED"
+        );
+    }
+
+    #[test]
+    fn parse_whoami_is_system_detects_the_localsystem_sid() {
+        let sys = b"USER INFORMATION\r\n----------------\r\n\
+            User Name           SID\r\n\
+            =================== ========\r\n\
+            nt authority\\system S-1-5-18\r\n";
+        assert!(parse_whoami_is_system(sys));
+        let user = b"User Name    SID\r\ndesktop\\alice S-1-5-21-111-222-333-1001\r\n";
+        assert!(!parse_whoami_is_system(user));
+        assert!(!parse_whoami_is_system(b""));
+    }
+
+    #[test]
+    fn is_system_never_panics() {
+        // Safe to call on any host (CI is not SYSTEM).
+        let _ = is_system();
     }
 
     #[cfg(unix)]

@@ -104,6 +104,115 @@ pub fn with_dig_local_entry(contents: &str) -> Option<String> {
     Some(out)
 }
 
+/// Does a hosts `line` actively map `dig.local` to a LOOPBACK address
+/// (`127.0.0.0/8` or `::1`)? A loopback mapping is what this installer (and its
+/// older versions) write — correcting a stale loopback mapping to the canonical
+/// `127.0.0.2` is the #499 fix, not overriding a user. A NON-loopback mapping
+/// (e.g. `10.0.0.5 dig.local`) is a deliberate user override we must NOT touch.
+fn line_maps_dig_local_to_loopback(line: &str) -> bool {
+    let code = match line.split_once('#') {
+        Some((before, _)) => before,
+        None => line,
+    };
+    let mut fields = code.split_whitespace();
+    match fields.next() {
+        Some(ip) if fields.any(|host| host.eq_ignore_ascii_case(DIG_LOCAL_HOST)) => {
+            ip.starts_with("127.") || ip == "::1"
+        }
+        _ => false,
+    }
+}
+
+/// Does a hosts `line` actively map `dig.local` to EXACTLY `ip`?
+fn line_maps_dig_local_to(line: &str, ip: &str) -> bool {
+    let code = match line.split_once('#') {
+        Some((before, _)) => before,
+        None => line,
+    };
+    let mut fields = code.split_whitespace();
+    match fields.next() {
+        Some(line_ip) if line_ip == ip => {
+            fields.any(|host| host.eq_ignore_ascii_case(DIG_LOCAL_HOST))
+        }
+        _ => false,
+    }
+}
+
+/// Is `dig.local` already mapped to the CORRECT [`DIG_LOCAL_IP`] (127.0.0.2)?
+pub fn has_correct_dig_local(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|l| line_maps_dig_local_to(l, DIG_LOCAL_IP))
+}
+
+/// Remove the `dig.local` alias from a mapping line (used to correct a
+/// wrong-IP entry, #499). Returns the rewritten line, or `None` if the line
+/// mapped ONLY `dig.local` (so the whole line should be dropped).
+fn strip_dig_local_from_line(line: &str) -> Option<String> {
+    let (code, comment) = match line.split_once('#') {
+        Some((before, after)) => (before, Some(after)),
+        None => (line, None),
+    };
+    let mut fields = code.split_whitespace();
+    let ip = fields.next()?;
+    let hosts: Vec<&str> = fields
+        .filter(|h| !h.eq_ignore_ascii_case(DIG_LOCAL_HOST))
+        .collect();
+    if hosts.is_empty() {
+        return None; // the line ONLY mapped dig.local (to a wrong IP) — drop it.
+    }
+    let mut rewritten = format!("{ip}\t{}", hosts.join(" "));
+    if let Some(c) = comment {
+        rewritten.push_str(&format!(" #{c}"));
+    }
+    Some(rewritten)
+}
+
+/// Compute corrected hosts contents that ENSURE `dig.local` maps to
+/// [`DIG_LOCAL_IP`] (127.0.0.2) — the node's dedicated loopback IP (#499).
+///
+/// * `None` if a correct `127.0.0.2 → dig.local` active mapping already exists
+///   (idempotent no-op).
+/// * Otherwise `Some(updated)`: any active `dig.local` mapping to a DIFFERENT
+///   IP (e.g. a stale `127.0.0.1 dig.local` from an older install — the bug
+///   that made the post-install resolve check warn 127.0.0.1) is corrected —
+///   the `dig.local` alias is stripped from that line (the line dropped if it
+///   then maps nothing) — and the canonical marked line is appended. Pure.
+pub fn ensure_dig_local_entry(contents: &str) -> Option<String> {
+    if has_correct_dig_local(contents) {
+        return None;
+    }
+    // Respect a DELIBERATE user override: an active `dig.local` mapping to a
+    // NON-loopback address that we did not add (no installer MARKER) is the user's
+    // choice — never rewrite it (return None, treating it as "present"). A stale
+    // LOOPBACK mapping (an older install's `127.0.0.1 dig.local`, or one carrying
+    // our MARKER) IS corrected below — that is the #499 fix, not a user override.
+    let has_deliberate_override = contents.lines().any(|l| {
+        line_maps_dig_local(l) && !l.contains(MARKER) && !line_maps_dig_local_to_loopback(l)
+    });
+    if has_deliberate_override {
+        return None;
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        if line_maps_dig_local(line) {
+            if let Some(rewritten) = strip_dig_local_from_line(line) {
+                kept.push(rewritten);
+            }
+            // else: drop a line that only mapped dig.local to the wrong IP.
+        } else {
+            kept.push(line.to_string());
+        }
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&dig_local_line());
+    out.push('\n');
+    Some(out)
+}
+
 /// Compute the new hosts-file contents with the installer's `dig.local` line(s)
 /// **removed**, or `None` if there is nothing tagged to remove.
 ///
@@ -125,6 +234,27 @@ pub fn without_dig_local_entry(contents: &str) -> Option<String> {
     Some(out)
 }
 
+/// Write `contents` to `path` ATOMICALLY: write a sibling temp file, then rename
+/// it over `path`. The rename is a single atomic filesystem operation on both
+/// Unix (`rename(2)`) and Windows (`MoveFileEx` with replace) — a crash or
+/// concurrent reader never observes a half-written hosts file (a truncate-then-
+/// write leaves a window where the hosts file is empty/partial, which would break
+/// name resolution system-wide). The temp file lives in the SAME directory so the
+/// rename stays on one filesystem (a cross-device rename is not atomic).
+fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("hosts");
+    let tmp = dir.join(format!(".{stem}.dig-installer.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Best-effort: ensure `127.0.0.2 dig.local` is in the system hosts file.
 ///
 /// Returns:
@@ -141,10 +271,14 @@ pub fn write_dig_local() -> Result<Option<String>, String> {
 /// roundtrip is exercised without touching the system hosts file.
 pub(crate) fn write_dig_local_at(path: &std::path::Path) -> Result<Option<String>, String> {
     let current = std::fs::read_to_string(path).unwrap_or_default();
-    match with_dig_local_entry(&current) {
+    // #499: CORRECT a stale/wrong-IP dig.local mapping (e.g. an old
+    // `127.0.0.1 dig.local`) to the canonical 127.0.0.2, not just append when
+    // absent — otherwise a stale entry silently wins and the resolve check
+    // warns 127.0.0.1.
+    match ensure_dig_local_entry(&current) {
         None => Ok(None),
         Some(updated) => {
-            std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+            atomic_write(path, &updated).map_err(|e| format!("write {}: {e}", path.display()))?;
             Ok(Some(format!(
                 "{DIG_LOCAL_IP} {DIG_LOCAL_HOST} → {}",
                 path.display()
@@ -169,7 +303,7 @@ pub(crate) fn remove_dig_local_at(path: &std::path::Path) -> Result<Option<Strin
     match without_dig_local_entry(&current) {
         None => Ok(None),
         Some(updated) => {
-            std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+            atomic_write(path, &updated).map_err(|e| format!("write {}: {e}", path.display()))?;
             Ok(Some(format!(
                 "removed {DIG_LOCAL_HOST} from {}",
                 path.display()
@@ -257,6 +391,89 @@ mod tests {
     fn idempotent_when_our_entry_present() {
         let before = format!("127.0.0.1 localhost\n{}\n", dig_local_line());
         assert_eq!(with_dig_local_entry(&before), None);
+    }
+
+    // -- #499: ensure_dig_local_entry corrects a stale/wrong-IP mapping --------
+
+    #[test]
+    fn ensure_is_noop_when_already_127_0_0_2() {
+        let before = format!("127.0.0.1 localhost\n{}\n", dig_local_line());
+        assert!(has_correct_dig_local(&before));
+        assert_eq!(ensure_dig_local_entry(&before), None);
+    }
+
+    #[test]
+    fn ensure_corrects_a_stale_127_0_0_1_dig_local_line() {
+        // The exact bug: an old install left `127.0.0.1 dig.local`, so the
+        // resolve check warned 127.0.0.1. ensure must DROP the stale line and
+        // add the canonical 127.0.0.2 entry.
+        let before = "127.0.0.1\tdig.local\n::1\tlocalhost\n";
+        let after = ensure_dig_local_entry(before).expect("must correct the stale entry");
+        assert!(
+            !after
+                .lines()
+                .any(|l| l.starts_with("127.0.0.1") && l.contains("dig.local")),
+            "stale 127.0.0.1 dig.local must be gone:\n{after}"
+        );
+        assert!(after.contains("127.0.0.2\tdig.local"));
+        assert!(after.contains(MARKER));
+        assert!(after.contains("::1\tlocalhost"), "other entries preserved");
+        // And the corrected file now has a valid entry.
+        assert!(has_correct_dig_local(&after));
+    }
+
+    #[test]
+    fn ensure_strips_dig_local_from_a_shared_wrong_ip_line_keeping_other_hosts() {
+        // A shared line `127.0.0.1 localhost dig.local` must keep localhost but
+        // lose dig.local (which moves to its own 127.0.0.2 line).
+        let before = "127.0.0.1 localhost dig.local\n";
+        let after = ensure_dig_local_entry(before).expect("must correct");
+        assert!(
+            after
+                .lines()
+                .any(|l| l.contains("localhost") && !l.contains("dig.local")),
+            "localhost must remain on 127.0.0.1 without dig.local:\n{after}"
+        );
+        assert!(after.contains("127.0.0.2\tdig.local"));
+        assert!(has_correct_dig_local(&after));
+    }
+
+    #[test]
+    fn ensure_appends_when_absent() {
+        let before = "127.0.0.1\tlocalhost\n";
+        let after = ensure_dig_local_entry(before).expect("append");
+        assert!(after.contains("127.0.0.2\tdig.local"));
+        assert!(after.contains("127.0.0.1\tlocalhost"));
+    }
+
+    #[test]
+    fn ensure_respects_a_deliberate_nonloopback_user_mapping() {
+        // A user who deliberately pointed dig.local at a non-loopback host must NOT
+        // be overridden — ensure is a no-op (returns None), leaving their line.
+        let before = "127.0.0.1 localhost\n10.0.0.5   dig.local\n";
+        assert_eq!(ensure_dig_local_entry(before), None);
+    }
+
+    #[test]
+    fn ensure_still_corrects_a_stale_loopback_mapping() {
+        // A stale loopback mapping (older install) is still corrected — it is not a
+        // deliberate override, so #499's fix stands.
+        let before = "127.0.0.1\tdig.local\n";
+        let after = ensure_dig_local_entry(before).expect("must correct stale loopback");
+        assert!(after.contains("127.0.0.2\tdig.local"));
+        assert!(!after
+            .lines()
+            .any(|l| l.starts_with("127.0.0.1") && l.contains("dig.local")));
+    }
+
+    #[test]
+    fn line_maps_dig_local_to_loopback_classifies_ips() {
+        assert!(line_maps_dig_local_to_loopback("127.0.0.1 dig.local"));
+        assert!(line_maps_dig_local_to_loopback("127.0.0.9\tdig.local"));
+        assert!(line_maps_dig_local_to_loopback("::1 dig.local"));
+        assert!(!line_maps_dig_local_to_loopback("10.0.0.5 dig.local"));
+        assert!(!line_maps_dig_local_to_loopback("192.168.1.2 dig.local"));
+        assert!(!line_maps_dig_local_to_loopback("127.0.0.1 localhost"));
     }
 
     #[test]

@@ -48,6 +48,13 @@ pub enum ErrorKind {
     /// running — so the overall install is NOT ready (#493). The final,
     /// aggregate verdict: never print "DIG is ready" when this holds.
     InstallIncomplete,
+    /// The installer is running as **LocalSystem/SYSTEM** (Windows S-1-5-18),
+    /// not the interactive user (#499). A SYSTEM token breaks the GUI (WebView2
+    /// writes to `…\systemprofile\AppData`) and makes per-user state land in the
+    /// wrong profile. Elevation MUST be a UAC elevation of the SAME interactive
+    /// user, never a SYSTEM-yielding relaunch. Refuse + tell the user to re-run
+    /// as themselves and approve the UAC prompt.
+    RunAsSystem,
     /// The dig-node service failed to install/start for a non-elevation reason.
     ServiceStartFailed,
     /// A currently-running service failed to stop before this run could safely
@@ -71,6 +78,7 @@ impl ErrorKind {
             ErrorKind::ServiceNeedsElevation => "SERVICE_NEEDS_ELEVATION",
             ErrorKind::NotElevated => "NOT_ELEVATED",
             ErrorKind::InstallIncomplete => "INSTALL_INCOMPLETE",
+            ErrorKind::RunAsSystem => "RUN_AS_SYSTEM",
             ErrorKind::ServiceStartFailed => "SERVICE_START_FAILED",
             ErrorKind::ServiceStopFailed => "SERVICE_STOP_FAILED",
             ErrorKind::Io => "IO",
@@ -91,6 +99,7 @@ impl ErrorKind {
             ErrorKind::ServiceStopFailed => 10,
             ErrorKind::NotElevated => 11,
             ErrorKind::InstallIncomplete => 12,
+            ErrorKind::RunAsSystem => 13,
         }
     }
 
@@ -110,6 +119,10 @@ impl ErrorKind {
             }
             ErrorKind::InstallIncomplete => {
                 "one or more selected components failed to install or start — DIG is not ready"
+            }
+            ErrorKind::RunAsSystem => {
+                "the installer is running as LocalSystem/SYSTEM — run it as your own user and \
+                 approve the UAC prompt (never via a service/scheduled-task)"
             }
             ErrorKind::ServiceStartFailed => "the dig-node service failed to install or start",
             ErrorKind::ServiceStopFailed => {
@@ -176,6 +189,9 @@ impl InstallError {
     }
     pub fn install_incomplete(msg: impl Into<String>) -> InstallError {
         InstallError::new(ErrorKind::InstallIncomplete, msg)
+    }
+    pub fn run_as_system(msg: impl Into<String>) -> InstallError {
+        InstallError::new(ErrorKind::RunAsSystem, msg)
     }
     pub fn service_start_failed(msg: impl Into<String>) -> InstallError {
         InstallError::new(ErrorKind::ServiceStartFailed, msg)
@@ -251,6 +267,11 @@ pub const EXIT_CODES: &[(u8, &str, &str)] = &[
         "INSTALL_INCOMPLETE",
         "one or more selected components failed to install or start — DIG is not ready",
     ),
+    (
+        13,
+        "RUN_AS_SYSTEM",
+        "the installer is running as LocalSystem/SYSTEM — run it as your own user + approve UAC",
+    ),
 ];
 
 #[cfg(test)]
@@ -272,6 +293,7 @@ mod tests {
         assert_eq!(ErrorKind::ServiceStopFailed.code(), "SERVICE_STOP_FAILED");
         assert_eq!(ErrorKind::NotElevated.code(), "NOT_ELEVATED");
         assert_eq!(ErrorKind::InstallIncomplete.code(), "INSTALL_INCOMPLETE");
+        assert_eq!(ErrorKind::RunAsSystem.code(), "RUN_AS_SYSTEM");
         assert_eq!(ErrorKind::Io.code(), "IO");
     }
 
@@ -288,6 +310,7 @@ mod tests {
             ErrorKind::ServiceStopFailed,
             ErrorKind::NotElevated,
             ErrorKind::InstallIncomplete,
+            ErrorKind::RunAsSystem,
             ErrorKind::Io,
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -326,6 +349,7 @@ mod tests {
                 "SERVICE_NEEDS_ELEVATION" => ErrorKind::ServiceNeedsElevation,
                 "NOT_ELEVATED" => ErrorKind::NotElevated,
                 "INSTALL_INCOMPLETE" => ErrorKind::InstallIncomplete,
+                "RUN_AS_SYSTEM" => ErrorKind::RunAsSystem,
                 "SERVICE_START_FAILED" => ErrorKind::ServiceStartFailed,
                 "SERVICE_STOP_FAILED" => ErrorKind::ServiceStopFailed,
                 "IO" => ErrorKind::Io,
@@ -351,6 +375,7 @@ mod tests {
                 "SERVICE_NEEDS_ELEVATION" => ErrorKind::ServiceNeedsElevation,
                 "NOT_ELEVATED" => ErrorKind::NotElevated,
                 "INSTALL_INCOMPLETE" => ErrorKind::InstallIncomplete,
+                "RUN_AS_SYSTEM" => ErrorKind::RunAsSystem,
                 "SERVICE_START_FAILED" => ErrorKind::ServiceStartFailed,
                 "SERVICE_STOP_FAILED" => ErrorKind::ServiceStopFailed,
                 "IO" => ErrorKind::Io,

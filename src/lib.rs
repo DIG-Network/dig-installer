@@ -37,6 +37,7 @@
 //! is unit-tested; [`run`] is the imperative orchestration that performs I/O.
 
 pub mod asset;
+pub mod daemon_dir;
 pub mod dns;
 pub mod download;
 pub mod elevation;
@@ -241,6 +242,10 @@ pub struct InstallReport {
     /// so the user can run it immediately. Empty on dry-run. A `resolved: false`
     /// entry makes the install NOT ready.
     pub cli_path_checks: Vec<pathcheck::CliPathCheck>,
+    /// Machine-wide daemon state directories created + ACL'd (#501/#499): the
+    /// identity-independent control/auth dirs the dig-node/dig-dns daemons +
+    /// the operator CLI share. Empty on dry-run / when no daemon is installed.
+    pub daemon_dirs: Vec<daemon_dir::DaemonDirResult>,
     /// The AGGREGATE verdict (#493): `true` iff EVERY selected component
     /// installed AND its service is verified RUNNING. Only when this is `true`
     /// may a caller print "✓ DIG is ready". Always `true` on a dry-run (nothing
@@ -419,13 +424,15 @@ fn run_report_gated(
         log("(dry run — no changes will be made)");
     }
 
-    // Pre-install elevation gate (#492): FIRST, before resolving/downloading/
-    // writing anything, so an un-elevated run fails fast and clean with NO
-    // partial state. Only enforced when the plan actually needs elevation
-    // (registers a service / writes hosts); a dry-run or digstore-only run does
-    // not trip it.
+    // Pre-install privilege guard (#492 + #499): FIRST, before resolving/
+    // downloading/writing anything, so a bad-privilege run fails fast and clean
+    // with NO partial state. Rejects running as LocalSystem/SYSTEM (#499 — a
+    // SYSTEM token breaks the GUI + lands state in the wrong profile) AND an
+    // un-elevated run (#492). Only enforced when the plan actually needs
+    // elevation (registers a service / writes hosts); a dry-run or digstore-only
+    // run does not trip it.
     if plan.requires_elevation() {
-        elevation::gate(is_elevated(), &target)?;
+        elevation::guard(is_elevated(), elevation::is_system(), &target)?;
     }
 
     let mut report = InstallReport {
@@ -440,9 +447,20 @@ fn run_report_gated(
         dns: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
+        daemon_dirs: Vec::new(),
         ready: true,
         failures: Vec::new(),
     };
+
+    // 0. Machine-wide daemon state directories (#501/#499). Created BEFORE any
+    //    daemon starts so dig-node/dig-dns write their control-token into a
+    //    stable, identity-independent, tightly-ACL'd dir the operator CLI can
+    //    read WITHOUT being SYSTEM (enables `dig-node pair approve …` from a
+    //    normal shell). Only when a daemon is being installed.
+    if plan.with_dig_node || plan.with_dig_dns {
+        log("Preparing the machine-wide daemon state directories:");
+        report.daemon_dirs = daemon_dir::ensure(target.os, plan.dry_run, log);
+    }
 
     // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
     //    published in the SAME digstore release under its own asset stem
@@ -573,7 +591,7 @@ fn run_report_gated(
                 let dig_dns_path = PathBuf::from(c.dest.clone());
                 report.components.push(c);
 
-                report.dns = Some(register_dig_dns(&dig_dns_path, &target, plan, log));
+                report.dns = Some(register_dig_dns(&dig_dns_path, plan, log));
             }
             // dig-dns is EPIC #174 and may ship no published release yet. Gate
             // this ONE component gracefully instead of failing the whole plan
@@ -591,6 +609,7 @@ fn run_report_gated(
                 report.dns = Some(dns::DnsInstallResult {
                     installed: false,
                     started: false,
+                    service_running: false,
                     needs_elevation: false,
                     note,
                     doctor: None,
@@ -775,6 +794,13 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
                 "dig-dns: the OS service did not register ({}); re-run elevated",
                 d.note
             )),
+            // F7: gate on the fail-loud service-manager RUNNING poll (mirror the
+            // dig-node `health_ok` gate) — a live `paths_live` probe alone is NOT
+            // sufficient (another process could satisfy it; #493 false-success).
+            Some(d) if plan.dns_service.start && !d.service_running => failures.push(format!(
+                "dig-dns: installed but the '{}' service did not reach RUNNING ({}); re-run elevated",
+                svc::DIG_DNS_SERVICE_ID, d.note
+            )),
             Some(d) if plan.dns_service.start && d.paths_live.is_empty() => failures.push(format!(
                 "dig-dns: installed but no live resolution path — the service is not serving ({})",
                 d.note
@@ -791,6 +817,27 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
                 r.note
             )),
             Some(_) => {}
+        }
+    }
+
+    // Machine-wide daemon state-dir hardening (#501 fail-closed, F2/F5): a
+    // control-token directory whose tight ACL could NOT be established AND verified
+    // by read-back is a hard failure. On failure the dir is deleted (fail closed),
+    // so the daemon has no dir to write its control-token into — the install must
+    // report NOT ready rather than let a daemon persist a control-token into a
+    // world/Users-readable directory (a local privilege escalation). Gate each dir
+    // on whether its daemon was selected for install.
+    for dir in &report.daemon_dirs {
+        let selected = match dir.daemon.as_str() {
+            "dig-node" => plan.with_dig_node,
+            "dig-dns" => plan.with_dig_dns,
+            _ => true,
+        };
+        if selected && !dir.acl_applied {
+            failures.push(format!(
+                "{}: the machine-wide state directory could not be hardened + verified ({}); re-run elevated",
+                dir.daemon, dir.note
+            ));
         }
     }
 
@@ -896,20 +943,14 @@ fn register_relay(
 /// (task #177).
 fn register_dig_dns(
     dig_dns_path: &std::path::Path,
-    target: &Target,
     plan: &InstallPlan,
     log: &mut dyn FnMut(&str),
 ) -> dns::DnsInstallResult {
     log("Registering dig-dns as an OS service (DNS responder + HTTP gateway):");
-    // The Windows Service Control Manager needs a binary that itself speaks the
-    // service protocol; dig-dns's `serve` is a plain blocking CLI loop, so the
-    // SCM is pointed at THIS installer's own binary (persisted here) running
-    // the hidden `run-dig-dns-service` entrypoint, which spawns the real
-    // `dig-dns serve` as a supervised child (see `dns::windows`). Unused on
-    // macOS/Linux, where the service execs `dig_dns_path` directly.
-    let persist_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
-
-    let result = dns::install(dig_dns_path, &persist_bin, &plan.dns_service, plan.dry_run);
+    // The OS service runs the dig-dns binary directly (`dig-dns run-service` on
+    // Windows — dig-dns's own SCM entrypoint — `dig-dns serve` on macOS/Linux):
+    // no installer host-shim to persist (the #499 `1053` fix, see `dns::windows`).
+    let mut result = dns::install(dig_dns_path, &plan.dns_service, plan.dry_run);
 
     if plan.dry_run {
         log(&format!("    ({})", result.note));
@@ -958,6 +999,43 @@ fn register_dig_dns(
     }
     if let Some(fallback) = &result.fallback_instruction {
         log(&format!("    {fallback}"));
+    }
+
+    // Post-install SERVICE health check (#493/#499/#502): when a start was
+    // requested, confirm the dig-dns service THIS run registered — identified by
+    // its canonical id (`net.dignetwork.dig-dns`) — actually reached RUNNING per
+    // the OS service manager (Windows `sc query` / Linux `systemctl is-active` /
+    // macOS `launchctl print`, all via `svc`). A Windows 1053 start-timeout, a
+    // failed systemd unit, or an unloaded launchd label surfaces here fail-loud
+    // instead of a false success. The authoritative readiness gate stays the
+    // live doctor path(s) below (a served `.dig` is the strongest signal); this
+    // adds the explicit cross-OS "reached RUNNING" confirmation to the note.
+    if result.installed && plan.dns_service.start {
+        let state = svc::wait_for_service_running(
+            svc::DIG_DNS_SERVICE_ID,
+            HEALTH_CHECK_ATTEMPTS,
+            HEALTH_CHECK_INTERVAL,
+        );
+        // F7: record the RUNNING verdict as a machine-checkable field so readiness
+        // gates on the fail-loud service-manager poll — NOT on `paths_live` alone
+        // (another process could satisfy the DNS/gateway probe; the #493 false-success).
+        result.service_running = state == svc::ServiceRunState::Running;
+        if state == svc::ServiceRunState::Running {
+            log(&format!(
+                "    ✓ service health: {}",
+                state.describe(svc::DIG_DNS_SERVICE_ID)
+            ));
+            result.note.push_str("; service reached RUNNING");
+        } else {
+            log(&format!(
+                "    ! service health: {} — the resolver may not be serving; re-run elevated if it did not start.",
+                state.describe(svc::DIG_DNS_SERVICE_ID)
+            ));
+            result.note.push_str(&format!(
+                "; NOT running ({})",
+                state.describe(svc::DIG_DNS_SERVICE_ID)
+            ));
+        }
     }
 
     result
@@ -1138,6 +1216,22 @@ fn register_dig_node(
                 ));
             }
         }
+        // Verify the Services-panel DISPLAY name persisted (#494/#499): read it
+        // back via `sc qc` DISPLAY_NAME and confirm it is the canonical ALL-CAPS
+        // "DIG NETWORK: NODE", not the raw reverse-DNS service id (the #499
+        // symptom). Windows-only + non-gating: a cosmetic label mismatch is
+        // surfaced in the note but never fails a genuinely-running service.
+        #[cfg(windows)]
+        if running {
+            let dn =
+                svc::verify_display_name(svc::DIG_NODE_SERVICE_ID, svc::DIG_NODE_SERVICE_DISPLAY);
+            if dn.matches {
+                note.push_str(&format!("; {}", dn.note));
+            } else {
+                note.push_str(&format!("; display name NOT verified — {}", dn.note));
+            }
+        }
+
         if running {
             log(&format!("    ✓ health check: {note}"));
         } else {
@@ -2181,6 +2275,7 @@ mod tests {
             dns: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
+            daemon_dirs: Vec::new(),
             ready: true,
             failures: Vec::new(),
         }
@@ -2313,6 +2408,7 @@ mod tests {
         report.dns = Some(dns::DnsInstallResult {
             installed: true,
             started: true,
+            service_running: true, // reached RUNNING, but serves no path
             needs_elevation: false,
             note: "registered".to_string(),
             doctor: None,
@@ -2325,6 +2421,70 @@ mod tests {
         assert_eq!(failures.len(), 1, "got: {failures:?}");
         assert!(failures[0].contains("dig-dns"));
         assert!(failures[0].contains("no live resolution path"));
+    }
+
+    #[test]
+    fn readiness_fails_when_the_dig_dns_service_did_not_reach_running() {
+        // F7: even with a live resolution path, dig-dns is NOT ready unless OUR
+        // service reached RUNNING per the service manager — a path probe another
+        // process could satisfy must not mark it ready (#493 false-success).
+        let mut plan = base_plan();
+        plan.dry_run = false;
+        plan.with_dig_dns = true;
+        let mut report = report_shell();
+        report.dns = Some(dns::DnsInstallResult {
+            installed: true,
+            started: true,
+            service_running: false, // did NOT reach RUNNING
+            needs_elevation: false,
+            note: "registered".to_string(),
+            doctor: None,
+            paths_live: vec!["dns".to_string()], // a path probe passed anyway
+            bound_port: None,
+            pac_url: None,
+            fallback_instruction: None,
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-dns"));
+        assert!(failures[0].contains("did not reach RUNNING"));
+    }
+
+    #[test]
+    fn readiness_fails_when_a_daemon_state_dir_is_not_hardened() {
+        // #501 F2/F5: a control-token dir whose tight ACL could not be verified is
+        // a hard failure — the install must report NOT ready (fail closed).
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.daemon_dirs = vec![daemon_dir::DaemonDirResult {
+            daemon: "dig-node".to_string(),
+            path: r"C:\ProgramData\DigNode".to_string(),
+            created: false,
+            acl_applied: false,
+            note: "ACL read-back verification FAILED".to_string(),
+        }];
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-node"));
+        assert!(failures[0].contains("state directory could not be hardened"));
+    }
+
+    #[test]
+    fn readiness_ignores_an_unhardened_dir_for_an_unselected_daemon() {
+        // Only the SELECTED daemon's dir gates readiness: a dig-dns dir failure
+        // must not fail a dig-node-only install (dig-dns was not requested).
+        let plan = dig_node_service_plan(); // with_dig_dns = false
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.daemon_dirs = vec![daemon_dir::DaemonDirResult {
+            daemon: "dig-dns".to_string(),
+            path: r"C:\ProgramData\DigDns".to_string(),
+            created: false,
+            acl_applied: false,
+            note: "not hardened".to_string(),
+        }];
+        assert!(evaluate_readiness(&plan, &report).is_empty());
     }
 
     #[test]

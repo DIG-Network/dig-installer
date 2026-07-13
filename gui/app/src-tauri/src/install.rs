@@ -190,6 +190,29 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // write, so an un-elevated run fails fast with NO partial state — never the
     // old "half-installed, falsely-successful" outcome (#493). digstore-only
     // (per-user) selections don't trip this.
+    // #499: refuse to run as LocalSystem/SYSTEM, UNCONDITIONALLY (even a
+    // digstore-only install as SYSTEM lands per-user state — PATH, .dig
+    // association — in the wrong profile). A SYSTEM token also breaks the GUI's
+    // own WebView2 (it writes to `…\systemprofile\…\EBWebView`). Elevation MUST
+    // be a UAC elevation of the SAME interactive user — never a service /
+    // scheduled-task / `psexec -s` relaunch that yields SYSTEM. Checked FIRST,
+    // before any unpack/write, so a SYSTEM launch leaves NO partial state.
+    if dig_installer::elevation::is_system() {
+        let msg = "the DIG installer is running as LocalSystem/SYSTEM, not your user account. \
+             A SYSTEM token cannot run the installer UI and writes settings to the wrong profile. \
+             Close this and re-launch the installer normally as your own user — it will prompt for \
+             Administrator via UAC, elevating YOUR account, not SYSTEM. Do NOT launch it via a \
+             service, scheduled task, or psexec -s."
+            .to_string();
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
+        return Err(msg);
+    }
+
     let selects_service = ["dig-node", "dig-dns", "dig-relay"]
         .iter()
         .any(|id| *opts.selected.get(*id).unwrap_or(&false));

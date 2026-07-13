@@ -5,7 +5,7 @@
 
 [package]
 name = "digstore-installer"
-version = "1.0.1"
+version = "1.1.0"
 description = "DIG Installer — the universal DIG Network desktop installer (digstore CLI + dig-node + dig-dns)"
 authors = ["DIG Network"]
 edition = "2021"
