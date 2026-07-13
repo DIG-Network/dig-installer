@@ -152,10 +152,7 @@ pub fn parse_sc_query(text: &str) -> ServiceRunState {
             return ServiceRunState::Running;
         }
         // STOPPED, START_PENDING, STOP_PENDING, PAUSED, … — all "not running".
-        if after.contains("STOP")
-            || after.contains("PENDING")
-            || after.contains("PAUSE")
-        {
+        if after.contains("STOP") || after.contains("PENDING") || after.contains("PAUSE") {
             return ServiceRunState::Stopped;
         }
     }
@@ -238,7 +235,10 @@ mod tests {
 
     #[test]
     fn systemctl_is_active_maps_states() {
-        assert_eq!(parse_systemctl_is_active("active\n"), ServiceRunState::Running);
+        assert_eq!(
+            parse_systemctl_is_active("active\n"),
+            ServiceRunState::Running
+        );
         assert_eq!(
             parse_systemctl_is_active("failed\n"),
             ServiceRunState::Stopped
@@ -259,7 +259,10 @@ mod tests {
         assert_eq!(parse_launchctl_print(running), ServiceRunState::Running);
         let waiting = "system/net.dignetwork.dig-node = {\n\tstate = waiting\n}";
         assert_eq!(parse_launchctl_print(waiting), ServiceRunState::Stopped);
-        assert_eq!(parse_launchctl_print("no state here"), ServiceRunState::Unknown);
+        assert_eq!(
+            parse_launchctl_print("no state here"),
+            ServiceRunState::Unknown
+        );
     }
 
     #[test]
@@ -270,7 +273,9 @@ mod tests {
             ServiceRunState::NotFound,
             ServiceRunState::Unknown,
         ] {
-            assert!(state.describe("net.dignetwork.dig-node").contains("net.dignetwork.dig-node"));
+            assert!(state
+                .describe("net.dignetwork.dig-node")
+                .contains("net.dignetwork.dig-node"));
         }
     }
 
@@ -278,6 +283,8 @@ mod tests {
     fn is_service_running_is_false_for_an_unregistered_service() {
         // A service id that certainly does not exist must NOT report running on
         // any CI host (the false-positive this whole module guards against).
-        assert!(!is_service_running("net.dignetwork.definitely-not-a-real-dig-service-xyz"));
+        assert!(!is_service_running(
+            "net.dignetwork.definitely-not-a-real-dig-service-xyz"
+        ));
     }
 }

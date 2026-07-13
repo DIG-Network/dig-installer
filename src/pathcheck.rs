@@ -116,7 +116,11 @@ mod tests {
     #[test]
     fn augmented_path_is_case_insensitive_on_windows() {
         assert_eq!(
-            augmented_path(r"C:\apps\DIGSTORE\BIN;C:\Windows", r"C:\Apps\DigStore\bin", ';'),
+            augmented_path(
+                r"C:\apps\DIGSTORE\BIN;C:\Windows",
+                r"C:\Apps\DigStore\bin",
+                ';'
+            ),
             r"C:\apps\DIGSTORE\BIN;C:\Windows"
         );
     }
@@ -127,6 +131,9 @@ mod tests {
         // never panic (the fail-loud path depends on this).
         let dir = std::env::temp_dir();
         let err = cli_resolves(&dir, "definitely-not-a-real-dig-cli-xyz").unwrap_err();
-        assert!(err.contains("did not resolve") || err.contains("exited"), "got: {err}");
+        assert!(
+            err.contains("did not resolve") || err.contains("exited"),
+            "got: {err}"
+        );
     }
 }

@@ -43,8 +43,8 @@ pub mod elevation;
 pub mod error;
 pub mod health;
 pub mod hosts;
-pub mod paths;
 pub mod pathcheck;
+pub mod paths;
 pub mod release;
 pub mod service;
 pub mod svc;
@@ -705,7 +705,11 @@ fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dy
             .components
             .iter()
             .find(|c| c.component == cli)
-            .and_then(|c| std::path::Path::new(&c.dest).parent().map(|p| p.to_path_buf()))
+            .and_then(|c| {
+                std::path::Path::new(&c.dest)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+            })
             .unwrap_or_else(paths::default_bin_dir);
         let check = match pathcheck::cli_resolves(&bin_dir, &exe) {
             Ok(version) => {
@@ -2023,9 +2027,7 @@ mod tests {
             .iter()
             .any(|l| l.contains("Installing the digs alias")));
         // The final line is the readiness verdict (dry-run variant).
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Done (dry run")));
+        assert!(lines.iter().any(|l| l.contains("Done (dry run")));
     }
 
     // -- Agent-facing JSON surfaces -----------------------------------------
@@ -2148,5 +2150,216 @@ mod tests {
             v["result"]["residue_removed"][0],
             "Windows service \"net.dignetwork.dig-dns\""
         );
+    }
+
+    // -- #492 elevation gate + #493 fail-loud readiness ----------------------
+
+    /// A non-dry-run plan whose ONLY selected component is the dig-node service.
+    fn dig_node_service_plan() -> InstallPlan {
+        InstallPlan {
+            bin_dir: std::env::temp_dir().join("dig-installer-readiness-test"),
+            with_digstore: false,
+            with_dig_node: true,
+            with_dig_dns: false,
+            modify_path: false,
+            dry_run: false,
+            ..InstallPlan::default()
+        }
+    }
+
+    /// A report shell (non-dry-run) the readiness tests populate per case.
+    fn report_shell() -> InstallReport {
+        InstallReport {
+            schema_version: SCHEMA_VERSION,
+            installer_version: "test".to_string(),
+            target: "windows-x64".to_string(),
+            dry_run: false,
+            components: Vec::new(),
+            path: None,
+            service: None,
+            relay: None,
+            dns: None,
+            installed: Vec::new(),
+            cli_path_checks: Vec::new(),
+            ready: true,
+            failures: Vec::new(),
+        }
+    }
+
+    fn running_service() -> ServiceResult {
+        ServiceResult {
+            installed: true,
+            started: true,
+            port: 9778,
+            note: "installed and started".to_string(),
+            dig_local: "ok".to_string(),
+            dig_local_resolves: true,
+            dig_local_resolve_note: "ok".to_string(),
+            health_checked: true,
+            health_ok: true,
+            health_note: "service 'net.dignetwork.dig-node' is RUNNING".to_string(),
+        }
+    }
+
+    #[test]
+    fn requires_elevation_tracks_privileged_actions() {
+        // A service/hosts install needs elevation; a dry-run or digstore-only
+        // (per-user) run does not.
+        assert!(dig_node_service_plan().requires_elevation());
+        let mut digstore_only = base_plan();
+        digstore_only.with_digstore = true;
+        digstore_only.dry_run = false;
+        assert!(
+            !digstore_only.requires_elevation(),
+            "digstore-only (no service) does not force elevation"
+        );
+        assert!(
+            !base_plan().requires_elevation(),
+            "a dry-run never requires elevation"
+        );
+    }
+
+    #[test]
+    fn elevation_gate_fails_fast_before_any_resolution_when_unprivileged() {
+        // #492 core: an un-elevated service install returns NOT_ELEVATED WITHOUT
+        // ever calling the resolver (the resolver panics if reached) — proving
+        // fail-fast, before any download/write, leaving no partial state.
+        let resolve = |_: &Repo, _: &Option<String>| -> Result<download::Release, InstallError> {
+            panic!("resolver must not run when the elevation gate rejects the run")
+        };
+        let err = run_report_gated(&dig_node_service_plan(), &resolve, &|| false, &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.code(), "NOT_ELEVATED");
+        assert_eq!(err.exit_code(), 11);
+    }
+
+    #[test]
+    fn elevation_gate_lets_an_elevated_run_proceed_to_resolution() {
+        // Elevated → the gate passes; resolution proceeds (a bad resolver error
+        // here would be a resolution failure, NOT a NOT_ELEVATED gate rejection).
+        let resolve = resolver_from(all_releases());
+        // Use a dry-run-equivalent by asserting the gate did not short-circuit:
+        // an elevated non-dry-run would attempt real I/O, so we assert only that
+        // the error (if any) is not the elevation gate.
+        let err = run_report_gated(&dig_node_service_plan(), &resolve, &|| true, &mut |_| {});
+        if let Err(e) = err {
+            assert_ne!(
+                e.code(),
+                "NOT_ELEVATED",
+                "an elevated run must pass the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_report_is_ready_with_no_failures() {
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.with_dig_node = true;
+        plan.with_dig_dns = true;
+        let report = run_dry(&plan, all_releases()).expect("ok");
+        assert!(
+            report.ready,
+            "a dry-run installs nothing, so it is trivially ready"
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn readiness_fails_when_the_dig_node_service_is_not_running() {
+        // #493 core: the service installed but is NOT running per the service
+        // manager → NOT ready (a bare port listener can no longer mask this).
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        let mut svc = running_service();
+        svc.health_ok = false;
+        svc.health_note = "service 'net.dignetwork.dig-node' is not registered".to_string();
+        report.service = Some(svc);
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-node"));
+        assert!(failures[0].contains("not running"));
+    }
+
+    #[test]
+    fn readiness_fails_when_the_dig_node_service_did_not_install() {
+        let plan = dig_node_service_plan();
+        let report = report_shell(); // service: None
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("dig-node"));
+    }
+
+    #[test]
+    fn readiness_passes_when_the_service_is_running_and_the_cli_resolves() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.cli_path_checks.push(pathcheck::CliPathCheck {
+            cli: "dig-node".to_string(),
+            resolved: true,
+            note: "resolved".to_string(),
+        });
+        assert!(evaluate_readiness(&plan, &report).is_empty());
+    }
+
+    #[test]
+    fn readiness_fails_when_dig_dns_has_no_live_resolution_path() {
+        // The user's exact symptom: dig-dns "installed" but `live path(s): NONE`.
+        let mut plan = base_plan();
+        plan.dry_run = false;
+        plan.with_dig_dns = true;
+        let mut report = report_shell();
+        report.dns = Some(dns::DnsInstallResult {
+            installed: true,
+            started: true,
+            needs_elevation: false,
+            note: "registered".to_string(),
+            doctor: None,
+            paths_live: Vec::new(), // NONE live
+            bound_port: None,
+            pac_url: None,
+            fallback_instruction: None,
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-dns"));
+        assert!(failures[0].contains("no live resolution path"));
+    }
+
+    #[test]
+    fn readiness_fails_when_a_required_cli_is_not_on_path() {
+        // #496: a CLI that does not resolve from a fresh shell makes the install
+        // NOT ready even if its service is otherwise up.
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.cli_path_checks.push(pathcheck::CliPathCheck {
+            cli: "dig-node".to_string(),
+            resolved: false,
+            note: "`dig-node` did not resolve on PATH".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-node"));
+        assert!(failures[0].contains("fresh shell"));
+    }
+
+    #[test]
+    fn readiness_verdict_logs_ready_only_when_ready() {
+        let mut lines = Vec::new();
+        let mut report = report_shell();
+        report.ready = true;
+        log_readiness_verdict(&report, &mut |l| lines.push(l.to_string()));
+        assert!(lines.iter().any(|l| l.contains("✓ DIG is ready")));
+
+        let mut lines = Vec::new();
+        let mut report = report_shell();
+        report.ready = false;
+        report.failures = vec!["dig-node: not running".to_string()];
+        log_readiness_verdict(&report, &mut |l| lines.push(l.to_string()));
+        assert!(lines.iter().any(|l| l.contains("✗ DIG is NOT ready")));
+        assert!(lines.iter().any(|l| l.contains("dig-node: not running")));
+        assert!(!lines.iter().any(|l| l.contains("✓ DIG is ready")));
     }
 }

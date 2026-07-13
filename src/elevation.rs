@@ -151,7 +151,11 @@ mod tests {
         assert_eq!(e.code(), "NOT_ELEVATED");
         assert_eq!(e.exit_code(), 11);
         // Honest messaging: it names the privilege + that nothing was changed.
-        assert!(e.message().contains("Administrator"), "got: {}", e.message());
+        assert!(
+            e.message().contains("Administrator"),
+            "got: {}",
+            e.message()
+        );
         assert!(
             e.message().contains("no partial state"),
             "must promise no partial state: {}",

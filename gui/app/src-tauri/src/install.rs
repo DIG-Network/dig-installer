@@ -184,6 +184,30 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     let bin_dir = install_dir.join("bin");
     let lib_dir = install_dir.join("lib");
 
+    // ---- Phase 0: enforce elevation (#492) ----
+    // If the selection registers an OS service (dig-node / dig-dns / dig-relay)
+    // the install needs Administrator/root. Check FIRST, before any unpack/
+    // write, so an un-elevated run fails fast with NO partial state — never the
+    // old "half-installed, falsely-successful" outcome (#493). digstore-only
+    // (per-user) selections don't trip this.
+    let selects_service = ["dig-node", "dig-dns", "dig-relay"]
+        .iter()
+        .any(|id| *opts.selected.get(*id).unwrap_or(&false));
+    if selects_service && !dig_installer::elevation::is_elevated() {
+        let msg = format!(
+            "elevation required: {}. Re-run the installer as Administrator (Windows) / with sudo \
+             (macOS/Linux). Nothing was changed.",
+            dig_installer::elevation::reason()
+        );
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
+        return Err(msg);
+    }
+
     // ---- Phase 1: resolve target ----
     emit_pct(app, 2.0, Some(bin_name()));
     let arch = std::env::consts::ARCH;
@@ -425,18 +449,41 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
             app,
             "Installing the other selected DIG components:".to_string(),
         );
-        if let Err(e) = dig_installer::run_report(&extra_plan, &mut |line| emit_line(app, line)) {
-            let msg = format!("installing additional components failed: {e}");
-            let _ = app.emit(
-                "install://error",
-                InstallError {
-                    message: msg.clone(),
-                },
-            );
-            return Err(msg);
+        // Fail-loud (#493): a completed run that is NOT ready (a selected
+        // component didn't install or its service isn't RUNNING) is a FAILURE —
+        // never emit "DIG is ready". The report's aggregate `ready`/`failures`
+        // (real service-manager health, not a bare port probe) is the verdict.
+        match dig_installer::run_report(&extra_plan, &mut |line| emit_line(app, line)) {
+            Ok(report) if !report.ready => {
+                let msg = format!(
+                    "DIG is NOT ready — {} component(s) failed: {}. Re-run elevated \
+                     (Administrator/root) if elevation is the cause.",
+                    report.failures.len(),
+                    report.failures.join("; ")
+                );
+                let _ = app.emit(
+                    "install://error",
+                    InstallError {
+                        message: msg.clone(),
+                    },
+                );
+                return Err(msg);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let msg = format!("installing additional components failed: {e}");
+                let _ = app.emit(
+                    "install://error",
+                    InstallError {
+                        message: msg.clone(),
+                    },
+                );
+                return Err(msg);
+            }
         }
     }
 
+    // Every selected component installed AND its service is verified RUNNING.
     emit_pct(app, 100.0, Some("done"));
     emit_line(app, r#"<span class="ok">✓</span> DIG is ready."#);
 

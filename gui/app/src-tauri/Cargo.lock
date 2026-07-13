@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "digstore-installer"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dig-installer",
  "dirs 5.0.1",
