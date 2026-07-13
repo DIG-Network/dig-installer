@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.13.0] - 2026-07-13
+
+### Features
+- **installer:** Version-aware updater — detect/update/skip per component (#309) (#19)
+
 ## [0.12.0] - 2026-07-13
 
 ### Features
