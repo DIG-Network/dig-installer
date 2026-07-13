@@ -1,11 +1,12 @@
 //! DIG Installer — Tauri backend.
 //!
 //! Exposes the commands the frontend (src/bridge.js) calls:
-//!   - installer_meta        → { version, compiler }
-//!   - default_install_path  → per-OS default dir
-//!   - run_install(opts)     → runs the real pipeline, streams events
-//!   - cancel_install()      → cooperatively cancels an in-flight install
-//!   - launch_terminal(path) → opens a terminal at the install dir
+//!   - installer_meta                    → { version, compiler }
+//!   - default_install_path              → per-OS default dir
+//!   - component_update_status(path)     → per-component Install/Update/Skip preview (#309)
+//!   - run_install(opts)                 → runs the real pipeline, streams events
+//!   - cancel_install()                  → cooperatively cancels an in-flight install
+//!   - launch_terminal(path)             → opens a terminal at the install dir
 //!
 //! The install runs on a background thread so the UI stays responsive while it
 //! streams `install://progress` / `install://error` / `install://done`.
@@ -76,6 +77,14 @@ fn bundled_version(app: &AppHandle) -> Option<String> {
 #[tauri::command]
 fn default_install_path() -> String {
     install::default_install_path()
+}
+
+/// Component-selection screen preview (issue #309): per-component Install/
+/// Update/Skip status for dig-node/dig-dns, checked against `install_path`
+/// BEFORE the user clicks Install.
+#[tauri::command]
+fn component_update_status(install_path: String) -> Vec<install::ComponentStatusDto> {
+    install::component_update_status(&install_path)
 }
 
 #[tauri::command]
@@ -179,6 +188,7 @@ pub fn run() {
             installer_meta,
             bundled_digstore_version,
             default_install_path,
+            component_update_status,
             run_install,
             cancel_install,
             launch_terminal

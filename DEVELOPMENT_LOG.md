@@ -3,6 +3,33 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## Version-aware updater (#309): a stub executable must match the REAL exe-name convention
+
+Testing the detect→compare→decide pipeline (`src/update.rs`) end-to-end (not just the pure
+`decide()` matrix) needs a fake binary at the EXACT path `resolve_component` would place the real
+one at — `bin_dir.join(target.exe_name(stem))`, i.e. literally `digstore.exe` on Windows, not some
+test-chosen name. That kills the `doctor.rs`/`service.rs` "write a `.cmd`/shell-script stub" trick
+for a genuine present-and-PARSEABLE (Skip/Update-by-version) integration test: Windows' `CreateProcess`
+only special-cases `.bat`/`.cmd`/`.exe`-associated extensions for that shim, and a plain file named
+`digstore.exe` containing batch-script text is NOT dispatched through `cmd.exe` — it's read as a
+(broken) PE and fails to launch. A cross-platform-safe integration test can therefore only cheaply
+prove **absent → Install** (no file at all) and **present-but-unrunnable → Update** (any garbage file
+at the exact dest fails to spawn on every OS, landing in the "unreadable" reinstall branch) — the
+Skip/Update-by-real-version-compare cells stay covered by `update.rs`'s pure `decide()` unit tests
+(which take `DetectedVersion` directly, no process spawn), not a full-pipeline integration test. A
+genuine end-to-end Skip test would need a real compiled per-OS stub binary — not worth the CI weight
+for what the pure matrix already proves.
+
+## Version-aware updater (#309): dependency-light on purpose — no `semver` crate
+
+Every DIG-Network release tag is a bare git-cliff `vMAJOR.MINOR.PATCH` (no pre-release/build
+metadata in practice), so `update.rs`'s comparator is a hand-rolled 3-part `SimpleVersion` rather
+than pulling in the `semver` crate: it is (a) all this installer will ever need, (b) trivially
+correct/testable, and (c) keeps the module dependency-free for its planned #504-B extraction into
+`dig-release-resolver`. A version string that doesn't fit `X.Y.Z` (a real pre-release tag, a
+foreign/garbled `--version` output) deliberately fails to parse rather than being approximated —
+`decide()` treats "can't parse" as "reinstall to be safe" either way, so under-parsing costs nothing.
+
 ## Register dig-dns's OWN `run-service` SCM entrypoint DIRECTLY — a host-shim caused the `1053` (task #494/#499)
 
 The field bug (`dig_ecosystem#499`): installing dig-dns as a Windows service failed with SCM error

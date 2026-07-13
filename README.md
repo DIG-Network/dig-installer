@@ -151,6 +151,7 @@ dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
 | `--no-open-firewall` | off | Opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; see [Firewall](#firewall-dig-nodes-peer-rpc-port) below). |
 | `--open-firewall` | on | Redundant explicit opt-in — the firewall rule is opened by default. |
+| `--force-reinstall` | off | Reinstall `digstore`/`dig-node`/`dig-dns` even if the [version-aware updater](#version-aware-updater) would otherwise skip them as already up to date. |
 | `--uninstall-dig-node` | — | Remove the dig-node OS service, the `dig.local` hosts entry, and the firewall rule this installer created. Idempotent; does not touch the digstore/browser/relay/dig-dns installs. Standalone action — ignores every other flag except `--bin-dir`/`--dry-run`/`--json`. |
 | `--no-dig-dns` | off | Skip `dig-dns` + its service (installed by default). |
 | `--with-dig-dns` | on | Redundant explicit opt-in — dig-dns installs + registers as a **boot-start** OS service (local `*.dig` name resolution) + wires OS split-DNS/NRPT + the Chrome/Edge DoH policy, by default. |
@@ -226,6 +227,20 @@ Default install location (`--bin-dir`):
 Every download is integrity-checkable (SHA-256). `--dry-run` resolves and prints
 every asset, URL, destination, and service command without touching the system
 (`--dry-run --json` emits it as a side-effect-free plan).
+
+---
+
+## Version-aware updater
+
+Re-running `dig-installer` is not a blind reinstall — for `digstore`/`dig-node`/`dig-dns` it
+**detects** what's already at the destination (`<bin> --version`), **compares** it to the release
+it just resolved, and **decides**: absent → install; an older (or unreadable) installed version →
+update (replace it, reusing the same stop/write/start lifecycle above); already current → skip,
+untouched. The decision is printed for every tracked component (`v0.14.0 → v0.15.0 (update)` /
+`v0.15.0 (up to date)` / `not installed → install v0.15.0`) and recorded in `--json`'s
+`components[].update_action`/`previous_version`. `--force-reinstall` overrides a skip and reinstalls
+anyway. The GUI's Components screen shows the same Install/Update/Up-to-date status per component
+before you click Install.
 
 ---
 

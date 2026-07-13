@@ -704,6 +704,36 @@ body {
   margin-left: auto;
 }
 
+/* Per-component Install/Update/Skip status pill (issue #309) — the
+   Components screen's pre-install preview. Colors: skip (already up to
+   date) reads calm/settled (--ok green); update (a newer release is
+   available) reads as an actionable highlight (--warn amber); install (not
+   present yet) and the loading/unknown states stay neutral so they don't
+   compete visually with the pink REQUIRED pill. */
+.comp .pill-status {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border: 1px solid var(--border-soft);
+  color: var(--fg3);
+  padding: 2px 7px;
+  border-radius: var(--r-pill);
+  margin-left: auto;
+  white-space: nowrap;
+}
+.comp .pill-status.skip {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.comp .pill-status.update {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.comp .pill-status.checking,
+.comp .pill-status.unknown {
+  color: var(--fg4);
+  border-color: var(--border-subtle);
+}
+
 /* install progress */
 .prog-wrap {
   margin-top: 26px;

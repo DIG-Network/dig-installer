@@ -135,11 +135,47 @@ fn help_lists_the_selectable_component_flags() {
         "--uninstall-dig-node",
         "--no-open-firewall",
         "--open-firewall",
+        "--force-reinstall",
         "--json",
         "--dry-run",
     ] {
         assert!(stdout.contains(flag), "--help is missing {flag}");
     }
+}
+
+/// #309: the version-aware updater's policy + its force-reinstall override
+/// must be advertised in the machine-readable contract, not just prose.
+#[test]
+fn help_json_advertises_the_update_policy_and_force_flag() {
+    let out = bin().arg("--help-json").assert().success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let policy = &doc["update_policy"];
+    assert!(!policy.is_null(), "help-json must document update_policy");
+    let actions: Vec<&str> = policy["actions"]
+        .as_array()
+        .expect("actions is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(actions, vec!["install", "update", "skip"]);
+    let components: Vec<&str> = policy["components"]
+        .as_array()
+        .expect("components is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(components, vec!["digstore", "dig-node", "dig-dns"]);
+    assert_eq!(policy["force_flag"], "--force-reinstall");
+    let force_flag_documented = doc["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["flag"] == "--force-reinstall");
+    assert!(
+        force_flag_documented,
+        "--force-reinstall must be in the flags list too"
+    );
 }
 
 /// #424: a dry-run dig-node-only install reports the firewall-rule intent

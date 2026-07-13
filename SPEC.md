@@ -331,3 +331,76 @@ component — see `gui/app/src-tauri/src/install.rs` phases 1–6). Every OTHER 
 stop/write/start lifecycle) via a pure `plan_from_selection(selected, bin_dir) -> InstallPlan`
 mapping (`install.rs`) — the GUI never reimplements release resolution, download, or service
 control.
+
+## 7. Version-aware updater (issue #309)
+
+`dig-installer` is not just an installer — a bare re-run is a version-aware UPDATER: for each of
+the three tracked components (`digstore`, `dig-node`, `dig-dns` — `digs`/`dig-relay`/the DIG Browser
+are out of scope, see §7.3), it detects what's already at the resolved destination, compares it
+against the release it just resolved, and decides what to do. The decision core lives in
+`src/update.rs`, deliberately dependency-light and self-contained (a hand-rolled 3-part semver
+comparator, no `semver` crate) so it can be extracted verbatim into the planned shared
+`dig-release-resolver` crate (#504-B) alongside `release.rs`/`download.rs`.
+
+### 7.1 Detect → compare → decide
+
+For each tracked component, in this order:
+
+1. **Resolve** the release the normal way (§1) — this is unconditional; the version-aware step
+   below reuses the version already resolved rather than a second API round trip.
+2. **Detect** what's at the destination: `update::detect_installed_version` spawns
+   `<dest> --version` (read-only — safe under `--dry-run`, so a dry-run preview is accurate) and
+   reads the reported version back, mirroring `pathcheck::cli_resolves`'s spawn convention.
+   `Absent` when nothing exists there yet; `Present(raw)` otherwise (`raw` is empty when the binary
+   exists but couldn't be queried — spawn failure or non-zero exit).
+3. **Decide** (`update::decide`, pure, no I/O) — the full matrix:
+
+   | detected                | vs. latest resolved   | action                              |
+   |-------------------------|------------------------|--------------------------------------|
+   | absent                  | —                      | **Install**                          |
+   | present, parses, older  | installed < latest    | **Update**                            |
+   | present, parses, equal  | installed == latest   | **Skip** (up to date)                 |
+   | present, parses, newer  | installed > latest    | **Skip** (never downgrade)            |
+   | present, does not parse | —                      | **Update** (treated as a reinstall)   |
+
+`--force-reinstall` upgrades a would-be Skip to Update (`update::decide_with_force`); it never
+changes an Install/Update decision, since those already replace the artifact.
+
+### 7.2 What Install/Update/Skip each do
+
+- **digstore** (a PATH binary, no service): Install/Update downloads + overwrites the destination;
+  Skip leaves the existing binary untouched (no download).
+- **dig-node**: Install/Update runs the existing §2 stop-before-write → write → register+start
+  lifecycle unchanged. Skip does NOT call `dig-node install`/`start` at all — the already-registered
+  service is left exactly as it is (never bounced) — but the post-registration health check
+  (`svc::wait_for_service_running`) still independently polls the SAME service-manager RUNNING state
+  a fresh install would, so a Skip can never silently paper over a service that died on its own.
+- **dig-dns**: Install/Update calls `dns::install` (§2.2's clean-reinstall — stop→delete→recreate).
+  Skip instead calls `dns::verify_existing`, which reuses the SAME standalone, read-only `doctor
+  --json`/`pac --json` probes an install ends with (no registration is touched) to build the
+  identical `DnsInstallResult` shape a fresh install reports — so the caller's logging and the
+  `service_running`/`paths_live` readiness gates (§4.2) work unchanged whether this run installed,
+  updated, or skipped.
+
+Every decision is logged as a single human-readable line (`UpdateDecision.summary`, e.g. `"v0.14.0
+→ v0.15.0 (update)"`, `"v0.15.0 (up to date)"`, `"not installed → install v0.15.0"`) and recorded on
+the component's `ComponentResult` (`update_action: "install"|"update"|"skip"`,
+`previous_version: string | null`) — both the CLI run summary and the `--json` payload surface it,
+so re-running the installer idempotently reports exactly what changed.
+
+### 7.3 Scope
+
+Only `digstore`/`dig-node`/`dig-dns` are update-tracked (`update::tracked_components`). `digs` (the
+digstore alias, §1.1) always re-downloads alongside digstore regardless of its own on-disk state
+— a known, accepted scope limit (it shares digstore's version pin and is cheap to refetch).
+`dig-relay` and the DIG Browser installer are opt-in, advanced/one-shot artifacts and are not
+update-tracked at all; selecting them always (re)installs.
+
+### 7.4 GUI preview
+
+The Components screen previews Install/Update/Skip status for `dig-node`/`dig-dns` (NOT `digstore`
+— its GUI install is the bundled/embedded payload from §6, with no network "latest" to diff
+against; its version is shown separately via the existing bundled-version badge) via the
+`component_update_status` Tauri command, calling `update::check_updates` with the real GitHub
+resolver. A status pill next to each tracked component reads "Install" / "Update available" / "Up
+to date"; a resolution failure (e.g. offline) reads "update check unavailable" rather than guessing.

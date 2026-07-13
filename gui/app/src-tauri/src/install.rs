@@ -555,8 +555,68 @@ fn plan_from_selection(
         // a `"open-firewall": false` selection opts out; an absent key means
         // the default (ON) — same convention as `register-scheme` above.
         open_firewall: *selected.get("open-firewall").unwrap_or(&true),
+        // #309: the GUI wizard has no force-reinstall toggle (the CLI's
+        // `--force-reinstall` covers that advanced case) — a GUI-driven
+        // install is always the version-aware install-or-update default.
+        force_reinstall: false,
         dry_run: false,
     }
+}
+
+/// One component's live Install/Update/Skip status (issue #309), shaped for
+/// the Components screen's pre-install preview.
+#[derive(Debug, Serialize)]
+pub struct ComponentStatusDto {
+    pub component: String,
+    /// `"install"` / `"update"` / `"skip"`, or `None` when the latest release
+    /// couldn't be resolved (e.g. offline) — see `summary` for why.
+    pub action: Option<String>,
+    pub installed_version: Option<String>,
+    pub latest_version: Option<String>,
+    /// A human-readable line: the decision summary on success, or the
+    /// resolution error when `action` is `None`.
+    pub summary: String,
+}
+
+/// Check dig-node/dig-dns Install/Update/Skip status for the Components
+/// screen's preview, BEFORE the user clicks Install (issue #309).
+///
+/// `digstore` is deliberately excluded: the GUI's own digstore install is a
+/// bundled/embedded payload with no network "latest" to diff against (see the
+/// module doc's Phase 7 note + `SPEC.md` §6) — its version is already shown
+/// via the `bundled_digstore_version` command, unpacked fresh every run.
+pub fn component_update_status(install_path: &str) -> Vec<ComponentStatusDto> {
+    let bin_dir = PathBuf::from(install_path).join("bin");
+    let target = match dig_installer::target::Target::current() {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    dig_installer::update::check_updates(
+        &bin_dir,
+        &target,
+        &dig_installer::update::live_latest_version_resolver,
+    )
+    .into_iter()
+    .filter(|status| status.component != "digstore")
+    .map(|status| match status.decision {
+        Some(d) => ComponentStatusDto {
+            component: status.component,
+            action: Some(d.action.as_str().to_string()),
+            installed_version: d.installed_version,
+            latest_version: Some(d.latest_version),
+            summary: d.summary,
+        },
+        None => ComponentStatusDto {
+            component: status.component,
+            action: None,
+            installed_version: None,
+            latest_version: None,
+            summary: status
+                .error
+                .unwrap_or_else(|| "could not check for updates".to_string()),
+        },
+    })
+    .collect()
 }
 
 /// Compute the new user-PATH string after appending `dir`.

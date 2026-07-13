@@ -65,6 +65,40 @@ export async function defaultInstallPath() {
   }
 }
 
+/* componentUpdateStatus — per-component Install/Update/Skip preview for the
+ * Components screen (issue #309): checks dig-node/dig-dns against
+ * `installPath` BEFORE the user clicks Install. In a plain browser (no
+ * backend to check against) it falls back to a representative demo dataset —
+ * same "still demonstrable outside Tauri" convention as `simulateInstall`
+ * below — so the screen's Install/Update/Up-to-date pills are visible in a
+ * plain `vite dev`/`preview` run, not just a packaged build. */
+const SIM_COMPONENT_STATUS = [
+  {
+    component: "dig-node",
+    action: "update",
+    installed_version: "0.14.0",
+    latest_version: "0.15.0",
+    summary: "v0.14.0 → v0.15.0 (update)",
+  },
+  {
+    component: "dig-dns",
+    action: "skip",
+    installed_version: "0.9.1",
+    latest_version: "0.9.1",
+    summary: "v0.9.1 (up to date)",
+  },
+];
+
+export async function componentUpdateStatus(installPath) {
+  const a = await api();
+  if (!a) return SIM_COMPONENT_STATUS;
+  try {
+    return await a.invoke("component_update_status", { installPath });
+  } catch {
+    return [];
+  }
+}
+
 export async function pickFolder(current) {
   if (!_tauri) {
     const v = window.prompt("Install location", current);

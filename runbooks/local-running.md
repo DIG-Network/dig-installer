@@ -9,6 +9,7 @@ cargo build                       # builds target/debug/dig-installer[.exe]
 cargo run -- --dry-run --json     # exercise the DEFAULT plan (digstore + dig-node + dig-dns), no writes
 cargo run -- --dry-run --with-relay --with-browser --json   # + the opt-in components
 cargo run -- --dry-run --no-dig-node --no-dig-dns --json    # opt out to just the digstore CLI
+cargo run -- --dry-run --force-reinstall --json              # #309: preview overriding a would-be Skip
 cargo test                        # unit + e2e CLI-contract tests (network-free)
 cargo fmt --all -- --check        # release gate
 cargo clippy --all-targets --all-features -- -D warnings   # release gate
@@ -17,6 +18,11 @@ cargo llvm-cov --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'   # cov
 
 No env vars are required to run the CLI locally; `--bin-dir` overrides the install location if
 you don't want it touching your real PATH/service state while iterating.
+
+**Version-aware updater (#309):** re-running against a `--bin-dir` that already has a component
+installed prints its Install/Update/Skip decision (`update_action`/`previous_version` in `--json`)
+instead of blindly redownloading — point `--bin-dir` at a directory with an existing `dig-node`/
+`dig-dns`/`digstore` binary to exercise Update/Skip locally; an empty dir always decides Install.
 
 **Firewall rule on Linux (#424):** a real (non-dry-run) `--with-dig-node` install never touches
 Linux firewall state — it only prints the manual remedy. If you want the same reachability a
@@ -51,7 +57,10 @@ npx tauri dev            # the REAL Tauri window, wired to the Rust backend (gui
 is undefined), useful for fast UI/theme/layout iteration and Playwright screenshot captures, but it
 never exercises the real Rust install pipeline. Use `npx tauri dev` to test the real pipeline
 (digstore embedded-payload install, plus dig-node/dig-dns/dig-relay/browser via the reused
-`dig_installer::run_report` — see `SPEC.md` §6).
+`dig_installer::run_report` — see `SPEC.md` §6). The Components screen's per-component Install/
+Update/Skip pills (#309, `SPEC.md` §7.4) likewise fall back to a fixed demo dataset
+(`SIM_COMPONENT_STATUS` in `bridge.js`) in plain-browser mode, so they're visible in a screenshot
+without a Tauri build; only `tauri dev` checks REAL on-disk versions.
 
 ### Rust backend (`gui/app/src-tauri`)
 
