@@ -17,5 +17,10 @@
 # Agent git worktrees live here (never on C:\ root) — regenerable, never committed
 /worktrees
 
+# Agent-local tooling (gitnexus skills, per-repo agent notes) — not product code
+/.claude/
+/AGENTS.md
+/CLAUDE.md
+
 # OS noise
 .DS_Store
