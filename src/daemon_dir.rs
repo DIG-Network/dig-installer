@@ -152,12 +152,7 @@ pub fn ensure(os: Os, dry_run: bool, log: &mut dyn FnMut(&str)) -> Vec<DaemonDir
     out
 }
 
-fn ensure_one(
-    os: Os,
-    d: &DaemonDir,
-    path_str: &str,
-    log: &mut dyn FnMut(&str),
-) -> DaemonDirResult {
+fn ensure_one(os: Os, d: &DaemonDir, path_str: &str, log: &mut dyn FnMut(&str)) -> DaemonDirResult {
     let mut result = DaemonDirResult {
         daemon: d.daemon.to_string(),
         path: path_str.to_string(),
@@ -270,9 +265,7 @@ mod tests {
         assert!(dirs[0]
             .path
             .ends_with("Library/Application Support/DigNode"));
-        assert!(dirs[1]
-            .path
-            .ends_with("Library/Application Support/DigDns"));
+        assert!(dirs[1].path.ends_with("Library/Application Support/DigDns"));
     }
 
     #[test]
@@ -286,7 +279,9 @@ mod tests {
         // The interactive user gets READ only — never full, never world.
         assert!(args.iter().any(|a| a == r"MYPC\alice:(OI)(CI)R"));
         assert!(
-            !args.iter().any(|a| a.contains("Everyone") || a.contains("Users:")),
+            !args
+                .iter()
+                .any(|a| a.contains("Everyone") || a.contains("Users:")),
             "must NOT grant Everyone/Users (loose ACL = priv-esc): {args:?}"
         );
     }

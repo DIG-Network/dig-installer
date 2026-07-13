@@ -359,7 +359,9 @@ mod tests {
         let before = "127.0.0.1\tdig.local\n::1\tlocalhost\n";
         let after = ensure_dig_local_entry(before).expect("must correct the stale entry");
         assert!(
-            !after.lines().any(|l| l.starts_with("127.0.0.1") && l.contains("dig.local")),
+            !after
+                .lines()
+                .any(|l| l.starts_with("127.0.0.1") && l.contains("dig.local")),
             "stale 127.0.0.1 dig.local must be gone:\n{after}"
         );
         assert!(after.contains("127.0.0.2\tdig.local"));
@@ -376,7 +378,9 @@ mod tests {
         let before = "127.0.0.1 localhost dig.local\n";
         let after = ensure_dig_local_entry(before).expect("must correct");
         assert!(
-            after.lines().any(|l| l.contains("localhost") && !l.contains("dig.local")),
+            after
+                .lines()
+                .any(|l| l.contains("localhost") && !l.contains("dig.local")),
             "localhost must remain on 127.0.0.1 without dig.local:\n{after}"
         );
         assert!(after.contains("127.0.0.2\tdig.local"));

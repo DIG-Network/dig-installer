@@ -1156,6 +1156,22 @@ fn register_dig_node(
                 ));
             }
         }
+        // Verify the Services-panel DISPLAY name persisted (#494/#499): read it
+        // back via `sc qc` DISPLAY_NAME and confirm it is the canonical ALL-CAPS
+        // "DIG NETWORK: NODE", not the raw reverse-DNS service id (the #499
+        // symptom). Windows-only + non-gating: a cosmetic label mismatch is
+        // surfaced in the note but never fails a genuinely-running service.
+        #[cfg(windows)]
+        if running {
+            let dn =
+                svc::verify_display_name(svc::DIG_NODE_SERVICE_ID, svc::DIG_NODE_SERVICE_DISPLAY);
+            if dn.matches {
+                note.push_str(&format!("; {}", dn.note));
+            } else {
+                note.push_str(&format!("; display name NOT verified — {}", dn.note));
+            }
+        }
+
         if running {
             log(&format!("    ✓ health check: {note}"));
         } else {

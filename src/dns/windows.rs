@@ -309,6 +309,19 @@ pub fn install(
         Err(e) => notes.push(format!("service display name not set: {e}")),
     }
 
+    // Verify the display name actually PERSISTED (#494/#499): read it back via
+    // `sc qc` DISPLAY_NAME. The bug was `sc config` appearing to succeed while
+    // the Services panel still showed the raw reverse-DNS service id — a bare
+    // "set" note is not proof it stuck. Never silent (non-gating: a cosmetic
+    // label mismatch does not fail the functional install).
+    let display_check =
+        crate::svc::verify_display_name(plan::SERVICE_LABEL, plan::SERVICE_DISPLAY_NAME);
+    if display_check.matches {
+        notes.push(format!("verified {}", display_check.note));
+    } else {
+        notes.push(format!("display name NOT verified: {}", display_check.note));
+    }
+
     let mut started = false;
     if cfg.start {
         match mgr.start(ServiceStartCtx { label: label() }) {

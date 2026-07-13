@@ -14,5 +14,8 @@
 /dist-gui
 /_digstore
 
+# Agent git worktrees live here (never on C:\ root) — regenerable, never committed
+/worktrees
+
 # OS noise
 .DS_Store

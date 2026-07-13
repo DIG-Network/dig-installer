@@ -95,6 +95,102 @@ pub fn wait_for_service_running(
     last
 }
 
+/// The result of verifying a Windows service's Services-panel DISPLAY name
+/// matches its canonical value (#494/#499): proof the human-friendly name
+/// persisted rather than silently reverting to the raw reverse-DNS service id
+/// (the exact #499 symptom — `services.msc` showing `net.dignetwork.dig-dns`
+/// instead of "DIG NETWORK: DNS"). Never silent — carries a human note either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayNameCheck {
+    /// The DISPLAY name matches the expected canonical value.
+    pub matches: bool,
+    /// What `sc qc` actually reported (`None` when it could not be read, or on a
+    /// non-Windows host where the Services-panel display name does not apply).
+    pub actual: Option<String>,
+    /// Human-readable detail behind [`Self::matches`].
+    pub note: String,
+}
+
+/// Classify an observed DISPLAY name against the `expected` canonical value for
+/// service `id` (#494/#499). Pure — the `sc qc` spawn is in
+/// [`service_display_name`], so the match/mismatch/absent verdict + its human
+/// note are unit-tested directly without touching the SCM.
+pub fn classify_display_name(actual: Option<&str>, expected: &str, id: &str) -> DisplayNameCheck {
+    match actual {
+        Some(a) if a == expected => DisplayNameCheck {
+            matches: true,
+            actual: Some(a.to_string()),
+            note: format!("display name is \"{expected}\""),
+        },
+        Some(a) => DisplayNameCheck {
+            matches: false,
+            actual: Some(a.to_string()),
+            note: format!("display name is \"{a}\", expected \"{expected}\" (it did not persist)"),
+        },
+        None => DisplayNameCheck {
+            matches: false,
+            actual: None,
+            note: format!("could not read the display name for '{id}' via `sc qc`"),
+        },
+    }
+}
+
+/// The DISPLAY name `sc qc <id>` reports for a Windows service, or `None` if the
+/// query failed, the service is absent, or there is no DISPLAY_NAME line. The
+/// Services-panel display name is a Windows concept (#494/#499), so this is
+/// always `None` on other platforms.
+pub fn service_display_name(id: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("sc")
+            .arg("qc")
+            .arg(id)
+            .output()
+            .ok()?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        parse_sc_qc_display_name(&text)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// Verify service `id` reports the canonical DISPLAY name `expected` via
+/// `sc qc` (#494/#499) — the health-check read-back that proves the
+/// `sc config … displayname=` override actually persisted (the #499 fix). Never
+/// silent: returns a [`DisplayNameCheck`] with a human note in every case.
+pub fn verify_display_name(id: &str, expected: &str) -> DisplayNameCheck {
+    classify_display_name(service_display_name(id).as_deref(), expected, id)
+}
+
+/// Parse the DISPLAY_NAME value from `sc qc <id>` output. The line reads
+/// `        DISPLAY_NAME       : DIG NETWORK: DNS`; the value is everything
+/// after the FIRST colon on that line (so a display name that itself contains a
+/// colon — like "DIG NETWORK: DNS" — is preserved intact), trimmed. `None` when
+/// there is no DISPLAY_NAME line or its value is empty. Pure.
+pub fn parse_sc_qc_display_name(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let is_display_key = trimmed
+            .split(':')
+            .next()
+            .map(|k| k.trim().eq_ignore_ascii_case("DISPLAY_NAME"))
+            .unwrap_or(false);
+        if is_display_key {
+            if let Some((_, value)) = trimmed.split_once(':') {
+                let v = value.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// [`service_run_state`] for an explicit [`Os`] — spawns the OS-appropriate
 /// query and parses it. Split out so the OS dispatch is explicit.
 fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
@@ -277,6 +373,76 @@ mod tests {
                 .describe("net.dignetwork.dig-node")
                 .contains("net.dignetwork.dig-node"));
         }
+    }
+
+    // -- Display-name verification (#494/#499): `sc qc <id>` DISPLAY_NAME. -------
+
+    #[test]
+    fn parse_sc_qc_reads_the_display_name_even_when_it_contains_a_colon() {
+        // Real `sc qc` output; the display name "DIG NETWORK: DNS" itself has a
+        // colon, so the parser must split on the FIRST colon only.
+        let out = "[SC] QueryServiceConfig SUCCESS\r\n\r\n\
+             SERVICE_NAME: net.dignetwork.dig-dns\r\n        \
+             TYPE               : 10  WIN32_OWN_PROCESS\r\n        \
+             START_TYPE         : 2   AUTO_START\r\n        \
+             BINARY_PATH_NAME   : C:\\Program Files\\DIG\\dig-installer.exe run-dig-dns-service\r\n        \
+             DISPLAY_NAME       : DIG NETWORK: DNS\r\n        \
+             SERVICE_START_NAME : LocalSystem\r\n";
+        assert_eq!(
+            parse_sc_qc_display_name(out).as_deref(),
+            Some("DIG NETWORK: DNS")
+        );
+    }
+
+    #[test]
+    fn parse_sc_qc_returns_none_when_no_display_name_line() {
+        let out = "SERVICE_NAME: x\r\n        TYPE : 10  WIN32_OWN_PROCESS\r\n";
+        assert_eq!(parse_sc_qc_display_name(out), None);
+        assert_eq!(parse_sc_qc_display_name(""), None);
+    }
+
+    #[test]
+    fn classify_display_name_matches_when_equal() {
+        let c = classify_display_name(
+            Some("DIG NETWORK: DNS"),
+            DIG_DNS_SERVICE_DISPLAY,
+            DIG_DNS_SERVICE_ID,
+        );
+        assert!(c.matches);
+        assert_eq!(c.actual.as_deref(), Some("DIG NETWORK: DNS"));
+        assert!(c.note.contains("DIG NETWORK: DNS"));
+    }
+
+    #[test]
+    fn classify_display_name_flags_the_did_not_persist_symptom() {
+        // The exact #499 bug: the panel shows the raw reverse-DNS service id
+        // instead of the display name — the config did not persist.
+        let c = classify_display_name(
+            Some("net.dignetwork.dig-dns"),
+            DIG_DNS_SERVICE_DISPLAY,
+            DIG_DNS_SERVICE_ID,
+        );
+        assert!(!c.matches);
+        assert!(c.note.contains("did not persist"), "note: {}", c.note);
+        assert!(c.note.contains("DIG NETWORK: DNS"), "note: {}", c.note);
+    }
+
+    #[test]
+    fn classify_display_name_reports_when_unreadable() {
+        let c = classify_display_name(None, DIG_NODE_SERVICE_DISPLAY, DIG_NODE_SERVICE_ID);
+        assert!(!c.matches);
+        assert!(c.note.contains("could not read"), "note: {}", c.note);
+    }
+
+    #[test]
+    fn verify_display_name_never_panics() {
+        // Safe to call on any host; a service that certainly does not exist
+        // must NOT verify as matching (never a false positive).
+        let c = verify_display_name(
+            "net.dignetwork.definitely-not-a-real-dig-service-xyz",
+            "DIG NETWORK: TEST",
+        );
+        assert!(!c.matches);
     }
 
     #[test]
