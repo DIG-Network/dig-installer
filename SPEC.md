@@ -39,6 +39,17 @@ for easy re-enable; `Components.jsx` filters out any `hidden` component). Desele
 removes it from the install plan entirely (its artifact is neither downloaded nor registered). This
 matches `InstallPlan::default()` (dig-relay + browser are opt-in: `--with-relay`/`--with-browser`).
 
+**Optional GitHub API authentication (#502/#524).** Every release lookup (`/releases/latest`,
+`/releases/tags/<tag>`, the releases-list fallback) is an unauthenticated `api.github.com` call by
+default — GitHub caps those at 60/hour per source IP, a limit shared/heavily-used networks (CI
+runners, corporate NAT) hit routinely. When the `GITHUB_TOKEN` environment variable is set (a
+non-empty string), every such call carries `Authorization: Bearer <token>`, raising the limit to
+5,000/hour — matching the name GitHub Actions already exposes as `secrets.GITHUB_TOKEN` and the `gh`
+CLI convention, so CI needs no new secret. Entirely optional and additive: unset (the default), the
+installer behaves exactly as before this existed; the token is never required, never logged, and the
+release ASSET download itself (a `github.com/.../releases/download/...` redirect, not the API) is
+never authenticated — only the JSON API lookups are. See `download::get_text_with_token`.
+
 ### 1.1 `digs` — a first-class alias of `digstore`
 
 `digs` (issue #434) is a real installed binary, not a shell alias: `digs <args>` behaves
@@ -167,6 +178,17 @@ again after it (now serving the new binary); a service that was never installed/
 skipped cleanly at step 2 and freshly installed+started at step 4; re-running the installer at any
 point is safe (idempotent).
 
+Every delegated subcommand (`install`/`start`/`stop`/`uninstall`) spawns the component's binary
+with its stdio **captured, never inherited** (`service::run_capturing`): a non-zero exit folds the
+child's own combined stdout+stderr into the returned error (nothing is lost — a Windows elevation
+hint dig-node itself prints, for example, still reaches the user via this installer's OWN error/
+`note` reporting), and a success discards it (this installer already logs its own confirmation for
+the same event). Inheriting stdio directly was the PRIOR behavior; it silently broke `--json` mode
+the moment a real (non-dry-run) install ran a delegated subcommand — the child's prose landed on
+the SAME stdout fd `--json` reserves for exactly one structured line, corrupting it for any
+consumer (`jq`, an agent) expecting well-formed JSON (found via the 3-OS installer-e2e job,
+dig_ecosystem#502/#524).
+
 `status --json`'s envelope shape differs per component and is parsed accordingly:
 `dig-node` → flat `{"serving": bool, ...}`; `dig-relay` → nested `{"result": {"serving": bool,
 ...}}"`. Neither binary's `status` can distinguish "not installed" from "installed but stopped" —
@@ -215,7 +237,7 @@ dig-dns's OS service identity is canonical and stable across releases:
 
 | | value |
 |---|---|
-| Service NAME (id) | `net.dignetwork.dig-dns` (`dns::plan::SERVICE_LABEL`) — the reverse-DNS SCM service name (Windows), launchd label (macOS), systemd unit/script name (Linux, `dns::plan::SERVICE_SCRIPT_NAME` = `dig-dns`) |
+| Service NAME (id) | `net.dignetwork.dig-dns` (`dns::plan::SERVICE_LABEL`) — the reverse-DNS SCM service name (Windows), launchd label (macOS); on Linux the REAL systemd unit name is `dignetwork-dig-dns`, derived from `SERVICE_LABEL` via `dns::plan::service_script_name()` (§4.2's "Linux queries the REAL unit name" note) |
 | Windows DISPLAY name | `DIG NETWORK: DNS` (`dns::plan::SERVICE_DISPLAY_NAME`) — the human-friendly name shown in `services.msc`/Task Manager's Services tab |
 
 The service NAME is the stable id every OS query/health-check targets; the DISPLAY name is
@@ -305,12 +327,47 @@ service THIS run registered, identified by its canonical reverse-DNS id — `net
 false success; the JSON-RPC `rpc.discover` probe is retained only as secondary detail. dig-dns
 readiness additionally requires at least one live resolution path (`paths_live`).
 
+**Linux checks BOTH systemd scopes (#502/#524).** dig-node's own `install` always prefers a
+USER-level unit regardless of privilege (a deliberate no-elevation-needed design), while
+dig-installer registers dig-dns machine-wide (§2.2) — so `svc::service_run_state_on` queries
+`systemctl --user is-active <id>` AND `systemctl is-active <id>` and combines them
+(`combine_systemctl_states`): Running wins if EITHER scope reports it. A single system-scoped-only
+query previously could never see a genuinely-running dig-node, permanently reporting "registered but
+NOT running" (found + fixed via the 3-OS installer-e2e job, dig_ecosystem#502).
+
+**Linux queries the REAL unit name, not the canonical id, on that one platform.** Windows (`sc`)
+and macOS (`launchctl`) both address a service by the FULL canonical id verbatim, but Linux does
+not: EVERY dig-node/dig-dns systemd registration in this workspace goes through the
+`service-manager` crate's `ServiceLabel`, whose systemd backend derives the unit name via
+`to_script_name()` — dropping the reverse-DNS qualifier and hyphen-joining
+`{organization}-{application}`, so `net.dignetwork.dig-node` registers as `dignetwork-dig-node` and
+`net.dignetwork.dig-dns` as `dignetwork-dig-dns`. `svc::linux_unit_name` applies the SAME
+parse-then-derive to any canonical id (never a hardcoded per-service guess), and
+`dns::plan::service_script_name` derives dig-dns's OWN registration name identically — so the two
+can never drift apart. This was a real, previously-undetected naming mismatch (a stale hardcoded
+`SERVICE_SCRIPT_NAME = "dig-dns"` constant, which LOOKED like the obvious dashed form but was never
+what actually got registered) that made the Linux health check — and dig-dns's own clean-reinstall
+detection — permanently false-negative even BEFORE the dual-scope fix above; only surfaced by a real
+`systemctl status` against a live install (dig_ecosystem#502/#524).
+
 ### CLI-on-PATH verification (#496)
 
 `digstore`, `dig-node`, and `dig-dns` are placed in one bin dir which is added to PATH; the installer
 then verifies each resolves **by bare name from a fresh shell** (`pathcheck` module) so a user can run
 `dig-node pair approve <id>` immediately. An unresolvable required CLI makes the install NOT ready.
 On Windows the PATH change is broadcast (`WM_SETTINGCHANGE`); a new terminal picks it up.
+
+### Cross-OS end-to-end conformance (#502)
+
+The readiness verdict above is exercised for real — against the actual Windows SCM / systemd /
+launchd, never a mock — by `.github/workflows/installer-e2e.yml`: build `dig-installer`, run it
+installing both dig-node and dig-dns, assert `ready`/`ok` are `true` with both services registered
+and RUNNING by their canonical id and the Windows display names read back correctly (`sc qc`), assert
+`dig.local` resolves, then run `--uninstall-dig-node`/`--uninstall-dig-dns` and assert both services
+are deregistered and the hosts entry is gone — on `windows-latest`, `macos-14`, and `ubuntu-latest`.
+This is distinct from dig-node's and dig-dns's own per-binary "service-smoke" CI (in their own
+repos), which prove each BINARY's own `install`/`start`/`uninstall` in isolation; this job proves the
+INSTALLER's aggregate contract — the thing an actual user runs — end to end.
 
 ## 5. Visual theme (task #233)
 

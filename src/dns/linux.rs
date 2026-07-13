@@ -307,7 +307,7 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     // Clean reinstall (task #494): a pre-existing unit is stopped + disabled
     // (and its unit file removed) BEFORE reinstalling — never reconfigured in
     // place.
-    if unit_registered(plan::SERVICE_SCRIPT_NAME) {
+    if unit_registered(&plan::service_script_name()) {
         clean_remove_existing_unit();
         notes.push(
             "removed the pre-existing dig-dns systemd unit for a clean reinstall".to_string(),
@@ -343,7 +343,7 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         Ok(()) => {
             notes.push(format!(
                 "registered the systemd unit \"{}\"",
-                plan::SERVICE_SCRIPT_NAME
+                plan::service_script_name()
             ));
             if cfg.start {
                 match mgr.start(ServiceStartCtx {
@@ -450,7 +450,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         })
         .is_ok()
     {
-        removed.push(format!("systemd unit \"{}\"", plan::SERVICE_SCRIPT_NAME));
+        removed.push(format!("systemd unit \"{}\"", plan::service_script_name()));
     }
 
     removed.extend(remove_split_dns());

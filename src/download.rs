@@ -130,13 +130,36 @@ pub fn release_by_tag(repo: &Repo, tag: &str) -> Result<Release, String> {
     release_from_json(&body)
 }
 
-/// GET a URL as text with the GitHub API headers. Internal helper.
+/// GET a URL as text with the GitHub API headers, optionally authenticated via
+/// [`GITHUB_TOKEN_ENV`] (see [`get_text_with_token`]). Internal helper — the
+/// production entry point every `latest_release`/`release_by_tag` call goes
+/// through.
 fn get_text(url: &str) -> Result<String, String> {
-    let resp = ureq::get(url)
+    get_text_with_token(url, std::env::var(GITHUB_TOKEN_ENV).ok().as_deref())
+}
+
+/// The environment variable an optional GitHub token is read from (task
+/// #502/#524: unauthenticated `api.github.com` calls are capped at 60/hour
+/// per source IP, a limit CI runners — which share a huge, heavily-used IP
+/// pool — hit routinely; a token raises it to 5,000/hour). Matches the name
+/// GitHub Actions already exposes as `secrets.GITHUB_TOKEN` and the `gh` CLI
+/// convention, so CI needs no new secret — just `env: GITHUB_TOKEN:
+/// ${{ secrets.GITHUB_TOKEN }}` on the step. Entirely optional: every call
+/// works unauthenticated exactly as before when it is unset.
+const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
+
+/// [`get_text`] with an injectable token — the pure-ish core so the
+/// Authorization-header decision is unit-tested (against a real local
+/// socket) without mutating the process environment. `token: None` sends the
+/// SAME anonymous request as before this option existed.
+fn get_text_with_token(url: &str, token: Option<&str>) -> Result<String, String> {
+    let mut req = ureq::get(url)
         .set("User-Agent", USER_AGENT)
-        .set("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
+        .set("Accept", "application/vnd.github+json");
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    let resp = req.call().map_err(|e| format!("GET {url}: {e}"))?;
     resp.into_string().map_err(|e| format!("read {url}: {e}"))
 }
 
@@ -401,5 +424,99 @@ mod tests {
         verify_and_write(b"#!/bin/sh\n", &dest, None).expect("ok");
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "owner/group/other exec bits set");
+    }
+
+    // -- get_text_with_token: the optional GitHub-auth header (#502/#524) ----
+    //
+    // Drives the REAL `ureq` request against a one-shot local server that
+    // echoes back whatever `Authorization` header it received (or `NONE`),
+    // so the assertion is on the actual wire request `get_text_with_token`
+    // sends — not a re-statement of its own `if let` branch. Uses an
+    // injected `token: Option<&str>` (never a real env var), so these run
+    // safely under Rust's parallel test harness with no shared mutable state.
+
+    /// A one-shot HTTP/1.1 server that reads the request line + headers,
+    /// replies 200 with the received `Authorization` header value (or `NONE`)
+    /// as the body, then exits. Mirrors `health.rs`'s `one_shot_json_server`.
+    fn one_shot_echo_auth_server() -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                    .ok();
+                let mut buf = [0u8; 4096];
+                let mut request = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&buf[..n]);
+                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let auth = text
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l.split_once(':').map_or("", |(_, v)| v).trim().to_string())
+                    .unwrap_or_else(|| "NONE".to_string());
+                let body = format!("{{\"tag_name\":\"v0.0.0\",\"__auth\":\"{auth}\"}}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn get_text_with_token_sends_no_authorization_header_when_token_is_none() {
+        let port = one_shot_echo_auth_server();
+        let body = get_text_with_token(&format!("http://127.0.0.1:{port}/"), None).unwrap();
+        assert!(body.contains(r#""__auth":"NONE""#), "got: {body}");
+    }
+
+    #[test]
+    fn get_text_with_token_sends_no_authorization_header_when_token_is_empty() {
+        // An empty string is treated the same as absent — never sends a
+        // hollow `Authorization: Bearer` header.
+        let port = one_shot_echo_auth_server();
+        let body = get_text_with_token(&format!("http://127.0.0.1:{port}/"), Some("")).unwrap();
+        assert!(body.contains(r#""__auth":"NONE""#), "got: {body}");
+    }
+
+    #[test]
+    fn get_text_with_token_sends_a_bearer_authorization_header_when_present() {
+        let port = one_shot_echo_auth_server();
+        let body =
+            get_text_with_token(&format!("http://127.0.0.1:{port}/"), Some("ghp_test123")).unwrap();
+        assert!(
+            body.contains(r#""__auth":"Bearer ghp_test123""#),
+            "got: {body}"
+        );
+    }
+
+    #[test]
+    fn get_text_reads_the_real_github_token_env_var() {
+        // get_text (the production entry point) reads GITHUB_TOKEN_ENV itself;
+        // this only proves the constant names the variable CI already
+        // exposes (`secrets.GITHUB_TOKEN`) — the header-sending behavior
+        // itself is covered token-injected above, never via a real env
+        // mutation (parallel-test-safe).
+        assert_eq!(GITHUB_TOKEN_ENV, "GITHUB_TOKEN");
     }
 }
