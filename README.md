@@ -72,12 +72,16 @@ DNS/proxy wiring). Then open a **new** terminal and check it works:
 digstore --version
 ```
 
-> **Registering the two services needs elevation** (Administrator on Windows,
-> `sudo` on macOS/Linux). Run the one-liner from an elevated console for the full
-> install; without elevation the digstore CLI still installs and the services are
-> skipped best-effort with a clear message (re-run elevated to finish). On
-> Windows, run PowerShell as Administrator before the `irm … | iex` line; on
-> macOS/Linux, `curl -fsSL … | sudo sh`.
+> **The installer REQUIRES elevation** (Administrator on Windows, `sudo` on
+> macOS/Linux) because it registers the dig-node + dig-dns OS services and
+> writes the `dig.local` hosts entry. An un-elevated run is refused **up front**
+> (`NOT_ELEVATED`, exit 11) before anything is downloaded or written — it never
+> leaves a half-installed state. On Windows, run PowerShell as Administrator
+> before the `irm … | iex` line; on macOS/Linux, `curl -fsSL … | sudo sh`.
+> **"✓ DIG is ready" prints only when every selected component installed AND its
+> service is verified RUNNING**; otherwise the installer reports exactly what
+> failed and exits non-zero (`INSTALL_INCOMPLETE`, exit 12) — never a false
+> success.
 
 ### Install only some components
 
@@ -196,11 +200,12 @@ Default install location (`--bin-dir`):
    `enable` / launchd `RunAtLoad` — the installer does not reimplement it),
    best-effort writes the `dig.local` hosts entry, runs a **post-install
    resolve check** confirming the OS actually maps `dig.local` → `127.0.0.2`
-   now, and finally a **post-install RPC health check** confirming the service
-   is actually answering `rpc.discover` on its configured port (see below for
-   both). On Windows, service registration needs an elevated console — if you
-   aren't elevated the installer surfaces a clear message and the digstore
-   install still succeeds. `--uninstall-dig-node` reverses it: removes the OS
+   now, and finally a **post-install SERVICE health check** confirming the OS
+   service manager reports the service (`net.dignetwork.dig-node`) as RUNNING —
+   a bare listener on the port started by something else does NOT count as a
+   pass (#493). Because this registers a service, the whole installer requires
+   elevation up front (see the elevation note above); an un-elevated run is
+   refused before any change. `--uninstall-dig-node` reverses it: removes the OS
    service (delegating to dig-node's own `uninstall`) and the hosts entry.
 6. **dig-dns** *(by default; `--no-dig-dns` to skip)* — downloads the `dig-dns`
    binary, then **owns the full per-OS service + DNS/browser wiring itself**
@@ -394,6 +399,8 @@ pre-existing org DNS/browser policy.
   | 8 | `SERVICE_START_FAILED` | the dig-node/dig-relay service failed to install or start |
   | 9 | `IO` | failed to write a downloaded binary to disk |
   | 10 | `SERVICE_STOP_FAILED` | a running dig-node/dig-relay service failed to stop before its binary could be safely replaced |
+  | 11 | `NOT_ELEVATED` | launched without elevation (Administrator/root) but the plan needs it — refused up front, no partial state (#492) |
+  | 12 | `INSTALL_INCOMPLETE` | the run completed but is NOT ready: a selected component failed to install or its service is not running (#493) |
 
   (Usage errors from argument parsing return clap's own exit code 2.)
 

@@ -219,3 +219,30 @@ Findings from actually turning these on:
   `tauri.conf.json`'s `beforeBuildCommand` only fires under the `tauri`
   CLI (`tauri build`/`tauri dev`), never under plain `cargo`; verified by
   removing `dist/` and rebuilding clean.
+
+## Fail-loud installs — never trust a bare port probe or a clean-looking log (#492/#493/#496)
+
+- **A "success" line must be earned, not printed.** The real bug: an un-elevated
+  run masked a `dig-node install` exit-6 with a ✓, hit `CreateService 1073`, yet
+  ended `✓ DIG is ready`. Lesson: the aggregate readiness verdict (`ready`/
+  `failures` on `InstallReport`) is computed from VERIFIED post-conditions, and
+  the green line + zero exit are gated on it. A component-level failure that was
+  only logged (never propagated) is the classic false-success trap.
+- **Verify the SERVICE, not the port.** The old post-install health check probed
+  `rpc.discover` on 9778 — a dig-node started by ANYTHING (a manual `serve`, a
+  stale process) answered, so the check passed without this run registering a
+  service. Fix: query the OS service manager by the canonical service id
+  (`net.dignetwork.dig-node`/`-dns`) — `sc query` STATE=RUNNING / `systemctl
+  is-active` / `launchctl print state=running`. The port probe is secondary
+  detail only. `svc.rs` owns the pure parsers.
+- **Enforce elevation FIRST, before any write.** Registering a service / writing
+  hosts needs admin; check it before downloading/writing so an un-elevated run
+  fails fast (`NOT_ELEVATED`) with zero partial state, rather than half-installing
+  then failing on the privileged step. `InstallPlan::requires_elevation()` scopes
+  it (dry-run / digstore-only never trips it). Detection: Windows `net session`,
+  Unix `id -u` == 0.
+- **"On PATH" means resolvable from a FRESH shell, not just "a file exists".**
+  `pathcheck` spawns each CLI by BARE NAME with PATH augmented to include the
+  install bin dir, so it proves name-resolution the way the user's next shell
+  will see it. On Windows the PATH write is followed by a `WM_SETTINGCHANGE`
+  broadcast so new shells pick it up without a reboot.
