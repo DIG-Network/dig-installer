@@ -42,6 +42,7 @@ pub mod dns;
 pub mod download;
 pub mod elevation;
 pub mod error;
+pub mod firewall;
 pub mod health;
 pub mod hosts;
 pub mod pathcheck;
@@ -106,6 +107,14 @@ pub struct InstallPlan {
     /// Default true — a first-class, toggleable install option
     /// (`--no-register-scheme` opts out). Per-user, no elevation.
     pub register_scheme: bool,
+    /// Open an inbound firewall rule scoped to the dig-node executable on its
+    /// peer-RPC port (#424), so the freshly-installed node is reachable for
+    /// direct peer connections immediately (relay fallback still works if
+    /// declined). Default true — a first-class, toggleable install option
+    /// (`--no-open-firewall` opts out). Only applied when [`Self::with_dig_node`]
+    /// is set; needs the same elevation the dig-node service registration
+    /// already requires.
+    pub open_firewall: bool,
     /// Print actions without performing them.
     pub dry_run: bool,
 }
@@ -149,6 +158,7 @@ impl Default for InstallPlan {
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: true,
             register_scheme: true,
+            open_firewall: true,
             dry_run: false,
         }
     }
@@ -224,6 +234,11 @@ pub struct ServiceUninstallResult {
     /// dry-run, would be). `false` if there was nothing tagged to remove
     /// (idempotent no-op) or the removal needs elevation.
     pub dig_local_removed: bool,
+    /// The app-scoped firewall rule this installer opened (#424) was removed
+    /// (or, on dry-run, would be). `false` if there was nothing to remove
+    /// (idempotent no-op — e.g. it was declined at install time, or this is
+    /// Linux, where a rule is never auto-applied).
+    pub firewall_rule_removed: bool,
     /// Human-readable detail — never silent.
     pub note: String,
 }
@@ -245,6 +260,9 @@ pub struct InstallReport {
     /// The `chia://`/`urn:` URL-scheme registration result (only when
     /// `register_scheme`) — #389.
     pub scheme: Option<scheme::SchemeResult>,
+    /// The app-scoped firewall rule result (only when `with_dig_node &&
+    /// open_firewall`) — #424.
+    pub firewall: Option<firewall::FirewallResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
     /// Per-CLI PATH-resolution checks (#496): confirms each required DIG CLI
@@ -456,6 +474,7 @@ fn run_report_gated(
         relay: None,
         dns: None,
         scheme: None,
+        firewall: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
@@ -577,6 +596,21 @@ fn run_report_gated(
         report.components.push(c);
 
         report.service = Some(register_dig_node(&dig_node_path, plan, log));
+
+        // 3b. App-scoped firewall rule for dig-node's peer-RPC listener
+        //     (#424) — default-on, toggleable, best-effort (never aborts the
+        //     install; a decline/failure just means peers reach this node
+        //     via the relay fallback instead of directly).
+        if plan.open_firewall {
+            log("Opening the firewall for dig-node's peer-RPC port:");
+            let f = firewall::open(&dig_node_path, plan.dry_run);
+            log(&format!(
+                "    {} {}",
+                if f.applied { "✓" } else { "·" },
+                f.note
+            ));
+            report.firewall = Some(f);
+        }
     }
 
     // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service. Unlike
@@ -1314,13 +1348,15 @@ fn register_dig_node(
 const HEALTH_CHECK_ATTEMPTS: u32 = 10;
 const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Uninstall the dig-node OS service and remove the `dig.local` hosts entry
-/// this installer added (task #140) — the counterpart to [`register_dig_node`].
-/// A standalone action (mirrors `--uninstall-dig-dns` / [`dns::uninstall`]):
-/// it locates the dig-node binary a prior `--with-dig-node` install placed at
-/// `bin_dir` (by the same [`Target::exe_name`] convention `register_dig_node`
-/// uses) and runs its own `uninstall` subcommand, then removes the hosts
-/// entry. Never touches the digstore/browser/relay/dig-dns installs. Never
+/// Uninstall the dig-node OS service, remove the `dig.local` hosts entry, and
+/// remove the app-scoped firewall rule (#424) this installer added (task
+/// #140) — the counterpart to [`register_dig_node`]. A standalone action
+/// (mirrors `--uninstall-dig-dns` / [`dns::uninstall`]): it locates the
+/// dig-node binary a prior `--with-dig-node` install placed at `bin_dir` (by
+/// the same [`Target::exe_name`] convention `register_dig_node` uses) and runs
+/// its own `uninstall` subcommand, then removes the hosts entry, then removes
+/// the firewall rule (idempotent — a declined/absent rule is a clean no-op).
+/// Never touches the digstore/browser/relay/dig-dns installs. Never
 /// panics/aborts — a failure (missing binary, needs elevation) is recorded in
 /// the result, always with a clear `note` (never silent).
 pub fn uninstall_dig_node(
@@ -1336,6 +1372,7 @@ pub fn uninstall_dig_node(
             return ServiceUninstallResult {
                 uninstalled: false,
                 dig_local_removed: false,
+                firewall_rule_removed: false,
                 note,
             };
         }
@@ -1344,13 +1381,14 @@ pub fn uninstall_dig_node(
 
     if dry_run {
         let note = format!(
-            "would run `{} uninstall` and remove the dig.local hosts entry",
+            "would run `{} uninstall`, remove the dig.local hosts entry, and remove the firewall rule (if present)",
             bin.display()
         );
         log(&format!("({note})"));
         return ServiceUninstallResult {
             uninstalled: false,
             dig_local_removed: false,
+            firewall_rule_removed: false,
             note,
         };
     }
@@ -1391,9 +1429,19 @@ pub fn uninstall_dig_node(
         }
     };
 
+    log("Removing the dig-node firewall rule (#424):");
+    let firewall_result = firewall::close(&bin, false);
+    log(&format!(
+        "    {} {}",
+        if firewall_result.applied { "✓" } else { "·" },
+        firewall_result.note
+    ));
+    notes.push(firewall_result.note.clone());
+
     ServiceUninstallResult {
         uninstalled,
         dig_local_removed,
+        firewall_rule_removed: firewall_result.applied,
         note: notes.join("; "),
     }
 }
@@ -1492,9 +1540,9 @@ pub fn help_json() -> String {
             { "flag": "--no-dig-node", "description": "opt out of the dig-node local node + service (installed by default)" },
             { "flag": "--with-dig-node", "alias": "--service", "description": "explicit (redundant) opt-in — dig-node installs + starts as a boot-start service by default" },
             { "flag": "--dig-node-version", "value": "VERSION", "description": "pin dig-node version (default: latest)" },
-            { "flag": "--dig-node-port", "value": "PORT", "default": 9778, "description": "loopback port for the dig-node service" },
+            { "flag": "--dig-node-port", "value": "PORT", "default": dig_constants::DIG_NODE_PORT, "description": "loopback port for the dig-node service" },
             { "flag": "--no-service-start", "description": "install the service(s) but do not start them (still registered boot-start)" },
-            { "flag": "--uninstall-dig-node", "description": "uninstall the dig-node OS service + remove the dig.local hosts entry this installer created (idempotent; does not touch the digstore/browser/relay/dig-dns installs)" },
+            { "flag": "--uninstall-dig-node", "description": "uninstall the dig-node OS service + remove the dig.local hosts entry + remove the firewall rule this installer created (idempotent; does not touch the digstore/browser/relay/dig-dns installs)" },
             { "flag": "--with-browser", "description": "download the DIG Browser native installer (opt-in)" },
             { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
             { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced, opt-in — the default node uses relay.dig.net)" },
@@ -1508,7 +1556,9 @@ pub fn help_json() -> String {
             { "flag": "--uninstall-dig-dns", "description": "uninstall the dig-dns OS service + OS wiring this installer created (idempotent, zero residue; does not touch pre-existing org policy)" },
             { "flag": "--no-register-scheme", "description": "opt out of registering the chia:// (+ best-effort urn:) OS URL-scheme handler (registered by default; #389)" },
             { "flag": "--register-scheme", "description": "explicit (redundant) opt-in — the chia:// URL-scheme handler is registered by default" },
-            { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" }
+            { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" },
+            { "flag": "--no-open-firewall", "description": "opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; #424)" },
+            { "flag": "--open-firewall", "description": "explicit (redundant) opt-in — the firewall rule is opened by default" }
         ],
         "url_scheme_handler": {
             "schemes": ["chia", "urn"],
@@ -1516,6 +1566,16 @@ pub fn help_json() -> String {
             "opt_out": "--no-register-scheme",
             "per_user": true,
             "description": "By default the installer registers itself as the OS handler for chia:// (and best-effort urn:) links: a clicked link is resolved through the local dig-node (the dig.local → localhost → rpc.dig.net ladder) and opened in the browser. Per-user, no elevation. The OS invokes `dig-installer handle-url <uri>` (a hidden subcommand, not part of the public flag surface)."
+        },
+        "firewall": {
+            "port": firewall::DEFAULT_PEER_PORT,
+            "port_override_env": firewall::ENV_PEER_PORT,
+            "default": true,
+            "opt_out": "--no-open-firewall",
+            "scope": "the installed dig-node executable only (program-scoped, never a blanket port-open)",
+            "families": ["ipv4", "ipv6"],
+            "linux": "never auto-applied; prints the manual `ufw allow <port>/tcp` remedy instead",
+            "description": "By default the installer opens an inbound firewall rule scoped to the dig-node executable on its mTLS peer-RPC port (dig-node's only non-loopback listener), covering both IPv4 and IPv6. Removed automatically on `--uninstall-dig-node`. Declining it is always safe — dig-relay fallback still reaches the node."
         },
         "exit_codes": exit_codes
     });
@@ -1623,6 +1683,7 @@ mod tests {
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: false,
             register_scheme: false,
+            open_firewall: false,
             dry_run: true,
         }
     }
@@ -1743,6 +1804,50 @@ mod tests {
     }
 
     #[test]
+    fn help_json_advertises_the_firewall_rule_and_opt_out() {
+        // #424: the app-scoped firewall rule is a default-on, toggleable
+        // option — the machine contract MUST advertise it + the CLI opt-out,
+        // same convention as the scheme handler above.
+        let doc: serde_json::Value =
+            serde_json::from_str(&help_json()).expect("help_json is valid JSON");
+        let flag_present = |f: &str| -> bool {
+            doc["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["flag"] == f)
+        };
+        assert!(flag_present("--no-open-firewall"), "opt-out advertised");
+        assert!(
+            flag_present("--open-firewall"),
+            "explicit opt-in advertised"
+        );
+        let f = &doc["firewall"];
+        assert_eq!(f["default"], true, "the rule is opened by default");
+        assert_eq!(f["opt_out"], "--no-open-firewall");
+        assert_eq!(f["port"], firewall::DEFAULT_PEER_PORT);
+        let families = f["families"].as_array().unwrap();
+        assert!(families.iter().any(|x| x == "ipv4"));
+        assert!(families.iter().any(|x| x == "ipv6"));
+    }
+
+    #[test]
+    fn help_json_dig_node_port_default_matches_dig_constants() {
+        // Both the CLI flag doc + the actual runtime default (`ServiceConfig`)
+        // must be sourced from the SAME constant so they can never drift.
+        let doc: serde_json::Value =
+            serde_json::from_str(&help_json()).expect("help_json is valid JSON");
+        let port_flag = doc["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["flag"] == "--dig-node-port")
+            .expect("--dig-node-port documented");
+        assert_eq!(port_flag["default"], dig_constants::DIG_NODE_PORT);
+        assert_eq!(ServiceConfig::default().port, dig_constants::DIG_NODE_PORT);
+    }
+
+    #[test]
     fn empty_plan_resolves_nothing_but_reports_target() {
         // Nothing selected: the report still carries the schema/target/installer
         // metadata and empty component/path/service sections.
@@ -1756,6 +1861,7 @@ mod tests {
         assert!(report.service.is_none());
         assert!(report.relay.is_none());
         assert!(report.dns.is_none());
+        assert!(report.firewall.is_none());
         assert!(report.installed.is_empty());
     }
 
@@ -1915,6 +2021,35 @@ mod tests {
         let svc = report.service.expect("service");
         assert!(svc.note.contains("would run `dig-node install`"));
         assert!(!svc.note.contains("start"));
+    }
+
+    #[test]
+    fn dig_node_dry_run_reports_the_firewall_rule_intent_when_enabled() {
+        // #424: the firewall rule is opened alongside the dig-node service by
+        // default; a dry-run must record the intent without touching the OS.
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.open_firewall = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-node resolves");
+        let firewall = report.firewall.expect("firewall result present");
+        assert!(!firewall.applied, "dry-run never touches the OS");
+        assert!(
+            firewall.note.contains("would open"),
+            "got: {}",
+            firewall.note
+        );
+    }
+
+    #[test]
+    fn dig_node_dry_run_skips_the_firewall_rule_when_declined() {
+        // `--no-open-firewall` must leave `report.firewall` entirely absent —
+        // not merely a `applied: false` result — so a caller can tell
+        // "declined" apart from "attempted and failed".
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.open_firewall = false;
+        let report = run_dry(&plan, all_releases()).expect("dig-node resolves");
+        assert!(report.firewall.is_none());
     }
 
     #[test]
@@ -2296,9 +2431,15 @@ mod tests {
         let result = uninstall_dig_node(&bin_dir, true, &mut |l| lines.push(l.to_string()));
         assert!(!result.uninstalled);
         assert!(!result.dig_local_removed);
+        assert!(!result.firewall_rule_removed);
         assert!(result.note.contains("would run"), "got: {}", result.note);
         assert!(result.note.contains("uninstall"), "got: {}", result.note);
         assert!(result.note.contains("dig.local"), "got: {}", result.note);
+        assert!(
+            result.note.contains("firewall"),
+            "the dry-run note documents removing the firewall rule too: {}",
+            result.note
+        );
         assert!(lines.iter().any(|l| l.contains("would run")));
     }
 
@@ -2321,12 +2462,14 @@ mod tests {
         let result = ServiceUninstallResult {
             uninstalled: true,
             dig_local_removed: true,
-            note: "dig-node service uninstalled; removed dig.local from /etc/hosts".to_string(),
+            firewall_rule_removed: true,
+            note: "dig-node service uninstalled; removed dig.local from /etc/hosts; removed the firewall rule".to_string(),
         };
         let v: serde_json::Value = serde_json::from_str(&service_uninstall_json(&result)).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["result"]["uninstalled"], true);
         assert_eq!(v["result"]["dig_local_removed"], true);
+        assert_eq!(v["result"]["firewall_rule_removed"], true);
     }
 
     #[test]
@@ -2374,6 +2517,7 @@ mod tests {
             relay: None,
             dns: None,
             scheme: None,
+            firewall: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),

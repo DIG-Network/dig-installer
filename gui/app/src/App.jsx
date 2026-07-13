@@ -48,8 +48,14 @@ export function App() {
   // default path (digstore is always installed, added separately below). Per
   // task #491, `dig-relay` defaults OFF (advanced/optional — the node already
   // uses relay.dig.net) but stays user-checkable, and the DIG Browser is not
-  // offered (hidden in `data.jsx`), so it is absent here entirely.
-  const [sel, setSel] = useState({ "dig-node": true, "dig-dns": true, "dig-relay": false });
+  // offered (hidden in `data.jsx`), so it is absent here entirely. `open-firewall`
+  // (#424) defaults ON, mirroring the CLI's default-on `open_firewall`.
+  const [sel, setSel] = useState({
+    "dig-node": true,
+    "dig-dns": true,
+    "dig-relay": false,
+    "open-firewall": true,
+  });
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
   const [pct, setPct] = useState(0);
   const [lines, setLines] = useState([]);

@@ -101,6 +101,48 @@ and opens it in the default browser. Registration is **best-effort within the in
 is recorded in `InstallReport.scheme` (a `SchemeResult { registered, schemes, note }`) but never
 aborts the install (every other component already succeeded).
 
+### 1.4 App-scoped firewall rule for dig-node's peer-RPC port (#424)
+
+By default the installer opens an inbound firewall rule scoped to the installed **dig-node**
+executable on its peer-RPC port — dig-node's ONLY non-loopback listener (every other surface —
+`localhost:<dig-node-port>` RPC, `dig-wallet`'s `127.0.0.1:9777`, `dig.local:80` — is loopback-only
+and is NEVER opened). This is a **first-class, toggleable install option**, default ON, controlled
+identically from the CLI and the GUI — the same convention as §1.3's `chia://` scheme handler:
+
+- **CLI:** opened by default. `--no-open-firewall` opts OUT; `--open-firewall` is the redundant
+  explicit opt-in. Both map to `InstallPlan.open_firewall` (`open_firewall = --open-firewall ||
+  !--no-open-firewall`), so `--no-*` wins if both are given. Only takes effect when
+  `with_dig_node` is also set — there is no standalone `--unopen-firewall` (unlike
+  `--unregister-scheme`): removal happens automatically via `--uninstall-dig-node` (below).
+- **GUI:** the same default-on option, surfaced as a checkbox (`gui/app/src/data.jsx` `OPTIONS`,
+  rendered by `Components.jsx` directly under the component list, only while dig-node itself is
+  checked) that sets `open_firewall` on the plan handed to the Rust pipeline.
+
+**Port resolution (`firewall::effective_peer_port`):** the rule targets `DIG_PEER_PORT` (parsed as
+a `u16`) if that env var is set, else `firewall::DEFAULT_PEER_PORT` (`9444`) — dig-node's own
+`peer::DEFAULT_P2P_PORT` default. The rule therefore always tracks whatever port dig-node is
+actually configured to listen on, never a stale hard-coded value.
+
+**Per-OS behaviour** (best-effort — a failure is recorded, never aborts the install; every
+per-OS command-line builder is pure and unit-tested, the actual process spawn is the thin,
+untested-by-`cargo test` I/O layer):
+
+| OS | Mechanism | Notes |
+|----|-----------|-------|
+| Windows | A single named `netsh advfirewall firewall add rule name="DIG Network Node (P2P)" dir=in action=allow program="<dig-node.exe>" protocol=TCP localport=<port>` | No `remoteip=`/`interfacetype=` restriction: an omitted `remoteip` defaults to "Any" in Windows Firewall, which is evaluated against BOTH IPv4 and IPv6 (§5.2) — one rule, both families. |
+| macOS | Adds the executable to the Application Firewall (ALF) exception list: `socketfilterfw --add <dig-node>` + `--unblockapp <dig-node>` | Only when ALF is actually enabled (`--getglobalstate`) — if it is off, every inbound connection is already unfiltered, so adding an exception would be a silent no-op dressed up as a success; skipped and reported as such. |
+| Linux | **Never auto-applied.** | Too many competing firewall managers (`ufw`/`firewalld`/bare `iptables`) to safely automate. The installer prints (and `runbooks/local-running.md` documents) the one-line manual remedy: `sudo ufw allow <port>/tcp`. |
+
+**Removal:** `--uninstall-dig-node` (§3, `ServiceUninstallResult`) removes the rule alongside the OS
+service and the `dig.local` hosts entry — idempotent (an already-absent/declined rule is a clean
+no-op, `firewall_rule_removed: false` with an explanatory note, never an error). Windows removal
+targets the rule by its stable name (`netsh advfirewall firewall delete rule name="DIG Network Node
+(P2P)"`), so it is correct even if `DIG_PEER_PORT` changed between install and uninstall.
+
+Declining the option (or a failure applying it) is always safe: a node without the rule remains
+fully reachable through the `dig-relay` fallback path — only direct/relay-free peer connections are
+affected.
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/
@@ -203,11 +245,15 @@ authoritative outcome).
 
 Stable, versioned (`schema_version`) JSON shape emitted by `--json` on success:
 `{schema_version, installer_version, target, dry_run, components[], path, service, relay, dns,
-installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc comments on
-`InstallReport`/`ComponentResult`/`PathResult`/`ServiceResult`/`RelayResult`/`dns::DnsInstallResult`/
-`pathcheck::CliPathCheck` for the exact field set; every boolean field has a paired human-readable
-`*_note` — no field is ever silently omitted to signal failure. `ready`/`failures` are the aggregate
-readiness verdict (§4.2); the `--json` envelope's `ok` mirrors `ready`.
+scheme, firewall, installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc comments
+on `InstallReport`/`ComponentResult`/`PathResult`/`ServiceResult`/`RelayResult`/
+`dns::DnsInstallResult`/`scheme::SchemeResult`/`firewall::FirewallResult`/`pathcheck::CliPathCheck`
+for the exact field set; every boolean field has a paired human-readable `*_note` — no field is
+ever silently omitted to signal failure. `firewall` is `None` when `open_firewall` is off (§1.4) —
+distinct from a present-but-`applied: false` result, so a caller can tell "declined" apart from
+"attempted and failed". `ready`/`failures` are the aggregate readiness verdict (§4.2) — the firewall
+rule is best-effort and never gates `ready`, same as the scheme handler; the `--json` envelope's
+`ok` mirrors `ready`.
 
 ## 4. Exit codes
 

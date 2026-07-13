@@ -68,6 +68,22 @@ export const COMPONENTS = [
   },
 ];
 
+// Toggleable install OPTIONS (distinct from COMPONENTS above — these configure
+// how a component installs rather than selecting a downloadable artifact).
+// `id` values map 1:1 to the `selected` map keys the Rust install pipeline
+// reads (`gui/app/src-tauri/src/install.rs` `plan_from_selection`). Each
+// entry's `requires` names the component id it only makes sense alongside —
+// `Components.jsx` hides it when that component is unchecked.
+export const OPTIONS = [
+  {
+    id: "open-firewall",
+    name: "Open the firewall for dig-node",
+    desc: "Lets other DIG nodes reach yours directly on its peer-to-peer port (9444), scoped to the dig-node program only. Declining is safe — your node still works via the relay fallback.",
+    requires: "dig-node",
+    on: true,
+  },
+];
+
 // Files surfaced in the progress header "writing <file>" while the real
 // pipeline runs (the Rust side overrides these with the actual current file).
 export const NOW_FILES = [

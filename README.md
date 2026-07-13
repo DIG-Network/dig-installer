@@ -149,7 +149,9 @@ dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local
 | `--no-service-start` | off | Install the service(s) but don't start them this run (still registered boot-start, so they come up on next boot). |
 | `--dig-node-port <PORT>` | `9778` | Loopback port the dig-node service serves on (matches dig-node's own uncommon-high-port default — the sibling of the dig-wallet HTTP API's `9777`; `dig.local` stays on `127.0.0.2:80` regardless). |
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
-| `--uninstall-dig-node` | — | Remove the dig-node OS service + the `dig.local` hosts entry this installer created. Idempotent; does not touch the digstore/browser/relay/dig-dns installs. Standalone action — ignores every other flag except `--bin-dir`/`--dry-run`/`--json`. |
+| `--no-open-firewall` | off | Opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; see [Firewall](#firewall-dig-nodes-peer-rpc-port) below). |
+| `--open-firewall` | on | Redundant explicit opt-in — the firewall rule is opened by default. |
+| `--uninstall-dig-node` | — | Remove the dig-node OS service, the `dig.local` hosts entry, and the firewall rule this installer created. Idempotent; does not touch the digstore/browser/relay/dig-dns installs. Standalone action — ignores every other flag except `--bin-dir`/`--dry-run`/`--json`. |
 | `--no-dig-dns` | off | Skip `dig-dns` + its service (installed by default). |
 | `--with-dig-dns` | on | Redundant explicit opt-in — dig-dns installs + registers as a **boot-start** OS service (local `*.dig` name resolution) + wires OS split-DNS/NRPT + the Chrome/Edge DoH policy, by default. |
 | `--dig-dns-version <VER>` | latest | Install a specific dig-dns version. |
@@ -292,6 +294,36 @@ dig-installer --uninstall-dig-node
 > `KeepAlive`) already restart it if it crashes. Windows SCM restart-on-crash
 > (recovery actions) is a known gap tracked upstream in dig-node-service — see
 > [DIG-Network/dig_ecosystem#224](https://github.com/DIG-Network/dig_ecosystem/issues/224).
+
+---
+
+## Firewall (dig-node's peer-RPC port)
+
+By default, installing dig-node also opens an inbound firewall rule scoped to the dig-node
+executable ONLY, on its peer-RPC port (`DIG_PEER_PORT`, default `9444` — dig-node's only
+non-loopback listener; every other surface, including the `--dig-node-port` RPC port above, stays
+loopback-only and is never opened). This makes a freshly-installed node reachable for direct peer
+connections immediately; declining it (`--no-open-firewall`) is always safe — the node still works
+via the `dig-relay` fallback.
+
+```sh
+dig-installer --with-dig-node
+#   Opening the firewall for dig-node's peer-RPC port:
+#     ✓ opened inbound TCP 9444 for C:\Users\you\.dig\bin\dig-node.exe (rule "DIG Network Node (P2P)", IPv4+IPv6)
+
+dig-installer --uninstall-dig-node
+#   Removing the dig-node firewall rule (#424):
+#     ✓ removed the "DIG Network Node (P2P)" firewall rule
+```
+
+| OS | What happens |
+|----|--------------|
+| Windows | A single named `netsh advfirewall firewall` rule (`name="DIG Network Node (P2P)"`), scoped to the installed `dig-node.exe`, `protocol=TCP`, on the port above — covering both IPv4 and IPv6 (no `remoteip=` restriction). |
+| macOS | Adds the executable to the Application Firewall (ALF) exception list — but ONLY if ALF is actually turned on; if it's off, every inbound connection is already unfiltered, so nothing is done. |
+| Linux | **Never applied automatically** (too many competing firewall managers to safely automate). If you have a firewall active, open the port yourself: `sudo ufw allow 9444/tcp` (or the equivalent for `firewalld`/`iptables`). |
+
+`--uninstall-dig-node` removes the rule alongside the OS service and the `dig.local` hosts entry —
+idempotent (a declined/already-absent rule is a clean no-op).
 
 ---
 

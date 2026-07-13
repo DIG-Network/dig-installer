@@ -1,5 +1,5 @@
 import { Ic } from "../icons.jsx";
-import { COMPONENTS } from "../data.jsx";
+import { COMPONENTS, OPTIONS } from "../data.jsx";
 
 // The DIG component catalogue (task #234/#491). The core stack (digstore +
 // dig-node + dig-dns) is pre-selected — installing it is the one-click default
@@ -13,6 +13,10 @@ export function Components({ sel, toggle, path, onChange }) {
   // A `hidden` component (e.g. the DIG Browser, #491) is never offered.
   const offered = COMPONENTS.filter((c) => !c.hidden);
   const selectedCount = offered.filter((c) => c.req || sel[c.id]).length;
+  // An option only makes sense alongside the component it configures (#424 —
+  // "open the firewall for dig-node" is meaningless without dig-node itself),
+  // so it drops out of the list the moment that component is unchecked.
+  const activeOptions = OPTIONS.filter((o) => !o.requires || sel[o.requires]);
   return (
     <div className="fade-key">
       <div className="eyebrow">Step 03 — Setup</div>
@@ -47,6 +51,27 @@ export function Components({ sel, toggle, path, onChange }) {
           </div>
         );
       })}
+      {activeOptions.length > 0 && (
+        <>
+          <p className="field-label" style={{ marginTop: 18 }}>
+            Options
+          </p>
+          {activeOptions.map((o) => {
+            const on = sel[o.id];
+            return (
+              <div className="comp" key={o.id} onClick={() => toggle(o.id)}>
+                <div className={"check" + (on ? " on" : "")} style={{ width: 22, height: 22, flex: "0 0 22px" }}>
+                  {Ic.check}
+                </div>
+                <div>
+                  <div className="ci">{o.name}</div>
+                  <div className="cd">{o.desc}</div>
+                </div>
+              </div>
+            );
+          })}
+        </>
+      )}
       <div className="meta-chips" style={{ marginTop: 22 }}>
         <span className="chip">
           <span className="k">selected</span>
