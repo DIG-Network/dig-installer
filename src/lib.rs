@@ -37,6 +37,7 @@
 //! is unit-tested; [`run`] is the imperative orchestration that performs I/O.
 
 pub mod asset;
+pub mod daemon_dir;
 pub mod dns;
 pub mod download;
 pub mod elevation;
@@ -241,6 +242,10 @@ pub struct InstallReport {
     /// so the user can run it immediately. Empty on dry-run. A `resolved: false`
     /// entry makes the install NOT ready.
     pub cli_path_checks: Vec<pathcheck::CliPathCheck>,
+    /// Machine-wide daemon state directories created + ACL'd (#501/#499): the
+    /// identity-independent control/auth dirs the dig-node/dig-dns daemons +
+    /// the operator CLI share. Empty on dry-run / when no daemon is installed.
+    pub daemon_dirs: Vec<daemon_dir::DaemonDirResult>,
     /// The AGGREGATE verdict (#493): `true` iff EVERY selected component
     /// installed AND its service is verified RUNNING. Only when this is `true`
     /// may a caller print "✓ DIG is ready". Always `true` on a dry-run (nothing
@@ -419,13 +424,15 @@ fn run_report_gated(
         log("(dry run — no changes will be made)");
     }
 
-    // Pre-install elevation gate (#492): FIRST, before resolving/downloading/
-    // writing anything, so an un-elevated run fails fast and clean with NO
-    // partial state. Only enforced when the plan actually needs elevation
-    // (registers a service / writes hosts); a dry-run or digstore-only run does
-    // not trip it.
+    // Pre-install privilege guard (#492 + #499): FIRST, before resolving/
+    // downloading/writing anything, so a bad-privilege run fails fast and clean
+    // with NO partial state. Rejects running as LocalSystem/SYSTEM (#499 — a
+    // SYSTEM token breaks the GUI + lands state in the wrong profile) AND an
+    // un-elevated run (#492). Only enforced when the plan actually needs
+    // elevation (registers a service / writes hosts); a dry-run or digstore-only
+    // run does not trip it.
     if plan.requires_elevation() {
-        elevation::gate(is_elevated(), &target)?;
+        elevation::guard(is_elevated(), elevation::is_system(), &target)?;
     }
 
     let mut report = InstallReport {
@@ -440,9 +447,20 @@ fn run_report_gated(
         dns: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
+        daemon_dirs: Vec::new(),
         ready: true,
         failures: Vec::new(),
     };
+
+    // 0. Machine-wide daemon state directories (#501/#499). Created BEFORE any
+    //    daemon starts so dig-node/dig-dns write their control-token into a
+    //    stable, identity-independent, tightly-ACL'd dir the operator CLI can
+    //    read WITHOUT being SYSTEM (enables `dig-node pair approve …` from a
+    //    normal shell). Only when a daemon is being installed.
+    if plan.with_dig_node || plan.with_dig_dns {
+        log("Preparing the machine-wide daemon state directories:");
+        report.daemon_dirs = daemon_dir::ensure(target.os, plan.dry_run, log);
+    }
 
     // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
     //    published in the SAME digstore release under its own asset stem
@@ -2181,6 +2199,7 @@ mod tests {
             dns: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
+            daemon_dirs: Vec::new(),
             ready: true,
             failures: Vec::new(),
         }
