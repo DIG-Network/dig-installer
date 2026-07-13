@@ -1,7 +1,7 @@
 {
   "name": "digstore-installer",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DIG Installer — the universal cross-platform DIG Network desktop installer (digstore CLI + dig-node + dig-dns).",
   "type": "module",
   "scripts": {

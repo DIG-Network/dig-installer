@@ -167,9 +167,11 @@ authoritative outcome).
 
 Stable, versioned (`schema_version`) JSON shape emitted by `--json` on success:
 `{schema_version, installer_version, target, dry_run, components[], path, service, relay, dns,
-installed[]}`. See `src/lib.rs` doc comments on `InstallReport`/`ComponentResult`/`PathResult`/
-`ServiceResult`/`RelayResult`/`dns::DnsInstallResult` for the exact field set; every boolean field
-has a paired human-readable `*_note` — no field is ever silently omitted to signal failure.
+installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc comments on
+`InstallReport`/`ComponentResult`/`PathResult`/`ServiceResult`/`RelayResult`/`dns::DnsInstallResult`/
+`pathcheck::CliPathCheck` for the exact field set; every boolean field has a paired human-readable
+`*_note` — no field is ever silently omitted to signal failure. `ready`/`failures` are the aggregate
+readiness verdict (§4.2); the `--json` envelope's `ok` mirrors `ready`.
 
 ## 4. Exit codes
 
@@ -185,9 +187,48 @@ has a paired human-readable `*_note` — no field is ever silently omitted to si
 | 8 | `SERVICE_START_FAILED` | the dig-node/dig-relay service failed to install or start |
 | 9 | `IO` | failed to write a downloaded binary to disk |
 | 10 | `SERVICE_STOP_FAILED` | a running service failed to stop before its binary could be safely replaced (task #232) |
+| 11 | `NOT_ELEVATED` | the installer was launched without elevation (Administrator/root) but the plan needs it — re-run elevated (#492) |
+| 12 | `INSTALL_INCOMPLETE` | a completed run that is NOT ready: a selected component failed to install or its service is not running — DIG is not ready (#493) |
 
 This table is generated from `src/error.rs::EXIT_CODES` and mirrored in `--help-json`; the two
 can never drift (`error::tests::exit_codes_table_matches_error_kinds`).
+
+## 4.1 Elevation enforcement (#492)
+
+The installer REQUIRES elevation — Administrator on Windows, root (sudo) on macOS/Linux — whenever
+the plan registers an OS service (dig-node / dig-dns / dig-relay) or writes the `dig.local` hosts
+entry (`InstallPlan::requires_elevation()`). The check runs **FIRST**, before resolving/downloading/
+writing anything: an un-elevated run of such a plan fails immediately with `NOT_ELEVATED` (exit 11)
+and leaves NO partial state. A `--dry-run` or a digstore-only (per-user) install never trips the
+gate. The per-OS elevation probe is `elevation::is_elevated` (Windows `net session`, Unix `id -u`);
+the pure decision + per-OS remedy is `elevation::gate` (unit-tested). The GUI enforces the same gate
+before its first write.
+
+## 4.2 Readiness verdict — fail loud (#493)
+
+A run does not report success merely because downloads succeeded. `InstallReport` carries an
+aggregate `ready: bool` + `failures: Vec<String>`: **`ready` is `true` only when every selected
+component installed AND its service is verified RUNNING**. The CLI prints `✓ DIG is ready` only when
+`ready`; otherwise it prints `✗ DIG is NOT ready` with each failure + the remedy and exits
+`INSTALL_INCOMPLETE` (exit 12). `--json` still emits the full report with `ok:false`. The GUI emits
+`install://error` (never `install://done`) when not ready. A `--dry-run` installs nothing, so it is
+trivially `ready`.
+
+### Real service health — by service id, not a port probe
+
+Post-install health is judged by querying the OS **service manager** for the RUNNING state of the
+service THIS run registered, identified by its canonical reverse-DNS id — `net.dignetwork.dig-node`
+/ `net.dignetwork.dig-dns` (`svc` module: Windows `sc query`, Linux `systemctl is-active`, macOS
+`launchctl print`). A bare listener on port 9778 started by something else can no longer produce a
+false success; the JSON-RPC `rpc.discover` probe is retained only as secondary detail. dig-dns
+readiness additionally requires at least one live resolution path (`paths_live`).
+
+### CLI-on-PATH verification (#496)
+
+`digstore`, `dig-node`, and `dig-dns` are placed in one bin dir which is added to PATH; the installer
+then verifies each resolves **by bare name from a fresh shell** (`pathcheck` module) so a user can run
+`dig-node pair approve <id>` immediately. An unresolvable required CLI makes the install NOT ready.
+On Windows the PATH change is broadcast (`WM_SETTINGCHANGE`); a new terminal picks it up.
 
 ## 5. Visual theme (task #233)
 
