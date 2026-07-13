@@ -46,6 +46,64 @@ pub fn is_elevated() -> bool {
         .unwrap_or(false)
 }
 
+/// Is a Windows Service named `service_name` currently registered with the
+/// SCM (in any state — running, stopped, etc.)? Probed via `sc query`, whose
+/// exit code [`plan::sc_query_means_not_registered`] interprets. Never
+/// requires elevation (querying, unlike creating/deleting/configuring, is
+/// available to any user).
+fn service_exists(service_name: &str) -> bool {
+    let output = std::process::Command::new("sc")
+        .args(["query", service_name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match output {
+        Ok(out) => !plan::sc_query_means_not_registered(out.status.code()),
+        // `sc.exe` failed to spawn at all — treat as absent (best-effort; the
+        // subsequent create attempt will surface the real failure).
+        Err(_) => false,
+    }
+}
+
+/// Poll [`service_exists`] until it reports gone or `max_wait` elapses. A `sc
+/// delete` marks a service for deletion, which the SCM can take a moment to
+/// fully complete; a bounded poll (not an unconditional sleep) means a fast
+/// removal proceeds immediately while a slow one still gets the full budget.
+fn wait_for_removal(service_name: &str, max_wait: Duration) {
+    let start = std::time::Instant::now();
+    while service_exists(service_name) {
+        if start.elapsed() >= max_wait {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Set the Windows Service's human-friendly DISPLAY name (task #494) via
+/// `sc config`. `service-manager`'s `ScServiceManager::install` always sets
+/// `displayname=` to the qualified service name at create time (no
+/// `ServiceInstallCtx` field overrides it), so this is a follow-up call.
+fn set_display_name(service_name: &str, display_name: &str) -> Result<(), String> {
+    let args = plan::sc_set_display_name_args(service_name, display_name);
+    let status = std::process::Command::new("sc")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("spawn sc config: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sc config exited with {}",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        ))
+    }
+}
+
 fn failed(note: impl Into<String>) -> DnsInstallResult {
     DnsInstallResult {
         installed: false,
@@ -172,11 +230,13 @@ pub fn install(
     if dry_run {
         return DnsInstallResult {
             note: format!(
-                "would register the Windows service \"{}\" (host {}, target {}), \
-                 add the .dig NRPT rule, and set the Chrome/Edge DoH policy",
+                "would ensure a clean reinstall (stop + delete any pre-existing service), \
+                 register the Windows service \"{}\" (host {}, target {}) with display name \
+                 \"{}\", add the .dig NRPT rule, and set the Chrome/Edge DoH policy",
                 plan::SERVICE_LABEL,
                 persist_bin.display(),
-                dig_dns_bin.display()
+                dig_dns_bin.display(),
+                plan::SERVICE_DISPLAY_NAME,
             ),
             ..failed(String::new())
         };
@@ -201,6 +261,24 @@ pub fn install(
 
     let mgr = service_manager::ScServiceManager::system();
     let args = plan::service_host_launch_args(&dig_dns_bin.to_string_lossy(), cfg.node.as_deref());
+
+    let mut notes = Vec::new();
+
+    // Clean reinstall (task #494): a pre-existing service is stopped +
+    // deregistered BEFORE recreating — never reconfigured in place. Fixes
+    // `CreateService 1073` ("already exists") on a second install run.
+    if service_exists(plan::SERVICE_LABEL) {
+        let _ = mgr.stop(ServiceStopCtx { label: label() });
+        match mgr.uninstall(ServiceUninstallCtx { label: label() }) {
+            Ok(()) => notes
+                .push("removed the pre-existing Windows service for a clean reinstall".to_string()),
+            Err(e) => notes.push(format!(
+                "could not remove the pre-existing Windows service before reinstall: {e}"
+            )),
+        }
+        wait_for_removal(plan::SERVICE_LABEL, Duration::from_secs(5));
+    }
+
     if let Err(e) = mgr.install(ServiceInstallCtx {
         label: label(),
         program: persist_bin.to_path_buf(),
@@ -215,11 +293,22 @@ pub fn install(
     }) {
         return failed(format!("dig-dns service registration failed: {e}"));
     }
-
-    let mut notes = vec![format!(
+    notes.push(format!(
         "registered the Windows service \"{}\"",
         plan::SERVICE_LABEL
-    )];
+    ));
+
+    // Human-friendly Services-panel display name (task #494): service-manager
+    // always sets displayname= to the qualified service name at create time,
+    // so override it with a follow-up `sc config` call.
+    match set_display_name(plan::SERVICE_LABEL, plan::SERVICE_DISPLAY_NAME) {
+        Ok(()) => notes.push(format!(
+            "set the service display name to \"{}\"",
+            plan::SERVICE_DISPLAY_NAME
+        )),
+        Err(e) => notes.push(format!("service display name not set: {e}")),
+    }
+
     let mut started = false;
     if cfg.start {
         match mgr.start(ServiceStartCtx { label: label() }) {
@@ -520,5 +609,34 @@ mod tests {
         // No assertion on the value (depends on the test runner's privilege); this only
         // exercises the probe without crashing.
         let _ = is_elevated();
+    }
+
+    /// A service name that certainly does not exist on any test host (task #494).
+    const NONEXISTENT_SERVICE: &str = "net.dignetwork.dig-dns-test-definitely-not-a-real-service";
+
+    #[test]
+    fn service_exists_is_false_for_an_unregistered_service() {
+        assert!(!service_exists(NONEXISTENT_SERVICE));
+    }
+
+    #[test]
+    fn wait_for_removal_returns_immediately_when_already_gone() {
+        // The service is already absent, so the poll must not spin for the full
+        // budget — it should return well within it.
+        let start = std::time::Instant::now();
+        wait_for_removal(NONEXISTENT_SERVICE, Duration::from_secs(5));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not wait the full budget when already removed"
+        );
+    }
+
+    #[test]
+    fn set_display_name_errors_for_a_nonexistent_service() {
+        // `sc config` on a service that doesn't exist (or without elevation)
+        // must fail cleanly, never panic — exercised without requiring a real
+        // elevated `sc create` in CI.
+        let err = set_display_name(NONEXISTENT_SERVICE, "DIG NETWORK: TEST").unwrap_err();
+        assert!(!err.is_empty());
     }
 }
