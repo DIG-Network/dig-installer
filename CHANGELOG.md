@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.0] - 2026-07-13
+
+### Features
+- **installer:** 3-OS install->health->uninstall e2e CI + Linux service-identity fixes it found (#20)
+
 ## [0.13.0] - 2026-07-13
 
 ### Features
