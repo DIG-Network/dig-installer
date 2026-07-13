@@ -184,6 +184,53 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     let bin_dir = install_dir.join("bin");
     let lib_dir = install_dir.join("lib");
 
+    // ---- Phase 0: enforce elevation (#492) ----
+    // If the selection registers an OS service (dig-node / dig-dns / dig-relay)
+    // the install needs Administrator/root. Check FIRST, before any unpack/
+    // write, so an un-elevated run fails fast with NO partial state — never the
+    // old "half-installed, falsely-successful" outcome (#493). digstore-only
+    // (per-user) selections don't trip this.
+    // #499: refuse to run as LocalSystem/SYSTEM, UNCONDITIONALLY (even a
+    // digstore-only install as SYSTEM lands per-user state — PATH, .dig
+    // association — in the wrong profile). A SYSTEM token also breaks the GUI's
+    // own WebView2 (it writes to `…\systemprofile\…\EBWebView`). Elevation MUST
+    // be a UAC elevation of the SAME interactive user — never a service /
+    // scheduled-task / `psexec -s` relaunch that yields SYSTEM. Checked FIRST,
+    // before any unpack/write, so a SYSTEM launch leaves NO partial state.
+    if dig_installer::elevation::is_system() {
+        let msg = "the DIG installer is running as LocalSystem/SYSTEM, not your user account. \
+             A SYSTEM token cannot run the installer UI and writes settings to the wrong profile. \
+             Close this and re-launch the installer normally as your own user — it will prompt for \
+             Administrator via UAC, elevating YOUR account, not SYSTEM. Do NOT launch it via a \
+             service, scheduled task, or psexec -s."
+            .to_string();
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
+        return Err(msg);
+    }
+
+    let selects_service = ["dig-node", "dig-dns", "dig-relay"]
+        .iter()
+        .any(|id| *opts.selected.get(*id).unwrap_or(&false));
+    if selects_service && !dig_installer::elevation::is_elevated() {
+        let msg = format!(
+            "elevation required: {}. Re-run the installer as Administrator (Windows) / with sudo \
+             (macOS/Linux). Nothing was changed.",
+            dig_installer::elevation::reason()
+        );
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
+        return Err(msg);
+    }
+
     // ---- Phase 1: resolve target ----
     emit_pct(app, 2.0, Some(bin_name()));
     let arch = std::env::consts::ARCH;
@@ -419,24 +466,50 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         || extra_plan.with_dig_dns
         || extra_plan.with_relay
         || extra_plan.with_browser
+        // #389: the default-on chia:// scheme handler must register even when no
+        // downloadable extra component is selected (e.g. a digstore-only GUI run).
+        || extra_plan.register_scheme
     {
         emit_pct(app, 94.0, Some("additional components"));
         emit_line(
             app,
             "Installing the other selected DIG components:".to_string(),
         );
-        if let Err(e) = dig_installer::run_report(&extra_plan, &mut |line| emit_line(app, line)) {
-            let msg = format!("installing additional components failed: {e}");
-            let _ = app.emit(
-                "install://error",
-                InstallError {
-                    message: msg.clone(),
-                },
-            );
-            return Err(msg);
+        // Fail-loud (#493): a completed run that is NOT ready (a selected
+        // component didn't install or its service isn't RUNNING) is a FAILURE —
+        // never emit "DIG is ready". The report's aggregate `ready`/`failures`
+        // (real service-manager health, not a bare port probe) is the verdict.
+        match dig_installer::run_report(&extra_plan, &mut |line| emit_line(app, line)) {
+            Ok(report) if !report.ready => {
+                let msg = format!(
+                    "DIG is NOT ready — {} component(s) failed: {}. Re-run elevated \
+                     (Administrator/root) if elevation is the cause.",
+                    report.failures.len(),
+                    report.failures.join("; ")
+                );
+                let _ = app.emit(
+                    "install://error",
+                    InstallError {
+                        message: msg.clone(),
+                    },
+                );
+                return Err(msg);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let msg = format!("installing additional components failed: {e}");
+                let _ = app.emit(
+                    "install://error",
+                    InstallError {
+                        message: msg.clone(),
+                    },
+                );
+                return Err(msg);
+            }
         }
     }
 
+    // Every selected component installed AND its service is verified RUNNING.
     emit_pct(app, 100.0, Some("done"));
     emit_line(app, r#"<span class="ok">✓</span> DIG is ready."#);
 
@@ -472,6 +545,11 @@ fn plan_from_selection(
         dig_dns_version: None,
         dns_service: dig_installer::dns::DnsInstallConfig::default(),
         modify_path: true,
+        // #389: register the chia:// (+ urn:) URL-scheme handler by default,
+        // in sync with the CLI's default-on `register_scheme`. Toggleable from
+        // the GUI: a `"register-scheme": false` selection opts out (mirrors the
+        // CLI's `--no-register-scheme`); an absent key means the default (ON).
+        register_scheme: *selected.get("register-scheme").unwrap_or(&true),
         dry_run: false,
     }
 }
@@ -766,6 +844,30 @@ mod plan_from_selection_tests {
     fn bin_dir_is_threaded_through() {
         let plan = plan_from_selection(&HashMap::new(), Path::new("/opt/dig/bin"));
         assert_eq!(plan.bin_dir, Path::new("/opt/dig/bin"));
+    }
+
+    #[test]
+    fn scheme_handler_defaults_on_in_sync_with_the_cli() {
+        // #389: absent from the selection map -> ON by default, matching the
+        // CLI's default-on `register_scheme` (GUI + CLI defaults in sync).
+        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        assert!(
+            plan.register_scheme,
+            "the chia:// scheme handler defaults ON in the GUI, mirroring the CLI"
+        );
+    }
+
+    #[test]
+    fn scheme_handler_can_be_toggled_off() {
+        // A GUI toggle sends `"register-scheme": false` — the same opt-out the
+        // CLI's `--no-register-scheme` produces.
+        let mut sel = HashMap::new();
+        sel.insert("register-scheme".to_string(), false);
+        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        assert!(
+            !plan.register_scheme,
+            "an explicit opt-out disables the handler"
+        );
     }
 }
 

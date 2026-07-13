@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-13
+
+### Bug Fixes
+- **installer:** P0 install-correctness — no SYSTEM token, daemon state dir, dig.local, dig-dns start (#17)
+
+## [0.9.0] - 2026-07-13
+
+### Bug Fixes
+- Enforce elevation + fail loud + verify real service/CLI health (#13)
+
 ## [0.8.1] - 2026-07-13
 
 ### Bug Fixes

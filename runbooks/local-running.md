@@ -18,6 +18,16 @@ cargo llvm-cov --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'   # cov
 No env vars are required to run the CLI locally; `--bin-dir` overrides the install location if
 you don't want it touching your real PATH/service state while iterating.
 
+**Elevation is required for a REAL install** (not `--dry-run`): registering the dig-node/dig-dns
+services + writing the `dig.local` hosts entry needs Administrator (Windows) / root (macOS/Linux).
+An un-elevated real install is refused up front (`NOT_ELEVATED`, exit 11) with no partial state
+(#492). Iterate against `--dry-run` (no elevation, no writes) or run the real path from an elevated
+console. The run reports `✓ DIG is ready` ONLY when every selected component installed AND its
+service is verified RUNNING (by service id via `sc query`/`systemctl is-active`/`launchctl print`)
+AND each CLI (digstore/dig-node/dig-dns) resolves on PATH; otherwise it exits `INSTALL_INCOMPLETE`
+(exit 12) listing what failed (#493/#496). After a real install, verify from a **new** shell:
+`dig-node --version` / `dig-dns --version` / `digstore --version` all resolve.
+
 ## GUI (`gui/app`, Tauri 2)
 
 Prereqs: Node 18+, the Rust stable toolchain, and the Tauri CLI prereqs for your OS

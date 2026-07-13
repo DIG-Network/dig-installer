@@ -5,13 +5,14 @@
 //! policy — NEVER editing the hosts file, NEVER a URL rewrite, NEVER TLS
 //! interception.
 //!
-//! dig-dns has no Windows-service-protocol entrypoint of its own (`serve` is
-//! a plain blocking CLI loop), so the SCM is registered to run THIS
-//! installer's own persisted binary with the hidden `run-dig-dns-service`
-//! entrypoint ([`super::service_host`]), which speaks
-//! `StartServiceCtrlDispatcher` and spawns the real `dig-dns.exe serve` as a
-//! supervised child process — mirroring dig-node-service's `win_service.rs`
-//! pattern (see the ecosystem `DEVELOPMENT_LOG.md`).
+//! The SCM service is registered to run `dig-dns.exe run-service` **directly**
+//! — dig-dns's OWN Windows Service Control Protocol entrypoint (v0.9.0+), which
+//! reports `SERVICE_RUNNING` to the SCM before any slow startup work. There is
+//! NO re-launching installer host-shim: the previous shim (the installer's own
+//! binary child-spawning `dig-dns serve`) added an indirection that missed the
+//! SCM start-timeout, producing the field `1053` error (#499); running dig-dns
+//! directly removes it. Any dig-node endpoint override is baked into the
+//! service ENVIRONMENT (`DIG_NODE_URL`), which `run-service` reads.
 
 use std::path::Path;
 use std::time::Duration;
@@ -20,7 +21,7 @@ use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
     ServiceUninstallCtx,
 };
-use winreg::enums::HKEY_LOCAL_MACHINE;
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
 
 use super::plan;
@@ -108,6 +109,7 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
     DnsInstallResult {
         installed: false,
         started: false,
+        service_running: false,
         needs_elevation: false,
         note: note.into(),
         doctor: None,
@@ -116,37 +118,6 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
         pac_url: None,
         fallback_instruction: None,
     }
-}
-
-/// Copy the currently-running dig-installer executable to `dest` so it
-/// survives as the Windows service's host process after the (often
-/// transient, `install.ps1`-downloaded) invoking copy is deleted. Idempotent:
-/// a no-op when `dest` already has identical bytes.
-pub fn persist_self_at(current: &Path, dest: &Path) -> Result<(), String> {
-    if current == dest {
-        return Ok(());
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    if files_identical(current, dest) {
-        return Ok(());
-    }
-    std::fs::copy(current, dest)
-        .map(|_| ())
-        .map_err(|e| format!("copy {} -> {}: {e}", current.display(), dest.display()))
-}
-
-fn files_identical(a: &Path, b: &Path) -> bool {
-    match (std::fs::read(a), std::fs::read(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    }
-}
-
-fn persist_self(dest: &Path) -> Result<(), String> {
-    let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    persist_self_at(&current, dest)
 }
 
 /// Run a PowerShell command line, discarding its stdout (used for `Add-`/`Remove-DnsClientNrptRule`,
@@ -193,19 +164,29 @@ fn apply_policy_under(hive: &RegKey, key_path: &str) -> Result<bool, String> {
 
 /// Remove the policy under `hive\key_path` ONLY if this installer created it (the
 /// [`plan::POLICY_MARKER_NAME`] marker is present). Returns `Ok(true)` if removed.
+///
+/// Deletes ONLY the three values THIS installer set (`POLICY_DOH_NAME`,
+/// `POLICY_BUILTIN_RESOLVER_NAME`, `POLICY_MARKER_NAME`) — NEVER the whole
+/// Chrome/Edge policy key via `delete_subkey_all`. An org (or another tool) may
+/// have added its own values to the same `…\Chrome`/`…\Edge` policy key after us;
+/// blowing the entire key away would destroy that unrelated managed policy. The
+/// (now possibly empty) key itself is left in place — a harmless empty policy key
+/// is far safer than nuking a key we do not exclusively own.
 fn remove_policy_under(hive: &RegKey, key_path: &str) -> Result<bool, String> {
-    match hive.open_subkey(key_path) {
+    match hive.open_subkey_with_flags(key_path, KEY_READ | KEY_SET_VALUE) {
         Ok(existing) => {
             let ours: u32 = existing.get_value(plan::POLICY_MARKER_NAME).unwrap_or(0);
             if ours != 1 {
-                return Ok(false); // not ours — never remove someone else's policy.
+                return Ok(false); // not ours — never touch someone else's policy.
             }
-            drop(existing);
-            hive.delete_subkey_all(key_path)
-                .map_err(|e| format!("delete {key_path}: {e}"))?;
+            // Delete only the values we own; leave any foreign values (and the key)
+            // intact. `delete_value` on an absent value is a no-op we can ignore.
+            let _ = existing.delete_value(plan::POLICY_DOH_NAME);
+            let _ = existing.delete_value(plan::POLICY_BUILTIN_RESOLVER_NAME);
+            let _ = existing.delete_value(plan::POLICY_MARKER_NAME);
             Ok(true)
         }
-        Err(_) => Ok(false), // nothing there.
+        Err(_) => Ok(false), // nothing there (or not readable) — nothing to remove.
     }
 }
 
@@ -217,24 +198,19 @@ fn remove_browser_policy(key_path: &str) -> Result<bool, String> {
     remove_policy_under(&RegKey::predef(HKEY_LOCAL_MACHINE), key_path)
 }
 
-/// Install dig-dns as a Windows Service: persist the installer's own binary
-/// (the service host), register + start the SCM service, add the `.dig` NRPT
-/// rule, apply the Chrome/Edge DoH policy, then self-verify with
+/// Install dig-dns as a Windows Service: register + start the SCM service
+/// pointing at `dig-dns.exe run-service` DIRECTLY (dig-dns's own SCM
+/// entrypoint — no installer host-shim, the #499 `1053` fix), add the `.dig`
+/// NRPT rule, apply the Chrome/Edge DoH policy, then self-verify with
 /// `dig-dns doctor` + `dig-dns pac`.
-pub fn install(
-    dig_dns_bin: &Path,
-    persist_bin: &Path,
-    cfg: &DnsInstallConfig,
-    dry_run: bool,
-) -> DnsInstallResult {
+pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> DnsInstallResult {
     if dry_run {
         return DnsInstallResult {
             note: format!(
                 "would ensure a clean reinstall (stop + delete any pre-existing service), \
-                 register the Windows service \"{}\" (host {}, target {}) with display name \
-                 \"{}\", add the .dig NRPT rule, and set the Chrome/Edge DoH policy",
+                 register the Windows service \"{}\" to run \"{} run-service\" directly with \
+                 display name \"{}\", add the .dig NRPT rule, and set the Chrome/Edge DoH policy",
                 plan::SERVICE_LABEL,
-                persist_bin.display(),
                 dig_dns_bin.display(),
                 plan::SERVICE_DISPLAY_NAME,
             ),
@@ -253,14 +229,11 @@ pub fn install(
         };
     }
 
-    if let Err(e) = persist_self(persist_bin) {
-        return failed(format!(
-            "could not persist dig-installer as the service host: {e}"
-        ));
-    }
-
     let mgr = service_manager::ScServiceManager::system();
-    let args = plan::service_host_launch_args(&dig_dns_bin.to_string_lossy(), cfg.node.as_deref());
+    // Register `dig-dns run-service` directly; bake an explicit dig-node
+    // override into the service environment (dig-dns reads DIG_NODE_URL).
+    let args = plan::run_service_args();
+    let environment = plan::service_node_env(cfg.node.as_deref());
 
     let mut notes = Vec::new();
 
@@ -281,13 +254,19 @@ pub fn install(
 
     if let Err(e) = mgr.install(ServiceInstallCtx {
         label: label(),
-        program: persist_bin.to_path_buf(),
+        program: dig_dns_bin.to_path_buf(),
         args: args.into_iter().map(std::ffi::OsString::from).collect(),
         contents: None,
         // No `username` → LocalSystem, required to bind :53/:80 on the dedicated loopback IP.
         username: None,
         working_directory: None,
-        environment: None,
+        // Bake DIG_NODE_URL when an explicit node override was given (else the
+        // service resolves dig-dns's own §5.3 ladder).
+        environment: if environment.is_empty() {
+            None
+        } else {
+            Some(environment)
+        },
         // Boot-start (#301): SCM `start= auto` — the service comes up on every boot.
         autostart: plan::DNS_SERVICE_AUTOSTART,
     }) {
@@ -307,6 +286,19 @@ pub fn install(
             plan::SERVICE_DISPLAY_NAME
         )),
         Err(e) => notes.push(format!("service display name not set: {e}")),
+    }
+
+    // Verify the display name actually PERSISTED (#494/#499): read it back via
+    // `sc qc` DISPLAY_NAME. The bug was `sc config` appearing to succeed while
+    // the Services panel still showed the raw reverse-DNS service id — a bare
+    // "set" note is not proof it stuck. Never silent (non-gating: a cosmetic
+    // label mismatch does not fail the functional install).
+    let display_check =
+        crate::svc::verify_display_name(plan::SERVICE_LABEL, plan::SERVICE_DISPLAY_NAME);
+    if display_check.matches {
+        notes.push(format!("verified {}", display_check.note));
+    } else {
+        notes.push(format!("display name NOT verified: {}", display_check.note));
     }
 
     let mut started = false;
@@ -367,6 +359,9 @@ pub fn install(
     DnsInstallResult {
         installed: true,
         started,
+        // The service-manager RUNNING poll happens in `register_dig_dns`
+        // (lib.rs) after this returns; it overwrites this with the observed state.
+        service_running: false,
         needs_elevation: false,
         note: notes.join("; "),
         doctor: doctor_summary,
@@ -439,57 +434,6 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
 mod tests {
     use super::*;
     use winreg::enums::HKEY_CURRENT_USER;
-
-    fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "dig-installer-dns-win-{tag}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn persist_self_copies_when_dest_absent() {
-        let dir = tmp_subdir("persist-new");
-        let src = dir.join("source.exe");
-        std::fs::write(&src, b"fake-binary-bytes").unwrap();
-        let dest = dir.join("nested").join("dig-installer.exe");
-        persist_self_at(&src, &dest).expect("copies");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"fake-binary-bytes");
-    }
-
-    #[test]
-    fn persist_self_is_idempotent_when_identical() {
-        let dir = tmp_subdir("persist-idem");
-        let src = dir.join("source.exe");
-        std::fs::write(&src, b"same-bytes").unwrap();
-        let dest = dir.join("dig-installer.exe");
-        persist_self_at(&src, &dest).expect("first copy");
-        // Modify the destination's mtime marker is irrelevant; re-run must still succeed
-        // (content-equal short-circuit) without erroring.
-        persist_self_at(&src, &dest).expect("second run is a no-op, not an error");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"same-bytes");
-    }
-
-    #[test]
-    fn persist_self_overwrites_when_content_differs() {
-        let dir = tmp_subdir("persist-diff");
-        let src = dir.join("source.exe");
-        let dest = dir.join("dig-installer.exe");
-        std::fs::write(&dest, b"old-bytes").unwrap();
-        std::fs::write(&src, b"new-bytes").unwrap();
-        persist_self_at(&src, &dest).expect("overwrites");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new-bytes");
-    }
-
-    #[test]
-    fn persist_self_is_a_noop_when_source_equals_dest() {
-        let dir = tmp_subdir("persist-same-path");
-        let p = dir.join("dig-installer.exe");
-        std::fs::write(&p, b"bytes").unwrap();
-        persist_self_at(&p, &p).expect("same path is a no-op");
-    }
 
     #[test]
     fn run_ps_succeeds_on_a_harmless_command() {
@@ -566,13 +510,31 @@ mod tests {
     }
 
     #[test]
-    fn remove_policy_deletes_a_key_it_owns() {
+    fn remove_policy_deletes_only_the_values_it_owns_not_the_key() {
         let hive = test_hive();
         let path = test_key_path("remove-owned");
         apply_policy_under(&hive, &path).unwrap();
+        // Simulate an org value added to the SAME policy key after us — it must
+        // survive (we must NOT `delete_subkey_all` the whole Chrome/Edge key).
+        {
+            let (key, _) = hive.create_subkey(&path).unwrap();
+            key.set_value("OrgSetting", &"keep-me").unwrap();
+        }
         let removed = remove_policy_under(&hive, &path).expect("removes");
         assert!(removed);
-        assert!(hive.open_subkey(&path).is_err(), "the key must be gone");
+        let key = hive
+            .open_subkey(&path)
+            .expect("the policy key itself must survive (an org may share it)");
+        // Our three values are gone …
+        assert!(key.get_raw_value(plan::POLICY_DOH_NAME).is_err());
+        assert!(key
+            .get_raw_value(plan::POLICY_BUILTIN_RESOLVER_NAME)
+            .is_err());
+        assert!(key.get_raw_value(plan::POLICY_MARKER_NAME).is_err());
+        // … but the foreign value is untouched.
+        let org: String = key.get_value("OrgSetting").expect("org value survives");
+        assert_eq!(org, "keep-me");
+        hive.delete_subkey_all(&path).unwrap();
     }
 
     #[test]

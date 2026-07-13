@@ -72,12 +72,16 @@ DNS/proxy wiring). Then open a **new** terminal and check it works:
 digstore --version
 ```
 
-> **Registering the two services needs elevation** (Administrator on Windows,
-> `sudo` on macOS/Linux). Run the one-liner from an elevated console for the full
-> install; without elevation the digstore CLI still installs and the services are
-> skipped best-effort with a clear message (re-run elevated to finish). On
-> Windows, run PowerShell as Administrator before the `irm … | iex` line; on
-> macOS/Linux, `curl -fsSL … | sudo sh`.
+> **The installer REQUIRES elevation** (Administrator on Windows, `sudo` on
+> macOS/Linux) because it registers the dig-node + dig-dns OS services and
+> writes the `dig.local` hosts entry. An un-elevated run is refused **up front**
+> (`NOT_ELEVATED`, exit 11) before anything is downloaded or written — it never
+> leaves a half-installed state. On Windows, run PowerShell as Administrator
+> before the `irm … | iex` line; on macOS/Linux, `curl -fsSL … | sudo sh`.
+> **"✓ DIG is ready" prints only when every selected component installed AND its
+> service is verified RUNNING**; otherwise the installer reports exactly what
+> failed and exits non-zero (`INSTALL_INCOMPLETE`, exit 12) — never a false
+> success.
 
 ### Install only some components
 
@@ -196,11 +200,12 @@ Default install location (`--bin-dir`):
    `enable` / launchd `RunAtLoad` — the installer does not reimplement it),
    best-effort writes the `dig.local` hosts entry, runs a **post-install
    resolve check** confirming the OS actually maps `dig.local` → `127.0.0.2`
-   now, and finally a **post-install RPC health check** confirming the service
-   is actually answering `rpc.discover` on its configured port (see below for
-   both). On Windows, service registration needs an elevated console — if you
-   aren't elevated the installer surfaces a clear message and the digstore
-   install still succeeds. `--uninstall-dig-node` reverses it: removes the OS
+   now, and finally a **post-install SERVICE health check** confirming the OS
+   service manager reports the service (`net.dignetwork.dig-node`) as RUNNING —
+   a bare listener on the port started by something else does NOT count as a
+   pass (#493). Because this registers a service, the whole installer requires
+   elevation up front (see the elevation note above); an un-elevated run is
+   refused before any change. `--uninstall-dig-node` reverses it: removes the OS
    service (delegating to dig-node's own `uninstall`) and the hosts entry.
 6. **dig-dns** *(by default; `--no-dig-dns` to skip)* — downloads the `dig-dns`
    binary, then **owns the full per-OS service + DNS/browser wiring itself**
@@ -314,7 +319,7 @@ installs; the overall run does not fail. Re-run once a release is published.
 |----|---------|-------------------|-----------------|
 | **macOS** | A **LaunchDaemon** (root, `KeepAlive`, logs to `/var/log/dig-dns.{out,err}.log`) runs `dig-dns serve`. A second, one-shot LaunchDaemon re-applies the `127.0.0.5` `lo0` alias at every boot (macOS does not persist `ifconfig` aliases across reboot). | `/etc/resolver/dig` → `nameserver 127.0.0.5` (macOS's per-TLD resolver mechanism). | A best-effort Chrome managed-preference plist (DoH off + built-in-resolver off) — written ONLY if no existing MDM-provisioned policy is detected; manual instructions are always also printed. |
 | **Ubuntu / Linux** | A **systemd unit** runs `dig-dns serve` as a dedicated, unprivileged `dig-dns` user granted ONLY `CAP_NET_BIND_SERVICE` (`CapabilityBoundingSet`, `NoNewPrivileges=yes`), `Restart=always`. | The resolv.conf owner is detected and wired accordingly: a `systemd-resolved` `~dig` domain drop-in, OR a NetworkManager-dnsmasq `server=/dig/127.0.0.5` config. A plain (unmanaged) `resolv.conf` is left untouched — never blindly rewritten — relying on the PAC fallback (Path B) instead. | Chrome **and** Chromium managed-policy JSON files (uniquely named, merged alongside any existing admin policy — never overwrites one). |
-| **Windows** | A **Windows Service** (admin-checked; the SCM launches dig-installer's own persisted binary via a hidden `run-dig-dns-service` entrypoint, which spawns `dig-dns serve` as a supervised child — dig-dns itself has no Windows-service-protocol entrypoint). | An **NRPT rule** (`Add-DnsClientNrptRule -Namespace .dig -NameServers 127.0.0.5`), added idempotently (never fights a pre-existing `.dig` rule). | Chrome **and** Edge HKLM policy (`DnsOverHttpsMode=off`, `BuiltInDnsClientEnabled=0`) — written ONLY under a key this installer created or already owns; a pre-existing org GPO is never touched. |
+| **Windows** | A **Windows Service** (admin-checked) registered to run `dig-dns.exe run-service` **directly** — dig-dns's own Service Control Protocol entrypoint, which reports `SERVICE_RUNNING` to the SCM immediately (no re-launching host shim; this is the fix for the field `1053` start-timeout). An explicit dig-node override is baked into the service environment as `DIG_NODE_URL`. | An **NRPT rule** (`Add-DnsClientNrptRule -Namespace .dig -NameServers 127.0.0.5`), added idempotently (never fights a pre-existing `.dig` rule). | Chrome **and** Edge HKLM policy (`DnsOverHttpsMode=off`, `BuiltInDnsClientEnabled=0`) — written ONLY under a key this installer created or already owns; a pre-existing org GPO is never touched. |
 
 Every artifact this installer writes is tagged with a stable marker so a re-run is a
 no-op (idempotent) and `--uninstall-dig-dns` removes ONLY what it created — a
@@ -394,6 +399,8 @@ pre-existing org DNS/browser policy.
   | 8 | `SERVICE_START_FAILED` | the dig-node/dig-relay service failed to install or start |
   | 9 | `IO` | failed to write a downloaded binary to disk |
   | 10 | `SERVICE_STOP_FAILED` | a running dig-node/dig-relay service failed to stop before its binary could be safely replaced |
+  | 11 | `NOT_ELEVATED` | launched without elevation (Administrator/root) but the plan needs it — refused up front, no partial state (#492) |
+  | 12 | `INSTALL_INCOMPLETE` | the run completed but is NOT ready: a selected component failed to install or its service is not running (#493) |
 
   (Usage errors from argument parsing return clap's own exit code 2.)
 

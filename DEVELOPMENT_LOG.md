@@ -3,20 +3,36 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
-## dig-dns has NO service code of its own — dig-installer owns its entire OS-service contract (task #494)
+## Register dig-dns's OWN `run-service` SCM entrypoint DIRECTLY — a host-shim caused the `1053` (task #494/#499)
 
-A directive naming "the dig-dns half" of a service-identity task can be misleading: `dig-dns`
-(`DIG-Network/dig-dns`) ships no `install`/`start`/service-registration code at all — its `serve`
-subcommand just blocks in the foreground. Unlike dig-node/dig-relay (which register THEMSELVES via
-`service-manager` internally and expose `install`/`start` verbs), **this installer's `src/dns/`
-module is the only place dig-dns's SCM service name, Windows display name, launchd label, and
-systemd unit exist** (`dns::plan::SERVICE_LABEL`/`SERVICE_DISPLAY_NAME`; see `SPEC.md` §2.2). A
-task phrased as "change dig-dns's SERVICE_NAME" must be implemented here, not in the `dig-dns` repo.
+The field bug (`dig_ecosystem#499`): installing dig-dns as a Windows service failed with SCM error
+`1053` ("the service did not respond to the start request in a timely fashion"). ROOT CAUSE was an
+**indirection**: the installer registered its OWN binary as the service, running a hidden
+`run-dig-dns-service` host-shim that child-spawned `dig-dns serve`. The host process's
+`StartServiceCtrlDispatcher`/RUNNING handshake was gated behind spawning the child, so the SCM's
+start-timeout could elapse before RUNNING was reported.
+
+FIX: dig-dns v0.9.0+ ships its OWN Service Control Protocol entrypoint, `dig-dns run-service`, which
+reports `SERVICE_RUNNING` to the SCM before any slow startup work. The installer now registers the
+SCM service to run **`dig-dns.exe run-service` directly** (program = the dig-dns binary, args =
+`["run-service"]`) — no host shim (`src/dns/service_host.rs` + the `run-dig-dns-service` subcommand
+DELETED, `windows-service` dep dropped). One coherent service process. An explicit dig-node override
+is baked into the service ENVIRONMENT as `DIG_NODE_URL` (dig-dns `config::ENV_NODE_URL`, a byte-identical
+cross-repo contract), which `run-service` reads; `ServiceInstallCtx.environment` carries it.
+
+Scope note: dig-dns (v0.9.0+) NOW has its own `install`/`uninstall`/`start`/`stop`/`status`/`run-service`
+verbs (it previously had none — old entries elsewhere calling dig-dns "a plain CLI with no service code"
+are superseded). But this installer STILL owns the surrounding per-OS wiring — the `.dig` NRPT rule /
+split-DNS resolver, the Chrome/Edge DoH policy, and `dig-dns doctor` self-verification — plus the
+canonical `dns::plan::SERVICE_LABEL`/`SERVICE_DISPLAY_NAME` it registers under. On macOS/Linux the
+service runs `dig-dns serve` directly (no SCM timeout there).
 
 Also: `service-manager` v0.7's `ScServiceManager::install` (Windows) ALWAYS sets `displayname=` to
 the qualified service name at create time — `ServiceInstallCtx` has no field to override it. A
 custom human-friendly display name (e.g. "DIG NETWORK: DNS") must be applied as a follow-up
-`sc config <name> displayname= "<display>"` call after `install` succeeds.
+`sc config <name> displayname= "<display>"` call, and VERIFIED by reading it back via
+`sc qc <id>` DISPLAY_NAME (`svc::verify_display_name`) — `sc config` can appear to succeed while the
+panel still shows the raw service id (the #499 display-name symptom).
 
 ## The installer's DEFAULT is the full 3-component stack, and boot-start is delegated vs owned (task #301)
 
@@ -219,3 +235,30 @@ Findings from actually turning these on:
   `tauri.conf.json`'s `beforeBuildCommand` only fires under the `tauri`
   CLI (`tauri build`/`tauri dev`), never under plain `cargo`; verified by
   removing `dist/` and rebuilding clean.
+
+## Fail-loud installs — never trust a bare port probe or a clean-looking log (#492/#493/#496)
+
+- **A "success" line must be earned, not printed.** The real bug: an un-elevated
+  run masked a `dig-node install` exit-6 with a ✓, hit `CreateService 1073`, yet
+  ended `✓ DIG is ready`. Lesson: the aggregate readiness verdict (`ready`/
+  `failures` on `InstallReport`) is computed from VERIFIED post-conditions, and
+  the green line + zero exit are gated on it. A component-level failure that was
+  only logged (never propagated) is the classic false-success trap.
+- **Verify the SERVICE, not the port.** The old post-install health check probed
+  `rpc.discover` on 9778 — a dig-node started by ANYTHING (a manual `serve`, a
+  stale process) answered, so the check passed without this run registering a
+  service. Fix: query the OS service manager by the canonical service id
+  (`net.dignetwork.dig-node`/`-dns`) — `sc query` STATE=RUNNING / `systemctl
+  is-active` / `launchctl print state=running`. The port probe is secondary
+  detail only. `svc.rs` owns the pure parsers.
+- **Enforce elevation FIRST, before any write.** Registering a service / writing
+  hosts needs admin; check it before downloading/writing so an un-elevated run
+  fails fast (`NOT_ELEVATED`) with zero partial state, rather than half-installing
+  then failing on the privileged step. `InstallPlan::requires_elevation()` scopes
+  it (dry-run / digstore-only never trips it). Detection: Windows `net session`,
+  Unix `id -u` == 0.
+- **"On PATH" means resolvable from a FRESH shell, not just "a file exists".**
+  `pathcheck` spawns each CLI by BARE NAME with PATH augmented to include the
+  install bin dir, so it proves name-resolution the way the user's next shell
+  will see it. On Windows the PATH write is followed by a `WM_SETTINGCHANGE`
+  broadcast so new shells pick it up without a reboot.

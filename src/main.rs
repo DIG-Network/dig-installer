@@ -174,31 +174,17 @@ struct Cli {
 }
 
 fn main() -> std::process::ExitCode {
-    // The Windows Service Control Manager launches THIS binary with the hidden
-    // `run-dig-dns-service` subcommand (task #177 — dig-dns has no service-protocol
-    // entrypoint of its own; see `dig_installer::dns::service_host`). It carries no public
-    // `--help` surface, so it must be sniffed BEFORE handing argv to clap (clap would reject
-    // it as an unrecognised argument — the `Cli` struct below defines no subcommands).
-    #[cfg(windows)]
-    {
-        let argv: Vec<String> = std::env::args().collect();
-        if let Some(rest) = dig_installer::dns::service_host::matches_service_host_invocation(&argv)
-        {
-            return match dig_installer::dns::service_host::run(&rest) {
-                Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("dig-dns service host error: {e}");
-                    std::process::ExitCode::FAILURE
-                }
-            };
-        }
-    }
+    // The Windows dig-dns service now runs `dig-dns.exe run-service` DIRECTLY
+    // (dig-dns's own SCM entrypoint) — the installer no longer hosts the service
+    // via a hidden re-launch subcommand (#499: that indirection missed the SCM
+    // start-timeout, causing `1053`). So there is nothing to intercept before
+    // clap on that account.
 
     // The OS URL-scheme handler (#389) launches THIS binary as
-    // `dig-installer handle-url <uri>` when a chia:// link is clicked. Like the
-    // service-host sniff above, it carries no public `--help` surface, so it is
-    // matched BEFORE clap (which would reject the bare subcommand). It resolves
-    // the URI through the local dig-node (§5.3) and opens the browser.
+    // `dig-installer handle-url <uri>` when a chia:// link is clicked. It carries
+    // no public `--help` surface, so it is matched BEFORE clap (which would
+    // reject the bare subcommand). It resolves the URI through the local
+    // dig-node (§5.3) and opens the browser.
     {
         let argv: Vec<String> = std::env::args().collect();
         if let Some(uri) = dig_installer::scheme::matches_handle_url_invocation(&argv) {
@@ -293,9 +279,28 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Pretty mode: human progress to stdout, typed error to stderr with its code.
+///
+/// Fail-loud (#493): a completed run that is NOT ready (a selected component
+/// failed to install or its service isn't running) exits NON-ZERO with an
+/// explicit "DIG is NOT ready" summary — never a silent success. The per-line
+/// verdict was already streamed by `run_report`; here we surface the aggregate
+/// + set the exit code.
 fn run_pretty(plan: &InstallPlan) -> std::process::ExitCode {
     match dig_installer::run_report(plan, &mut |line| println!("{line}")) {
-        Ok(_) => std::process::ExitCode::SUCCESS,
+        Ok(report) if report.ready => std::process::ExitCode::SUCCESS,
+        Ok(report) => {
+            eprintln!(
+                "DIG is NOT ready — {} component(s) failed:",
+                report.failures.len()
+            );
+            for f in &report.failures {
+                eprintln!("  - {f}");
+            }
+            eprintln!("re-run elevated (Administrator/root) if elevation is the cause, then run the installer again");
+            std::process::ExitCode::from(
+                dig_installer::error::ErrorKind::InstallIncomplete.exit_code(),
+            )
+        }
         Err(e) => {
             eprintln!("error [{}]: {}", e.code(), e);
             if let Some(hint) = e.hint() {
@@ -307,14 +312,23 @@ fn run_pretty(plan: &InstallPlan) -> std::process::ExitCode {
 }
 
 /// JSON mode: progress prose to stderr; a single structured object to stdout.
-/// Success → the InstallReport with `ok:true`; failure → `{ok:false,error:{…}}`.
+/// Success → the InstallReport with `ok:true`; a NOT-ready completion →
+/// `ok:false` with the full report (so an agent sees exactly what failed) +
+/// exit `INSTALL_INCOMPLETE`; a hard failure → `{ok:false,error:{…}}`.
 fn run_json(plan: &InstallPlan) -> std::process::ExitCode {
     let result = dig_installer::run_report(plan, &mut |line| eprintln!("{line}"));
     match result {
         Ok(report) => {
-            let envelope = serde_json::json!({ "ok": true, "result": report });
+            let ready = report.ready;
+            let envelope = serde_json::json!({ "ok": ready, "result": report });
             println!("{}", serde_json::to_string(&envelope).unwrap());
-            std::process::ExitCode::SUCCESS
+            if ready {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::from(
+                    dig_installer::error::ErrorKind::InstallIncomplete.exit_code(),
+                )
+            }
         }
         Err(e) => {
             println!("{}", error_json(&e));

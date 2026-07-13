@@ -388,7 +388,11 @@ fn register_linux(bin: &Path, schemes: &[String]) -> SchemeResult {
     }
     for scheme in schemes {
         let _ = Command::new("xdg-mime")
-            .args(["default", &desktop_name, &format!("x-scheme-handler/{scheme}")])
+            .args([
+                "default",
+                &desktop_name,
+                &format!("x-scheme-handler/{scheme}"),
+            ])
             .status();
     }
     SchemeResult {
@@ -407,7 +411,11 @@ fn unregister_linux(schemes: &[String]) -> SchemeResult {
     };
     SchemeResult {
         registered: false,
-        schemes: if removed { schemes.to_vec() } else { Vec::new() },
+        schemes: if removed {
+            schemes.to_vec()
+        } else {
+            Vec::new()
+        },
         note: if removed {
             "removed the DIG .desktop scheme handler".to_string()
         } else {
@@ -547,7 +555,10 @@ mod tests {
             store: "s1".into(),
             path: "a/b.html".into(),
         };
-        assert_eq!(serve_url("http://dig.local", &t), "http://dig.local/s/s1/a/b.html");
+        assert_eq!(
+            serve_url("http://dig.local", &t),
+            "http://dig.local/s/s1/a/b.html"
+        );
         // trailing slash on base is trimmed.
         assert_eq!(
             serve_url("http://localhost:9778/", &t),
@@ -601,7 +612,8 @@ mod tests {
 
     #[test]
     fn linux_desktop_contents_declares_scheme_mimetypes() {
-        let body = linux_desktop_contents(&PathBuf::from("/opt/dig/dig-installer"), &["chia", "urn"]);
+        let body =
+            linux_desktop_contents(&PathBuf::from("/opt/dig/dig-installer"), &["chia", "urn"]);
         assert!(body.contains("MimeType=x-scheme-handler/chia;x-scheme-handler/urn;"));
         assert!(body.contains("handle-url %u"));
         assert!(body.contains("Type=Application"));

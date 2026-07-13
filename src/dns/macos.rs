@@ -90,6 +90,7 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
     DnsInstallResult {
         installed: false,
         started: false,
+        service_running: false,
         needs_elevation: false,
         note: note.into(),
         doctor: None,
@@ -358,6 +359,8 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     DnsInstallResult {
         installed: true,
         started,
+        // Set by the RUNNING poll in `register_dig_dns` (lib.rs) after this returns.
+        service_running: false,
         needs_elevation: false,
         note: notes.join("; "),
         doctor: doctor_summary,

@@ -64,11 +64,21 @@ pub const HTTP_FALLBACK_PORT: u16 = 8053;
 /// runs as (granted only `CAP_NET_BIND_SERVICE`, never root).
 pub const LINUX_SERVICE_USER: &str = "dig-dns";
 
-/// The hidden dig-installer subcommand the Windows service is registered to
-/// run (it is not part of the public `--help` surface — see
-/// [`super::windows`]). It speaks the Windows Service Control Protocol and
-/// spawns the real `dig-dns serve` as a child process.
-pub const SERVICE_HOST_SUBCOMMAND: &str = "run-dig-dns-service";
+/// The dig-dns subcommand the OS service is registered to run **directly**:
+/// `dig-dns run-service` — dig-dns's OWN Windows Service Control Protocol
+/// entrypoint (dig-dns v0.9.0+), which reports `SERVICE_RUNNING` to the SCM
+/// before any slow startup work. Registering this binary+arg directly (no
+/// re-launching installer host-shim) is what avoids the SCM start-timeout
+/// `1053` seen in the field (#499). Byte-identical to dig-dns's own
+/// `service::plan_program_args` Windows arg.
+pub const RUN_SERVICE_SUBCOMMAND: &str = "run-service";
+
+/// The environment variable dig-dns reads for an explicit dig-node endpoint
+/// override (dig-dns `config::ENV_NODE_URL`). A cross-repo byte-identical
+/// contract (§4.1): the installer bakes it into the service environment so
+/// `dig-dns run-service` serves against the chosen node; absent it, dig-dns
+/// resolves its own §5.3 ladder.
+pub const ENV_NODE_URL: &str = "DIG_NODE_URL";
 
 /// dig-dns is registered as a **boot-start** OS service (#301): it starts
 /// automatically on every boot, on all three platforms. This single flag is
@@ -308,23 +318,28 @@ pub fn sc_set_display_name_args(service_name: &str, display_name: &str) -> Vec<S
     ]
 }
 
-/// Build the launch arguments dig-installer registers as the Windows service's
-/// `binPath` arguments (after its own program path): the hidden
-/// [`SERVICE_HOST_SUBCOMMAND`], the target `dig-dns` binary to spawn, and an
-/// optional `--node` override forwarded to `dig-dns serve`.
-pub fn service_host_launch_args(dig_dns_path: &str, node: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        SERVICE_HOST_SUBCOMMAND.to_string(),
-        "--exec".to_string(),
-        dig_dns_path.to_string(),
-    ];
-    if let Some(n) = node {
-        if !n.trim().is_empty() {
-            args.push("--node".to_string());
-            args.push(n.trim().to_string());
+/// The launch arguments the OS service registers AFTER the `dig-dns` program
+/// path: just `run-service`. The service's `binPath` is the dig-dns binary
+/// itself (`dig-dns run-service`) — dig-dns's own SCM entrypoint — with NO
+/// re-launching installer host-shim, so the SCM's start-timeout is satisfied by
+/// dig-dns directly (#499 root-cause fix). The dig-node endpoint override is
+/// NOT an argument here; it is baked into the service ENVIRONMENT via
+/// [`service_node_env`] (dig-dns `run-service` reads its config from env).
+pub fn run_service_args() -> Vec<String> {
+    vec![RUN_SERVICE_SUBCOMMAND.to_string()]
+}
+
+/// The service ENVIRONMENT overrides to bake in (task #177, #499): an explicit
+/// dig-node endpoint as [`ENV_NODE_URL`], or empty when none is given (dig-dns
+/// then resolves its own §5.3 ladder). A blank/whitespace override is ignored.
+/// Pure so the exact baked environment is unit-tested.
+pub fn service_node_env(node: Option<&str>) -> Vec<(String, String)> {
+    match node {
+        Some(n) if !n.trim().is_empty() => {
+            vec![(ENV_NODE_URL.to_string(), n.trim().to_string())]
         }
+        _ => Vec::new(),
     }
-    args
 }
 
 // ---------------------------------------------------------------------------
@@ -595,39 +610,32 @@ mod tests {
     }
 
     #[test]
-    fn service_host_launch_args_wrap_the_target_binary() {
-        let args = service_host_launch_args(r"C:\dig\bin\dig-dns.exe", None);
-        assert_eq!(
-            args,
-            vec![
-                SERVICE_HOST_SUBCOMMAND.to_string(),
-                "--exec".to_string(),
-                r"C:\dig\bin\dig-dns.exe".to_string(),
-            ]
-        );
+    fn run_service_args_register_dig_dns_own_scm_entrypoint_directly() {
+        // #499 root-cause fix: the service runs `dig-dns run-service` DIRECTLY
+        // (no `--exec`, no installer host-shim subcommand) — just the one arg.
+        assert_eq!(run_service_args(), vec!["run-service".to_string()]);
+        assert_eq!(RUN_SERVICE_SUBCOMMAND, "run-service");
     }
 
     #[test]
-    fn service_host_launch_args_forward_a_node_override() {
-        let args = service_host_launch_args("dig-dns.exe", Some("http://localhost:9778"));
+    fn service_node_env_bakes_an_explicit_node_override() {
+        let env = service_node_env(Some("http://localhost:9778"));
         assert_eq!(
-            args,
-            vec![
-                SERVICE_HOST_SUBCOMMAND.to_string(),
-                "--exec".to_string(),
-                "dig-dns.exe".to_string(),
-                "--node".to_string(),
-                "http://localhost:9778".to_string(),
-            ]
+            env,
+            vec![(
+                "DIG_NODE_URL".to_string(),
+                "http://localhost:9778".to_string()
+            )]
         );
+        // Byte-identical to dig-dns's config env contract (§4.1).
+        assert_eq!(ENV_NODE_URL, "DIG_NODE_URL");
     }
 
     #[test]
-    fn service_host_launch_args_ignore_a_blank_node_override() {
-        let args = service_host_launch_args("dig-dns.exe", Some("   "));
-        // Base is [SUBCOMMAND, "--exec", path] = 3; a blank --node adds nothing.
-        assert_eq!(args.len(), 3, "a blank --node must not be forwarded");
-        assert!(!args.contains(&"--node".to_string()));
+    fn service_node_env_is_empty_without_an_override() {
+        // Absent (or blank/whitespace) → no env baked; dig-dns resolves its ladder.
+        assert!(service_node_env(None).is_empty());
+        assert!(service_node_env(Some("   ")).is_empty());
     }
 
     #[test]
