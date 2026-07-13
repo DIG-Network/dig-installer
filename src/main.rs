@@ -142,6 +142,22 @@ struct Cli {
     #[arg(long)]
     no_path: bool,
 
+    /// Opt OUT of registering the `chia://` (+ `urn:`) OS URL-scheme handler
+    /// (registered by default): clicking a chia:// link anywhere opens the
+    /// resolved DIG content in the browser via the local dig-node (#389).
+    #[arg(long = "no-register-scheme")]
+    no_register_scheme: bool,
+
+    /// Explicitly register the chia:// URL-scheme handler (redundant — it is
+    /// registered by default; here for symmetry with `--no-register-scheme`).
+    #[arg(long = "register-scheme")]
+    register_scheme: bool,
+
+    /// Unregister the chia:// / urn: URL-scheme handler this installer created
+    /// (idempotent). Runs standalone — ignores every other install flag.
+    #[arg(long = "unregister-scheme")]
+    unregister_scheme: bool,
+
     /// Print what would be done without downloading or changing anything.
     #[arg(long)]
     dry_run: bool,
@@ -178,6 +194,27 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // The OS URL-scheme handler (#389) launches THIS binary as
+    // `dig-installer handle-url <uri>` when a chia:// link is clicked. Like the
+    // service-host sniff above, it carries no public `--help` surface, so it is
+    // matched BEFORE clap (which would reject the bare subcommand). It resolves
+    // the URI through the local dig-node (§5.3) and opens the browser.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(uri) = dig_installer::scheme::matches_handle_url_invocation(&argv) {
+            return match dig_installer::scheme::handle_url(&uri) {
+                Ok(url) => {
+                    eprintln!("opening {url}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("dig-installer handle-url error: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
+    }
+
     let cli = Cli::parse();
 
     if cli.help_json {
@@ -194,6 +231,17 @@ fn main() -> std::process::ExitCode {
     if cli.uninstall_dig_node {
         let bin_dir = cli.bin_dir.clone().unwrap_or_else(paths::default_bin_dir);
         return run_uninstall_dig_node(&bin_dir, cli.dry_run, cli.json);
+    }
+
+    if cli.unregister_scheme {
+        let result = dig_installer::scheme::unregister(cli.dry_run);
+        if cli.json {
+            let envelope = serde_json::json!({ "ok": true, "result": result });
+            println!("{}", serde_json::to_string(&envelope).unwrap());
+        } else {
+            println!("scheme handler: {}", result.note);
+        }
+        return std::process::ExitCode::SUCCESS;
     }
 
     // #301 — universal installer: digstore + dig-node + dig-dns ALL install by
@@ -231,6 +279,9 @@ fn main() -> std::process::ExitCode {
             node: cli.dig_dns_node,
         },
         modify_path: !cli.no_path,
+        // #389: register chia:// by default; `--no-register-scheme` opts out
+        // (`--register-scheme` is the redundant explicit opt-in).
+        register_scheme: cli.register_scheme || !cli.no_register_scheme,
         dry_run: cli.dry_run,
     };
 

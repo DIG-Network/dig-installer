@@ -44,6 +44,7 @@ pub mod health;
 pub mod hosts;
 pub mod paths;
 pub mod release;
+pub mod scheme;
 pub mod service;
 pub mod target;
 
@@ -96,6 +97,11 @@ pub struct InstallPlan {
     pub dns_service: dns::DnsInstallConfig,
     /// Add the bin dir to PATH (default true).
     pub modify_path: bool,
+    /// Register the `chia://` (+ best-effort `urn:`) OS URL-scheme handler that
+    /// routes clicked links through the local dig-node into the browser (#389).
+    /// Default true — a first-class, toggleable install option
+    /// (`--no-register-scheme` opts out). Per-user, no elevation.
+    pub register_scheme: bool,
     /// Print actions without performing them.
     pub dry_run: bool,
 }
@@ -125,6 +131,7 @@ impl Default for InstallPlan {
             dig_dns_version: None,
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: true,
+            register_scheme: true,
             dry_run: false,
         }
     }
@@ -218,6 +225,9 @@ pub struct InstallReport {
     pub relay: Option<RelayResult>,
     /// The dig-dns OS-service install result (only when `--with-dig-dns`).
     pub dns: Option<dns::DnsInstallResult>,
+    /// The `chia://`/`urn:` URL-scheme registration result (only when
+    /// `register_scheme`) — #389.
+    pub scheme: Option<scheme::SchemeResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
 }
@@ -385,6 +395,7 @@ fn run_report_with(
         service: None,
         relay: None,
         dns: None,
+        scheme: None,
         installed: Vec::new(),
     };
 
@@ -604,8 +615,52 @@ fn run_report_with(
         report.components.push(c);
     }
 
+    // 7. chia:// (+ urn:) OS URL-scheme handler (#389) — default-on, toggleable.
+    //    Registers THIS installer's persisted binary as the handler; a clicked
+    //    chia:// link resolves through the local dig-node (§5.3) into the
+    //    browser. Per-user (no elevation). Best-effort: a registration failure
+    //    is recorded, never aborts the install (the rest already succeeded).
+    if plan.register_scheme {
+        log("Registering the chia:// URL-scheme handler (opens links via the local dig-node):");
+        report.scheme = Some(register_scheme_handler(plan, &target, log));
+    }
+
     log("Done.");
     Ok(report)
+}
+
+/// Register the `chia://`/`urn:` OS URL-scheme handler (#389). Persists this
+/// installer's own binary to `bin_dir` (a stable handler target that survives a
+/// transient `irm|iex` download) and points the OS handler at it. Never
+/// aborts — a failure is recorded in the result. Reports intent on dry-run.
+fn register_scheme_handler(
+    plan: &InstallPlan,
+    target: &Target,
+    log: &mut dyn FnMut(&str),
+) -> scheme::SchemeResult {
+    if plan.dry_run {
+        let r = scheme::register(&plan.bin_dir.join(target.exe_name("dig-installer")), true, true);
+        log(&format!("    ({})", r.note));
+        return r;
+    }
+    // Persist the running installer to a stable path so the registered handler
+    // keeps working after a transient download copy is gone.
+    let handler_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
+    if let Ok(current) = std::env::current_exe() {
+        if current != handler_bin {
+            if let Some(parent) = handler_bin.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&current, &handler_bin);
+        }
+    }
+    let r = scheme::register(&handler_bin, true, false);
+    if r.registered {
+        log(&format!("    ✓ {}", r.note));
+    } else {
+        log(&format!("    ! {}", r.note));
+    }
+    r
 }
 
 /// Register dig-relay as an OS service by delegating to its own `install`/`start` subcommands.
@@ -1218,6 +1273,7 @@ mod tests {
             dig_dns_version: None,
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: false,
+            register_scheme: false,
             dry_run: true,
         }
     }
