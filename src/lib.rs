@@ -609,6 +609,7 @@ fn run_report_gated(
                 report.dns = Some(dns::DnsInstallResult {
                     installed: false,
                     started: false,
+                    service_running: false,
                     needs_elevation: false,
                     note,
                     doctor: None,
@@ -793,6 +794,13 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
                 "dig-dns: the OS service did not register ({}); re-run elevated",
                 d.note
             )),
+            // F7: gate on the fail-loud service-manager RUNNING poll (mirror the
+            // dig-node `health_ok` gate) — a live `paths_live` probe alone is NOT
+            // sufficient (another process could satisfy it; #493 false-success).
+            Some(d) if plan.dns_service.start && !d.service_running => failures.push(format!(
+                "dig-dns: installed but the '{}' service did not reach RUNNING ({}); re-run elevated",
+                svc::DIG_DNS_SERVICE_ID, d.note
+            )),
             Some(d) if plan.dns_service.start && d.paths_live.is_empty() => failures.push(format!(
                 "dig-dns: installed but no live resolution path — the service is not serving ({})",
                 d.note
@@ -809,6 +817,27 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
                 r.note
             )),
             Some(_) => {}
+        }
+    }
+
+    // Machine-wide daemon state-dir hardening (#501 fail-closed, F2/F5): a
+    // control-token directory whose tight ACL could NOT be established AND verified
+    // by read-back is a hard failure. On failure the dir is deleted (fail closed),
+    // so the daemon has no dir to write its control-token into — the install must
+    // report NOT ready rather than let a daemon persist a control-token into a
+    // world/Users-readable directory (a local privilege escalation). Gate each dir
+    // on whether its daemon was selected for install.
+    for dir in &report.daemon_dirs {
+        let selected = match dir.daemon.as_str() {
+            "dig-node" => plan.with_dig_node,
+            "dig-dns" => plan.with_dig_dns,
+            _ => true,
+        };
+        if selected && !dir.acl_applied {
+            failures.push(format!(
+                "{}: the machine-wide state directory could not be hardened + verified ({}); re-run elevated",
+                dir.daemon, dir.note
+            ));
         }
     }
 
@@ -987,6 +1016,10 @@ fn register_dig_dns(
             HEALTH_CHECK_ATTEMPTS,
             HEALTH_CHECK_INTERVAL,
         );
+        // F7: record the RUNNING verdict as a machine-checkable field so readiness
+        // gates on the fail-loud service-manager poll — NOT on `paths_live` alone
+        // (another process could satisfy the DNS/gateway probe; the #493 false-success).
+        result.service_running = state == svc::ServiceRunState::Running;
         if state == svc::ServiceRunState::Running {
             log(&format!(
                 "    ✓ service health: {}",
@@ -2375,6 +2408,7 @@ mod tests {
         report.dns = Some(dns::DnsInstallResult {
             installed: true,
             started: true,
+            service_running: true, // reached RUNNING, but serves no path
             needs_elevation: false,
             note: "registered".to_string(),
             doctor: None,
@@ -2387,6 +2421,70 @@ mod tests {
         assert_eq!(failures.len(), 1, "got: {failures:?}");
         assert!(failures[0].contains("dig-dns"));
         assert!(failures[0].contains("no live resolution path"));
+    }
+
+    #[test]
+    fn readiness_fails_when_the_dig_dns_service_did_not_reach_running() {
+        // F7: even with a live resolution path, dig-dns is NOT ready unless OUR
+        // service reached RUNNING per the service manager — a path probe another
+        // process could satisfy must not mark it ready (#493 false-success).
+        let mut plan = base_plan();
+        plan.dry_run = false;
+        plan.with_dig_dns = true;
+        let mut report = report_shell();
+        report.dns = Some(dns::DnsInstallResult {
+            installed: true,
+            started: true,
+            service_running: false, // did NOT reach RUNNING
+            needs_elevation: false,
+            note: "registered".to_string(),
+            doctor: None,
+            paths_live: vec!["dns".to_string()], // a path probe passed anyway
+            bound_port: None,
+            pac_url: None,
+            fallback_instruction: None,
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-dns"));
+        assert!(failures[0].contains("did not reach RUNNING"));
+    }
+
+    #[test]
+    fn readiness_fails_when_a_daemon_state_dir_is_not_hardened() {
+        // #501 F2/F5: a control-token dir whose tight ACL could not be verified is
+        // a hard failure — the install must report NOT ready (fail closed).
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.daemon_dirs = vec![daemon_dir::DaemonDirResult {
+            daemon: "dig-node".to_string(),
+            path: r"C:\ProgramData\DigNode".to_string(),
+            created: false,
+            acl_applied: false,
+            note: "ACL read-back verification FAILED".to_string(),
+        }];
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-node"));
+        assert!(failures[0].contains("state directory could not be hardened"));
+    }
+
+    #[test]
+    fn readiness_ignores_an_unhardened_dir_for_an_unselected_daemon() {
+        // Only the SELECTED daemon's dir gates readiness: a dig-dns dir failure
+        // must not fail a dig-node-only install (dig-dns was not requested).
+        let plan = dig_node_service_plan(); // with_dig_dns = false
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.daemon_dirs = vec![daemon_dir::DaemonDirResult {
+            daemon: "dig-dns".to_string(),
+            path: r"C:\ProgramData\DigDns".to_string(),
+            created: false,
+            acl_applied: false,
+            note: "not hardened".to_string(),
+        }];
+        assert!(evaluate_readiness(&plan, &report).is_empty());
     }
 
     #[test]

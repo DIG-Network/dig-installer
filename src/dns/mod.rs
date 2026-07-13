@@ -64,6 +64,14 @@ impl Default for DnsInstallConfig {
 pub struct DnsInstallResult {
     pub installed: bool,
     pub started: bool,
+    /// `true` iff the dig-dns OS service was polled AND observed RUNNING by the
+    /// service manager after install (#493/F7 — the SAME fail-loud gate dig-node
+    /// uses via `ServiceResult::health_ok`). A live `paths_live` probe is NOT
+    /// sufficient on its own: another process could satisfy the DNS/gateway probe
+    /// while OUR service failed to reach RUNNING (the #493 false-success). Readiness
+    /// (`evaluate_readiness`) gates on this in addition to `paths_live`.
+    #[serde(default)]
+    pub service_running: bool,
     /// `true` when installation was refused because the process is not
     /// elevated (Administrator/root) — a stable, agent-checkable signal
     /// distinct from parsing `note`'s prose (CLAUDE.md §6.2).
@@ -126,6 +134,7 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         DnsInstallResult {
             installed: false,
             started: false,
+            service_running: false,
             needs_elevation: false,
             note: "dig-dns OS-service install is not supported on this platform".to_string(),
             doctor: None,

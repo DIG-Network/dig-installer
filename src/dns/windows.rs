@@ -21,7 +21,7 @@ use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
     ServiceUninstallCtx,
 };
-use winreg::enums::HKEY_LOCAL_MACHINE;
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
 
 use super::plan;
@@ -109,6 +109,7 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
     DnsInstallResult {
         installed: false,
         started: false,
+        service_running: false,
         needs_elevation: false,
         note: note.into(),
         doctor: None,
@@ -163,19 +164,29 @@ fn apply_policy_under(hive: &RegKey, key_path: &str) -> Result<bool, String> {
 
 /// Remove the policy under `hive\key_path` ONLY if this installer created it (the
 /// [`plan::POLICY_MARKER_NAME`] marker is present). Returns `Ok(true)` if removed.
+///
+/// Deletes ONLY the three values THIS installer set (`POLICY_DOH_NAME`,
+/// `POLICY_BUILTIN_RESOLVER_NAME`, `POLICY_MARKER_NAME`) — NEVER the whole
+/// Chrome/Edge policy key via `delete_subkey_all`. An org (or another tool) may
+/// have added its own values to the same `…\Chrome`/`…\Edge` policy key after us;
+/// blowing the entire key away would destroy that unrelated managed policy. The
+/// (now possibly empty) key itself is left in place — a harmless empty policy key
+/// is far safer than nuking a key we do not exclusively own.
 fn remove_policy_under(hive: &RegKey, key_path: &str) -> Result<bool, String> {
-    match hive.open_subkey(key_path) {
+    match hive.open_subkey_with_flags(key_path, KEY_READ | KEY_SET_VALUE) {
         Ok(existing) => {
             let ours: u32 = existing.get_value(plan::POLICY_MARKER_NAME).unwrap_or(0);
             if ours != 1 {
-                return Ok(false); // not ours — never remove someone else's policy.
+                return Ok(false); // not ours — never touch someone else's policy.
             }
-            drop(existing);
-            hive.delete_subkey_all(key_path)
-                .map_err(|e| format!("delete {key_path}: {e}"))?;
+            // Delete only the values we own; leave any foreign values (and the key)
+            // intact. `delete_value` on an absent value is a no-op we can ignore.
+            let _ = existing.delete_value(plan::POLICY_DOH_NAME);
+            let _ = existing.delete_value(plan::POLICY_BUILTIN_RESOLVER_NAME);
+            let _ = existing.delete_value(plan::POLICY_MARKER_NAME);
             Ok(true)
         }
-        Err(_) => Ok(false), // nothing there.
+        Err(_) => Ok(false), // nothing there (or not readable) — nothing to remove.
     }
 }
 
@@ -348,6 +359,9 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
     DnsInstallResult {
         installed: true,
         started,
+        // The service-manager RUNNING poll happens in `register_dig_dns`
+        // (lib.rs) after this returns; it overwrites this with the observed state.
+        service_running: false,
         needs_elevation: false,
         note: notes.join("; "),
         doctor: doctor_summary,
@@ -496,13 +510,31 @@ mod tests {
     }
 
     #[test]
-    fn remove_policy_deletes_a_key_it_owns() {
+    fn remove_policy_deletes_only_the_values_it_owns_not_the_key() {
         let hive = test_hive();
         let path = test_key_path("remove-owned");
         apply_policy_under(&hive, &path).unwrap();
+        // Simulate an org value added to the SAME policy key after us — it must
+        // survive (we must NOT `delete_subkey_all` the whole Chrome/Edge key).
+        {
+            let (key, _) = hive.create_subkey(&path).unwrap();
+            key.set_value("OrgSetting", &"keep-me").unwrap();
+        }
         let removed = remove_policy_under(&hive, &path).expect("removes");
         assert!(removed);
-        assert!(hive.open_subkey(&path).is_err(), "the key must be gone");
+        let key = hive
+            .open_subkey(&path)
+            .expect("the policy key itself must survive (an org may share it)");
+        // Our three values are gone …
+        assert!(key.get_raw_value(plan::POLICY_DOH_NAME).is_err());
+        assert!(key
+            .get_raw_value(plan::POLICY_BUILTIN_RESOLVER_NAME)
+            .is_err());
+        assert!(key.get_raw_value(plan::POLICY_MARKER_NAME).is_err());
+        // … but the foreign value is untouched.
+        let org: String = key.get_value("OrgSetting").expect("org value survives");
+        assert_eq!(org, "keep-me");
+        hive.delete_subkey_all(&path).unwrap();
     }
 
     #[test]

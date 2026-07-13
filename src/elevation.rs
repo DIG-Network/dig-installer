@@ -148,12 +148,15 @@ pub fn guard(elevated: bool, is_system: bool, target: &Target) -> Result<(), Ins
 pub fn is_system() -> bool {
     #[cfg(windows)]
     {
-        std::process::Command::new("whoami")
-            .arg("/user")
-            .output()
-            .ok()
-            .map(|o| parse_whoami_is_system(&o.stdout))
-            .unwrap_or(false)
+        match std::process::Command::new("whoami").arg("/user").output() {
+            Ok(o) if o.status.success() => parse_whoami_is_system(&o.stdout),
+            // FAIL CLOSED: if the identity cannot be determined (whoami failed to
+            // spawn or exited non-zero) we must NOT proceed as an interactive user
+            // — treat the indeterminate result as SYSTEM so `guard` aborts. A
+            // mis-detected interactive SYSTEM install is the bug this guards (#499);
+            // failing open here would let it through on any transient whoami error.
+            _ => true,
+        }
     }
     #[cfg(not(windows))]
     {

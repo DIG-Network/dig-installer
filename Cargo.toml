@@ -71,6 +71,11 @@ winreg = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # SHGetKnownFolderPath(FOLDERID_ProgramData) — resolve %ProgramData% via the
+    # known-folder API (not the spoofable %PROGRAMDATA% env) for the hardened
+    # machine-wide daemon state dir (daemon_dir.rs). CoTaskMemFree frees its buffer.
+    "Win32_UI_Shell",
+    "Win32_System_Com",
 ] }
 # NOTE: the `windows-service` crate (the SCM service-protocol dispatcher) was
 # removed with the host-shim (#499): the dig-dns Windows service now runs

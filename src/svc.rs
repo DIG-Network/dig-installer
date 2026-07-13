@@ -255,13 +255,19 @@ pub fn parse_sc_query(text: &str) -> ServiceRunState {
     ServiceRunState::Unknown
 }
 
-/// Parse Linux `systemctl is-active <id>` output. `active` (or `activating`) →
-/// Running; `failed`/`inactive`/`deactivating` → Stopped; `unknown` (unit not
-/// loaded) → NotFound; anything else → Unknown. Pure.
+/// Parse Linux `systemctl is-active <id>` output. ONLY exactly `active` →
+/// Running: `activating`/`reloading` are NOT healthy — a crash-looping unit that
+/// systemd is auto-restarting reports `activating`, and treating it as RUNNING
+/// would be a false-success (the #493 class of bug). `failed`/`inactive`/
+/// `deactivating`/`activating`/`reloading` → Stopped (not yet, or no longer,
+/// actually serving); `unknown` (unit not loaded) → NotFound; anything else →
+/// Unknown. Pure.
 pub fn parse_systemctl_is_active(text: &str) -> ServiceRunState {
     match text.trim() {
-        "active" | "activating" | "reloading" => ServiceRunState::Running,
-        "failed" | "inactive" | "deactivating" => ServiceRunState::Stopped,
+        "active" => ServiceRunState::Running,
+        "failed" | "inactive" | "deactivating" | "activating" | "reloading" => {
+            ServiceRunState::Stopped
+        }
         "unknown" | "" => ServiceRunState::NotFound,
         _ => ServiceRunState::Unknown,
     }
@@ -346,6 +352,16 @@ mod tests {
         assert_eq!(
             parse_systemctl_is_active("unknown\n"),
             ServiceRunState::NotFound
+        );
+        // A crash-looping unit systemd is auto-restarting reads `activating` — it
+        // must NOT be treated as RUNNING (require exactly `active`).
+        assert_eq!(
+            parse_systemctl_is_active("activating\n"),
+            ServiceRunState::Stopped
+        );
+        assert_eq!(
+            parse_systemctl_is_active("reloading\n"),
+            ServiceRunState::Stopped
         );
     }
 
