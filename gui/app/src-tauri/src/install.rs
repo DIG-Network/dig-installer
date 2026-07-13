@@ -466,6 +466,9 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         || extra_plan.with_dig_dns
         || extra_plan.with_relay
         || extra_plan.with_browser
+        // #389: the default-on chia:// scheme handler must register even when no
+        // downloadable extra component is selected (e.g. a digstore-only GUI run).
+        || extra_plan.register_scheme
     {
         emit_pct(app, 94.0, Some("additional components"));
         emit_line(
@@ -542,6 +545,11 @@ fn plan_from_selection(
         dig_dns_version: None,
         dns_service: dig_installer::dns::DnsInstallConfig::default(),
         modify_path: true,
+        // #389: register the chia:// (+ urn:) URL-scheme handler by default,
+        // in sync with the CLI's default-on `register_scheme`. Toggleable from
+        // the GUI: a `"register-scheme": false` selection opts out (mirrors the
+        // CLI's `--no-register-scheme`); an absent key means the default (ON).
+        register_scheme: *selected.get("register-scheme").unwrap_or(&true),
         dry_run: false,
     }
 }
@@ -836,6 +844,30 @@ mod plan_from_selection_tests {
     fn bin_dir_is_threaded_through() {
         let plan = plan_from_selection(&HashMap::new(), Path::new("/opt/dig/bin"));
         assert_eq!(plan.bin_dir, Path::new("/opt/dig/bin"));
+    }
+
+    #[test]
+    fn scheme_handler_defaults_on_in_sync_with_the_cli() {
+        // #389: absent from the selection map -> ON by default, matching the
+        // CLI's default-on `register_scheme` (GUI + CLI defaults in sync).
+        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        assert!(
+            plan.register_scheme,
+            "the chia:// scheme handler defaults ON in the GUI, mirroring the CLI"
+        );
+    }
+
+    #[test]
+    fn scheme_handler_can_be_toggled_off() {
+        // A GUI toggle sends `"register-scheme": false` — the same opt-out the
+        // CLI's `--no-register-scheme` produces.
+        let mut sel = HashMap::new();
+        sel.insert("register-scheme".to_string(), false);
+        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        assert!(
+            !plan.register_scheme,
+            "an explicit opt-out disables the handler"
+        );
     }
 }
 

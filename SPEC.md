@@ -26,14 +26,18 @@ opt-in.
 | `digs`     | `DIG-Network/digstore` (alias, issue #434) | raw binary, added to PATH (same bin dir as `digstore`) | NO separate flag — follows `digstore`'s `--no-digstore`/`--with-digstore`/`--digstore-version` | follows `digstore` |
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
-| `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | yes |
-| `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | yes |
+| `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | no — unchecked, user-checkable (#491) |
+| `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | no — hidden, not offered (#491) |
 
-The GUI wizard's Components screen (`gui/app/src/data.jsx` → `COMPONENTS`) lists exactly this
-catalogue, one-line description each. **Every component is pre-selected by default** — "install
-all" is the one-click default path; the user may deselect any component except `digstore` (marked
-`REQUIRED`, no checkbox). Deselecting a component removes it from the install plan entirely (its
-artifact is neither downloaded nor registered).
+The GUI wizard's Components screen (`gui/app/src/data.jsx` → `COMPONENTS`, rendered by
+`steps/Components.jsx`, initial selection in `App.jsx`) mirrors the CLI defaults (task #491): the
+**core stack (digstore + dig-node + dig-dns) is pre-selected** — installing it is the one-click
+default path; `digstore` is `REQUIRED` (no checkbox). **`dig-relay` is present but UNCHECKED by
+default** (advanced; the node already uses the canonical `relay.dig.net`) — the user may check it.
+**The DIG Browser is `hidden`** — not offered in the installer for now (the catalogue entry is kept
+for easy re-enable; `Components.jsx` filters out any `hidden` component). Deselecting a component
+removes it from the install plan entirely (its artifact is neither downloaded nor registered). This
+matches `InstallPlan::default()` (dig-relay + browser are opt-in: `--with-relay`/`--with-browser`).
 
 ### 1.1 `digs` — a first-class alias of `digstore`
 
@@ -64,6 +68,38 @@ published" as opposed to a network/transport failure), the installer:
 
 A genuine transport/network failure resolving dig-dns (not "no release exists") is NOT gated —
 it propagates like any other component's resolution failure (`NETWORK`, exit code 4).
+
+### 1.3 `chia://` URL-scheme handler (#389)
+
+By default the installer registers itself as the OS handler for `chia://` links (and, best-effort,
+`urn:` where the OS permits a generic handler). This is a **first-class, toggleable install
+option**, default ON, controlled identically from the CLI and the GUI:
+
+- **CLI:** registered by default. `--no-register-scheme` opts OUT; `--register-scheme` is the
+  redundant explicit opt-in (symmetry with the `--no-<component>`/`--with-<component>` flags). Both
+  map to the single `InstallPlan.register_scheme` field (`register_scheme = --register-scheme ||
+  !--no-register-scheme`), so `--no-*` wins if both are given. `--unregister-scheme` removes a
+  handler this installer created and runs standalone (ignores every other flag).
+- **GUI:** the same default-on option, surfaced as a checkbox that sets `register_scheme` on the
+  plan handed to the Rust pipeline — the GUI and CLI defaults are in sync.
+
+Registration is **per-user, no elevation** (unlike the OS services). Per-OS mechanism:
+
+| OS | Registration | `urn:` |
+|----|--------------|--------|
+| Windows | `HKCU\Software\Classes\chia` with an empty `URL Protocol` value + `shell\open\command` = `"<bin>" handle-url "%1"` | yes (`HKCU\Software\Classes\urn`) |
+| Linux | a `~/.local/share/applications/dig-network-url-handler.desktop` with `MimeType=x-scheme-handler/chia;` + `xdg-mime default` | yes (`x-scheme-handler/urn`) |
+| macOS | LaunchServices binds a scheme to a `.app` bundle, not a bare CLI — a CLI-only install cannot own the scheme, so registration is a documented best-effort no-op (reported honestly in `SchemeResult.note`, never a silent fake success); the DIG Browser `.app` registers it when installed | n/a |
+
+The registered handler is **this installer's own binary**, persisted to the bin dir so it survives
+a transient `irm|iex` download copy, invoked by the OS as the hidden subcommand `dig-installer
+handle-url <uri>`. `handle-url` parses the URI (`chia://<store>/<path>` or
+`urn:dig:chia:<store>[/<path>]`), picks the first reachable §5.3 base
+(`http://dig.local` → `http://localhost:9778` → `https://rpc.dig.net`, falling back to the public
+gateway so a click always opens something), builds the node serve URL `<base>/s/<store>/<path>`,
+and opens it in the default browser. Registration is **best-effort within the install**: a failure
+is recorded in `InstallReport.scheme` (a `SchemeResult { registered, schemes, note }`) but never
+aborts the install (every other component already succeeded).
 
 ## 2. Install lifecycle — stop before write, start after write
 

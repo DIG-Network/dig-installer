@@ -47,6 +47,7 @@ pub mod hosts;
 pub mod pathcheck;
 pub mod paths;
 pub mod release;
+pub mod scheme;
 pub mod service;
 pub mod svc;
 pub mod target;
@@ -100,6 +101,11 @@ pub struct InstallPlan {
     pub dns_service: dns::DnsInstallConfig,
     /// Add the bin dir to PATH (default true).
     pub modify_path: bool,
+    /// Register the `chia://` (+ best-effort `urn:`) OS URL-scheme handler that
+    /// routes clicked links through the local dig-node into the browser (#389).
+    /// Default true — a first-class, toggleable install option
+    /// (`--no-register-scheme` opts out). Per-user, no elevation.
+    pub register_scheme: bool,
     /// Print actions without performing them.
     pub dry_run: bool,
 }
@@ -142,6 +148,7 @@ impl Default for InstallPlan {
             dig_dns_version: None,
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: true,
+            register_scheme: true,
             dry_run: false,
         }
     }
@@ -235,6 +242,9 @@ pub struct InstallReport {
     pub relay: Option<RelayResult>,
     /// The dig-dns OS-service install result (only when `--with-dig-dns`).
     pub dns: Option<dns::DnsInstallResult>,
+    /// The `chia://`/`urn:` URL-scheme registration result (only when
+    /// `register_scheme`) — #389.
+    pub scheme: Option<scheme::SchemeResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
     /// Per-CLI PATH-resolution checks (#496): confirms each required DIG CLI
@@ -445,6 +455,7 @@ fn run_report_gated(
         service: None,
         relay: None,
         dns: None,
+        scheme: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
@@ -679,6 +690,16 @@ fn run_report_gated(
         report.components.push(c);
     }
 
+    // 7. chia:// (+ urn:) OS URL-scheme handler (#389) — default-on, toggleable.
+    //    Registers THIS installer's persisted binary as the handler; a clicked
+    //    chia:// link resolves through the local dig-node (§5.3) into the
+    //    browser. Per-user (no elevation). Best-effort: a registration failure
+    //    is recorded, never aborts the install (the rest already succeeded).
+    if plan.register_scheme {
+        log("Registering the chia:// URL-scheme handler (opens links via the local dig-node):");
+        report.scheme = Some(register_scheme_handler(plan, &target, log));
+    }
+
     // PATH verification (#496): confirm each required DIG CLI resolves by bare
     // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
     // immediately. Non-dry-run only (dry-run installs nothing to resolve).
@@ -694,6 +715,44 @@ fn run_report_gated(
     report.ready = report.failures.is_empty();
     log_readiness_verdict(&report, log);
     Ok(report)
+}
+
+/// Register the `chia://`/`urn:` OS URL-scheme handler (#389). Persists this
+/// installer's own binary to `bin_dir` (a stable handler target that survives a
+/// transient `irm|iex` download) and points the OS handler at it. Never
+/// aborts — a failure is recorded in the result. Reports intent on dry-run.
+fn register_scheme_handler(
+    plan: &InstallPlan,
+    target: &Target,
+    log: &mut dyn FnMut(&str),
+) -> scheme::SchemeResult {
+    if plan.dry_run {
+        let r = scheme::register(
+            &plan.bin_dir.join(target.exe_name("dig-installer")),
+            true,
+            true,
+        );
+        log(&format!("    ({})", r.note));
+        return r;
+    }
+    // Persist the running installer to a stable path so the registered handler
+    // keeps working after a transient download copy is gone.
+    let handler_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
+    if let Ok(current) = std::env::current_exe() {
+        if current != handler_bin {
+            if let Some(parent) = handler_bin.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&current, &handler_bin);
+        }
+    }
+    let r = scheme::register(&handler_bin, true, false);
+    if r.registered {
+        log(&format!("    ✓ {}", r.note));
+    } else {
+        log(&format!("    ! {}", r.note));
+    }
+    r
 }
 
 /// The user-facing DIG CLIs that MUST be runnable by bare name after install
@@ -1446,8 +1505,18 @@ pub fn help_json() -> String {
             { "flag": "--with-dig-dns", "description": "explicit (redundant) opt-in — dig-dns installs + registers as a boot-start OS service by default (local *.dig name resolution: DNS responder + HTTP gateway)" },
             { "flag": "--dig-dns-version", "value": "VERSION", "description": "pin dig-dns version (default: latest)" },
             { "flag": "--dig-dns-node", "value": "URL", "description": "dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node`); default: dig-dns's own ladder" },
-            { "flag": "--uninstall-dig-dns", "description": "uninstall the dig-dns OS service + OS wiring this installer created (idempotent, zero residue; does not touch pre-existing org policy)" }
+            { "flag": "--uninstall-dig-dns", "description": "uninstall the dig-dns OS service + OS wiring this installer created (idempotent, zero residue; does not touch pre-existing org policy)" },
+            { "flag": "--no-register-scheme", "description": "opt out of registering the chia:// (+ best-effort urn:) OS URL-scheme handler (registered by default; #389)" },
+            { "flag": "--register-scheme", "description": "explicit (redundant) opt-in — the chia:// URL-scheme handler is registered by default" },
+            { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" }
         ],
+        "url_scheme_handler": {
+            "schemes": ["chia", "urn"],
+            "default": true,
+            "opt_out": "--no-register-scheme",
+            "per_user": true,
+            "description": "By default the installer registers itself as the OS handler for chia:// (and best-effort urn:) links: a clicked link is resolved through the local dig-node (the dig.local → localhost → rpc.dig.net ladder) and opened in the browser. Per-user, no elevation. The OS invokes `dig-installer handle-url <uri>` (a hidden subcommand, not part of the public flag surface)."
+        },
         "exit_codes": exit_codes
     });
     serde_json::to_string_pretty(&doc).expect("help doc serializes") + "\n"
@@ -1553,6 +1622,7 @@ mod tests {
             dig_dns_version: None,
             dns_service: dns::DnsInstallConfig::default(),
             modify_path: false,
+            register_scheme: false,
             dry_run: true,
         }
     }
@@ -1640,6 +1710,36 @@ mod tests {
         assert!(by_id("dig-dns"), "dig-dns default: true (#301)");
         assert!(!by_id("dig-relay"), "dig-relay stays opt-in");
         assert!(!by_id("browser"), "browser stays opt-in");
+    }
+
+    #[test]
+    fn help_json_advertises_the_scheme_handler_and_opt_out() {
+        // #389: the chia:// URL-scheme handler is a default-on, toggleable
+        // option — the machine contract MUST advertise it + the CLI opt-out so
+        // an agent can discover both without scraping `--help`.
+        let doc: serde_json::Value =
+            serde_json::from_str(&help_json()).expect("help_json is valid JSON");
+        let flag_present = |f: &str| -> bool {
+            doc["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["flag"] == f)
+        };
+        assert!(flag_present("--no-register-scheme"), "opt-out advertised");
+        assert!(
+            flag_present("--register-scheme"),
+            "explicit opt-in advertised"
+        );
+        assert!(flag_present("--unregister-scheme"), "unregister advertised");
+        let h = &doc["url_scheme_handler"];
+        assert_eq!(h["default"], true, "the handler is registered by default");
+        assert_eq!(h["opt_out"], "--no-register-scheme");
+        let schemes = h["schemes"].as_array().unwrap();
+        assert!(
+            schemes.iter().any(|s| s == "chia"),
+            "chia scheme documented"
+        );
     }
 
     #[test]
@@ -2273,6 +2373,7 @@ mod tests {
             service: None,
             relay: None,
             dns: None,
+            scheme: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),

@@ -44,9 +44,12 @@ export function App() {
   // Always start at Welcome — the installer never resumes a prior run's step.
   const [step, setStep] = useState(0);
   const [agreed, setAgreed] = useState(false);
-  // Every optional component pre-selected by default (task #234) — "install
-  // all" is the one-click default path; the user can deselect any of them.
-  const [sel, setSel] = useState({ "dig-node": true, "dig-dns": true, "dig-relay": true, browser: true });
+  // The core DIG stack (dig-node + dig-dns) is pre-selected — the one-click
+  // default path (digstore is always installed, added separately below). Per
+  // task #491, `dig-relay` defaults OFF (advanced/optional — the node already
+  // uses relay.dig.net) but stays user-checkable, and the DIG Browser is not
+  // offered (hidden in `data.jsx`), so it is absent here entirely.
+  const [sel, setSel] = useState({ "dig-node": true, "dig-dns": true, "dig-relay": false });
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
   const [pct, setPct] = useState(0);
   const [lines, setLines] = useState([]);
