@@ -26,14 +26,18 @@ opt-in.
 | `digs`     | `DIG-Network/digstore` (alias, issue #434) | raw binary, added to PATH (same bin dir as `digstore`) | NO separate flag — follows `digstore`'s `--no-digstore`/`--with-digstore`/`--digstore-version` | follows `digstore` |
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
-| `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | yes |
-| `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | yes |
+| `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | no — unchecked, user-checkable (#491) |
+| `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | no — hidden, not offered (#491) |
 
-The GUI wizard's Components screen (`gui/app/src/data.jsx` → `COMPONENTS`) lists exactly this
-catalogue, one-line description each. **Every component is pre-selected by default** — "install
-all" is the one-click default path; the user may deselect any component except `digstore` (marked
-`REQUIRED`, no checkbox). Deselecting a component removes it from the install plan entirely (its
-artifact is neither downloaded nor registered).
+The GUI wizard's Components screen (`gui/app/src/data.jsx` → `COMPONENTS`, rendered by
+`steps/Components.jsx`, initial selection in `App.jsx`) mirrors the CLI defaults (task #491): the
+**core stack (digstore + dig-node + dig-dns) is pre-selected** — installing it is the one-click
+default path; `digstore` is `REQUIRED` (no checkbox). **`dig-relay` is present but UNCHECKED by
+default** (advanced; the node already uses the canonical `relay.dig.net`) — the user may check it.
+**The DIG Browser is `hidden`** — not offered in the installer for now (the catalogue entry is kept
+for easy re-enable; `Components.jsx` filters out any `hidden` component). Deselecting a component
+removes it from the install plan entirely (its artifact is neither downloaded nor registered). This
+matches `InstallPlan::default()` (dig-relay + browser are opt-in: `--with-relay`/`--with-browser`).
 
 ### 1.1 `digs` — a first-class alias of `digstore`
 

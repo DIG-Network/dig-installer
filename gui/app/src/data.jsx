@@ -26,9 +26,15 @@ export const FEATURES = [
 // The REAL DIG component catalogue (task #234) — `id` values map 1:1 to the
 // component identifiers the Rust install pipeline understands (mirrors the
 // `dig-installer --help-json` "components" list: digstore, dig-node,
-// dig-relay, dig-dns, browser). Every optional component is pre-checked
-// (`on: true`) so "install all" is the default one-click path; digstore is
-// `req: true` — it is the CLI itself and is always installed.
+// dig-relay, dig-dns, browser). The default one-click path installs the core
+// DIG stack (digstore + dig-node + dig-dns); digstore is `req: true` (the CLI
+// itself, always installed). `dig-relay` is `on: false` (task #491 — advanced/
+// optional: most users use the canonical relay.dig.net, so it is present +
+// selectable but NOT pre-checked). `browser` is `hidden: true` (task #491 —
+// not offered in the installer for now; the entry is kept for easy re-enable,
+// and `Components.jsx` does not render a `hidden` component). This mirrors the
+// CLI defaults (`InstallPlan::default()`: dig-relay + browser are opt-in only,
+// `--with-relay`/`--with-browser`).
 export const COMPONENTS = [
   {
     id: "digstore",
@@ -52,13 +58,13 @@ export const COMPONENTS = [
     id: "dig-relay",
     name: "dig-relay (advanced)",
     desc: "Run your own NAT-traversal relay. Optional — every node already uses the canonical relay.dig.net by default.",
-    on: true,
+    on: false,
   },
   {
     id: "browser",
     name: "DIG Browser",
     desc: "The DIG-native desktop browser — chia:// and dig:// links resolve natively. Downloads the native installer.",
-    on: true,
+    hidden: true, // HIDDEN for now (re-enable later) — not offered in the installer.
   },
 ];
 

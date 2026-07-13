@@ -349,3 +349,59 @@ fn rejects_unknown_flag_with_usage_error() {
     // clap returns exit code 2 for a usage error — distinct from our runtime codes.
     bin().arg("--definitely-not-a-flag").assert().failure();
 }
+
+/// #491: the GUI component-selection defaults must match the CLI —
+/// **dig-relay UNCHECKED by default** (advanced/opt-in) and the **DIG Browser
+/// hidden** (not offered). Reads the actual shipped GUI sources (same
+/// text-assertion pattern as the branding/vocabulary guards) so neither can
+/// silently regress to pre-checked/offered. The CLI side is already guarded by
+/// `help_json_advertises_all_three_core_components_as_default` (dig-relay +
+/// browser are `default: false`).
+#[test]
+fn gui_defaults_dig_relay_unchecked_and_browser_hidden() {
+    use std::fs;
+    use std::path::Path;
+
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let read = |rel: &str| -> String {
+        fs::read_to_string(Path::new(dir).join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+
+    // data.jsx: dig-relay present but NOT pre-checked; browser entry kept but hidden.
+    let data = read("gui/app/src/data.jsx");
+    assert!(
+        data.contains(r#"id: "dig-relay""#),
+        "dig-relay entry present"
+    );
+    assert!(
+        data.contains(r#"id: "browser""#),
+        "browser entry kept (for easy re-enable)"
+    );
+    assert!(
+        data.contains("hidden: true"),
+        "the DIG Browser must be hidden by default (#491)"
+    );
+    // dig-relay is the only `on: false` optional component.
+    assert!(
+        data.contains("on: false"),
+        "dig-relay must default UNCHECKED (on: false) (#491)"
+    );
+
+    // App.jsx initial selection: dig-relay false, browser NOT pre-selected.
+    let app = read("gui/app/src/App.jsx");
+    assert!(
+        app.contains(r#""dig-relay": false"#),
+        "dig-relay must default OFF in the initial GUI selection (#491)"
+    );
+    assert!(
+        !app.contains("browser: true"),
+        "the DIG Browser must not be pre-selected in the GUI (#491)"
+    );
+
+    // Components.jsx filters `hidden` components out of the offered set.
+    let comp = read("gui/app/src/steps/Components.jsx");
+    assert!(
+        comp.contains("!c.hidden"),
+        "Components.jsx must not render a hidden component (#491)"
+    );
+}
