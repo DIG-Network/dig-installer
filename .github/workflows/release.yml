@@ -88,7 +88,7 @@ jobs:
       # pure logic + the run_report orchestration (via an injected release
       # resolver) + the file/service I/O wrappers are all covered.
       - name: Test with coverage (gate >=80% lines, nextest retries flaky failures)
-        run: cargo llvm-cov nextest --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' -- --retries 2
+        run: cargo llvm-cov nextest --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' --retries 2
 
   # ---------------------------------------------------------------------------
   # Build the universal CLI installer binary per OS/arch. Runs on both a plain
