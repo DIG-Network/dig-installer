@@ -550,6 +550,11 @@ fn plan_from_selection(
         // the GUI: a `"register-scheme": false` selection opts out (mirrors the
         // CLI's `--no-register-scheme`); an absent key means the default (ON).
         register_scheme: *selected.get("register-scheme").unwrap_or(&true),
+        // #424: open the dig-node peer-RPC firewall rule by default, in sync
+        // with the CLI's default-on `open_firewall`. Toggleable from the GUI:
+        // a `"open-firewall": false` selection opts out; an absent key means
+        // the default (ON) — same convention as `register-scheme` above.
+        open_firewall: *selected.get("open-firewall").unwrap_or(&true),
         dry_run: false,
     }
 }
@@ -867,6 +872,30 @@ mod plan_from_selection_tests {
         assert!(
             !plan.register_scheme,
             "an explicit opt-out disables the handler"
+        );
+    }
+
+    #[test]
+    fn firewall_rule_defaults_on_in_sync_with_the_cli() {
+        // #424: absent from the selection map -> ON by default, matching the
+        // CLI's default-on `open_firewall` (GUI + CLI defaults in sync).
+        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        assert!(
+            plan.open_firewall,
+            "the dig-node firewall rule defaults ON in the GUI, mirroring the CLI"
+        );
+    }
+
+    #[test]
+    fn firewall_rule_can_be_toggled_off() {
+        // A GUI toggle sends `"open-firewall": false` — the same opt-out the
+        // CLI's `--no-open-firewall` produces.
+        let mut sel = HashMap::new();
+        sel.insert("open-firewall".to_string(), false);
+        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        assert!(
+            !plan.open_firewall,
+            "an explicit opt-out disables the firewall rule"
         );
     }
 }

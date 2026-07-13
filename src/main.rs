@@ -71,7 +71,7 @@ struct Cli {
     dig_node_version: Option<String>,
 
     /// Loopback port the dig-node service serves on (with --with-dig-node).
-    #[arg(long, value_name = "PORT", default_value_t = 9778)]
+    #[arg(long, value_name = "PORT", default_value_t = dig_constants::DIG_NODE_PORT)]
     dig_node_port: u16,
 
     /// With --with-dig-node, install the service but do NOT start it.
@@ -79,10 +79,10 @@ struct Cli {
     #[arg(long = "no-service-start")]
     no_service_start: bool,
 
-    /// Uninstall the dig-node OS service + remove the `dig.local` hosts entry
-    /// this installer created (idempotent; does not touch the digstore/
-    /// browser/relay/dig-dns installs). Runs standalone — ignores every other
-    /// install flag except --bin-dir/--dry-run/--json.
+    /// Uninstall the dig-node OS service, the `dig.local` hosts entry, and the
+    /// firewall rule this installer created (idempotent; does not touch the
+    /// digstore/browser/relay/dig-dns installs). Runs standalone — ignores
+    /// every other install flag except --bin-dir/--dry-run/--json.
     #[arg(long = "uninstall-dig-node")]
     uninstall_dig_node: bool,
 
@@ -157,6 +157,18 @@ struct Cli {
     /// (idempotent). Runs standalone — ignores every other install flag.
     #[arg(long = "unregister-scheme")]
     unregister_scheme: bool,
+
+    /// Opt OUT of opening the app-scoped inbound firewall rule for dig-node's
+    /// peer-RPC port (opened by default when dig-node is installed): a
+    /// direct-reachable node without it just falls back to the dig-relay
+    /// path, so declining is always safe (#424).
+    #[arg(long = "no-open-firewall")]
+    no_open_firewall: bool,
+
+    /// Explicitly open the firewall rule (redundant — it is opened by
+    /// default; here for symmetry with `--no-open-firewall`).
+    #[arg(long = "open-firewall")]
+    open_firewall: bool,
 
     /// Print what would be done without downloading or changing anything.
     #[arg(long)]
@@ -268,6 +280,10 @@ fn main() -> std::process::ExitCode {
         // #389: register chia:// by default; `--no-register-scheme` opts out
         // (`--register-scheme` is the redundant explicit opt-in).
         register_scheme: cli.register_scheme || !cli.no_register_scheme,
+        // #424: open the dig-node peer-RPC firewall rule by default;
+        // `--no-open-firewall` opts out (`--open-firewall` is the redundant
+        // explicit opt-in) — same "`--no-*` wins" pattern as register_scheme.
+        open_firewall: cli.open_firewall || !cli.no_open_firewall,
         dry_run: cli.dry_run,
     };
 
@@ -358,8 +374,9 @@ fn run_uninstall_dig_dns(dry_run: bool, json: bool) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// `--uninstall-dig-node`: tear down the dig-node OS service + the `dig.local`
-/// hosts entry this installer created (task #140). Standalone action —
+/// `--uninstall-dig-node`: tear down the dig-node OS service, the `dig.local`
+/// hosts entry, and the firewall rule (#424) this installer created (task
+/// #140). Standalone action —
 /// [`dig_installer::uninstall_dig_node`] never fails outright (a missing
 /// binary or elevation issue is reported via `note`, not an `Err`), so this
 /// always exits success; the caller re-runs elevated if prompted.

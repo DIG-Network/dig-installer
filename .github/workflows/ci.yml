@@ -188,6 +188,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # `tauri::generate_context!()` (src-tauri/src/lib.rs) reads `frontendDist`
+      # ("../dist") and PANICS at macro-expansion time if it's missing. A plain
+      # `cargo build`/`cargo test --no-run` tolerates a stale/absent `dist/` on
+      # an already-warm target dir (the cached rustc artifact is reused without
+      # re-expanding the macro), but `clippy-driver` keeps its own separate
+      # metadata and always re-expands it fresh — so clippy fails on a genuinely
+      # cold cache (verified: `rm -rf target && cargo clippy` fails without
+      # this step, `cargo build`/`cargo test --no-run` do not). Building the
+      # frontend first — same as `release.yml`'s `build-gui` job — keeps this
+      # gate green regardless of cache state.
+      - name: Install + build the frontend (frontendDist prerequisite)
+        working-directory: gui/app
+        run: |
+          npm ci || npm install
+          npm run build
       - uses: actions/cache@v4
         with:
           path: |

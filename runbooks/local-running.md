@@ -18,6 +18,11 @@ cargo llvm-cov --fail-under-lines 80 --ignore-filename-regex 'main\.rs$'   # cov
 No env vars are required to run the CLI locally; `--bin-dir` overrides the install location if
 you don't want it touching your real PATH/service state while iterating.
 
+**Firewall rule on Linux (#424):** a real (non-dry-run) `--with-dig-node` install never touches
+Linux firewall state — it only prints the manual remedy. If you want the same reachability a
+Windows/macOS install gets automatically, run it yourself: `sudo ufw allow 9444/tcp` (swap `9444`
+for `$DIG_PEER_PORT` if you've overridden it, or the equivalent command for `firewalld`/`iptables`).
+
 **Elevation is required for a REAL install** (not `--dry-run`): registering the dig-node/dig-dns
 services + writing the `dig.local` hosts entry needs Administrator (Windows) / root (macOS/Linux).
 An un-elevated real install is refused up front (`NOT_ELEVATED`, exit 11) with no partial state
@@ -53,9 +58,17 @@ never exercises the real Rust install pipeline. Use `npx tauri dev` to test the 
 ```sh
 cd gui/app/src-tauri
 cargo build            # a plain library-level ../../../ path dep on the root dig-installer crate
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings   # needs gui/app/dist/ built first on a cold cache — see below
 cargo fmt --all -- --check
 ```
+
+**`cargo clippy` needs `gui/app/dist/` built first (on a cold cache).** `src-tauri/src/lib.rs`'s
+`tauri::generate_context!()` reads the `frontendDist` config ("../dist") and panics at
+macro-expansion time if it's missing. A plain `cargo build`/`cargo test --no-run` tolerates a
+missing `dist/` (a warm target dir reuses the cached rustc artifact without re-running the macro),
+but `clippy-driver` keeps its own metadata and always re-expands it — so run `cd gui/app && npm
+install && npm run build` at least once before `cargo clippy` in this crate (CI's `gui-clippy` job
+does this automatically).
 
 **Known local-Windows quirk:** `cargo test` in this specific crate currently fails to even
 *launch* its compiled test-harness binary on a non-elevated Windows console

@@ -133,11 +133,52 @@ fn help_lists_the_selectable_component_flags() {
         "--dig-dns-node",
         "--uninstall-dig-dns",
         "--uninstall-dig-node",
+        "--no-open-firewall",
+        "--open-firewall",
         "--json",
         "--dry-run",
     ] {
         assert!(stdout.contains(flag), "--help is missing {flag}");
     }
+}
+
+/// #424: a dry-run dig-node-only install reports the firewall-rule intent
+/// (opened by default) in the `--json` payload — network-free (dry-run never
+/// resolves a release).
+#[test]
+fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
+    let out = bin()
+        .args(["--no-digstore", "--no-dig-dns", "--dry-run", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    let note = v["result"]["firewall"]["note"]
+        .as_str()
+        .expect("firewall result present by default");
+    assert!(note.contains("would open"), "got: {note}");
+    assert_eq!(v["result"]["firewall"]["applied"], false);
+}
+
+/// `--no-open-firewall` must leave the report's `firewall` field entirely
+/// absent (`null`), not merely an unapplied result — proving the opt-out
+/// actually reaches `InstallPlan` from the CLI flag.
+#[test]
+fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
+    let out = bin()
+        .args([
+            "--no-digstore",
+            "--no-dig-dns",
+            "--no-open-firewall",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(v["result"]["firewall"].is_null());
 }
 
 /// #301: the machine contract must advertise the universal-installer default —

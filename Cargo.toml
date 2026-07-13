@@ -23,7 +23,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.11.0"
+version = "0.12.0"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, and the dig-dns service by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -58,6 +58,13 @@ tempfile = "3"
 # supply a fully custom unit-file/plist body (CAP_NET_BIND_SERVICE, a
 # dedicated user, log paths) that the crate's own generator does not cover.
 service-manager = "0.7"
+# The canonical DIG-node loopback port default (`DIG_NODE_PORT`) — one source of
+# truth shared with dig-node itself, so the installer's own default (service.rs
+# `ServiceConfig::default`, the `--dig-node-port` CLI default, and the
+# `--help-json` doc value) can never drift from dig-node's real default. No
+# `rev` pin (bare `version + git`): the ecosystem convention (see dig-node-core's
+# own dig-constants dependency) so a shared consumer graph resolves to ONE copy.
+dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
 
 [dev-dependencies]
 # End-to-end CLI contract tests: drive the built `dig-installer` binary and

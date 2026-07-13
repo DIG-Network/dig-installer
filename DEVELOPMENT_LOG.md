@@ -230,11 +230,29 @@ Findings from actually turning these on:
 - Tauri/`wry` on Linux needs `libwebkit2gtk-4.1-dev libappindicator3-dev
   librsvg2-dev patchelf` from apt just to **compile** (not just bundle) —
   `gui-clippy`/`gui-test` on ubuntu-latest install these first, mirroring
-  `release.yml`'s `build-gui` Linux step. `cargo build`/`clippy`/`test`
+  `release.yml`'s `build-gui` Linux step. `cargo build`/`cargo test --no-run`
   against this crate do NOT require the frontend `dist/` to exist first —
   `tauri.conf.json`'s `beforeBuildCommand` only fires under the `tauri`
-  CLI (`tauri build`/`tauri dev`), never under plain `cargo`; verified by
-  removing `dist/` and rebuilding clean.
+  CLI (`tauri build`/`tauri dev`), never under plain `cargo`.
+- **CORRECTION (#424): `cargo clippy` is the exception to the bullet above —
+  it DOES need `dist/` on a cold cache.** `src-tauri/src/lib.rs`'s
+  `tauri::generate_context!()` reads `frontendDist` ("../dist") and PANICS
+  at macro-expansion time if it's absent. `cargo build`/`cargo test --no-run`
+  tolerate a missing `dist/` because a warm target dir reuses the cached
+  rustc artifact without re-expanding the macro — but `clippy-driver` keeps
+  its OWN separate metadata and always re-expands it fresh, so `gui-clippy`
+  fails the moment its cache is cold (verified directly: `rm -rf target &&
+  cargo clippy` fails without `dist/` present; `cargo build`/`cargo test
+  --no-run` on the same clean `target/` do not). `gui-clippy`'s cache key is
+  keyed on `gui/app/src-tauri/Cargo.lock` alone, so ANY change that touches
+  the root `dig-installer` crate (a path-dependency of this one — a new
+  field, a new module, a new upstream dep) forces a fresh recompile of this
+  crate too, exposing the gap. Fixed by adding an `npm ci && npm run build`
+  step to `gui-clippy` before its `cargo clippy` call (mirrors
+  `release.yml`'s `build-gui` job, which already builds the frontend via
+  `npx tauri build`'s `beforeBuildCommand`). `gui-fmt` (pure parsing, no
+  macro expansion) and `gui-build-os-matrix`/`gui-test`'s compile step are
+  unaffected — confirmed on a truly clean `target/` for both.
 
 ## Fail-loud installs — never trust a bare port probe or a clean-looking log (#492/#493/#496)
 

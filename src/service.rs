@@ -17,7 +17,8 @@ use std::process::Command;
 /// Configuration for the dig-node service the installer will register.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceConfig {
-    /// Loopback port dig-node should serve on (default 9778, per dig-node).
+    /// Loopback port dig-node should serve on (default
+    /// [`dig_constants::DIG_NODE_PORT`], per dig-node).
     pub port: u16,
     /// Start the service immediately after installing it.
     pub start: bool,
@@ -25,13 +26,14 @@ pub struct ServiceConfig {
 
 impl Default for ServiceConfig {
     fn default() -> Self {
-        // 9778 matches dig-node's own default (config.rs DEFAULT_PORT) — an
-        // uncommon high port deliberately clear of the collision-prone
-        // common-dev ports (80/443/3000/5000/8000/8080/8888/9000), the sibling
-        // of the dig-wallet HTTP API's 9777 (task #132). `dig.local` on
+        // dig_constants::DIG_NODE_PORT (9778) matches dig-node's own default
+        // (config.rs DEFAULT_PORT) — an uncommon high port deliberately clear
+        // of the collision-prone common-dev ports
+        // (80/443/3000/5000/8000/8080/8888/9000), the sibling of the
+        // dig-wallet HTTP API's 9777 (task #132). `dig.local` on
         // `127.0.0.2:80` is unaffected — only this localhost port moves.
         ServiceConfig {
-            port: 9778,
+            port: dig_constants::DIG_NODE_PORT,
             start: true,
         }
     }
