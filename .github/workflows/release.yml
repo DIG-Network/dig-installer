@@ -294,7 +294,19 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [build-cli, build-gui]
-    if: github.ref_type == 'tag'
+    # `build-cli`/`build-gui` themselves depend on `check`, which is SKIPPED on
+    # a tag push (by design — see `check`'s own `if`). Without `always()`, a
+    # skip anywhere upstream in the transitive `needs` graph propagates down
+    # and skips this job by default too, even though build-cli/build-gui both
+    # completed with conclusion `success` (observed: v0.7.0/v0.7.1/v0.8.0 all
+    # built binaries successfully but NEVER actually published a GitHub
+    # Release — `gh release view` 404s for every one of them). Mirrors the
+    # exact `always() && (needs.X.result == …)` pattern `build-cli`/`build-gui`
+    # already use to escape this same transitive-skip gotcha.
+    if: >-
+      always() && github.ref_type == 'tag' &&
+      needs.build-cli.result == 'success' &&
+      needs.build-gui.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
