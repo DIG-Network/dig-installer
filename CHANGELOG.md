@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.17.0] - 2026-07-14
+
+### Features
+- **install:** Install dign + digd alias binaries alongside dig-node/dig-dns (#548) (#24)
+
 ## [0.16.0] - 2026-07-14
 
 ### Features
