@@ -150,9 +150,10 @@ pub fn launchctl_system_target(id: &str) -> String {
 /// `Ok(())` when the service is not RUNNING afterward (including "was already
 /// stopped" / "not registered"); `Err` only when it is STILL running.
 pub fn stop_service(id: &str) -> Result<(), String> {
-    let final_state = stop_service_command(id);
-    // Whatever the command reported, the authority is the observed state.
-    let _ = final_state;
+    // Best-effort issue the OS stop command; the authoritative signal is the
+    // state poll below, never the command's exit code (a stop of an
+    // already-stopped service exits non-zero on Windows).
+    stop_service_command(id);
     match wait_until_not_running(id, std::time::Duration::from_secs(10)) {
         ServiceRunState::Running => Err(format!("service '{id}' is still RUNNING after a stop")),
         _ => Ok(()),
