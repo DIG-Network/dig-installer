@@ -50,12 +50,14 @@ export function App() {
   // task #491, `dig-relay` defaults OFF (advanced/optional — the node already
   // uses relay.dig.net) but stays user-checkable, and the DIG Browser is not
   // offered (hidden in `data.jsx`), so it is absent here entirely. `open-firewall`
-  // (#424) defaults ON, mirroring the CLI's default-on `open_firewall`.
+  // (#424) and `auto-update` (#514) default ON, mirroring the CLI's default-on
+  // `open_firewall`/`auto_update`.
   const [sel, setSel] = useState({
     "dig-node": true,
     "dig-dns": true,
     "dig-relay": false,
     "open-firewall": true,
+    "auto-update": true,
   });
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
   // Per-component Install/Update/Skip preview (#309) for the Components

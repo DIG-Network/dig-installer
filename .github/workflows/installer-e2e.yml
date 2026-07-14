@@ -8,12 +8,14 @@
 # "DIG is ready" verdict (#493). This job drives exactly that, against the
 # REAL OS service manager, on all three OSes DIG ships for:
 #
-#   build dig-installer -> run it (installing pinned dig-node + dig-dns
-#   releases) -> assert the #493 fail-loud readiness verdict sees BOTH
-#   services registered + RUNNING by their canonical id, the Windows SCM
-#   display names read back correctly (#494), and `dig.local` resolves (#140)
-#   -> run --uninstall-dig-node/--uninstall-dig-dns -> assert both services
-#   are deregistered and the hosts entry is gone.
+#   build dig-installer -> run it (installing pinned dig-node + dig-dns +
+#   dig-updater releases) -> assert the #493 fail-loud readiness verdict sees
+#   BOTH services registered + RUNNING by their canonical id, the Windows SCM
+#   display names read back correctly (#494), `dig.local` resolves (#140), AND
+#   the auto-update beacon's daily scheduler artifact is registered by the
+#   real OS scheduler (#514) -> run --uninstall-dig-node/--uninstall-dig-dns/
+#   --uninstall-dig-updater -> assert both services are deregistered, the
+#   hosts entry is gone, and the beacon's scheduler artifact is removed.
 #
 # dig_ecosystem#524: the dig-node/dig-dns versions below are PINNED to a
 # specific released tag (never "latest"), so this job — like the two
@@ -48,6 +50,9 @@ env:
   CARGO_TERM_COLOR: always
   DIG_NODE_VERSION: "0.29.0"
   DIG_DNS_VERSION: "0.9.1"
+  # Auto-update beacon (#514) — pinned for the same determinism reason as the
+  # two above (dig_ecosystem#524): a specific tagged release, never "latest".
+  DIG_UPDATER_VERSION: "0.6.0"
   # Authenticates the installer's GitHub release-API lookups (never the asset
   # download itself) so this job doesn't race the unauthenticated 60/hour
   # per-IP cap GitHub Actions' shared runner pool routinely exhausts — see
@@ -161,12 +166,13 @@ jobs:
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.
-      - name: Install (dig-node + dig-dns, pinned versions)
+      - name: Install (dig-node + dig-dns + the auto-update beacon, pinned versions)
         run: |
           $SUDO "$INSTALLER" \
             --no-digstore \
             --dig-node-version "$DIG_NODE_VERSION" \
             --dig-dns-version "$DIG_DNS_VERSION" \
+            --dig-updater-version "$DIG_UPDATER_VERSION" \
             --bin-dir "$BIN_DIR" \
             --json | tee install.json
 
@@ -210,6 +216,37 @@ jobs:
           jq -e '.result.dns.installed == true' install.json
           jq -e '.result.dns.service_running == true' install.json
           jq -e '(.result.dns.paths_live | length) > 0' install.json
+
+      - name: Assert the auto-update beacon's daily scheduler registered (#514)
+        run: |
+          jq -e '.result.beacon.applied == true' install.json
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            test -f "$BIN_DIR/dig-updater.exe"
+            test -f "$BIN_DIR/dig-updater-worker.exe"
+          else
+            test -f "$BIN_DIR/dig-updater"
+            test -f "$BIN_DIR/dig-updater-worker"
+          fi
+
+      # `MSYS_NO_PATHCONV=1` is REQUIRED: git-bash's automatic POSIX-path
+      # conversion mistakes `/Query` for a Unix-style absolute path and
+      # rewrites it to `<git-install-root>/Query`, so a bare
+      # `schtasks.exe /Query /TN …` fails with "Invalid argument/option -
+      # 'C:/Program Files/Git/Query'" — confirmed live on this exact job
+      # (dig_ecosystem#514). Every OTHER `sc.exe`/`schtasks`-style call in this
+      # file uses positional (non-`/flag`) args, so this is the first one to
+      # trip the well-known MSYS argv-mangling pitfall.
+      - name: Windows — the beacon's Scheduled Task is registered (#514)
+        if: runner.os == 'Windows'
+        run: MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater'
+
+      - name: Linux — the beacon's systemd timer is enabled (#514)
+        if: runner.os == 'Linux'
+        run: systemctl is-enabled dig-updater.timer
+
+      - name: macOS — the beacon's LaunchDaemon is loaded (#514)
+        if: runner.os == 'macOS'
+        run: sudo launchctl print system/net.dignetwork.dig-updater
 
       - name: Windows — verify the SCM display names via `sc qc` (#494)
         if: runner.os == 'Windows'
@@ -259,6 +296,26 @@ jobs:
           $SUDO "$INSTALLER" --uninstall-dig-dns --json | tee uninstall-dns.json
           jq -e '.result.uninstalled == true' uninstall-dns.json
 
+      - name: Uninstall the auto-update beacon's scheduler via the installer flag + assert removed (#514)
+        run: |
+          $SUDO "$INSTALLER" --uninstall-dig-updater --bin-dir "$BIN_DIR" --json | tee uninstall-updater.json
+          jq -e '.result.applied == true' uninstall-updater.json
+
+      - name: Windows — the beacon's Scheduled Task is gone
+        if: runner.os == 'Windows'
+        run: |
+          ! MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater'
+
+      - name: Linux — the beacon's systemd timer is gone
+        if: runner.os == 'Linux'
+        run: |
+          ! systemctl cat dig-updater.timer
+
+      - name: macOS — the beacon's LaunchDaemon is gone
+        if: runner.os == 'macOS'
+        run: |
+          ! sudo launchctl print system/net.dignetwork.dig-updater
+
       - name: Windows — both services gone per `sc query`
         if: runner.os == 'Windows'
         run: |
@@ -295,4 +352,5 @@ jobs:
             install.json
             uninstall-node.json
             uninstall-dns.json
+            uninstall-updater.json
           if-no-files-found: ignore

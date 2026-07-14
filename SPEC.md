@@ -14,9 +14,10 @@ selecting the matching asset from the release's actual asset list (`src/asset.rs
 guessed filename.
 
 **The default install is the full DIG stack in one run** — the `digstore` CLI, the `dig-node`
-service, and the `dig-dns` service are ALL installed by default (a bare `dig-installer` with no
-flags installs all three; `InstallPlan::default()` encodes this). `dig-node` and `dig-dns` are
-registered as **boot-start** OS services (§2.1). Opt out of any of the three with the matching
+service, the `dig-dns` service, and the `dig-updater` auto-update beacon are ALL installed by
+default (a bare `dig-installer` with no flags installs all four; `InstallPlan::default()` encodes
+this). `dig-node` and `dig-dns` are registered as **boot-start** OS services (§2.1); `dig-updater`
+registers its own **daily scheduler artifact** (§1.5). Opt out of any of the four with the matching
 `--no-<component>` flag. `dig-relay` (advanced, run-your-own-relay) and the DIG Browser stay
 opt-in.
 
@@ -26,6 +27,8 @@ opt-in.
 | `digs`     | `DIG-Network/digstore` (alias, issue #434) | raw binary, added to PATH (same bin dir as `digstore`) | NO separate flag — follows `digstore`'s `--no-digstore`/`--with-digstore`/`--digstore-version` | follows `digstore` |
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
+| `dig-updater` | `DIG-Network/dig-updater`  | raw binary + a daily OS-scheduled task/timer/LaunchDaemon (issue #514, §1.5) | on by default; `--no-auto-update` opts out; `--auto-update` (redundant) | yes, as the "Keep DIG up to date automatically" option |
+| `dig-updater-worker` | `DIG-Network/dig-updater` (alias, issue #514) | raw binary, added to PATH (same bin dir as `dig-updater`) | NO separate flag — follows `dig-updater`'s `--no-auto-update`/`--auto-update`/`--dig-updater-version` | follows `dig-updater` |
 | `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | no — unchecked, user-checkable (#491) |
 | `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | no — hidden, not offered (#491) |
 
@@ -154,6 +157,57 @@ Declining the option (or a failure applying it) is always safe: a node without t
 fully reachable through the `dig-relay` fallback path — only direct/relay-free peer connections are
 affected.
 
+### 1.5 The DIG auto-update beacon (`dig-updater`, issue #514)
+
+By default the installer installs the **DIG auto-update beacon** — `DIG-Network/dig-updater`'s
+`dig-updater` binary plus its unprivileged `dig-updater-worker` sibling (published in the SAME
+release, resolved via `Repo::dig_updater`/`Repo::dig_updater_worker`, exactly like the
+`digstore`/`digs` pair in §1.1) — and asks the freshly-installed `dig-updater` to register its own
+**daily scheduler artifact** (a Windows Scheduled Task / systemd timer / macOS LaunchDaemon that
+runs `dig-updater run` once a day, checking for + installing new signed DIG releases). This is a
+**first-class, toggleable install option**, default ON, controlled identically from the CLI and the
+GUI — the same convention as §1.3/§1.4:
+
+- **CLI:** installed by default. `--no-auto-update` opts OUT; `--auto-update` is the redundant
+  explicit opt-in. Both map to the single `InstallPlan.auto_update` field (`auto_update =
+  --auto-update || !--no-auto-update`), so `--no-*` wins if both are given.
+  `--dig-updater-version` pins the beacon (and its worker sibling) to a specific release; default
+  latest. `--uninstall-dig-updater` removes the scheduler registration this installer created and
+  runs standalone (ignores every other flag) — it does NOT delete the downloaded binaries, only the
+  scheduler artifact (mirrors `--uninstall-dig-node`'s scope: the binary stays, only the OS
+  registration is torn down).
+- **GUI:** the same default-on option, surfaced as a checkbox ("Keep DIG up to date automatically
+  (recommended)", `gui/app/src/data.jsx` `OPTIONS`) that sets `auto_update` on the plan handed to
+  the Rust pipeline — the GUI and CLI defaults are in sync.
+
+**Registration mechanism (`src/beacon.rs`):** this installer does **not** hand-roll a scheduler — it
+delegates to the beacon's OWN `dig-updater schedule install`/`schedule uninstall` verbs (the same
+"drive the component's own subcommands, never reimplement OS service/scheduler control" pattern
+`src/service.rs` uses for dig-node/dig-relay), passing `std::env::current_exe()` implicitly (the
+beacon registers a schedule against ITSELF). Registering a SYSTEM/root-run daily schedule is itself
+a privileged operation — `InstallPlan::requires_elevation()` includes `auto_update`, the same
+elevation gate (§4.1) dig-node/dig-dns/dig-relay service registration already trips.
+
+Unlike a firewall rule (which can be a genuine no-op, e.g. ALF disabled), `dig-updater schedule
+install`/`uninstall` are themselves **idempotent** — a re-install overwrites the existing artifact,
+and an uninstall of an already-absent artifact still exits zero — so `beacon::BeaconResult.applied`
+is `true` on every successful call, `false` only on dry-run or a genuine failure (`note` always
+explains which, mirroring `firewall::FirewallResult`).
+
+**Readiness (§4.2):** unlike the firewall rule/scheme handler (best-effort, never gate readiness),
+the beacon's scheduler registration is a selected, privileged OS-registration step — like
+dig-node/dig-relay's own service registration, a failed registration makes the overall install NOT
+ready (`InstallReport.beacon` is `None` when `auto_update` is off — distinct from a
+present-but-`applied: false` failed attempt).
+
+**Version-aware updates:** `dig-updater` is one of the four `update::tracked_components()` (§7) —
+a bare re-run detects what's already installed and only re-downloads an outdated/unreadable binary,
+same as digstore/dig-node/dig-dns. `dig-updater-worker` is not independently tracked (mirrors
+`digs`, §7.3) — it always re-downloads alongside `dig-updater`, sharing its version pin.
+
+Declining the beacon (or a registration failure) is always safe: DIG simply never auto-updates, and
+the user re-runs the installer manually to pick up new versions.
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/
@@ -267,15 +321,16 @@ authoritative outcome).
 
 Stable, versioned (`schema_version`) JSON shape emitted by `--json` on success:
 `{schema_version, installer_version, target, dry_run, components[], path, service, relay, dns,
-scheme, firewall, installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc comments
-on `InstallReport`/`ComponentResult`/`PathResult`/`ServiceResult`/`RelayResult`/
-`dns::DnsInstallResult`/`scheme::SchemeResult`/`firewall::FirewallResult`/`pathcheck::CliPathCheck`
-for the exact field set; every boolean field has a paired human-readable `*_note` — no field is
-ever silently omitted to signal failure. `firewall` is `None` when `open_firewall` is off (§1.4) —
-distinct from a present-but-`applied: false` result, so a caller can tell "declined" apart from
-"attempted and failed". `ready`/`failures` are the aggregate readiness verdict (§4.2) — the firewall
-rule is best-effort and never gates `ready`, same as the scheme handler; the `--json` envelope's
-`ok` mirrors `ready`.
+scheme, firewall, beacon, installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc
+comments on `InstallReport`/`ComponentResult`/`PathResult`/`ServiceResult`/`RelayResult`/
+`dns::DnsInstallResult`/`scheme::SchemeResult`/`firewall::FirewallResult`/`beacon::BeaconResult`/
+`pathcheck::CliPathCheck` for the exact field set; every boolean field has a paired human-readable
+`*_note` — no field is ever silently omitted to signal failure. `firewall`/`beacon` are `None` when
+`open_firewall`/`auto_update` are off (§1.4/§1.5) — distinct from a present-but-`applied: false`
+result, so a caller can tell "declined" apart from "attempted and failed". `ready`/`failures` are
+the aggregate readiness verdict (§4.2) — the firewall rule and the scheme handler are best-effort
+and never gate `ready`; the beacon's scheduler registration DOES gate `ready` (§1.5, like
+dig-node/dig-relay's own service registration). The `--json` envelope's `ok` mirrors `ready`.
 
 ## 4. Exit codes
 
@@ -300,8 +355,9 @@ can never drift (`error::tests::exit_codes_table_matches_error_kinds`).
 ## 4.1 Elevation enforcement (#492)
 
 The installer REQUIRES elevation — Administrator on Windows, root (sudo) on macOS/Linux — whenever
-the plan registers an OS service (dig-node / dig-dns / dig-relay) or writes the `dig.local` hosts
-entry (`InstallPlan::requires_elevation()`). The check runs **FIRST**, before resolving/downloading/
+the plan registers an OS service (dig-node / dig-dns / dig-relay), the auto-update beacon's daily
+scheduler artifact (dig-updater, §1.5), or writes the `dig.local` hosts entry
+(`InstallPlan::requires_elevation()`). The check runs **FIRST**, before resolving/downloading/
 writing anything: an un-elevated run of such a plan fails immediately with `NOT_ELEVATED` (exit 11)
 and leaves NO partial state. A `--dry-run` or a digstore-only (per-user) install never trips the
 gate. The per-OS elevation probe is `elevation::is_elevated` (Windows `net session`, Unix `id -u`);
@@ -383,17 +439,18 @@ canonical theme going forward is dark.
 The GUI is a Tauri 2 desktop wizard (Welcome → License → Components → Install → Done). Its `digstore`
 CLI install remains a self-contained embedded/staged payload (no network call for that one
 component — see `gui/app/src-tauri/src/install.rs` phases 1–6). Every OTHER selected component
-(`dig-node`/`dig-dns`/`dig-relay`/`browser`) is installed by delegating to this repo's OWN
-`dig_installer::run_report` (the same thin-shim orchestration the CLI uses, including the §2
-stop/write/start lifecycle) via a pure `plan_from_selection(selected, bin_dir) -> InstallPlan`
-mapping (`install.rs`) — the GUI never reimplements release resolution, download, or service
-control.
+(`dig-node`/`dig-dns`/`dig-relay`/`browser`/the auto-update beacon, §1.5) is installed by delegating
+to this repo's OWN `dig_installer::run_report` (the same thin-shim orchestration the CLI uses,
+including the §2 stop/write/start lifecycle and the beacon's own scheduler-registration delegation)
+via a pure `plan_from_selection(selected, bin_dir) -> InstallPlan` mapping (`install.rs`) — the GUI
+never reimplements release resolution, download, service, or scheduler control.
 
 ## 7. Version-aware updater (issue #309)
 
 `dig-installer` is not just an installer — a bare re-run is a version-aware UPDATER: for each of
-the three tracked components (`digstore`, `dig-node`, `dig-dns` — `digs`/`dig-relay`/the DIG Browser
-are out of scope, see §7.3), it detects what's already at the resolved destination, compares it
+the four tracked components (`digstore`, `dig-node`, `dig-dns`, `dig-updater` — `digs`/
+`dig-updater-worker`/`dig-relay`/the DIG Browser are out of scope, see §7.3), it detects what's
+already at the resolved destination, compares it
 against the release it just resolved, and decides what to do. The decision core lives in
 `src/update.rs`, deliberately dependency-light and self-contained (a hand-rolled 3-part semver
 comparator, no `semver` crate) so it can be extracted verbatim into the planned shared
@@ -438,6 +495,10 @@ changes an Install/Update decision, since those already replace the artifact.
   identical `DnsInstallResult` shape a fresh install reports — so the caller's logging and the
   `service_running`/`paths_live` readiness gates (§4.2) work unchanged whether this run installed,
   updated, or skipped.
+- **dig-updater** (§1.5): Install/Update downloads + overwrites both the `dig-updater` and
+  `dig-updater-worker` binaries, then registers the scheduler (`beacon::register`) — idempotent, so
+  it runs on every Install/Update/Skip alike, self-healing a scheduler that was somehow removed
+  without the installer's knowledge even on an otherwise-Skip run.
 
 Every decision is logged as a single human-readable line (`UpdateDecision.summary`, e.g. `"v0.14.0
 → v0.15.0 (update)"`, `"v0.15.0 (up to date)"`, `"not installed → install v0.15.0"`) and recorded on
@@ -447,11 +508,12 @@ so re-running the installer idempotently reports exactly what changed.
 
 ### 7.3 Scope
 
-Only `digstore`/`dig-node`/`dig-dns` are update-tracked (`update::tracked_components`). `digs` (the
-digstore alias, §1.1) always re-downloads alongside digstore regardless of its own on-disk state
-— a known, accepted scope limit (it shares digstore's version pin and is cheap to refetch).
-`dig-relay` and the DIG Browser installer are opt-in, advanced/one-shot artifacts and are not
-update-tracked at all; selecting them always (re)installs.
+Only `digstore`/`dig-node`/`dig-dns`/`dig-updater` are update-tracked (`update::tracked_components`).
+`digs` (the digstore alias, §1.1) and `dig-updater-worker` (the beacon's sibling, §1.5) always
+re-download alongside their primary regardless of their own on-disk state — a known, accepted scope
+limit (each shares its primary's version pin and is cheap to refetch). `dig-relay` and the DIG
+Browser installer are opt-in, advanced/one-shot artifacts and are not update-tracked at all;
+selecting them always (re)installs.
 
 ### 7.4 GUI preview
 
@@ -461,3 +523,7 @@ against; its version is shown separately via the existing bundled-version badge)
 `component_update_status` Tauri command, calling `update::check_updates` with the real GitHub
 resolver. A status pill next to each tracked component reads "Install" / "Update available" / "Up
 to date"; a resolution failure (e.g. offline) reads "update check unavailable" rather than guessing.
+`update::check_updates` also returns a `dig-updater` entry (it is one of the four tracked
+components, §7.3) but the Components screen renders no row for the beacon (it is an OPTIONS
+checkbox, not a COMPONENTS entry, §1.5) — that entry is simply unused by the current UI rather than
+displayed.

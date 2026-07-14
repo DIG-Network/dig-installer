@@ -82,6 +82,12 @@ export const OPTIONS = [
     requires: "dig-node",
     on: true,
   },
+  {
+    id: "auto-update",
+    name: "Keep DIG up to date automatically (recommended)",
+    desc: "Installs the DIG update beacon, which checks daily for new signed releases of the DIG stack and installs them automatically. Turn this off any time.",
+    on: true,
+  },
 ];
 
 // Files surfaced in the progress header "writing <file>" while the real

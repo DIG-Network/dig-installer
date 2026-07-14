@@ -273,16 +273,18 @@ pub fn live_latest_version_resolver(repo: &Repo) -> Result<String, String> {
 }
 
 /// The components this module tracks version-aware Install/Update/Skip
-/// status for (issue #309's explicit scope: digstore, dig-node, dig-dns —
-/// `digs`/`dig-relay`/the DIG Browser are not update-tracked). Each entry's
-/// id matches [`crate::asset::AssetKind::RawBinary`]'s on-PATH exe name (via
+/// status for (issue #309's explicit scope, extended by #514: digstore,
+/// dig-node, dig-dns, dig-updater — `digs`/`dig-updater-worker`/`dig-relay`/
+/// the DIG Browser are not update-tracked). Each entry's id matches
+/// [`crate::asset::AssetKind::RawBinary`]'s on-PATH exe name (via
 /// `Target::exe_name`), so a caller builds a destination with
 /// `bin_dir.join(target.exe_name(id))`.
-pub fn tracked_components() -> [(&'static str, Repo); 3] {
+pub fn tracked_components() -> [(&'static str, Repo); 4] {
     [
         ("digstore", Repo::digstore()),
         ("dig-node", Repo::dig_node()),
         ("dig-dns", Repo::dig_dns()),
+        ("dig-updater", Repo::dig_updater()),
     ]
 }
 
@@ -527,7 +529,7 @@ mod tests {
     // -- check_updates (the GUI preview path, network-injected) -----------------
 
     #[test]
-    fn check_updates_covers_exactly_the_three_tracked_components() {
+    fn check_updates_covers_exactly_the_four_tracked_components() {
         let target = crate::target::Target {
             os: crate::target::Os::Linux,
             arch: crate::target::Arch::X64,
@@ -536,7 +538,11 @@ mod tests {
         let resolve_latest = |_: &Repo| -> Result<String, String> { Ok("1.0.0".to_string()) };
         let statuses = check_updates(&bin_dir, &target, &resolve_latest);
         let ids: Vec<&str> = statuses.iter().map(|s| s.component.as_str()).collect();
-        assert_eq!(ids, vec!["digstore", "dig-node", "dig-dns"]);
+        assert_eq!(
+            ids,
+            vec!["digstore", "dig-node", "dig-dns", "dig-updater"],
+            "issue #514 extends the tracked set to include the auto-update beacon"
+        );
         for s in &statuses {
             let decision = s.decision.as_ref().expect("resolver succeeded");
             assert_eq!(decision.action, UpdateAction::Install, "nothing on disk");

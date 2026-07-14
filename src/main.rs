@@ -28,11 +28,13 @@ By DEFAULT it installs the full DIG stack in one run:\n  \
 * the dig-node local node (installed + started as a boot-start OS service, with a best-effort \
 127.0.0.2 dig.local hosts entry), and\n  \
 * the dig-dns local *.dig name resolver (installed + started as a boot-start OS service, with \
-the OS split-DNS/NRPT + browser DoH wiring).\n\n\
-Opt OUT of any of the three with --no-digstore / --no-dig-node / --no-dig-dns. The dig-relay \
-(advanced, run-your-own-relay) and the DIG Browser stay OPT-IN (--with-relay / --with-browser). \
-Use --json for machine-readable output and --help-json for the full invocation contract (incl. \
-the exit-code table)."
+the OS split-DNS/NRPT + browser DoH wiring), and\n  \
+* the DIG auto-update beacon (dig-updater, registered as a daily scheduled check that installs \
+new signed DIG releases automatically).\n\n\
+Opt OUT of any of the four with --no-digstore / --no-dig-node / --no-dig-dns / --no-auto-update. \
+The dig-relay (advanced, run-your-own-relay) and the DIG Browser stay OPT-IN (--with-relay / \
+--with-browser). Use --json for machine-readable output and --help-json for the full invocation \
+contract (incl. the exit-code table)."
 )]
 struct Cli {
     /// Directory to install the binaries into (default: per-user DIG bin dir).
@@ -170,9 +172,34 @@ struct Cli {
     #[arg(long = "open-firewall")]
     open_firewall: bool,
 
-    /// Force a fresh reinstall of digstore/dig-node/dig-dns even when the
-    /// version-aware updater (#309) would otherwise skip a component that's
-    /// already up to date.
+    /// Opt OUT of installing + registering the DIG auto-update beacon
+    /// (installed by default): `dig-updater` + its `dig-updater-worker`
+    /// sibling check daily for new signed DIG releases and install them
+    /// automatically (#514). Declining is always safe — nothing auto-updates;
+    /// re-run the installer manually to get new versions.
+    #[arg(long = "no-auto-update")]
+    no_auto_update: bool,
+
+    /// Explicitly install the auto-update beacon (redundant — it is on by
+    /// default; here for symmetry with `--no-auto-update`).
+    #[arg(long = "auto-update")]
+    auto_update: bool,
+
+    /// dig-updater version to install (e.g. 0.6.0); default: latest released.
+    /// Also pins the `dig-updater-worker` sibling, published in the same release.
+    #[arg(long, value_name = "VERSION")]
+    dig_updater_version: Option<String>,
+
+    /// Remove the auto-update beacon's daily scheduler registration this
+    /// installer created (idempotent; does not remove the downloaded binaries
+    /// or touch the digstore/browser/relay/dig-node/dig-dns installs). Runs
+    /// standalone — ignores every other install flag.
+    #[arg(long = "uninstall-dig-updater")]
+    uninstall_dig_updater: bool,
+
+    /// Force a fresh reinstall of digstore/dig-node/dig-dns/dig-updater even
+    /// when the version-aware updater (#309) would otherwise skip a component
+    /// that's already up to date.
     #[arg(long = "force-reinstall")]
     force_reinstall: bool,
 
@@ -237,6 +264,11 @@ fn main() -> std::process::ExitCode {
         return run_uninstall_dig_node(&bin_dir, cli.dry_run, cli.json);
     }
 
+    if cli.uninstall_dig_updater {
+        let bin_dir = cli.bin_dir.clone().unwrap_or_else(paths::default_bin_dir);
+        return run_uninstall_beacon(&bin_dir, cli.dry_run, cli.json);
+    }
+
     if cli.unregister_scheme {
         let result = dig_installer::scheme::unregister(cli.dry_run);
         if cli.json {
@@ -290,6 +322,11 @@ fn main() -> std::process::ExitCode {
         // `--no-open-firewall` opts out (`--open-firewall` is the redundant
         // explicit opt-in) — same "`--no-*` wins" pattern as register_scheme.
         open_firewall: cli.open_firewall || !cli.no_open_firewall,
+        // #514: install + register the auto-update beacon by default;
+        // `--no-auto-update` opts out (`--auto-update` is the redundant
+        // explicit opt-in) — same "`--no-*` wins" pattern as the two above.
+        auto_update: cli.auto_update || !cli.no_auto_update,
+        dig_updater_version: cli.dig_updater_version,
         force_reinstall: cli.force_reinstall,
         dry_run: cli.dry_run,
     };
@@ -401,6 +438,29 @@ fn run_uninstall_dig_node(
         println!("{}", dig_installer::service_uninstall_json(&result));
     } else {
         println!("dig-node uninstall: {}", result.note);
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// `--uninstall-dig-updater`: remove the DIG auto-update beacon's daily
+/// scheduler registration (task #514). Standalone action —
+/// [`dig_installer::uninstall_beacon`] never fails outright (a missing binary
+/// or elevation issue is reported via `note`, not an `Err`), so this always
+/// exits success; the caller re-runs elevated if prompted.
+fn run_uninstall_beacon(
+    bin_dir: &std::path::Path,
+    dry_run: bool,
+    json: bool,
+) -> std::process::ExitCode {
+    let result = if json {
+        dig_installer::uninstall_beacon(bin_dir, dry_run, &mut |line| eprintln!("{line}"))
+    } else {
+        dig_installer::uninstall_beacon(bin_dir, dry_run, &mut |line| println!("{line}"))
+    };
+    if json {
+        println!("{}", dig_installer::beacon_uninstall_json(&result));
+    } else {
+        println!("dig-updater uninstall: {}", result.note);
     }
     std::process::ExitCode::SUCCESS
 }

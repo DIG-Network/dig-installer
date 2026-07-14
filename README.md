@@ -14,6 +14,10 @@ the latest DIG components for your OS/arch:
   service (Windows Service / macOS LaunchDaemon / Linux systemd), with the OS
   DNS/proxy wiring (split-DNS, NRPT, browser DoH policy) so a browser can open
   `http://<storeId>.dig/…` directly (see [dig-dns](#dig-dns-local-dig-name-resolution) below),
+- the **DIG auto-update beacon** (`dig-updater`, + its unprivileged
+  `dig-updater-worker` sibling) — installed and registered to check daily for
+  new signed DIG releases and install them automatically (see
+  [Auto-update beacon](#auto-update-beacon-dig-updater) below),
 - the **dig-relay** *(advanced, optional)* — run your own NAT-traversal relay,
   installed + started as an OS service. Most users do **not** need this: every
   node already uses the canonical `relay.dig.net` out of the box.
@@ -29,6 +33,7 @@ downloads it. Sources:
 - the **dig-node** local node from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
 - the **dig-dns** local resolver from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
+- the **auto-update beacon** (+ its worker sibling) from [`DIG-Network/dig-updater`](https://github.com/DIG-Network/dig-updater/releases)
 - the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
 - the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
   — resolution works against DIG Browser's current **alpha/prerelease-only**
@@ -41,9 +46,10 @@ downloads it. Sources:
   only the token/extension pattern is checked, not the product-name prefix.
 
 **By default it installs the full DIG stack in one run** — the digstore CLI, the
-dig-node service, and the dig-dns service (the last two as **boot-start** OS
-services that come up automatically on every boot). Opt out of any of them with
-`--no-digstore` / `--no-dig-node` / `--no-dig-dns`. The dig-relay *(advanced)*
+dig-node service, the dig-dns service (both boot-start OS services that come up
+automatically on every boot), and the auto-update beacon (a daily scheduled
+task/timer/LaunchDaemon). Opt out of any of them with `--no-digstore` /
+`--no-dig-node` / `--no-dig-dns` / `--no-auto-update`. The dig-relay *(advanced)*
 and the DIG Browser stay opt-in (`--with-relay` / `--with-browser`). This is the
 canonical home of the DIG installer, migrated out of `digstore`.
 
@@ -132,8 +138,9 @@ dig-installer --no-dig-node --no-dig-dns   # just the digstore CLI
 dig-installer --with-browser       # ALSO download the DIG Browser installer
 dig-installer --dry-run            # show exactly what would happen, change nothing
 dig-installer --dry-run --json     # the same, as a machine-readable plan
-dig-installer --uninstall-dig-dns  # remove the dig-dns service + OS wiring this installer created
-dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local hosts entry
+dig-installer --uninstall-dig-dns     # remove the dig-dns service + OS wiring this installer created
+dig-installer --uninstall-dig-node    # remove the dig-node service + the dig.local hosts entry
+dig-installer --uninstall-dig-updater # remove the auto-update beacon's daily scheduler registration
 ```
 
 ### Flags
@@ -158,6 +165,10 @@ dig-installer --uninstall-dig-node # remove the dig-node service + the dig.local
 | `--dig-dns-version <VER>` | latest | Install a specific dig-dns version. |
 | `--dig-dns-node <URL>` | dig-dns's own ladder | Explicit dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node <URL>`). |
 | `--uninstall-dig-dns` | — | Remove the dig-dns service + every OS artifact (service, split-DNS/NRPT rule, browser policy key) THIS installer created; leaves zero residue. Standalone action — ignores every other flag except `--dry-run`/`--json`. |
+| `--no-auto-update` | off | Opt out of installing + registering the DIG auto-update beacon (installed by default; see [Auto-update beacon](#auto-update-beacon-dig-updater) below). |
+| `--auto-update` | on | Redundant explicit opt-in — the auto-update beacon is installed by default. |
+| `--dig-updater-version <VER>` | latest | Install a specific auto-update beacon version (also pins its `dig-updater-worker` sibling). |
+| `--uninstall-dig-updater` | — | Remove the auto-update beacon's daily scheduler registration this installer created. Idempotent; does not remove the downloaded binaries or touch the digstore/browser/relay/dig-node/dig-dns installs. Standalone action — ignores every other flag except `--bin-dir`/`--dry-run`/`--json`. |
 | `--with-browser` | off | Also download the DIG Browser native installer for this OS (opt-in). |
 | `--browser-version <VER>` | latest | Install a specific DIG Browser version. |
 | `--with-relay` | off | **Advanced (opt-in).** Also install the `dig-relay` NAT-traversal relay + register it as an OS service (run your own relay). Most users don't need this — nodes use `relay.dig.net` by default. |
@@ -221,7 +232,15 @@ Default install location (`--bin-dir`):
    live, the bound gateway port, the PAC URL, and a browser-fallback
    instruction. See [dig-dns](#dig-dns-local-dig-name-resolution) below for the
    full per-OS contract.
-7. **DIG Browser** *(opt-in, with `--with-browser`)* — downloads the native
+7. **Auto-update beacon** *(by default; `--no-auto-update` to skip)* —
+   downloads the `dig-updater` binary and its unprivileged `dig-updater-worker`
+   sibling (published in the same release), then **delegates to dig-updater's
+   own `schedule install`** subcommand to register a daily OS-scheduled task/
+   systemd timer/LaunchDaemon that checks for + installs new signed DIG
+   releases automatically. See [Auto-update beacon](#auto-update-beacon-dig-updater)
+   below. `--uninstall-dig-updater` reverses it: removes the scheduler
+   registration (the downloaded binaries stay in place).
+8. **DIG Browser** *(opt-in, with `--with-browser`)* — downloads the native
    installer for your OS into the bin dir; run it to finish.
 
 Every download is integrity-checkable (SHA-256). `--dry-run` resolves and prints
@@ -232,8 +251,8 @@ every asset, URL, destination, and service command without touching the system
 
 ## Version-aware updater
 
-Re-running `dig-installer` is not a blind reinstall — for `digstore`/`dig-node`/`dig-dns` it
-**detects** what's already at the destination (`<bin> --version`), **compares** it to the release
+Re-running `dig-installer` is not a blind reinstall — for `digstore`/`dig-node`/`dig-dns`/
+`dig-updater` it **detects** what's already at the destination (`<bin> --version`), **compares** it to the release
 it just resolved, and **decides**: absent → install; an older (or unreadable) installed version →
 update (replace it, reusing the same stop/write/start lifecycle above); already current → skip,
 untouched. The decision is printed for every tracked component (`v0.14.0 → v0.15.0 (update)` /
@@ -342,6 +361,41 @@ idempotent (a declined/already-absent rule is a clean no-op).
 
 ---
 
+## Auto-update beacon (`dig-updater`)
+
+By default, the installer also installs [`dig-updater`](https://github.com/DIG-Network/dig-updater)
+— the DIG auto-update **beacon** — plus its unprivileged `dig-updater-worker` sibling (published in
+the same release), and asks the freshly-installed `dig-updater` to register its own **daily
+scheduler artifact**: a Windows Scheduled Task, a systemd timer, or a macOS LaunchDaemon that wakes
+once a day, checks the signed DIG release feed, and installs any new version of the DIG stack
+automatically. The installer never hand-rolls the scheduler — it delegates to `dig-updater schedule
+install`, the same "drive the component's own subcommands" pattern used for dig-node/dig-relay's OS
+service registration above.
+
+```sh
+dig-installer --dig-updater-version 0.6.0
+#   Installing the DIG auto-update beacon:
+#     dig-updater 0.6.0 (dig-updater-0.6.0-windows-x64.exe)
+#   Installing the dig-updater-worker sibling (same release, published as a separate binary):
+#     dig-updater-worker 0.6.0 (dig-updater-worker-0.6.0-windows-x64.exe)
+#   Registering the beacon's daily update-check scheduler:
+#     ✓ registered the daily update-check scheduler
+
+dig-installer --uninstall-dig-updater
+#   Removing the DIG auto-update beacon's daily scheduler:
+#     ✓ removed the daily update-check scheduler
+```
+
+Declining the beacon (`--no-auto-update`) is always safe — DIG simply never auto-updates, and you
+re-run the installer manually to pick up new versions. Registering a SYSTEM/root-run daily schedule
+is itself a privileged operation, so — like dig-node/dig-dns/dig-relay's own service registration —
+it requires the installer to run elevated; unlike the firewall rule/scheme handler above, a failed
+beacon registration DOES make the overall install report "DIG is NOT ready" (`INSTALL_INCOMPLETE`).
+`--uninstall-dig-updater` removes only the scheduler registration — it never deletes the downloaded
+binaries or touches the digstore/dig-node/dig-dns/relay/browser installs.
+
+---
+
 ## dig-dns (local `.dig` name resolution)
 
 `--with-dig-dns` installs [`dig-dns`](https://github.com/DIG-Network/dig-dns) — the
@@ -414,7 +468,7 @@ pre-existing org DNS/browser policy.
 
 - **`--json`** — emits a single structured object to **stdout** (all human prose
   goes to **stderr**, no prompts/spinners). On success:
-  `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,relay,dns,installed:[…]}}`
+  `{"ok":true,"result":{schema_version,installer_version,target,dry_run,components:[…],path,service,relay,dns,beacon,installed:[…]}}`
   — `service` (present with `--with-dig-node`) carries
   `{installed,started,port,note,dig_local,dig_local_resolves,dig_local_resolve_note,health_checked,health_ok,health_note}` —
   `dig_local_resolves`/`dig_local_resolve_note` are the task-#140 post-install
@@ -423,11 +477,15 @@ pre-existing org DNS/browser policy.
   task-#223 post-install RPC health check (whether `rpc.discover` actually
   answered on the service's loopback port). `dns` (present
   with `--with-dig-dns`) carries `{installed,started,needs_elevation,note,doctor,paths_live,bound_port,pac_url,fallback_instruction}`.
+  `beacon` (present unless `--no-auto-update`, issue #514) carries
+  `{applied,note}` — whether the daily scheduler registration succeeded.
   On failure: `{"ok":false,"error":{"code","exit_code","message","hint"}}`.
   `--uninstall-dig-dns --json` emits `{"ok":true,"result":{uninstalled,needs_elevation,note,residue_removed:[…]}}`
   standalone (it never touches the other components).
   `--uninstall-dig-node --json` emits `{"ok":true,"result":{uninstalled,dig_local_removed,note}}`
   standalone (never touches the digstore/browser/relay/dig-dns installs).
+  `--uninstall-dig-updater --json` emits `{"ok":true,"result":{applied,note}}`
+  standalone (never touches the downloaded binaries or the other components).
 - **`--help-json`** — prints the full invocation contract (components, flags,
   supported targets, and the exit-code table) as JSON.
 - **Stable error codes + exit codes** — every failure carries an `UPPER_SNAKE`
@@ -476,6 +534,8 @@ Following the ecosystem's canonical branding (see the superproject's `SYSTEM.md`
 - **dig-dns** — the local `*.dig` name resolver (a DNS responder + HTTP
   gateway) that lets a browser open `http://<storeId>.dig/…` directly, backed
   by a dig-node as its content source.
+- **the beacon** (`dig-updater`) — the DIG auto-update service that checks
+  daily for new signed releases and installs them automatically.
 
 ---
 
@@ -489,10 +549,11 @@ it on a tag by downloading the latest released `digstore` binary, staging it
 (`gui/app/scripts/stage-binary.mjs --src <path>`), and running `tauri build`.
 
 The Components step lists the SAME catalogue as the CLI (digstore + dig-node +
-dig-dns + dig-relay + DIG Browser — see `SPEC.md` §1), every component
-pre-selected so "install all" is the one-click default path; deselect anything
-you don't want. digstore installs via the embedded payload above; every other
-selected component is installed by the wizard delegating to this repo's own
+dig-dns + the auto-update beacon + dig-relay + DIG Browser — see `SPEC.md` §1),
+every default-on component pre-selected so "install all" is the one-click
+default path; deselect anything you don't want. digstore installs via the
+embedded payload above; every other selected component is installed by the
+wizard delegating to this repo's own
 `dig_installer::run_report` — the exact same release-resolution/download/
 service-lifecycle orchestration the CLI uses (see `SPEC.md` §2 for the
 stop-before-write/start-after-write service lifecycle both surfaces share).
