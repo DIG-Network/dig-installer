@@ -577,13 +577,14 @@ brand-designed desktop wizard over the same underlying install engine.
 
 ## Releasing
 
-Tag-driven (mirrors digstore / dig-node) — **do not hand-push a tag**. On
-merge to `main`, `changelog-tag.yml` regenerates `CHANGELOG.md`, commits
-`chore(release): vX.Y.Z`, and pushes that commit + the matching `vX.Y.Z` tag
+Tag-driven (mirrors digstore / dig-node) — **do not hand-push a tag**. Releases
+are cut by the nightly-release.yml orchestrator (not on merge to `main`); run on
+a midnight UTC cron or manual dispatch. The stable channel regenerates `CHANGELOG.md`,
+commits `chore(release): vX.Y.Z`, and pushes that commit + the matching `vX.Y.Z` tag
 (via `RELEASE_TOKEN`, so the push actually fires the tag-triggered workflow).
 The pushed tag runs `release.yml`, which builds the `dig-installer` CLI for
 every OS/arch **and** the GUI installers, and attaches them all to one GitHub
-Release. See `runbooks/deployment.md` for the full trigger/verify checklist.
+Release. See `runbooks/release.md` for the full trigger/verify checklist.
 
 A push to `main` builds the CLI (no publish) so a broken build is caught before
 the release tag is even created.

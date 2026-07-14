@@ -2,10 +2,12 @@
 
 ## Trigger
 
-Tag-driven, per CLAUDE.md §3.6. On merge to `main`, `.github/workflows/changelog-tag.yml` reads
-the version from `Cargo.toml`, regenerates `CHANGELOG.md` with git-cliff, commits
-`chore(release): vX.Y.Z`, and pushes both the commit and the `vX.Y.Z` tag using
-`secrets.RELEASE_TOKEN`. The pushed tag fires `.github/workflows/release.yml`.
+Tag-driven, per CLAUDE.md §3.6. Releases are triggered by the `nightly-release.yml`
+orchestrator (run on a nightly cron or manual dispatch, NOT on merge to `main`).
+The stable channel reads the version from `Cargo.toml`, regenerates `CHANGELOG.md`
+with git-cliff, commits `chore(release): vX.Y.Z`, and pushes both the commit and
+the `vX.Y.Z` tag using `secrets.RELEASE_TOKEN`. The pushed tag fires
+`.github/workflows/release.yml`. See `runbooks/release.md` for the orchestrator details.
 
 ## Credentials / secrets
 
