@@ -9,16 +9,22 @@
 //!   same bin dir (no separate flag or PATH entry),
 //! * the **dig-node** local node (`DIG-Network/dig-node`) → installed + started
 //!   as an OS service (Windows service / systemd / launchd) by delegating to
-//!   dig-node's own `install`/`start` subcommands, and (best-effort) a
-//!   `127.0.0.2 dig.local` hosts entry so consumers reach it port-free,
+//!   dig-node's own `install`/`start` subcommands, along with its **`dign`
+//!   alias binary** (issue #548) — published in the SAME dig-node release
+//!   under a separate asset stem, installed alongside dig-node in the same bin
+//!   dir — and (best-effort) a `127.0.0.2 dig.local` hosts entry so consumers
+//!   reach it port-free,
 //! * the **DIG Browser** (`DIG-Network/DIG_Browser`) → the native installer
 //!   (`.exe`/`.dmg`/`.AppImage`) downloaded for the user to run, and
 //! * **dig-dns** (`DIG-Network/dig-dns`) → installed + registered as an OS
 //!   service (Windows Service / macOS LaunchDaemon / Linux systemd unit) for
-//!   local `*.dig` name resolution. Unlike dig-node/dig-relay, dig-dns ships
-//!   no `install`/`start` subcommands of its own, so this installer owns the
-//!   full per-OS service + split-DNS/NRPT + browser-policy wiring directly
-//!   (see [`dns`]), self-verifying with `dig-dns doctor` when done.
+//!   local `*.dig` name resolution, along with its **`digd` alias binary**
+//!   (issue #548) — published in the SAME dig-dns release under a separate
+//!   asset stem, installed alongside dig-dns in the same bin dir. Unlike
+//!   dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of its
+//!   own, so this installer owns the full per-OS service + split-DNS/NRPT +
+//!   browser-policy wiring directly (see [`dns`]), self-verifying with
+//!   `dig-dns doctor` when done.
 //!
 //! Each component is selectable (`--with-digstore`/`--with-dig-node`/
 //! `--with-browser`/`--with-dig-dns`/`--service`) with a pinnable per-artifact version override,
@@ -77,9 +83,12 @@ pub struct InstallPlan {
     /// through to the `digs` alias resolution (published in the same release).
     pub digstore_version: Option<String>,
     /// Install + register dig-node as a boot-start OS service (default true —
-    /// part of the universal 3-component stack, #301).
+    /// part of the universal 3-component stack, #301). Also gates the `dign`
+    /// alias binary (issue #548), which has no flag of its own and
+    /// installs/uninstalls alongside dig-node.
     pub with_dig_node: bool,
-    /// dig-node version/tag to install: `None` ⇒ latest released.
+    /// dig-node version/tag to install: `None` ⇒ latest released. Also threads
+    /// through to the `dign` alias resolution (published in the same release).
     pub dig_node_version: Option<String>,
     /// Service configuration when `with_dig_node` is set.
     pub service: ServiceConfig,
@@ -96,9 +105,12 @@ pub struct InstallPlan {
     pub relay_service: ServiceConfigRelay,
     /// Install dig-dns and register it as a boot-start OS service (local `*.dig`
     /// name resolution: a DNS responder + HTTP gateway). Default true — part of
-    /// the universal 3-component stack, #301.
+    /// the universal 3-component stack, #301. Also gates the `digd` alias
+    /// binary (issue #548), which has no flag of its own and
+    /// installs/uninstalls alongside dig-dns.
     pub with_dig_dns: bool,
-    /// dig-dns version/tag to install: `None` ⇒ latest released.
+    /// dig-dns version/tag to install: `None` ⇒ latest released. Also threads
+    /// through to the `digd` alias resolution (published in the same release).
     pub dig_dns_version: Option<String>,
     /// dig-dns service configuration when `with_dig_dns` is set (start +
     /// optional dig-node endpoint override forwarded to `dig-dns serve --node`).
@@ -198,8 +210,8 @@ impl Default for InstallPlan {
 /// One installed/resolved component in the result.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ComponentResult {
-    /// Component id: `digstore` | `digs` | `dig-node` | `dig-dns` | `dig-relay`
-    /// | `DIG-Browser`.
+    /// Component id: `digstore` | `digs` | `dig-node` | `dign` | `dig-dns` |
+    /// `digd` | `dig-relay` | `DIG-Browser`.
     pub component: String,
     /// Resolved version (bare semver, e.g. `0.6.0`).
     pub version: String,
@@ -215,8 +227,9 @@ pub struct ComponentResult {
     /// this run installed it fresh, replaced an outdated/unreadable install,
     /// or skipped one that was already current. Only `digstore`/`dig-node`/
     /// `dig-dns` (see `update::tracked_components`) are actually detected;
-    /// every other component (`digs`, `dig-relay`, the DIG Browser) defaults
-    /// to `Install`, matching their existing always-fresh-download behavior.
+    /// every other component (`digs`, `dign`, `digd`, `dig-relay`, the DIG
+    /// Browser) defaults to `Install`, matching their existing
+    /// always-fresh-download behavior.
     pub update_action: update::UpdateAction,
     /// The version detected at this component's destination before this run
     /// (`None` when it was absent). Mirrors
@@ -664,7 +677,8 @@ fn run_report_gated(
         }
     }
 
-    // 3. dig-node service (optional) + dig.local hosts entry.
+    // 3. dig-node service (optional) + its `dign` alias binary (issue #548) +
+    //    dig.local hosts entry.
     if plan.with_dig_node {
         log("Installing the dig-node local node:");
         let mut c = resolve_dig_node(resolve, &plan.dig_node_version, &target, &plan.bin_dir, log)?;
@@ -702,6 +716,45 @@ fn run_report_gated(
         let dig_node_path = PathBuf::from(c.dest.clone());
         report.components.push(c);
 
+        // dign (issue #548): a first-class alias of dig-node, published in the
+        // SAME dig-node release under its own asset stem, installed alongside
+        // it — same version pin, same bin dir, no separate PATH entry needed —
+        // mirroring the digs-alongside-digstore pattern above (§1 in this
+        // file's header). Not update-tracked (mirrors digs, #309 §7.3): it
+        // always re-downloads fresh when present, sharing dig-node's version
+        // pin. Resolution failure is gated gracefully (logged, not fatal): the
+        // pre-rename `dig-companion` fallback above resolves dig-node from a
+        // DIFFERENT repo than `Repo::dign()` targets, so a dig-node install
+        // that fell back to the legacy repo has no dign asset to find —
+        // exercised by `dig_node_falls_back_to_legacy_dig_companion_release`
+        // below — and that must never sink the otherwise-successful install.
+        log(
+            "Installing the dign alias (same dig-node local node, published as a separate binary):",
+        );
+        match resolve_component(
+            resolve,
+            &Repo::dign(),
+            &plan.dig_node_version,
+            &target,
+            AssetKind::RawBinary,
+            &plan.bin_dir,
+        ) {
+            Ok(dign) => {
+                log_component(log, &dign);
+                download_component(&dign, plan.dry_run)?;
+                if !plan.dry_run {
+                    report.installed.push(dign.dest.clone());
+                }
+                report.components.push(dign);
+            }
+            Err(e) if e.code() == "ASSET_NOT_FOUND" => {
+                log(&format!(
+                    "    · dign alias not available for this release ({e}) — skipping; dig-node itself is unaffected"
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+
         report.service = Some(register_dig_node(&dig_node_path, plan, &decision, log));
 
         // 3b. App-scoped firewall rule for dig-node's peer-RPC listener
@@ -720,10 +773,11 @@ fn run_report_gated(
         }
     }
 
-    // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service. Unlike
-    //    dig-node/dig-relay, dig-dns has no `install`/`start` subcommands of its own, so this
-    //    installer owns the full per-OS service + split-DNS/NRPT + browser-policy wiring (see
-    //    the `dns` module) and self-verifies with `dig-dns doctor` once started.
+    // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service, along
+    //    with its `digd` alias binary (issue #548). Unlike dig-node/dig-relay, dig-dns has no
+    //    `install`/`start` subcommands of its own, so this installer owns the full per-OS
+    //    service + split-DNS/NRPT + browser-policy wiring (see the `dns` module) and
+    //    self-verifies with `dig-dns doctor` once started.
     if plan.with_dig_dns {
         log("Installing dig-dns (local *.dig name resolution):");
         match resolve_component(
@@ -765,6 +819,36 @@ fn run_report_gated(
                 }
                 let dig_dns_path = PathBuf::from(c.dest.clone());
                 report.components.push(c);
+
+                // digd (issue #548): a first-class alias of dig-dns, published
+                // in the SAME dig-dns release under its own asset stem,
+                // installed alongside it — same version pin, same bin dir, no
+                // separate PATH entry needed — exactly mirroring
+                // digs-alongside-digstore above. Unlike dign (which has a
+                // pre-rename legacy-repo fallback dig-node itself can take),
+                // digd resolves against the IDENTICAL repo + version pin as
+                // dig-dns itself with no such divergence, so it always
+                // succeeds whenever dig-dns just did — no separate gate is
+                // needed here (only reached inside this `Ok(mut c)` arm, i.e.
+                // once dig-dns itself resolved; the ASSET_NOT_FOUND gate below
+                // handles dig-dns being entirely unpublished). Not
+                // update-tracked (mirrors digs, #309 §7.3): it always
+                // re-downloads fresh, sharing dig-dns's version pin.
+                log("Installing the digd alias (same dig-dns resolver, published as a separate binary):");
+                let digd = resolve_component(
+                    resolve,
+                    &Repo::digd(),
+                    &plan.dig_dns_version,
+                    &target,
+                    AssetKind::RawBinary,
+                    &plan.bin_dir,
+                )?;
+                log_component(log, &digd);
+                download_component(&digd, plan.dry_run)?;
+                if !plan.dry_run {
+                    report.installed.push(digd.dest.clone());
+                }
+                report.components.push(digd);
 
                 report.dns = Some(register_dig_dns(&dig_dns_path, plan, &decision, log));
             }
@@ -1809,8 +1893,10 @@ pub fn help_json() -> String {
             { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
             { "id": "digs", "repo": "DIG-Network/digstore", "default": true, "flag": "alias of digstore — no separate flag; follows --no-digstore/--with-digstore/--digstore-version", "kind": "raw_binary_alias" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
+            { "id": "dign", "repo": "DIG-Network/dig-node", "default": true, "flag": "alias of dig-node — no separate flag; follows --no-dig-node/--with-dig-node/--dig-node-version", "kind": "raw_binary_alias" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": true, "flag": "--no-dig-dns disables; --with-dig-dns redundant", "kind": "raw_binary+boot-start-service+split-dns+browser-policy" },
+            { "id": "digd", "repo": "DIG-Network/dig-dns", "default": true, "flag": "alias of dig-dns — no separate flag; follows --no-dig-dns/--with-dig-dns/--dig-dns-version", "kind": "raw_binary_alias" },
             { "id": "dig-updater", "repo": "DIG-Network/dig-updater", "default": true, "flag": "--no-auto-update disables; --auto-update redundant", "kind": "raw_binary+daily-scheduler" },
             { "id": "dig-updater-worker", "repo": "DIG-Network/dig-updater", "default": true, "flag": "alias of dig-updater — no separate flag; follows --auto-update/--no-auto-update/--dig-updater-version", "kind": "raw_binary_alias" },
             { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
@@ -1944,6 +2030,12 @@ mod tests {
             "dig-node-0.2.0-linux-x64",
             "dig-node-0.2.0-macos-arm64",
             "dig-node-0.2.0-macos-x64",
+            // `dign` (issue #548) is published in the SAME dig-node release,
+            // under its own stem — see dig-node's release.yml.
+            "dign-0.2.0-windows-x64.exe",
+            "dign-0.2.0-linux-x64",
+            "dign-0.2.0-macos-arm64",
+            "dign-0.2.0-macos-x64",
         ];
         let relay: Vec<&'static str> = vec![
             "dig-relay-0.1.0-windows-x64.exe",
@@ -1961,6 +2053,12 @@ mod tests {
             "dig-dns-0.6.0-linux-x64",
             "dig-dns-0.6.0-macos-arm64",
             "dig-dns-0.6.0-macos-x64",
+            // `digd` (issue #548) is published in the SAME dig-dns release,
+            // under its own stem — see dig-dns's release.yml.
+            "digd-0.6.0-windows-x64.exe",
+            "digd-0.6.0-linux-x64",
+            "digd-0.6.0-macos-arm64",
+            "digd-0.6.0-macos-x64",
         ];
         // The beacon (#514) and its dig-updater-worker sibling publish from the
         // SAME repo (`dig-updater`), so — exactly like digstore/digs above —
@@ -2332,6 +2430,156 @@ mod tests {
     }
 
     #[test]
+    fn dign_alias_installs_alongside_dig_node_from_the_same_release() {
+        // Issue #548: `dign` is a first-class alias binary published in the SAME
+        // dig-node release, under its own asset stem. Selecting dig-node must
+        // resolve + place BOTH binaries, sharing the bin dir (so no separate
+        // PATH entry is needed) and the dig-node version pin.
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-node + dign resolve");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["dig-node", "dign"],
+            "dign installs right after dig-node"
+        );
+
+        let dig_node = &report.components[0];
+        let dign = report
+            .components
+            .iter()
+            .find(|c| c.component == "dign")
+            .expect("dign component present");
+        assert_eq!(dign.version, "0.2.0");
+        assert_eq!(dign.tag, "v0.2.0");
+        assert!(dign.asset.starts_with("dign-0.2.0-"));
+        assert!(dign
+            .url
+            .contains("github.com/DIG-Network/dig-node/releases/download/v0.2.0/"));
+
+        // Same bin dir as dig-node — no separate PATH entry is needed.
+        let dig_node_dir = std::path::Path::new(&dig_node.dest).parent().unwrap();
+        let dign_dir = std::path::Path::new(&dign.dest).parent().unwrap();
+        assert_eq!(dig_node_dir, dign_dir);
+        assert_ne!(
+            dig_node.dest, dign.dest,
+            "dig-node and dign are distinct files"
+        );
+        // dry-run installs nothing on disk.
+        assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn dign_alias_honors_the_pinned_dig_node_version() {
+        // A pinned --dig-node-version threads through to the dign resolution
+        // too, since dign is published in the same dig-node release.
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.dig_node_version = Some("0.2.0".to_string());
+        let report = run_dry(&plan, all_releases()).expect("pinned resolves");
+        let dign = report
+            .components
+            .iter()
+            .find(|c| c.component == "dign")
+            .expect("dign component present");
+        assert_eq!(dign.tag, "v0.2.0");
+    }
+
+    #[test]
+    fn dign_is_not_installed_when_dig_node_is_opted_out() {
+        // dign has no separate flag: opting out of dig-node opts out of dign too.
+        let plan = base_plan(); // with_dig_node defaults false in base_plan()
+        let report = run_dry(&plan, all_releases()).expect("empty plan ok");
+        assert!(!report.components.iter().any(|c| c.component == "dign"));
+    }
+
+    #[test]
+    fn digd_alias_installs_alongside_dig_dns_from_the_same_release() {
+        // Issue #548: `digd` is a first-class alias binary published in the SAME
+        // dig-dns release, under its own asset stem. Selecting dig-dns must
+        // resolve + place BOTH binaries, sharing the bin dir (so no separate
+        // PATH entry is needed) and the dig-dns version pin.
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-dns + digd resolve");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["dig-dns", "digd"],
+            "digd installs right after dig-dns"
+        );
+
+        let dig_dns = &report.components[0];
+        let digd = report
+            .components
+            .iter()
+            .find(|c| c.component == "digd")
+            .expect("digd component present");
+        assert_eq!(digd.version, "0.6.0");
+        assert_eq!(digd.tag, "v0.6.0");
+        assert!(digd.asset.starts_with("digd-0.6.0-"));
+        assert!(digd
+            .url
+            .contains("github.com/DIG-Network/dig-dns/releases/download/v0.6.0/"));
+
+        // Same bin dir as dig-dns — no separate PATH entry is needed.
+        let dig_dns_dir = std::path::Path::new(&dig_dns.dest).parent().unwrap();
+        let digd_dir = std::path::Path::new(&digd.dest).parent().unwrap();
+        assert_eq!(dig_dns_dir, digd_dir);
+        assert_ne!(
+            dig_dns.dest, digd.dest,
+            "dig-dns and digd are distinct files"
+        );
+        // dry-run installs nothing on disk.
+        assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn digd_alias_honors_the_pinned_dig_dns_version() {
+        // A pinned --dig-dns-version threads through to the digd resolution
+        // too, since digd is published in the same dig-dns release.
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        plan.dig_dns_version = Some("0.6.0".to_string());
+        let report = run_dry(&plan, all_releases()).expect("pinned resolves");
+        let digd = report
+            .components
+            .iter()
+            .find(|c| c.component == "digd")
+            .expect("digd component present");
+        assert_eq!(digd.tag, "v0.6.0");
+    }
+
+    #[test]
+    fn digd_is_not_installed_when_dig_dns_is_opted_out() {
+        // digd has no separate flag: opting out of dig-dns opts out of digd too.
+        let plan = base_plan(); // with_dig_dns defaults false in base_plan()
+        let report = run_dry(&plan, all_releases()).expect("empty plan ok");
+        assert!(!report.components.iter().any(|c| c.component == "digd"));
+    }
+
+    #[test]
+    fn digd_is_gated_alongside_dig_dns_availability() {
+        // #234's graceful-skip when dig-dns has no published release must also
+        // skip digd — it is only reached inside the Ok(mut c) arm after dig-dns
+        // itself resolves.
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        let report = run_dry(&plan, HashMap::new()).expect("gated, not an error");
+        assert!(!report.components.iter().any(|c| c.component == "dig-dns"));
+        assert!(!report.components.iter().any(|c| c.component == "digd"));
+    }
+
+    #[test]
     fn modify_path_records_a_would_add_path_result_on_dry_run() {
         let mut plan = base_plan();
         plan.with_digstore = true;
@@ -2458,6 +2706,12 @@ mod tests {
         // Sourced from the legacy repo + asset, but presented as dig-node.
         assert!(node.url.contains("dig-companion"));
         assert!(node.dest.contains("dig-node"));
+        // dign (issue #548) postdates the pre-rename dig-companion era, so the
+        // modern `dig-node` repo having no release at all (forcing this legacy
+        // fallback) also means dign is unresolvable — gated gracefully rather
+        // than sinking this otherwise-successful install (see
+        // `dign_is_gated_gracefully_when_the_release_has_no_dign_asset`).
+        assert!(!report.components.iter().any(|c| c.component == "dign"));
     }
 
     #[test]
@@ -2577,8 +2831,9 @@ mod tests {
 
     #[test]
     fn full_plan_resolves_all_components_in_order() {
-        // digstore + digs + dig-node + dig-dns + relay + browser, PATH on. All
-        // six components resolve, plus path/service/dns/relay sections.
+        // digstore + digs + dig-node + dign + dig-dns + digd + relay + browser,
+        // PATH on. All eight components resolve, plus path/service/dns/relay
+        // sections.
         let mut plan = base_plan();
         plan.with_digstore = true;
         plan.with_dig_node = true;
@@ -2598,7 +2853,9 @@ mod tests {
                 "digstore",
                 "digs",
                 "dig-node",
+                "dign",
                 "dig-dns",
+                "digd",
                 "dig-relay",
                 "DIG-Browser"
             ]
@@ -2764,8 +3021,10 @@ mod tests {
             "digstore",
             "digs",
             "dig-node",
+            "dign",
             "dig-relay",
             "dig-dns",
+            "digd",
             "browser",
         ] {
             assert!(ids.contains(&id), "help-json missing component {id}");
@@ -3342,22 +3601,26 @@ mod tests {
 
     #[test]
     fn untracked_components_always_default_to_install() {
-        // digs/dig-relay/the DIG Browser never run through `apply_update_decision`
-        // — they keep the existing always-fresh-download behavior regardless of
-        // what's on disk at their destination.
+        // digs/dign/digd/dig-relay/the DIG Browser never run through
+        // `apply_update_decision` — they keep the existing always-fresh-download
+        // behavior regardless of what's on disk at their destination.
         let bin_dir = wiring_test_bin_dir("untracked");
         let _ = std::fs::remove_dir_all(&bin_dir);
         let mut plan = base_plan();
         plan.with_digstore = true; // brings in `digs` alongside it
+        plan.with_dig_node = true; // brings in `dign` alongside it
+        plan.with_dig_dns = true; // brings in `digd` alongside it
         plan.with_relay = true;
         plan.bin_dir = bin_dir.clone();
 
         let target = Target::current().unwrap();
         write_unrunnable_file(&bin_dir.join(target.exe_name("digs")));
+        write_unrunnable_file(&bin_dir.join(target.exe_name("dign")));
+        write_unrunnable_file(&bin_dir.join(target.exe_name("digd")));
         write_unrunnable_file(&bin_dir.join(target.exe_name("dig-relay")));
 
         let report = run_dry(&plan, all_releases()).expect("resolves");
-        for id in ["digs", "dig-relay"] {
+        for id in ["digs", "dign", "digd", "dig-relay"] {
             let c = report
                 .components
                 .iter()

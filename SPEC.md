@@ -26,7 +26,9 @@ opt-in.
 | `digstore` | `DIG-Network/digstore`        | raw binary, added to PATH          | on by default; `--no-digstore` opts out; `--with-digstore` (redundant, symmetry) | always (required, no checkbox) |
 | `digs`     | `DIG-Network/digstore` (alias, issue #434) | raw binary, added to PATH (same bin dir as `digstore`) | NO separate flag — follows `digstore`'s `--no-digstore`/`--with-digstore`/`--digstore-version` | follows `digstore` |
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
+| `dign`     | `DIG-Network/dig-node` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-node`) | NO separate flag — follows `dig-node`'s `--no-dig-node`/`--with-dig-node`/`--dig-node-version` | follows `dig-node` |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
+| `digd`     | `DIG-Network/dig-dns` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-dns`) | NO separate flag — follows `dig-dns`'s `--no-dig-dns`/`--with-dig-dns`/`--dig-dns-version` | follows `dig-dns` |
 | `dig-updater` | `DIG-Network/dig-updater`  | raw binary + a daily OS-scheduled task/timer/LaunchDaemon (issue #514, §1.5) | on by default; `--no-auto-update` opts out; `--auto-update` (redundant) | yes, as the "Keep DIG up to date automatically" option |
 | `dig-updater-worker` | `DIG-Network/dig-updater` (alias, issue #514) | raw binary, added to PATH (same bin dir as `dig-updater`) | NO separate flag — follows `dig-updater`'s `--no-auto-update`/`--auto-update`/`--dig-updater-version` | follows `dig-updater` |
 | `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | no — unchecked, user-checkable (#491) |
@@ -53,19 +55,31 @@ installer behaves exactly as before this existed; the token is never required, n
 release ASSET download itself (a `github.com/.../releases/download/...` redirect, not the API) is
 never authenticated — only the JSON API lookups are. See `download::get_text_with_token`.
 
-### 1.1 `digs` — a first-class alias of `digstore`
+### 1.1 First-class alias binaries (`digs`, `dign`, `digd`)
 
-`digs` (issue #434) is a real installed binary, not a shell alias: `digs <args>` behaves
-IDENTICALLY to `digstore <args>` (same subcommands/flags/`--json`/help — see digstore's `SPEC.md`
-§ "CLI binaries"). It is published in the **SAME** `DIG-Network/digstore` GitHub release as
-`digstore`, under its own asset stem (`digs-<ver>-<os_arch>[.exe]`, byte-for-byte the same shape as
-`digstore-<ver>-<os_arch>[.exe]`) — resolved via the identical asset matcher
-(`src/asset.rs::select_asset`), parameterized on stem `"digs"` instead of `"digstore"`.
+Three components are real installed binaries, not shell aliases, that behave IDENTICALLY to a
+primary component (same subcommands/flags/`--json`/help): `digs` ↔ `digstore` (issue #434), `dign`
+↔ `dig-node`, and `digd` ↔ `dig-dns` (both issue #548). Each is published in the **SAME** GitHub
+release as its primary, under its own asset stem (`digs-<ver>-<os_arch>[.exe]` /
+`dign-<ver>-<os_arch>[.exe]` / `digd-<ver>-<os_arch>[.exe]` — byte-for-byte the same shape as the
+primary's own `<stem>-<ver>-<os_arch>[.exe]`) — resolved via the identical asset matcher
+(`src/asset.rs::select_asset`), parameterized on the alias's own stem instead of the primary's.
 
-`digs` has **no CLI flag of its own**: it installs/uninstalls exactly when `digstore` does, pinned
-to the SAME version (`--digstore-version` threads through to both), and is written to the SAME bin
-dir — so no separate PATH entry is needed. Resolution order in `run_report_with`: `digstore` is
-resolved and downloaded first, then `digs`, both gated by `with_digstore`.
+Every alias has **no CLI flag of its own**: it installs/uninstalls exactly when its primary does,
+pinned to the SAME version (the primary's own `--<primary>-version` flag threads through to both),
+and is written to the SAME bin dir — so no separate PATH entry is needed. Resolution order in
+`run_report_with`: each primary resolves and downloads first, then its alias, immediately
+afterward, both gated by the primary's own `with_<primary>` flag. None of the three aliases is
+update-tracked (§7.3) — each always re-downloads fresh alongside its primary.
+
+`dign` additionally gates its OWN resolution failure gracefully (logged, not fatal, distinct from
+`digs`/`digd`): dig-node has a pre-rename `dig-companion` legacy-repo fallback (`resolve_dig_node`
+in `src/lib.rs` — the renamed `DIG-Network/dig-node` repo having no release falls back to the
+original `DIG-Network/dig-companion` repo) that `Repo::dign()` does not share (it always targets
+the modern `DIG-Network/dig-node` repo), so a dig-node install that fell back to the legacy repo
+resolves dig-node itself successfully while having no `dign` asset to find. That must never sink
+the otherwise-successful install — `digd` needs no equivalent gate, since it resolves against the
+identical repo + version pin as `dig-dns` itself with no such divergence.
 
 ### 1.2 dig-dns availability gate
 
@@ -78,7 +92,7 @@ published" as opposed to a network/transport failure), the installer:
   `needs_elevation: false`, and a `note` explicitly stating dig-dns is "not yet available" and
   naming EPIC #174;
 - continues installing every other selected component (order preserved: digstore → digs → dig-node →
-  dig-dns[gated] → dig-relay → browser).
+  dign → dig-dns[gated, digd skipped alongside it] → dig-relay → browser).
 
 A genuine transport/network failure resolving dig-dns (not "no release exists") is NOT gated —
 it propagates like any other component's resolution failure (`NETWORK`, exit code 4).
@@ -574,9 +588,9 @@ so re-running the installer idempotently reports exactly what changed.
 ### 7.3 Scope
 
 Only `digstore`/`dig-node`/`dig-dns`/`dig-updater` are update-tracked (`update::tracked_components`).
-`digs` (the digstore alias, §1.1) and `dig-updater-worker` (the beacon's sibling, §1.5) always
-re-download alongside their primary regardless of their own on-disk state — a known, accepted scope
-limit (each shares its primary's version pin and is cheap to refetch). `dig-relay` and the DIG
+`digs`/`dign`/`digd` (the alias binaries, §1.1) and `dig-updater-worker` (the beacon's sibling, §1.5)
+always re-download alongside their primary regardless of their own on-disk state — a known, accepted
+scope limit (each shares its primary's version pin and is cheap to refetch). `dig-relay` and the DIG
 Browser installer are opt-in, advanced/one-shot artifacts and are not update-tracked at all;
 selecting them always (re)installs.
 

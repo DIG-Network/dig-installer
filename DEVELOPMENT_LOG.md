@@ -439,3 +439,21 @@ the existing mocked-resolver/mocked-service-backend unit suite:
   to catch it. Fix: raise `tauri.conf.json` `minWidth` 880 → 980 so the three-action footer always
   has room. Lesson: a new nav/footer control must be re-verified at the window's MINIMUM size, not
   just its default.
+
+## `select_asset` matches by OS/arch + extension only — the `stem` param is a TIE-BREAKER, not a filter (#548)
+
+Adding the `dign`/`digd` alias binaries surfaced a real (and, on reflection, desirable) property of
+`asset.rs::select_asset`: the `stem` argument never DISQUALIFIES a candidate — it only orders
+multiple candidates that already matched on OS/arch token + accepted extension (`stem_rank` in the
+scoring tuple). Consequently, resolving an alias whose OWN asset is genuinely absent from a release
+(an old/pinned tag published before the alias existed) does NOT raise `ASSET_NOT_FOUND` as long as
+the release has ANY OTHER raw-binary asset for that OS/arch — `select_asset` silently returns the
+PRIMARY's own asset under the alias's query. This is harmless-by-design here (an alias and its
+primary are byte-for-byte the same shape, so downloading the primary's asset and placing it at the
+alias's dest is a correct fallback, not a bug) — but it means "no dedicated `<alias>-*` asset
+published for this tag" is **not independently testable** via `select_asset`/`resolve_component`
+returning `None`; it can only be exercised by making the WHOLE release lookup fail for the alias's
+`Repo` (a different repo entirely, e.g. `dign`'s pre-rename `dig-companion` fallback divergence from
+`Repo::dign()`). Two tests that assumed the former (giving a release with only primary-stem assets
+and asserting the alias resolves to `None`) were flawed and had to be deleted — asset name matching
+in this crate is genuinely permissive by design, not per-stem-strict.

@@ -45,6 +45,12 @@ real network too (resolution runs regardless of `--dry-run` — only the downloa
 actually testing; `--uninstall-dig-updater` reverses the scheduler registration a real run created
 (delegates to `dig-updater schedule uninstall`, idempotent).
 
+**Alias binaries `digs`/`dign`/`digd` (issues #434/#548):** selecting `digstore`/`dig-node`/
+`dig-dns` also installs its alias binary (`digs`/`dign`/`digd` respectively) alongside it, in the
+SAME bin dir, with no flag of its own — `--bin-dir` a directory to inspect after a real run shows
+both files side by side. `SPEC.md` §1.1 has the full mechanics (including `dign`'s graceful skip
+when a pinned/legacy dig-node release predates the alias).
+
 **Firewall rule on Linux (#424):** a real (non-dry-run) `--with-dig-node` install never touches
 Linux firewall state — it only prints the manual remedy. If you want the same reachability a
 Windows/macOS install gets automatically, run it yourself: `sudo ufw allow 9444/tcp` (swap `9444`

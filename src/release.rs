@@ -113,6 +113,28 @@ impl Repo {
         Repo::new("DIG-Network", "digstore", "digs")
     }
 
+    /// The `dign` alias binary's release source (issue #548): `dign <args>`
+    /// behaves IDENTICALLY to `dig-node <args>` and is published in the
+    /// **SAME** `DIG-Network/dig-node` release as `dig-node`, under its own
+    /// asset stem (`dign-<ver>-<os_arch>[.exe]` — byte-for-byte the same shape
+    /// as `dig-node-<ver>-<os_arch>[.exe]`). Same owner/repo as
+    /// [`Repo::dig_node`], only the stem differs, so it resolves via the SAME
+    /// [`crate::asset::select_asset`] matcher, mirroring [`Repo::digs`].
+    pub fn dign() -> Repo {
+        Repo::new("DIG-Network", "dig-node", "dign")
+    }
+
+    /// The `digd` alias binary's release source (issue #548): `digd <args>`
+    /// behaves IDENTICALLY to `dig-dns <args>` and is published in the
+    /// **SAME** `DIG-Network/dig-dns` release as `dig-dns`, under its own
+    /// asset stem (`digd-<ver>-<os_arch>[.exe]` — byte-for-byte the same shape
+    /// as `dig-dns-<ver>-<os_arch>[.exe]`). Same owner/repo as
+    /// [`Repo::dig_dns`], only the stem differs, so it resolves via the SAME
+    /// [`crate::asset::select_asset`] matcher, mirroring [`Repo::digs`].
+    pub fn digd() -> Repo {
+        Repo::new("DIG-Network", "dig-dns", "digd")
+    }
+
     /// GitHub API URL for the latest release of this repo (returns JSON with a
     /// `tag_name` and an `assets` array).
     pub fn latest_release_api(&self) -> String {
@@ -225,6 +247,8 @@ mod tests {
             Repo::new("DIG-Network", "dig-dns", "dig-dns")
         );
         assert_eq!(Repo::digs(), Repo::new("DIG-Network", "digstore", "digs"));
+        assert_eq!(Repo::dign(), Repo::new("DIG-Network", "dig-node", "dign"));
+        assert_eq!(Repo::digd(), Repo::new("DIG-Network", "dig-dns", "digd"));
         assert_eq!(
             Repo::dig_updater(),
             Repo::new("DIG-Network", "dig-updater", "dig-updater")
@@ -285,6 +309,58 @@ mod tests {
         assert_eq!(
             Repo::digs().binary_url("v0.6.0", "0.6.0", &win()),
             "https://github.com/DIG-Network/digstore/releases/download/v0.6.0/digs-0.6.0-windows-x64.exe"
+        );
+    }
+
+    #[test]
+    fn dign_shares_the_dig_node_repo_with_its_own_stem() {
+        // dign (issue #548) is published in the SAME dig-node release, just under
+        // a different asset stem — same owner/name as Repo::dig_node().
+        let dign = Repo::dign();
+        let dig_node = Repo::dig_node();
+        assert_eq!(dign.owner, dig_node.owner);
+        assert_eq!(dign.name, dig_node.name);
+        assert_eq!(dign.stem, "dign");
+    }
+
+    #[test]
+    fn dign_binary_url_matches_published_asset_naming() {
+        // dig-node's release.yml publishes dign-<ver>-<os_arch>[.exe] alongside
+        // dig-node-<ver>-<os_arch>[.exe] in the SAME release — the installer must
+        // build the same URL shape, against the dig-node repo, to resolve it.
+        assert_eq!(
+            Repo::dign().binary_url("v0.31.0", "0.31.0", &lin()),
+            "https://github.com/DIG-Network/dig-node/releases/download/v0.31.0/dign-0.31.0-linux-x64"
+        );
+        assert_eq!(
+            Repo::dign().binary_url("v0.31.0", "0.31.0", &win()),
+            "https://github.com/DIG-Network/dig-node/releases/download/v0.31.0/dign-0.31.0-windows-x64.exe"
+        );
+    }
+
+    #[test]
+    fn digd_shares_the_dig_dns_repo_with_its_own_stem() {
+        // digd (issue #548) is published in the SAME dig-dns release, just under
+        // a different asset stem — same owner/name as Repo::dig_dns().
+        let digd = Repo::digd();
+        let dig_dns = Repo::dig_dns();
+        assert_eq!(digd.owner, dig_dns.owner);
+        assert_eq!(digd.name, dig_dns.name);
+        assert_eq!(digd.stem, "digd");
+    }
+
+    #[test]
+    fn digd_binary_url_matches_published_asset_naming() {
+        // dig-dns's release.yml publishes digd-<ver>-<os_arch>[.exe] alongside
+        // dig-dns-<ver>-<os_arch>[.exe] in the SAME release — the installer must
+        // build the same URL shape, against the dig-dns repo, to resolve it.
+        assert_eq!(
+            Repo::digd().binary_url("v0.12.0", "0.12.0", &lin()),
+            "https://github.com/DIG-Network/dig-dns/releases/download/v0.12.0/digd-0.12.0-linux-x64"
+        );
+        assert_eq!(
+            Repo::digd().binary_url("v0.12.0", "0.12.0", &win()),
+            "https://github.com/DIG-Network/dig-dns/releases/download/v0.12.0/digd-0.12.0-windows-x64.exe"
         );
     }
 
