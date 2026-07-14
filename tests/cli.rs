@@ -55,8 +55,10 @@ fn help_json_emits_the_full_contract() {
     assert!(ids.contains(&"digstore"));
     assert!(ids.contains(&"digs"));
     assert!(ids.contains(&"dig-node"));
+    assert!(ids.contains(&"dign"));
     assert!(ids.contains(&"dig-relay"));
     assert!(ids.contains(&"dig-dns"));
+    assert!(ids.contains(&"digd"));
     assert!(ids.contains(&"dig-updater"));
     assert!(ids.contains(&"dig-updater-worker"));
     assert!(ids.contains(&"browser"));

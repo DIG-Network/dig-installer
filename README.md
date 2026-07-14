@@ -8,10 +8,12 @@ the latest DIG components for your OS/arch:
   `digstore <args>`; published in the same release, installed alongside it —
   no separate flag or PATH entry needed),
 - the **dig-node** local node — installed + started as an OS service (Windows
-  service / systemd / launchd), with a best-effort `127.0.0.2 dig.local` hosts
+  service / systemd / launchd), along with its **`dign` alias binary** (same
+  pattern as `digs` above), with a best-effort `127.0.0.2 dig.local` hosts
   entry so apps and the DIG Browser can reach it port-free at `http://dig.local`,
 - the **dig-dns** local `*.dig` name resolver — installed + started as an OS
-  service (Windows Service / macOS LaunchDaemon / Linux systemd), with the OS
+  service (Windows Service / macOS LaunchDaemon / Linux systemd), along with
+  its **`digd` alias binary** (same pattern as `digs`/`dign`), with the OS
   DNS/proxy wiring (split-DNS, NRPT, browser DoH policy) so a browser can open
   `http://<storeId>.dig/…` directly (see [dig-dns](#dig-dns-local-dig-name-resolution) below),
 - the **DIG auto-update beacon** (`dig-updater`, + its unprivileged
@@ -30,9 +32,9 @@ artifact for your OS/arch (resilient to naming differences across repos), then
 downloads it. Sources:
 
 - the **digstore CLI** (and its `digs` alias) from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
-- the **dig-node** local node from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
+- the **dig-node** local node (and its `dign` alias) from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
-- the **dig-dns** local resolver from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
+- the **dig-dns** local resolver (and its `digd` alias) from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
 - the **auto-update beacon** (+ its worker sibling) from [`DIG-Network/dig-updater`](https://github.com/DIG-Network/dig-updater/releases)
 - the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
 - the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
@@ -153,6 +155,7 @@ dig-installer --uninstall-dig-updater # remove the auto-update beacon's daily sc
 | _(no flag)_ | — | The **`digs`** alias binary (`digs <args>` ≡ `digstore <args>`) installs/uninstalls alongside `digstore` automatically — it follows the `--*-digstore*` flags above and has none of its own. |
 | `--no-dig-node` | off | Skip the `dig-node` local node + service (installed by default). |
 | `--with-dig-node` (alias `--service`) | on | Redundant explicit opt-in — dig-node installs + registers as a **boot-start** OS service (+ the `dig.local` hosts entry) by default. |
+| _(no flag)_ | — | The **`dign`** alias binary (`dign <args>` ≡ `dig-node <args>`) installs alongside `dig-node` automatically — it follows the `--*-dig-node*` flags above and has none of its own. |
 | `--no-service-start` | off | Install the service(s) but don't start them this run (still registered boot-start, so they come up on next boot). |
 | `--dig-node-port <PORT>` | `9778` | Loopback port the dig-node service serves on (matches dig-node's own uncommon-high-port default — the sibling of the dig-wallet HTTP API's `9777`; `dig.local` stays on `127.0.0.2:80` regardless). |
 | `--dig-node-version <VER>` | latest | Install a specific dig-node version. |
@@ -164,6 +167,7 @@ dig-installer --uninstall-dig-updater # remove the auto-update beacon's daily sc
 | `--with-dig-dns` | on | Redundant explicit opt-in — dig-dns installs + registers as a **boot-start** OS service (local `*.dig` name resolution) + wires OS split-DNS/NRPT + the Chrome/Edge DoH policy, by default. |
 | `--dig-dns-version <VER>` | latest | Install a specific dig-dns version. |
 | `--dig-dns-node <URL>` | dig-dns's own ladder | Explicit dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node <URL>`). |
+| _(no flag)_ | — | The **`digd`** alias binary (`digd <args>` ≡ `dig-dns <args>`) installs alongside `dig-dns` automatically — it follows the `--*-dig-dns*` flags above and has none of its own. |
 | `--uninstall-dig-dns` | — | Remove the dig-dns service + every OS artifact (service, split-DNS/NRPT rule, browser policy key) THIS installer created; leaves zero residue. Standalone action — ignores every other flag except `--dry-run`/`--json`. |
 | `--no-auto-update` | off | Opt out of installing + registering the DIG auto-update beacon (installed by default; see [Auto-update beacon](#auto-update-beacon-dig-updater) below). |
 | `--auto-update` | on | Redundant explicit opt-in — the auto-update beacon is installed by default. |
@@ -207,31 +211,38 @@ Default install location (`--bin-dir`):
    extra PATH entry is needed.
 4. **PATH** — adds the bin dir to your user `PATH` (HKCU on Windows with a
    `WM_SETTINGCHANGE` broadcast; a profile `export PATH` line on unix). Idempotent.
-5. **dig-node** *(by default; `--no-dig-node` to skip)* — downloads the
-   `dig-node` binary the same way, then **delegates to dig-node's own `install`
-   (+ `start`)** subcommands to register it as a **boot-start** (auto-start-on-
-   boot), auto-restarting OS service (Windows SCM `start= auto` / systemd
-   `enable` / launchd `RunAtLoad` — the installer does not reimplement it),
-   best-effort writes the `dig.local` hosts entry, runs a **post-install
+5. **dig-node (+ its `dign` alias)** *(by default; `--no-dig-node` to skip)* —
+   downloads the `dig-node` binary the same way, then **delegates to dig-node's
+   own `install` (+ `start`)** subcommands to register it as a **boot-start**
+   (auto-start-on-boot), auto-restarting OS service (Windows SCM `start= auto` /
+   systemd `enable` / launchd `RunAtLoad` — the installer does not reimplement
+   it), best-effort writes the `dig.local` hosts entry, runs a **post-install
    resolve check** confirming the OS actually maps `dig.local` → `127.0.0.2`
    now, and finally a **post-install SERVICE health check** confirming the OS
    service manager reports the service (`net.dignetwork.dig-node`) as RUNNING —
    a bare listener on the port started by something else does NOT count as a
-   pass (#493). Because this registers a service, the whole installer requires
-   elevation up front (see the elevation note above); an un-elevated run is
-   refused before any change. `--uninstall-dig-node` reverses it: removes the OS
-   service (delegating to dig-node's own `uninstall`) and the hosts entry.
-6. **dig-dns** *(by default; `--no-dig-dns` to skip)* — downloads the `dig-dns`
-   binary, then **owns the full per-OS service + DNS/browser wiring itself**
-   (unlike dig-node/dig-relay, dig-dns ships no `install`/`start` subcommands of
-   its own): registers + starts it as a **boot-start** OS service (Windows SCM
-   `start= auto` / systemd `enable` + `WantedBy=multi-user.target` / launchd
-   `RunAtLoad`), wires OS split-DNS/NRPT, applies the Chrome/Edge DoH policy
-   (never clobbering an existing org policy), then self-verifies with `dig-dns
-   doctor` + `dig-dns pac` and prints the report — which resolution path(s) are
-   live, the bound gateway port, the PAC URL, and a browser-fallback
-   instruction. See [dig-dns](#dig-dns-local-dig-name-resolution) below for the
-   full per-OS contract.
+   pass (#493). Right after, it downloads `dign` — a real binary published in
+   the SAME dig-node release under its own asset stem (`dign-<ver>-<os_arch>[.exe]`)
+   that behaves identically to `dig-node`; `dign` has no flag of its own and
+   shares dig-node's bin dir. Because this registers a service, the whole
+   installer requires elevation up front (see the elevation note above); an
+   un-elevated run is refused before any change. `--uninstall-dig-node`
+   reverses it: removes the OS service (delegating to dig-node's own
+   `uninstall`) and the hosts entry.
+6. **dig-dns (+ its `digd` alias)** *(by default; `--no-dig-dns` to skip)* —
+   downloads the `dig-dns` binary, then **owns the full per-OS service +
+   DNS/browser wiring itself** (unlike dig-node/dig-relay, dig-dns ships no
+   `install`/`start` subcommands of its own): registers + starts it as a
+   **boot-start** OS service (Windows SCM `start= auto` / systemd `enable` +
+   `WantedBy=multi-user.target` / launchd `RunAtLoad`), wires OS split-DNS/NRPT,
+   applies the Chrome/Edge DoH policy (never clobbering an existing org
+   policy), then self-verifies with `dig-dns doctor` + `dig-dns pac` and prints
+   the report — which resolution path(s) are live, the bound gateway port, the
+   PAC URL, and a browser-fallback instruction. Right after, it downloads
+   `digd` — the same-shape alias published in the SAME dig-dns release, no flag
+   of its own, sharing dig-dns's bin dir. See
+   [dig-dns](#dig-dns-local-dig-name-resolution) below for the full per-OS
+   contract.
 7. **Auto-update beacon** *(by default; `--no-auto-update` to skip)* —
    downloads the `dig-updater` binary and its unprivileged `dig-updater-worker`
    sibling (published in the same release), then **delegates to dig-updater's
