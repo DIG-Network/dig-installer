@@ -121,9 +121,27 @@ jobs:
             # 0750 permissions that account cannot traverse (systemd reports
             # this as `status=203/EXEC`, a bare exec failure — found via this
             # job). `/opt` is world-traversable, matching what a real Linux
-            # package (`.deb`) would install into.
+            # package (`.deb`) would install into. Root-owned 0755 also satisfies
+            # the #565 H3 install-root ACL verify (no group/other write).
             sudo mkdir -p /opt/dig-bin && sudo chmod 755 /opt/dig-bin
             echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            # #565 H3: a privileged (service-executed) install into a custom
+            # --bin-dir is now ACL-verified fail-loud, exactly like the protected
+            # root — a LocalSystem service must not run a binary from a
+            # user-writable dir. `${{ runner.temp }}` inherits a Users-writable
+            # ACE, so harden this custom dir admin-only FIRST (mirror Program
+            # Files' DACL + the root-owned Linux /opt/dig-bin above): SYSTEM +
+            # Administrators full, Users read+execute, inheritance removed.
+            # `MSYS_NO_PATHCONV=1` keeps git-bash from mangling icacls's
+            # `/inheritance:r`/`/grant:r` flags (same pitfall as `schtasks /Query`).
+            BIN_DIR="${{ runner.temp }}/dig-bin"
+            mkdir -p "$BIN_DIR"
+            MSYS_NO_PATHCONV=1 icacls "$(cygpath -w "$BIN_DIR")" /inheritance:r \
+              /grant:r '*S-1-5-18:(OI)(CI)F' \
+              /grant:r '*S-1-5-32-544:(OI)(CI)F' \
+              /grant:r '*S-1-5-32-545:(OI)(CI)RX'
+            echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
           else
             echo "BIN_DIR=${{ runner.temp }}/dig-bin" >> "$GITHUB_ENV"
           fi
@@ -203,6 +221,15 @@ jobs:
           jq -e '.ok == true' install.json
           jq -e '.result.ready == true' install.json
           jq -e '.result.failures == []' install.json
+
+      # #565: the install root a privileged service runs from was actually
+      # ACL-verified admin-only (not merely assumed), and no privileged
+      # registration's binPath resolves under a legacy/user-writable root.
+      - name: Assert the #565 install-root is verified admin-only + no legacy-bound registration
+        run: |
+          jq -e '.result.install_root_security.checked == true' install.json
+          jq -e '.result.install_root_security.secure == true' install.json
+          jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
 
       - name: Assert dig-node registered + RUNNING by canonical id, dig.local resolves
         run: |
