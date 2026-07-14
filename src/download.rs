@@ -196,13 +196,17 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 pub enum WriteOutcome {
     /// The bytes were written to the destination — the new binary is live now.
     Replaced,
-    /// The destination was still locked by a running service/process (on
-    /// Windows a running executable cannot be opened for writing → a sharing
-    /// violation, "os error 32"), so the new binary was STAGED beside it and an
-    /// atomic replace was scheduled for the next reboot
+    /// The destination was still locked by a running service/process at
+    /// FILE-OPEN time — on Windows a running executable cannot be opened for
+    /// writing, so `File::create` failed with `ERROR_SHARING_VIOLATION`
+    /// ("os error 32") BEFORE truncating anything. Because the open failed,
+    /// `dest` is provably UNTOUCHED, so the new binary was STAGED beside it and
+    /// an atomic replace was scheduled for the next reboot
     /// (`MoveFileEx … MOVEFILE_DELAY_UNTIL_REBOOT`). The old binary keeps
-    /// running until then; the destination is NEVER left half-written. The
-    /// caller must tell the user a restart is required to finish the update.
+    /// running until then; the destination is NEVER left half-written — ONLY
+    /// this open-time case stages, since any write-time error (the file already
+    /// opened + truncated) propagates as a hard failure instead. The caller
+    /// must tell the user a restart is required to finish the update.
     ScheduledForReboot,
 }
 
@@ -242,16 +246,23 @@ fn verify_and_write(
     replace_binary(dest, bytes)
 }
 
-/// Write `bytes` to `dest`, resilient to `dest` being held open by a running
-/// service/process (#544).
+/// Write `bytes` to `dest`, resilient — on Windows — to `dest` being held open
+/// by a running service/process (#544).
 ///
 /// On Windows a running executable is locked against being opened for writing,
-/// so a plain in-place write fails with a sharing violation ("os error 32") —
-/// the exact failure a running `dig-dns` service produced when an upgrade tried
-/// to overwrite `dig-dns.exe`. When that happens the new binary is staged beside
-/// `dest` and an atomic replace is scheduled for the next reboot, rather than
-/// aborting with a half-written or missing binary. On unix, replacing a busy
-/// binary in place is permitted, so the write always applies immediately.
+/// so a plain in-place write fails with a sharing violation ("os error 32") at
+/// OPEN time — the exact failure a running `dig-dns` service produced when an
+/// upgrade tried to overwrite `dig-dns.exe`. Because that open fails before any
+/// truncation, `dest` is untouched; the new binary is then staged beside it and
+/// an atomic replace scheduled for the next reboot, rather than aborting. Any
+/// other, write-time error — including `ERROR_LOCK_VIOLATION` (33) — is a hard
+/// failure and propagates (see [`is_sharing_violation`]).
+///
+/// On Linux, opening a RUNNING binary for write instead fails hard AT OPEN with
+/// `ETXTBSY` (errno 26): the write aborts with `dest` intact (fail-closed, never
+/// half-written), and this reboot-time staging fallback does NOT apply — it is a
+/// Windows-only guarantee. (A genuine atomic write-temp + `rename(2)` replace on
+/// unix is a recommended future follow-up, separately ticketed.)
 pub fn replace_binary(dest: &Path, bytes: &[u8]) -> Result<WriteOutcome, String> {
     replace_binary_with(dest, bytes, schedule_replace_on_reboot)
 }
@@ -279,15 +290,26 @@ fn replace_binary_with(
     }
 }
 
-/// Does this write error mean the destination is locked by another process?
-/// `ERROR_SHARING_VIOLATION` (32) is exactly the "the process cannot access the
-/// file because it is being used by another process" a running Windows service
-/// produces; `ERROR_LOCK_VIOLATION` (33) is its byte-range sibling. Never true
-/// on non-Windows, where a busy binary can be replaced in place.
+/// Does this write error mean the destination is a RUNNING executable that
+/// could not be opened for writing — the one recoverable case (#544)?
+///
+/// Only Windows `ERROR_SHARING_VIOLATION` (32) qualifies. It is "the process
+/// cannot access the file because it is being used by another process", raised
+/// by `File::create` at FILE-OPEN time — BEFORE any truncation — which is
+/// exactly the running-`dig-dns` case and the one state in which `dest` is
+/// provably UNTOUCHED, so staging a reboot-time replace is safe.
+///
+/// `ERROR_LOCK_VIOLATION` (33) is deliberately NOT recoverable: it is a
+/// byte-range-lock error raised at WRITE time, so reaching it means
+/// `File::create` already SUCCEEDED and truncated `dest`. Treating it as a
+/// sharing violation would stage-and-succeed over a half-written destination,
+/// breaking the "never left half-written" invariant — so it (and every other
+/// write-time error) propagates as a hard failure instead. Never true off
+/// Windows, where this open-time lock does not occur.
 fn is_sharing_violation(e: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
-        matches!(e.raw_os_error(), Some(32) | Some(33))
+        matches!(e.raw_os_error(), Some(32))
     }
     #[cfg(not(windows))]
     {
@@ -373,8 +395,9 @@ fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Non-Windows never reaches the delayed-replace fallback ([`is_sharing_violation`]
-/// is always `false` off Windows, since a busy binary is replaceable in place),
-/// so this exists only to satisfy the injection seam's signature.
+/// is always `false` off Windows, where the open-time sharing-violation lock does
+/// not occur — a busy-binary write instead fails hard at open with `ETXTBSY`), so
+/// this exists only to satisfy the injection seam's signature.
 #[cfg(not(windows))]
 fn schedule_replace_on_reboot(dest: &Path, _bytes: &[u8]) -> Result<(), String> {
     Err(format!(
@@ -695,6 +718,55 @@ mod tests {
         // A plain not-found error is never a sharing violation on any OS.
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(!is_sharing_violation(&not_found));
+    }
+
+    /// #544 integrity guard: the recoverable case is EXACTLY the open-time
+    /// `ERROR_SHARING_VIOLATION` (32) — `File::create` fails opening a running
+    /// executable BEFORE truncating anything, so `dest` is provably untouched
+    /// and staging a reboot-time replace is safe. `ERROR_LOCK_VIOLATION` (33)
+    /// is a byte-range-lock error raised at WRITE time: reaching it means the
+    /// file was already opened + truncated, so classifying it as a sharing
+    /// violation would stage-and-succeed over a half-written destination. Only
+    /// 32 is recoverable; 33 (and every other write-time error) must hard-fail.
+    #[cfg(windows)]
+    #[test]
+    fn is_sharing_violation_accepts_open_time_32_but_not_write_time_33() {
+        assert!(
+            is_sharing_violation(&std::io::Error::from_raw_os_error(32)),
+            "open-time ERROR_SHARING_VIOLATION (32) is the recoverable running-exe case"
+        );
+        assert!(
+            !is_sharing_violation(&std::io::Error::from_raw_os_error(33)),
+            "write-time ERROR_LOCK_VIOLATION (33) must NOT be recoverable — dest is already truncated"
+        );
+    }
+
+    /// A write failure that is NOT the recoverable open-time sharing violation
+    /// must propagate as a hard error — the fallback must never silently
+    /// stage-and-succeed over it. Writing to a path that is itself a directory
+    /// fails with a non-32 error on every OS, so `replace_binary_with` returns
+    /// `Err` (never `ScheduledForReboot`) and the injected scheduler is proven
+    /// never to run. Guards the "never left half-written" invariant against any
+    /// write-time failure (ERROR_LOCK_VIOLATION 33 included).
+    #[test]
+    fn replace_binary_hard_errors_on_a_non_sharing_violation_write_failure() {
+        let dir = std::env::temp_dir().join(format!("dig-dl-harderr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scheduled = std::cell::Cell::new(false);
+        // `dir` is a directory → std::fs::write fails with a non-32 error.
+        let result = replace_binary_with(&dir, b"NEW", |_dest, _bytes| {
+            scheduled.set(true);
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "a non-sharing-violation write failure must hard-error, not stage"
+        );
+        assert!(
+            !scheduled.get(),
+            "the reboot-replace fallback must NOT run for a non-32 failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The exact user-reported failure, reproduced end-to-end: a running

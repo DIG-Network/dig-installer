@@ -331,8 +331,11 @@ On an Install/Update (not on Skip), BEFORE the new binary is written:
    bounded poll waits for it to leave RUNNING so its process exits and releases the binary's file
    handle. A Stopped/NotFound/Unknown state → skip.
 3. Unlike dig-node/dig-relay (whose stop FAILURE aborts the write with `SERVICE_STOP_FAILED`), a
-   dig-dns stop failure is **non-fatal** — it is recorded and the install continues, because the
-   locked-binary write fallback below is the safety net.
+   dig-dns stop failure is **non-fatal** — it is recorded and the install continues. On **Windows**
+   the locked-binary write fallback below is the safety net (a still-running dig-dns just stages a
+   reboot-time replace). On Linux there is NO such net: if the service is still running, the write
+   fails hard with `ETXTBSY` and the destination is left intact (fail-closed) — the failure surfaces
+   loudly rather than corrupting the binary.
 
 **Locked-binary write fallback (all components).** Every component binary is written through
 `download::replace_binary`, which is resilient to a destination held open by a running process:
@@ -340,16 +343,23 @@ On an Install/Update (not on Skip), BEFORE the new binary is written:
 - The ordinary case writes the bytes in place (`WriteOutcome::Replaced`).
 - On Windows, a running executable cannot be opened for writing, so an in-place overwrite fails with
   a sharing violation (`ERROR_SHARING_VIOLATION`, "os error 32" — the exact reported #544 failure).
-  When that happens the new binary is STAGED beside the destination and an atomic replace is
+  This is an OPEN-time failure (`File::create`), raised BEFORE any truncation, so the destination is
+  provably untouched. ONLY then is the new binary STAGED beside the destination and an atomic replace
   scheduled for the next reboot via `MoveFileExW(staging, dest, MOVEFILE_REPLACE_EXISTING |
-  MOVEFILE_DELAY_UNTIL_REBOOT)` (`WriteOutcome::ScheduledForReboot`). The destination is NEVER left
-  half-written; the old binary keeps running until the reboot applies the swap.
-- The caller LOUDLY logs that a **restart is required** to finish the update. On unix a busy binary
-  is replaceable in place, so this fallback never triggers there.
+  MOVEFILE_DELAY_UNTIL_REBOOT)` (`WriteOutcome::ScheduledForReboot`); the destination is NEVER left
+  half-written and the old binary keeps running until the reboot applies the swap. A WRITE-time error
+  — including `ERROR_LOCK_VIOLATION` (33) — is NOT treated as recoverable: reaching it means the file
+  was already opened + truncated, so it propagates as a hard failure rather than staging over a
+  half-written destination. The caller LOUDLY logs that a **restart is required** to finish the update.
+- On Linux, opening a RUNNING binary for write fails hard AT OPEN with `ETXTBSY` (errno 26): the write
+  aborts with the destination intact (fail-closed, never half-written), and this reboot-time staging
+  fallback does NOT apply — it is a **Windows-only** guarantee. (A genuine atomic write-temp +
+  `rename(2)` replace on unix is a RECOMMENDED FUTURE follow-up, separately ticketed.)
 
 This covers all three run-states idempotently: **running-as-service** (stopped at step 2 → in-place
-write), **running-as-foreground-process** (step 2 skips — no registered running service — and the
-write fallback stages a reboot-time replace), and **not-running** (skip → in-place write).
+write), **running-as-foreground-process** (step 2 skips — no registered running service — so on
+Windows the write fallback stages a reboot-time replace, while on Linux the write fails closed with
+`ETXTBSY`, dest intact), and **not-running** (skip → in-place write).
 
 ## 3. `InstallReport` (the `--json` payload)
 
