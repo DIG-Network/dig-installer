@@ -52,6 +52,7 @@ pub mod error;
 pub mod firewall;
 pub mod health;
 pub mod hosts;
+pub mod migrate;
 pub mod pathcheck;
 pub mod paths;
 pub mod proc;
@@ -409,6 +410,11 @@ pub struct InstallReport {
     /// when no privileged component was placed (nothing to verify). A definitive
     /// `checked && !secure` makes the install NOT ready ([`evaluate_readiness`]).
     pub install_root_security: Option<secure::InstallRootSecurity>,
+    /// The record of migrating an existing install off the legacy user-writable
+    /// root onto the protected root (#565): services deregistered/re-pointed,
+    /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
+    /// when no legacy install was detected.
+    pub migration: Option<migrate::MigrationResult>,
     /// The AGGREGATE verdict (#493): `true` iff EVERY selected component
     /// installed AND its service is verified RUNNING. Only when this is `true`
     /// may a caller print "✓ DIG is ready". Always `true` on a dry-run (nothing
@@ -661,15 +667,22 @@ fn run_report_gated(
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
         install_root_security: None,
+        migration: None,
         ready: true,
         failures: Vec::new(),
     };
 
-    // #565: ensure the admin-only protected install root exists + is hardened
-    //    (unix `chmod 0755`; Windows inherits Program Files' admin-only DACL)
-    //    BEFORE placing any privileged binary in it. (The legacy-root migration
-    //    is wired in ahead of this in a following change.)
+    // #565: MIGRATE any existing user-writable install off the legacy root, then
+    //    ensure the admin-only protected root exists + is hardened (unix `chmod
+    //    0755`; Windows inherits Program Files' admin-only DACL) — BEFORE placing
+    //    any privileged binary in it. The migration stops + re-points services by
+    //    canonical id via the OS service manager; it NEVER executes a binary from
+    //    the (possibly attacker-replaced) legacy user-writable dir.
     if !plan.dry_run && plan.installs_a_protected_component(target.os) {
+        let migration = migrate::migrate_from_legacy_roots(&target, plan, log);
+        if migration.migrated {
+            report.migration = Some(migration);
+        }
         let protected = paths::protected_bin_dir();
         if let Err(e) = secure::ensure_protected_dir(target.os, &protected) {
             log(&format!(
@@ -3310,6 +3323,7 @@ mod tests {
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
             install_root_security: None,
+            migration: None,
             ready: true,
             failures: Vec::new(),
         }

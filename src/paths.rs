@@ -317,7 +317,7 @@ fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn string_to_reg_expand_sz_bytes(s: &str) -> Vec<u8> {
+pub(crate) fn string_to_reg_expand_sz_bytes(s: &str) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = std::ffi::OsStr::new(s)
         .encode_wide()
@@ -331,7 +331,7 @@ fn string_to_reg_expand_sz_bytes(s: &str) -> Vec<u8> {
 }
 
 #[cfg(windows)]
-fn broadcast_environment_change() {
+pub(crate) fn broadcast_environment_change() {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
