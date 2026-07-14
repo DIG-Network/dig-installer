@@ -57,6 +57,7 @@ pub mod migrate;
 pub mod pathcheck;
 pub mod paths;
 pub mod proc;
+pub mod regaudit;
 pub mod release;
 pub mod scheme;
 pub mod secure;
@@ -222,6 +223,25 @@ impl InstallPlan {
         self.selected_components()
             .iter()
             .any(|c| paths::is_privileged_component(os, c))
+    }
+
+    /// The directory a PRIVILEGED/service-executed component will actually land
+    /// in — the admin-only [`paths::protected_bin_dir`] by default, OR the
+    /// user's `--bin-dir` when an override redirected the whole stack (#565 H3).
+    /// `None` when no privileged component is selected (nothing to gate).
+    ///
+    /// This is the dir the fail-loud ACL verify (`secure::verify_install_root`)
+    /// must run on — DECOUPLED from [`Self::installs_a_protected_component`] so a
+    /// privileged install into a NON-admin-only custom dir (the CLI `--bin-dir`
+    /// case, and the shipped GUI's user-writable `bin_dir`) STILL gets verified
+    /// and REFUSES ready if the dir grants unprivileged write, instead of
+    /// silently shipping the escalation.
+    pub fn privileged_install_root(&self, os: target::Os) -> Option<PathBuf> {
+        let component = self
+            .selected_components()
+            .into_iter()
+            .find(|c| paths::is_privileged_component(os, c))?;
+        Some(self.bin_dir_for(component, os))
     }
 
     /// The component ids this plan will install (before per-OS availability
@@ -416,6 +436,14 @@ pub struct InstallReport {
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
     /// when no legacy install was detected.
     pub migration: Option<migrate::MigrationResult>,
+    /// The post-registration binPath audit of every privileged DIG registration
+    /// (#565 review — H1 backstop + H2b): each service / the SYSTEM beacon task's
+    /// ACTUAL configured binary, read back from the OS, and whether it still
+    /// resolves under a legacy/user-writable root. An entry with
+    /// `under_legacy_root == true` makes the install NOT ready
+    /// ([`evaluate_readiness`]). Empty on dry-run / when no privileged component
+    /// was placed.
+    pub registration_audit: Vec<regaudit::RegistrationAudit>,
     /// The authoritative install-root record written to `install.json` (#581):
     /// the single source of truth the auto-update beacon reads for the install
     /// root. `None` on dry-run or when no privileged component was placed.
@@ -673,6 +701,7 @@ fn run_report_gated(
         daemon_dirs: Vec::new(),
         install_root_security: None,
         migration: None,
+        registration_audit: Vec::new(),
         install_manifest: None,
         ready: true,
         failures: Vec::new(),
@@ -685,7 +714,7 @@ fn run_report_gated(
     //    canonical id via the OS service manager; it NEVER executes a binary from
     //    the (possibly attacker-replaced) legacy user-writable dir.
     if !plan.dry_run && plan.installs_a_protected_component(target.os) {
-        let migration = migrate::migrate_from_legacy_roots(&target, plan, log);
+        let migration = migrate::migrate_from_legacy_roots(&target, log);
         if migration.migrated {
             report.migration = Some(migration);
         }
@@ -1134,42 +1163,68 @@ fn run_report_gated(
         verify_clis_on_path(&target, &mut report, log);
     }
 
-    // #565: VERIFY the protected install root denies unprivileged write, now
-    //    that every privileged binary is in place. This is the machine-checkable
-    //    "no service binary sits where a non-admin could replace it" gate; a
-    //    DEFINITIVE breach (an unprivileged Allow-write ACE / group-writable
-    //    mode) makes the install NOT ready. Only when a privileged component was
-    //    actually placed into the protected root (else there is nothing to check).
-    if !plan.dry_run && plan.installs_a_protected_component(target.os) {
-        log("Verifying the protected install root denies unprivileged write:");
-        let verdict = secure::verify_install_root(target.os, &paths::protected_bin_dir());
-        log(&format!(
-            "    {} {}",
-            if verdict.checked && !verdict.secure {
-                "!"
-            } else {
-                "✓"
-            },
-            verdict.note
-        ));
-        report.install_root_security = Some(verdict);
+    // #565: VERIFY the dir every privileged/service-executed binary landed in
+    //    denies unprivileged write, now that all are in place. This is the
+    //    machine-checkable "no service binary sits where a non-admin could
+    //    replace it" gate; a DEFINITIVE breach (an unprivileged Allow-write ACE /
+    //    group-writable mode) makes the install NOT ready. The dir is the
+    //    admin-only protected root by default OR the `--bin-dir` / GUI-chosen dir
+    //    when an override redirected the stack (#565 H3): the verify follows the
+    //    binaries so a privileged install into a user-writable custom dir can
+    //    NEVER silently succeed.
+    if !plan.dry_run {
+        if let Some(root) = plan.privileged_install_root(target.os) {
+            log("Verifying the install root denies unprivileged write:");
+            let verdict = secure::verify_install_root(target.os, &root);
+            log(&format!(
+                "    {} {}",
+                if verdict.checked && !verdict.secure {
+                    "!"
+                } else {
+                    "✓"
+                },
+                verdict.note
+            ));
+            report.install_root_security = Some(verdict);
 
-        // #581: record the authoritative install root in install.json so the
-        // auto-update beacon has a single source of truth for where DIG lives
-        // (coherent with the beacon's own current_exe-derived root, now that its
-        // binary lives in the protected root).
-        let m = manifest::write_install_manifest(
-            target.os,
-            &paths::protected_bin_dir(),
-            env!("CARGO_PKG_VERSION"),
-            plan.dry_run,
-        );
-        log(&format!(
-            "    {} {}",
-            if m.written { "✓" } else { "·" },
-            m.note
-        ));
-        report.install_manifest = Some(m);
+            // #581: record the authoritative install root in install.json so the
+            // auto-update beacon has a single source of truth for where DIG lives
+            // (coherent with the beacon's own current_exe-derived root). Only for
+            // the DEFAULT protected root — a custom override is the user's own dir.
+            if root == paths::protected_bin_dir() {
+                let m = manifest::write_install_manifest(
+                    target.os,
+                    &paths::protected_bin_dir(),
+                    env!("CARGO_PKG_VERSION"),
+                    plan.dry_run,
+                );
+                log(&format!(
+                    "    {} {}",
+                    if m.written { "✓" } else { "·" },
+                    m.note
+                ));
+                report.install_manifest = Some(m);
+            }
+        }
+
+        // #565 (review — H1 backstop + H2b): AUDIT every privileged registration's
+        //    ACTUAL configured binPath, read back from the OS (never by executing
+        //    the binary). A registration still resolving under a legacy/
+        //    user-writable root — a service the tolerated re-install left there, or
+        //    an orphaned SYSTEM beacon task a component opt-out stranded — makes the
+        //    install NOT ready ([`evaluate_readiness`]). Runs on the migration path
+        //    (a privileged component into the default protected root).
+        if plan.installs_a_protected_component(target.os) {
+            log("Auditing that every privileged registration runs from the protected root:");
+            report.registration_audit = regaudit::audit(target.os);
+            for a in &report.registration_audit {
+                log(&format!(
+                    "    {} {}",
+                    if a.under_legacy_root { "!" } else { "✓" },
+                    a.note
+                ));
+            }
+        }
     }
 
     // Aggregate readiness verdict (#493 + @mt-dev firm directive): "if
@@ -1382,12 +1437,14 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         }
     }
 
-    // #565: the protected install root MUST deny unprivileged write. A
-    // DEFINITIVE breach (the ACL/mode read back and an unprivileged principal
-    // CAN write) is a hard failure — a service binary a non-admin can replace is
-    // the exact local privilege escalation this family closes. An inconclusive
-    // read (`checked == false`) is only a warning (logged above), never a false
-    // failure: the admin-only LOCATION remains the primary guarantee.
+    // #565: the install root MUST deny unprivileged write. A DEFINITIVE breach
+    // (the ACL/mode read back and an unprivileged principal CAN write) is a hard
+    // failure — a service binary a non-admin can replace is the exact local
+    // privilege escalation this family closes. This now covers a privileged
+    // install into a user-writable `--bin-dir`/GUI dir too (#565 H3), since the
+    // verify runs on whichever dir the privileged binaries landed in. An
+    // inconclusive read (`checked == false`) is only a warning (logged above),
+    // never a false failure: the admin-only LOCATION remains the primary guarantee.
     if let Some(sec) = &report.install_root_security {
         if sec.checked && !sec.secure {
             failures.push(format!(
@@ -1397,6 +1454,26 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
             ));
         }
     }
+
+    // #565 (review — H2a): a privileged registration that could NOT be
+    // deregistered off the legacy root during migration is FATAL — continuing
+    // into a tolerated re-install could leave the service/task pointing at the
+    // writable legacy binPath.
+    if let Some(m) = &report.migration {
+        for f in &m.deregister_failures {
+            failures.push(format!(
+                "migration: {f}; re-run elevated so the privileged registration is re-pointed \
+                 into the protected root"
+            ));
+        }
+    }
+
+    // #565 (review — H1 backstop + H2b): any privileged registration whose ACTUAL
+    // binPath still resolves under a legacy/user-writable root is a hard failure —
+    // an orphaned auto-start service / SYSTEM beacon task a non-admin could replant
+    // and run as SYSTEM. This catches both a component opt-out that stranded a
+    // registration and a tolerated re-install that never re-pointed it.
+    failures.extend(regaudit::audit_failures(&report.registration_audit));
 
     // PATH resolution (#496): any required CLI that does not resolve by bare
     // name from a fresh shell makes the install NOT ready — the user could not
@@ -3347,6 +3424,7 @@ mod tests {
             daemon_dirs: Vec::new(),
             install_root_security: None,
             migration: None,
+            registration_audit: Vec::new(),
             install_manifest: None,
             ready: true,
             failures: Vec::new(),
@@ -3508,6 +3586,174 @@ mod tests {
             !failures.iter().any(|f| f.contains("install root")),
             "an inconclusive ACL read must not fail readiness: {failures:?}"
         );
+    }
+
+    /// #565 review — H1: a re-run that leaves the SYSTEM auto-update beacon task
+    /// (or any privileged registration) pointing at a binary inside the
+    /// user-writable legacy root is a residual local privilege escalation — a
+    /// non-admin replants that path and runs as SYSTEM on the next daily fire.
+    /// The post-registration audit MUST make such an install NOT ready.
+    #[test]
+    fn readiness_fails_when_a_privileged_registration_is_orphaned_under_the_legacy_root() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        let mut report = report_shell();
+        report.registration_audit = vec![
+            regaudit::RegistrationAudit {
+                registration: "dig-updater beacon task".to_string(),
+                bin_path: Some(
+                    r"C:\Users\me\AppData\Local\Programs\DIG\bin\dig-updater.exe".to_string(),
+                ),
+                under_legacy_root: true,
+                note: "beacon runs a binary under a user-writable legacy root".to_string(),
+            },
+            regaudit::RegistrationAudit {
+                registration: "dig-node".to_string(),
+                bin_path: Some(r"C:\Program Files\DIG\bin\dig-node.exe".to_string()),
+                under_legacy_root: false,
+                note: "dig-node runs from a protected location".to_string(),
+            },
+        ];
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("beacon")),
+            "an orphaned SYSTEM beacon task under the legacy root must fail readiness: {failures:?}"
+        );
+        // The already-protected dig-node registration must NOT be flagged.
+        assert!(
+            !failures.iter().any(|f| f.contains("dig-node")),
+            "a protected registration must not fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H2a: a privileged registration that could NOT be
+    /// deregistered off the legacy root during migration is FATAL — the installer
+    /// must not silently continue into a tolerated re-install that leaves the
+    /// service at the writable legacy binPath.
+    #[test]
+    fn readiness_fails_when_a_migration_deregister_failed() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        let mut report = report_shell();
+        report.migration = Some(migrate::MigrationResult {
+            migrated: true,
+            deregister_failures: vec![
+                "could not deregister dig-node off the legacy root (access denied)".to_string(),
+            ],
+            ..Default::default()
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("migration") && f.contains("dig-node")),
+            "a failed migration deregister must fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H2b: a service whose ACTUAL binPath resolves under the legacy
+    /// root — the tolerated-re-install case that left it un-re-pointed — must fail
+    /// readiness even though the protected DIR's ACL looks fine.
+    #[test]
+    fn readiness_fails_when_a_service_binpath_still_points_at_the_legacy_root() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service()); // installed + RUNNING
+        report.registration_audit = vec![regaudit::RegistrationAudit {
+            registration: "dig-node".to_string(),
+            bin_path: Some(
+                r"C:\Users\me\AppData\Local\Programs\DIG\bin\dig-node.exe run".to_string(),
+            ),
+            under_legacy_root: true,
+            note: "dig-node runs a binary under a user-writable legacy root".to_string(),
+        }];
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("dig-node")),
+            "a service still pointing at the legacy binPath must fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H3: a PRIVILEGED component routed into a user-writable custom
+    /// `--bin-dir` (the CLI override and the shipped GUI both do this) must STILL
+    /// be ACL-verified. `installs_a_protected_component` is false for a custom dir,
+    /// but `privileged_install_root` returns that custom dir so the verify runs —
+    /// and a definitive write breach on it refuses ready.
+    #[test]
+    fn custom_bin_dir_privileged_install_is_still_acl_verified_and_can_refuse_ready() {
+        use target::Os;
+        let host = Target::current().expect("supported host").os;
+        let custom = std::path::PathBuf::from(if host == Os::Windows {
+            r"C:\Users\me\AppData\Local\Programs\DIG\bin"
+        } else {
+            "/home/me/.local/dig/bin"
+        });
+        let plan = InstallPlan {
+            bin_dir: custom.clone(),
+            with_dig_node: true, // a privileged (service-executed) component
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        assert!(plan.has_custom_bin_dir());
+        // The OLD gate is OFF for a custom dir …
+        assert!(
+            !plan.installs_a_protected_component(host),
+            "installs_a_protected_component stays false for a --bin-dir override"
+        );
+        // … but the verify gate is DECOUPLED: the custom dir is what gets checked.
+        assert_eq!(
+            plan.privileged_install_root(host),
+            Some(custom.clone()),
+            "a privileged component into a custom dir must still be routed through the verify"
+        );
+        // A definitive write breach on that custom dir refuses ready.
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.install_root_security = Some(secure::InstallRootSecurity {
+            root: custom.to_string_lossy().into_owned(),
+            checked: true,
+            secure: false,
+            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("install root")),
+            "a privileged install into a user-writable custom dir must refuse ready: {failures:?}"
+        );
+    }
+
+    /// #565 review — H3 (negative): with NO privileged component selected there is
+    /// nothing to gate, so `privileged_install_root` is `None` (the verify is
+    /// skipped rather than run against an irrelevant dir).
+    #[test]
+    fn privileged_install_root_is_none_without_a_privileged_component() {
+        use target::Os;
+        // digstore-only into a custom dir on unix: digstore is NOT privileged
+        // there, so there is no service-executed binary to protect.
+        let plan = InstallPlan {
+            bin_dir: std::path::PathBuf::from("/home/me/.local/dig/bin"),
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            ..InstallPlan::default()
+        };
+        assert_eq!(plan.privileged_install_root(Os::Linux), None);
     }
 
     #[test]

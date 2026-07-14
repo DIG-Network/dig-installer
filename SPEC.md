@@ -249,26 +249,44 @@ single resolver.
 elevates on Windows (the CLI lands in Program Files); a CLI-only unix install into `~/.dig/bin` does
 not (`InstallPlan::requires_elevation`, §4.1).
 
-**Verification (fail-loud).** After placement the installer reads the protected root's effective
-permissions back (`secure::verify_install_root`): Windows parses `Get-Acl` SID-based output and
+**Verification (fail-loud) — the ACL check runs on WHEREVER privileged binaries land.** After
+placement the installer reads the effective permissions of the dir every privileged/service-executed
+binary landed in (`secure::verify_install_root`): Windows parses `Get-Acl` SID-based output and
 REFUSES any Allow-write ACE for a well-known unprivileged principal (`S-1-5-32-545` Users, `S-1-1-0`
 Everyone, `S-1-5-11` Authenticated Users, `S-1-5-4` INTERACTIVE); unix requires root ownership with
-no group/other write bit. A DEFINITIVE breach makes the install NOT ready (`InstallReport
-.install_root_security`, readiness §4.2); an inconclusive read is a warning only (the admin-only
-LOCATION remains the primary guarantee). The service binary MUST NEVER be executed to control it —
-the installer stops/deregisters services by canonical id via the OS service manager
-(`svc::stop_service`/`deregister_service`), so an elevated installer can never be tricked into
-running an attacker-replaced binary.
+no group/other write bit. That dir is the admin-only protected root by default, but ALSO a
+`--bin-dir` / GUI-chosen custom dir when an override redirected the stack: the verify follows the
+binaries (`InstallPlan::privileged_install_root`, DECOUPLED from `installs_a_protected_component`), so
+a privileged install into a user-writable custom dir can NEVER silently succeed — it fails loud. A
+DEFINITIVE breach makes the install NOT ready (`InstallReport.install_root_security`, readiness §4.2);
+an inconclusive read is a warning only (the admin-only LOCATION remains the primary guarantee). The
+service binary MUST NEVER be executed to control it — the installer stops/deregisters services by
+canonical id via the OS service manager (`svc::stop_service`/`deregister_service`), so an elevated
+installer can never be tricked into running an attacker-replaced binary.
+
+**binPath assertion (fail-loud).** Beyond the DIR's ACL, after (re-)registration the installer reads
+back the ACTUAL configured binary of every privileged registration — the three LocalSystem services
+via `sc qc` / `systemctl show -p ExecStart` / `launchctl print`, and the SYSTEM auto-update beacon
+scheduled task via `schtasks /Query /XML` / systemd / launchd (`regaudit::audit`, always by canonical
+id / task path — never by executing the binary) — and REFUSES ready if any still resolves UNDER a
+legacy/user-writable root. This catches a service a tolerated "already exists" re-install left
+pointing at the writable legacy path, and an orphaned registration a component opt-out stranded.
+Recorded in `InstallReport.registration_audit`.
 
 **Migration (existing installs).** On a re-run that detects DIG binaries in a legacy user-writable
 root (`%LOCALAPPDATA%\Programs\{DIG,DigStore}\bin` on Windows; the privileged binaries in `~/.dig/bin`
-on unix), the installer re-points the install onto the protected root (`migrate` module): it
-deregisters the moving self-registering services (dig-node/dig-relay on Windows) BY ID so the normal
-install re-registers them fresh from the protected path; removes the legacy binaries by KNOWN
-filename (never a recursive walk that could follow a planted junction/reparse point — all on Windows,
-only the privileged ones on unix); and drops the legacy dir from the user PATH on Windows. It never
-executes a legacy-dir binary. A re-registration failure surfaces fail-loud via the readiness verdict
-(never a service left registered against the writable legacy path). Recorded in
+on unix) OR a privileged registration still pointing under one, the installer re-points the install
+onto the protected root (`migrate` module): it deregisters EVERY privileged registration whose binary
+resolves under a legacy root — INDEPENDENT of the current plan — the dig-node/dig-relay/dig-dns
+services BY ID *and the SYSTEM auto-update beacon scheduled task* by its own scheduler tool
+(`schtasks /Delete` / systemd-timer disable / launchd bootout), so a component OMITTED from the run
+cannot keep an auto-start service or daily SYSTEM task registered against a replaceable legacy
+binPath; the normal install then re-registers whatever is in-plan fresh from the protected path. It
+removes the legacy binaries by KNOWN filename (never a recursive walk that could follow a planted
+junction/reparse point — all on Windows, only the privileged ones on unix); and drops the legacy dir
+from the user PATH on Windows. It never executes a legacy-dir binary. A DEREGISTER FAILURE is FATAL —
+the install reports NOT ready (`MigrationResult::deregister_failures`), never a silent continue into a
+tolerated re-install that could leave the service at the legacy binPath. Recorded in
 `InstallReport.migration`.
 
 **Authoritative install-root record (`install.json`, #581).** The installer writes

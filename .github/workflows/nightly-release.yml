@@ -284,7 +284,10 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
+          # dig_ecosystem#610: never attach the Tauri GUI installer to a release —
+          # it re-opens the #565 LPE. Belt-and-braces beside build-binaries.yml's
+          # withheld upload: exclude any DIG-Installer-Setup-* even if one appears.
+          find artifacts -type f ! -name 'DIG-Installer-Setup-*' -exec cp {} release/ \;
           ls -la release
 
       - name: Move nightly tags (dated + rolling) to this build

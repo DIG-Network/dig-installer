@@ -469,7 +469,11 @@ pub fn parse_systemctl_is_active(text: &str) -> ServiceRunState {
 /// A canonical id that fails to parse (never expected — [`DIG_NODE_SERVICE_ID`]/
 /// [`DIG_DNS_SERVICE_ID`] are both fixed, valid `owner.org.app` strings) is
 /// returned unchanged rather than panicking.
-fn linux_unit_name(id: &str) -> String {
+///
+/// `pub(crate)`: [`crate::regaudit`] reuses this to resolve the systemd unit a
+/// privileged service registers under when reading its `ExecStart` binary path
+/// (the #565 binPath audit), so the two derive the identical name by construction.
+pub(crate) fn linux_unit_name(id: &str) -> String {
     id.parse::<service_manager::ServiceLabel>()
         .map(|label| label.to_script_name())
         .unwrap_or_else(|_| id.to_string())

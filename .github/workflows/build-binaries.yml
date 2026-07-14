@@ -222,10 +222,18 @@ jobs:
       - name: Stage bundled digstore binary
         working-directory: gui/app
         run: node scripts/stage-binary.mjs --src ../../_digstore/${{ matrix.digstore_bin }}
+      # Keep BUILDING the GUI (compile/bundle CI coverage) but do NOT stage or
+      # upload it as a release artifact — dig_ecosystem#610: the Tauri GUI
+      # re-opens the #565 user->SYSTEM LPE (asInvoker + a user-writable bin_dir
+      # routes LocalSystem services into a dir a non-admin can write). The
+      # `DIG-Installer-Setup-*` artifact is WITHHELD from every release until
+      # #610 fixes the GUI's elevation + protected-root routing. Re-enable the
+      # stage + upload steps below (drop the `if: false`) when #610 lands.
       - name: Build the GUI installer
         working-directory: gui/app
         run: npx tauri build ${{ matrix.build_args }}
       - name: Collect single installer artifact
+        if: false # dig_ecosystem#610 — do not publish the GUI installer (LPE); re-enable when #610 lands
         shell: bash
         working-directory: gui/app
         run: |
@@ -235,6 +243,7 @@ jobs:
           cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
           ls -la ../../dist-gui
       - name: Upload GUI installer artifact
+        if: false # dig_ecosystem#610 — do not publish the GUI installer (LPE); re-enable when #610 lands
         uses: actions/upload-artifact@v4
         with:
           name: digstore-gui-installer-${{ matrix.os }}
