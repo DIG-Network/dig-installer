@@ -469,6 +469,10 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         // #389: the default-on chia:// scheme handler must register even when no
         // downloadable extra component is selected (e.g. a digstore-only GUI run).
         || extra_plan.register_scheme
+        // #514: the default-on auto-update beacon is itself a downloadable
+        // component (dig-updater + its worker sibling) — must run even when
+        // no OTHER extra component is selected (e.g. a digstore-only GUI run).
+        || extra_plan.auto_update
     {
         emit_pct(app, 94.0, Some("additional components"));
         emit_line(
@@ -555,6 +559,14 @@ fn plan_from_selection(
         // a `"open-firewall": false` selection opts out; an absent key means
         // the default (ON) — same convention as `register-scheme` above.
         open_firewall: *selected.get("open-firewall").unwrap_or(&true),
+        // #514: install + register the DIG auto-update beacon by default, in
+        // sync with the CLI's default-on `auto_update`. Toggleable from the
+        // GUI: a `"auto-update": false` selection opts out; an absent key
+        // means the default (ON) — same convention as the two options above.
+        // The GUI wizard has no version-pin field for it (mirrors the other
+        // extra components below).
+        auto_update: *selected.get("auto-update").unwrap_or(&true),
+        dig_updater_version: None,
         // #309: the GUI wizard has no force-reinstall toggle (the CLI's
         // `--force-reinstall` covers that advanced case) — a GUI-driven
         // install is always the version-aware install-or-update default.
@@ -956,6 +968,30 @@ mod plan_from_selection_tests {
         assert!(
             !plan.open_firewall,
             "an explicit opt-out disables the firewall rule"
+        );
+    }
+
+    #[test]
+    fn auto_update_beacon_defaults_on_in_sync_with_the_cli() {
+        // #514: absent from the selection map -> ON by default, matching the
+        // CLI's default-on `auto_update` (GUI + CLI defaults in sync).
+        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        assert!(
+            plan.auto_update,
+            "the auto-update beacon defaults ON in the GUI, mirroring the CLI"
+        );
+    }
+
+    #[test]
+    fn auto_update_beacon_can_be_toggled_off() {
+        // A GUI toggle sends `"auto-update": false` — the same opt-out the
+        // CLI's `--no-auto-update` produces.
+        let mut sel = HashMap::new();
+        sel.insert("auto-update".to_string(), false);
+        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        assert!(
+            !plan.auto_update,
+            "an explicit opt-out disables the auto-update beacon"
         );
     }
 }

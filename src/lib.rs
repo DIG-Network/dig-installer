@@ -37,6 +37,7 @@
 //! is unit-tested; [`run`] is the imperative orchestration that performs I/O.
 
 pub mod asset;
+pub mod beacon;
 pub mod daemon_dir;
 pub mod dns;
 pub mod download;
@@ -116,12 +117,24 @@ pub struct InstallPlan {
     /// is set; needs the same elevation the dig-node service registration
     /// already requires.
     pub open_firewall: bool,
+    /// Install the DIG auto-update beacon (`dig-updater` + its
+    /// `dig-updater-worker` sibling, `DIG-Network/dig-updater`) and register
+    /// its daily update-check scheduler (issue #514). Default true — a
+    /// first-class, toggleable install option (`--no-auto-update` opts out),
+    /// mirroring [`Self::register_scheme`]/[`Self::open_firewall`]'s
+    /// default-on-but-always-safe-to-decline posture: without it, DIG simply
+    /// never auto-updates and the user re-runs the installer manually for new
+    /// versions.
+    pub auto_update: bool,
+    /// dig-updater version/tag to install: `None` ⇒ latest released. Also
+    /// pins the `dig-updater-worker` sibling, published in the same release.
+    pub dig_updater_version: Option<String>,
     /// Force a fresh reinstall of every selected tracked component (digstore /
-    /// dig-node / dig-dns) even when [`update::decide`] would otherwise call
-    /// it up to date (issue #309). Default false: a bare re-run is a version-
-    /// aware update that skips what's already current. Has no effect on a
-    /// component that was already going to Install or Update — those already
-    /// replace the artifact.
+    /// dig-node / dig-dns / dig-updater) even when [`update::decide`] would
+    /// otherwise call it up to date (issue #309). Default false: a bare
+    /// re-run is a version-aware update that skips what's already current.
+    /// Has no effect on a component that was already going to Install or
+    /// Update — those already replace the artifact.
     pub force_reinstall: bool,
     /// Print actions without performing them.
     pub dry_run: bool,
@@ -133,13 +146,15 @@ pub use service::RelayServiceConfig as ServiceConfigRelay;
 impl InstallPlan {
     /// Whether running this plan requires OS elevation (Administrator/root).
     ///
-    /// Registering an OS service (dig-node, dig-dns, dig-relay) or writing the
+    /// Registering an OS service (dig-node, dig-dns, dig-relay), a daily
+    /// update-scheduler artifact (dig-updater, #514), or writing the
     /// `dig.local` hosts entry needs elevation; a `--dry-run` changes nothing
     /// so never does. This gates the pre-install elevation check (#492) — a
     /// digstore-only install to a per-user dir does not force elevation, but the
     /// default full-stack install (which registers services) does.
     pub fn requires_elevation(&self) -> bool {
-        !self.dry_run && (self.with_dig_node || self.with_dig_dns || self.with_relay)
+        !self.dry_run
+            && (self.with_dig_node || self.with_dig_dns || self.with_relay || self.auto_update)
     }
 }
 
@@ -167,6 +182,8 @@ impl Default for InstallPlan {
             modify_path: true,
             register_scheme: true,
             open_firewall: true,
+            auto_update: true,
+            dig_updater_version: None,
             force_reinstall: false,
             dry_run: false,
         }
@@ -284,6 +301,9 @@ pub struct InstallReport {
     /// The app-scoped firewall rule result (only when `with_dig_node &&
     /// open_firewall`) — #424.
     pub firewall: Option<firewall::FirewallResult>,
+    /// The DIG auto-update beacon's daily scheduler registration result (only
+    /// when `auto_update`) — #514.
+    pub beacon: Option<beacon::BeaconResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
     /// Per-CLI PATH-resolution checks (#496): confirms each required DIG CLI
@@ -523,6 +543,7 @@ fn run_report_gated(
         dns: None,
         scheme: None,
         firewall: None,
+        beacon: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
@@ -740,7 +761,64 @@ fn run_report_gated(
         }
     }
 
-    // 5. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
+    // 5. The DIG auto-update beacon (dig-updater + its dig-updater-worker sibling, #514) —
+    //    default-on, toggleable. Resolves + downloads BOTH binaries (the broker spawns the
+    //    worker as a sibling process, so they must be co-located), then asks the freshly-
+    //    installed `dig-updater` to register its own daily scheduler against itself
+    //    (`beacon::register`) — the same "delegate to the component's own subcommands" pattern
+    //    dig-node/dig-relay's service registration already uses.
+    if plan.auto_update {
+        log("Installing the DIG auto-update beacon:");
+        let mut c = resolve_component(
+            resolve,
+            &Repo::dig_updater(),
+            &plan.dig_updater_version,
+            &target,
+            AssetKind::RawBinary,
+            &plan.bin_dir,
+        )?;
+        log_component(log, &c);
+        // #309 version-aware updater, extended to the beacon (#514): same
+        // decide-before-touch convention as digstore/dig-node/dig-dns above.
+        let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+        if decision.action != update::UpdateAction::Skip {
+            download_component(&c, plan.dry_run)?;
+        } else {
+            log("    · already up to date — skipping the download");
+        }
+        if !plan.dry_run {
+            report.installed.push(c.dest.clone());
+        }
+        let dig_updater_path = PathBuf::from(c.dest.clone());
+        report.components.push(c);
+
+        log("Installing the dig-updater-worker sibling (same release, published as a separate binary):");
+        let worker = resolve_component(
+            resolve,
+            &Repo::dig_updater_worker(),
+            &plan.dig_updater_version,
+            &target,
+            AssetKind::RawBinary,
+            &plan.bin_dir,
+        )?;
+        log_component(log, &worker);
+        download_component(&worker, plan.dry_run)?;
+        if !plan.dry_run {
+            report.installed.push(worker.dest.clone());
+        }
+        report.components.push(worker);
+
+        log("Registering the beacon's daily update-check scheduler:");
+        let b = beacon::register(&dig_updater_path, plan.dry_run);
+        log(&format!(
+            "    {} {}",
+            if b.applied { "✓" } else { "!" },
+            b.note
+        ));
+        report.beacon = Some(b);
+    }
+
+    // 6. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
     //    points at relay.dig.net, so this is only for users who want to operate a relay.
     if plan.with_relay {
         log("Installing the dig-relay (run-your-own-relay):");
@@ -776,7 +854,7 @@ fn run_report_gated(
         report.relay = Some(register_relay(&relay_path, plan, log));
     }
 
-    // 6. DIG Browser native installer (optional).
+    // 7. DIG Browser native installer (optional).
     if plan.with_browser {
         log("Downloading the DIG Browser installer:");
         let c = resolve_component(
@@ -796,7 +874,7 @@ fn run_report_gated(
         report.components.push(c);
     }
 
-    // 7. chia:// (+ urn:) OS URL-scheme handler (#389) — default-on, toggleable.
+    // 8. chia:// (+ urn:) OS URL-scheme handler (#389) — default-on, toggleable.
     //    Registers THIS installer's persisted binary as the handler; a clicked
     //    chia:// link resolves through the local dig-node (§5.3) into the
     //    browser. Per-user (no elevation). Best-effort: a registration failure
@@ -980,6 +1058,23 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
             Some(r) if !r.installed => failures.push(format!(
                 "dig-relay: the OS service did not register ({}); re-run elevated",
                 r.note
+            )),
+            Some(_) => {}
+        }
+    }
+
+    // #514: the beacon's daily scheduler registration gates readiness the same
+    // way dig-relay's service registration does above — it is a selected,
+    // privileged OS-registration step, not a best-effort convenience like the
+    // firewall rule/scheme handler.
+    if plan.auto_update {
+        match &report.beacon {
+            None => failures.push(
+                "dig-updater: the auto-update beacon was not installed".to_string(),
+            ),
+            Some(b) if !b.applied => failures.push(format!(
+                "dig-updater: the daily update-check scheduler did not register ({}); re-run elevated",
+                b.note
             )),
             Some(_) => {}
         }
@@ -1554,6 +1649,44 @@ pub fn uninstall_dig_node(
     }
 }
 
+/// Remove the DIG auto-update beacon's daily scheduler registration (issue
+/// #514) — the counterpart to the beacon-install step in [`run_report_gated`].
+/// A standalone action (mirrors [`uninstall_dig_node`] / [`dns::uninstall`]):
+/// locates the `dig-updater` binary a prior `--auto-update` run placed at
+/// `bin_dir` (the same [`Target::exe_name`] convention every tracked component
+/// uses) and delegates to its own `schedule uninstall` verb. Never touches the
+/// digstore/dig-node/dig-dns/relay/browser installs, and never deletes the
+/// downloaded binaries themselves — only the scheduler registration. Never
+/// returns an error — a missing binary or elevation issue is recorded in the
+/// result's `note`, mirroring every other uninstall action in this crate.
+pub fn uninstall_beacon(
+    bin_dir: &std::path::Path,
+    dry_run: bool,
+    log: &mut dyn FnMut(&str),
+) -> beacon::BeaconResult {
+    let target = match Target::current() {
+        Ok(t) => t,
+        Err(e) => {
+            let note = format!("could not detect the current OS/arch target: {e}");
+            log(&format!("! {note}"));
+            return beacon::BeaconResult {
+                applied: false,
+                note,
+            };
+        }
+    };
+    let bin = bin_dir.join(target.exe_name("dig-updater"));
+
+    log("Removing the DIG auto-update beacon's daily scheduler:");
+    let result = beacon::unregister(&bin, dry_run);
+    log(&format!(
+        "    {} {}",
+        if result.applied { "✓" } else { "·" },
+        result.note
+    ));
+    result
+}
+
 /// Log a resolved component's source + dest in the pretty format.
 fn log_component(log: &mut dyn FnMut(&str), c: &ComponentResult) {
     log(&format!("  {} {} ({})", c.component, c.version, c.asset));
@@ -1607,6 +1740,15 @@ pub fn service_uninstall_json(result: &ServiceUninstallResult) -> String {
     serde_json::to_string(&envelope).expect("service uninstall envelope serializes")
 }
 
+/// The structured envelope emitted to stdout under `--json` for
+/// `--uninstall-dig-updater`: `{"ok":true,"result":<beacon::BeaconResult>}`
+/// (mirrors [`service_uninstall_json`]; [`uninstall_beacon`] never returns an
+/// `Err` — a failure is recorded in the result's `note`, not raised).
+pub fn beacon_uninstall_json(result: &beacon::BeaconResult) -> String {
+    let envelope = serde_json::json!({ "ok": true, "result": result });
+    serde_json::to_string(&envelope).expect("beacon uninstall envelope serializes")
+}
+
 /// The full machine-readable invocation contract for `--help-json`: the
 /// component catalogue, supported targets, global/per-command flags, and the
 /// exit-code table. An agent introspects this instead of scraping `--help`.
@@ -1631,6 +1773,8 @@ pub fn help_json() -> String {
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": true, "flag": "--no-dig-dns disables; --with-dig-dns redundant", "kind": "raw_binary+boot-start-service+split-dns+browser-policy" },
+            { "id": "dig-updater", "repo": "DIG-Network/dig-updater", "default": true, "flag": "--no-auto-update disables; --auto-update redundant", "kind": "raw_binary+daily-scheduler" },
+            { "id": "dig-updater-worker", "repo": "DIG-Network/dig-updater", "default": true, "flag": "alias of dig-updater — no separate flag; follows --auto-update/--no-auto-update/--dig-updater-version", "kind": "raw_binary_alias" },
             { "id": "browser",  "repo": "DIG-Network/DIG_Browser", "default": false, "flag": "--with-browser", "kind": "installer" }
         ],
         "targets": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"],
@@ -1667,11 +1811,15 @@ pub fn help_json() -> String {
             { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" },
             { "flag": "--no-open-firewall", "description": "opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; #424)" },
             { "flag": "--open-firewall", "description": "explicit (redundant) opt-in — the firewall rule is opened by default" },
-            { "flag": "--force-reinstall", "description": "reinstall digstore/dig-node/dig-dns even if `update_policy` would otherwise skip them as already up to date (#309)" }
+            { "flag": "--no-auto-update", "description": "opt out of installing + registering the DIG auto-update beacon (installed by default; #514)" },
+            { "flag": "--auto-update", "description": "explicit (redundant) opt-in — the auto-update beacon is installed by default" },
+            { "flag": "--dig-updater-version", "value": "VERSION", "description": "pin the auto-update beacon's version (default: latest)" },
+            { "flag": "--uninstall-dig-updater", "description": "remove the auto-update beacon's daily scheduler registration this installer created (idempotent; does not remove the downloaded binaries or touch the digstore/browser/relay/dig-node/dig-dns installs)" },
+            { "flag": "--force-reinstall", "description": "reinstall digstore/dig-node/dig-dns/dig-updater even if `update_policy` would otherwise skip them as already up to date (#309)" }
         ],
         "update_policy": {
-            "description": "Every run detects what's already installed for digstore/dig-node/dig-dns (`<bin> --version`), compares it to the release just resolved, and decides per component: absent -> install, an older or unreadable installed version -> update (replace it, reusing the §2 stop/replace/restart lifecycle for the service components), already current (or newer than the latest release) -> skip. A bare re-run is therefore idempotent: it updates only what's outdated and leaves the rest untouched. `--force-reinstall` overrides a skip decision back to update.",
-            "components": ["digstore", "dig-node", "dig-dns"],
+            "description": "Every run detects what's already installed for digstore/dig-node/dig-dns/dig-updater (`<bin> --version`), compares it to the release just resolved, and decides per component: absent -> install, an older or unreadable installed version -> update (replace it, reusing the §2 stop/replace/restart lifecycle for the service components), already current (or newer than the latest release) -> skip. A bare re-run is therefore idempotent: it updates only what's outdated and leaves the rest untouched. `--force-reinstall` overrides a skip decision back to update.",
+            "components": ["digstore", "dig-node", "dig-dns", "dig-updater"],
             "actions": ["install", "update", "skip"],
             "force_flag": "--force-reinstall"
         },
@@ -1691,6 +1839,13 @@ pub fn help_json() -> String {
             "families": ["ipv4", "ipv6"],
             "linux": "never auto-applied; prints the manual `ufw allow <port>/tcp` remedy instead",
             "description": "By default the installer opens an inbound firewall rule scoped to the dig-node executable on its mTLS peer-RPC port (dig-node's only non-loopback listener), covering both IPv4 and IPv6. Removed automatically on `--uninstall-dig-node`. Declining it is always safe — dig-relay fallback still reaches the node."
+        },
+        "auto_update_beacon": {
+            "default": true,
+            "opt_out": "--no-auto-update",
+            "uninstall_flag": "--uninstall-dig-updater",
+            "repo": "DIG-Network/dig-updater",
+            "description": "By default the installer installs the dig-updater beacon (+ its dig-updater-worker sibling, published in the same release) and asks it to register its own daily OS-scheduled task/systemd-timer/LaunchDaemon (dig-updater's own `schedule install` verb), which checks for new signed DIG releases and installs them automatically. Declining is always safe — nothing auto-updates; re-run the installer manually to get new versions. `--uninstall-dig-updater` removes the scheduler registration (idempotent; leaves the downloaded binaries in place)."
         },
         "exit_codes": exit_codes
     });
@@ -1769,12 +1924,26 @@ mod tests {
             "dig-dns-0.6.0-macos-arm64",
             "dig-dns-0.6.0-macos-x64",
         ];
+        // The beacon (#514) and its dig-updater-worker sibling publish from the
+        // SAME repo (`dig-updater`), so — exactly like digstore/digs above —
+        // both asset stems live under ONE map entry keyed by the repo name.
+        let updater: Vec<&'static str> = vec![
+            "dig-updater-0.6.0-windows-x64.exe",
+            "dig-updater-0.6.0-linux-x64",
+            "dig-updater-0.6.0-macos-arm64",
+            "dig-updater-0.6.0-macos-x64",
+            "dig-updater-worker-0.6.0-windows-x64.exe",
+            "dig-updater-worker-0.6.0-linux-x64",
+            "dig-updater-worker-0.6.0-macos-arm64",
+            "dig-updater-worker-0.6.0-macos-x64",
+        ];
         let mut m = HashMap::new();
         m.insert("digstore", ("v0.6.0", digstore));
         m.insert("dig-node", ("v0.2.0", node));
         m.insert("dig-relay", ("v0.1.0", relay));
         m.insert("DIG_Browser", ("v1.0.0", browser));
         m.insert("dig-dns", ("v0.6.0", dns));
+        m.insert("dig-updater", ("v0.6.0", updater));
         m
     }
 
@@ -1799,6 +1968,8 @@ mod tests {
             modify_path: false,
             register_scheme: false,
             open_firewall: false,
+            auto_update: false,
+            dig_updater_version: None,
             force_reinstall: false,
             dry_run: true,
         }
@@ -1813,10 +1984,11 @@ mod tests {
     }
 
     /// #301 (universal installer): a bare install with no opt-out flags installs
-    /// the FULL DIG stack — the digstore CLI, the dig-node service, AND the
-    /// dig-dns service — in one run. `InstallPlan::default()` is the single
-    /// source of truth for that default; `main.rs` maps the `--no-<component>`
-    /// opt-outs onto it. dig-relay (advanced) and the DIG Browser stay opt-in.
+    /// the FULL DIG stack — the digstore CLI, the dig-node service, the
+    /// dig-dns service, AND the auto-update beacon (#514) — in one run.
+    /// `InstallPlan::default()` is the single source of truth for that
+    /// default; `main.rs` maps the `--no-<component>` opt-outs onto it.
+    /// dig-relay (advanced) and the DIG Browser stay opt-in.
     #[test]
     fn default_plan_installs_the_full_dig_stack() {
         let plan = InstallPlan::default();
@@ -1829,15 +2001,20 @@ mod tests {
             plan.with_dig_dns,
             "dig-dns is installed by default (#301 universal installer)"
         );
+        assert!(
+            plan.auto_update,
+            "the auto-update beacon is installed by default (#514)"
+        );
         assert!(!plan.with_relay, "dig-relay stays opt-in (advanced)");
         assert!(!plan.with_browser, "DIG Browser stays a separate opt-in");
         assert!(plan.modify_path, "the bin dir is added to PATH by default");
     }
 
-    /// #301: driving the DEFAULT plan through the orchestration resolves all
-    /// three core components (digstore + dig-node + dig-dns) and neither of the
-    /// opt-in ones (dig-relay / browser) — proving the default is a genuine
-    /// one-shot 3-component install end to end, not just a struct flag.
+    /// #301/#514: driving the DEFAULT plan through the orchestration resolves
+    /// the core stack (digstore + dig-node + dig-dns) AND the auto-update
+    /// beacon (+ its dig-updater-worker sibling), and neither of the opt-in
+    /// components (dig-relay / browser) — proving the default is a genuine
+    /// one-shot install end to end, not just struct flags.
     #[test]
     fn default_plan_resolves_all_three_core_components() {
         let plan = InstallPlan {
@@ -1855,6 +2032,14 @@ mod tests {
         assert!(names.contains(&"digstore"), "digstore in default plan");
         assert!(names.contains(&"dig-node"), "dig-node in default plan");
         assert!(names.contains(&"dig-dns"), "dig-dns in default plan");
+        assert!(
+            names.contains(&"dig-updater"),
+            "the auto-update beacon is in the default plan (#514)"
+        );
+        assert!(
+            names.contains(&"dig-updater-worker"),
+            "the beacon's worker sibling is in the default plan (#514)"
+        );
         assert!(
             !names.contains(&"dig-relay"),
             "dig-relay is opt-in, not in the default plan"
@@ -1885,8 +2070,45 @@ mod tests {
         assert!(by_id("digstore"), "digstore default: true");
         assert!(by_id("dig-node"), "dig-node default: true (#301)");
         assert!(by_id("dig-dns"), "dig-dns default: true (#301)");
+        assert!(by_id("dig-updater"), "dig-updater default: true (#514)");
+        assert!(
+            by_id("dig-updater-worker"),
+            "dig-updater-worker default: true (#514)"
+        );
         assert!(!by_id("dig-relay"), "dig-relay stays opt-in");
         assert!(!by_id("browser"), "browser stays opt-in");
+    }
+
+    #[test]
+    fn help_json_advertises_the_auto_update_beacon_and_opt_out() {
+        // #514: mirrors help_json_advertises_the_scheme_handler_and_opt_out /
+        // ..._the_firewall_rule_and_opt_out below — the machine contract MUST
+        // advertise the beacon's default-on toggle + the CLI opt-out/uninstall
+        // flags so an agent discovers them without scraping `--help`.
+        let doc: serde_json::Value =
+            serde_json::from_str(&help_json()).expect("help_json is valid JSON");
+        let flag_present = |f: &str| -> bool {
+            doc["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["flag"] == f)
+        };
+        assert!(flag_present("--no-auto-update"), "opt-out advertised");
+        assert!(flag_present("--auto-update"), "explicit opt-in advertised");
+        assert!(
+            flag_present("--dig-updater-version"),
+            "version pin advertised"
+        );
+        assert!(
+            flag_present("--uninstall-dig-updater"),
+            "uninstall advertised"
+        );
+        let b = &doc["auto_update_beacon"];
+        assert_eq!(b["default"], true, "the beacon is installed by default");
+        assert_eq!(b["opt_out"], "--no-auto-update");
+        assert_eq!(b["uninstall_flag"], "--uninstall-dig-updater");
+        assert_eq!(b["repo"], "DIG-Network/dig-updater");
     }
 
     #[test]
@@ -2617,6 +2839,9 @@ mod tests {
     // -- #492 elevation gate + #493 fail-loud readiness ----------------------
 
     /// A non-dry-run plan whose ONLY selected component is the dig-node service.
+    /// `auto_update` is explicitly off so these dig-node-focused readiness
+    /// cases stay isolated to the ONE failure they assert on — the beacon has
+    /// its own dedicated readiness tests below.
     fn dig_node_service_plan() -> InstallPlan {
         InstallPlan {
             bin_dir: std::env::temp_dir().join("dig-installer-readiness-test"),
@@ -2624,6 +2849,7 @@ mod tests {
             with_dig_node: true,
             with_dig_dns: false,
             modify_path: false,
+            auto_update: false,
             dry_run: false,
             ..InstallPlan::default()
         }
@@ -2643,6 +2869,7 @@ mod tests {
             dns: None,
             scheme: None,
             firewall: None,
+            beacon: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
@@ -2873,6 +3100,67 @@ mod tests {
         assert_eq!(failures.len(), 1, "got: {failures:?}");
         assert!(failures[0].contains("dig-node"));
         assert!(failures[0].contains("fresh shell"));
+    }
+
+    /// #514: an `auto_update`-only plan (the beacon is a privileged OS-scheduler
+    /// registration, so it gates readiness like dig-node/dig-relay's own service
+    /// registration — never best-effort like the firewall rule/scheme handler).
+    fn beacon_only_plan() -> InstallPlan {
+        InstallPlan {
+            bin_dir: std::env::temp_dir().join("dig-installer-readiness-beacon-test"),
+            with_digstore: false,
+            with_dig_node: false,
+            with_dig_dns: false,
+            modify_path: false,
+            auto_update: true,
+            dry_run: false,
+            ..InstallPlan::default()
+        }
+    }
+
+    #[test]
+    fn readiness_fails_when_the_beacon_did_not_install() {
+        let plan = beacon_only_plan();
+        let report = report_shell(); // beacon: None
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-updater"));
+        assert!(failures[0].contains("not installed"));
+    }
+
+    #[test]
+    fn readiness_fails_when_the_beacon_scheduler_did_not_register() {
+        let plan = beacon_only_plan();
+        let mut report = report_shell();
+        report.beacon = Some(beacon::BeaconResult {
+            applied: false,
+            note: "could not run `dig-updater schedule install`: exit code 5".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-updater"));
+        assert!(failures[0].contains("did not register"));
+    }
+
+    #[test]
+    fn readiness_passes_when_the_beacon_scheduler_registered() {
+        let plan = beacon_only_plan();
+        let mut report = report_shell();
+        report.beacon = Some(beacon::BeaconResult {
+            applied: true,
+            note: "registered the daily update-check scheduler".to_string(),
+        });
+        assert!(evaluate_readiness(&plan, &report).is_empty());
+    }
+
+    #[test]
+    fn readiness_ignores_an_absent_beacon_when_auto_update_is_off() {
+        // The beacon is opt-out (`--no-auto-update`) — a plan that declined it
+        // must never fail readiness over its absence.
+        let plan = dig_node_service_plan(); // auto_update: false
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        assert!(evaluate_readiness(&plan, &report).is_empty());
     }
 
     #[test]

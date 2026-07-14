@@ -13,8 +13,13 @@
 #     as a boot-start OS service — Windows Service / macOS LaunchDaemon / Linux
 #     systemd — but, unlike dig-node/dig-relay, dig-dns ships no service
 #     subcommands of its own, so this installer owns the full per-OS service +
-#     split-DNS/NRPT + browser-policy wiring directly (`src/dns/`).
-# Any of the three can be opted OUT with `--no-<component>`; `dig-relay` and the
+#     split-DNS/NRPT + browser-policy wiring directly (`src/dns/`); and
+#   * the `dig-updater` auto-update beacon (+ its `dig-updater-worker`
+#     sibling, issue #514), registered by delegating to dig-updater's own
+#     `schedule install` subcommand (a daily Windows Scheduled Task / systemd
+#     timer / macOS LaunchDaemon that checks for + installs new signed DIG
+#     releases automatically; see `src/beacon.rs`).
+# Any of the four can be opted OUT with `--no-<component>`; `dig-relay` and the
 # DIG Browser stay opt-in (`--with-relay`/`--with-browser`).
 #
 # It does NOT build either binary itself: digstore still `cargo`-builds and
@@ -23,8 +28,8 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.14.0"
-description = "Universal DIG installer — installs the digstore CLI, the dig-node service, and the dig-dns service by default (dig-relay + DIG Browser opt-in)"
+version = "0.15.0"
+description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
 license = "GPL-2.0-only"

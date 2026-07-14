@@ -27,6 +27,10 @@ use serde_json::Value;
 /// specific tag is ever removed upstream, not to "chase latest".
 const PINNED_DIG_NODE_VERSION: &str = "0.29.0";
 
+/// A dig-updater (auto-update beacon, #514) release known to be permanently
+/// published — same rationale as [`PINNED_DIG_NODE_VERSION`] above.
+const PINNED_DIG_UPDATER_VERSION: &str = "0.6.0";
+
 fn bin() -> Command {
     Command::cargo_bin("dig-installer").expect("dig-installer binary built")
 }
@@ -53,6 +57,8 @@ fn help_json_emits_the_full_contract() {
     assert!(ids.contains(&"dig-node"));
     assert!(ids.contains(&"dig-relay"));
     assert!(ids.contains(&"dig-dns"));
+    assert!(ids.contains(&"dig-updater"));
+    assert!(ids.contains(&"dig-updater-worker"));
     assert!(ids.contains(&"browser"));
 
     // The full exit-code table is present, including the distinct elevation code.
@@ -150,6 +156,10 @@ fn help_lists_the_selectable_component_flags() {
         "--uninstall-dig-node",
         "--no-open-firewall",
         "--open-firewall",
+        "--no-auto-update",
+        "--auto-update",
+        "--dig-updater-version",
+        "--uninstall-dig-updater",
         "--force-reinstall",
         "--json",
         "--dry-run",
@@ -180,7 +190,10 @@ fn help_json_advertises_the_update_policy_and_force_flag() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(components, vec!["digstore", "dig-node", "dig-dns"]);
+    assert_eq!(
+        components,
+        vec!["digstore", "dig-node", "dig-dns", "dig-updater"]
+    );
     assert_eq!(policy["force_flag"], "--force-reinstall");
     let force_flag_documented = doc["flags"]
         .as_array()
@@ -197,13 +210,16 @@ fn help_json_advertises_the_update_policy_and_force_flag() {
 /// (opened by default) in the `--json` payload. Pins `--dig-node-version`
 /// (dig_ecosystem#524, see the module doc) — dig-node stays selected (the
 /// #301 default), so this still resolves a real release over the network
-/// even though nothing is downloaded/written.
+/// even though nothing is downloaded/written. `--no-auto-update` keeps this
+/// test scoped to the firewall feature alone (#514 would otherwise resolve a
+/// second, unrelated release for the also-default-on beacon).
 #[test]
 fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
     let out = bin()
         .args([
             "--no-digstore",
             "--no-dig-dns",
+            "--no-auto-update",
             "--dig-node-version",
             PINNED_DIG_NODE_VERSION,
             "--dry-run",
@@ -224,7 +240,8 @@ fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
 /// `--no-open-firewall` must leave the report's `firewall` field entirely
 /// absent (`null`), not merely an unapplied result — proving the opt-out
 /// actually reaches `InstallPlan` from the CLI flag. Pins `--dig-node-version`
-/// for the same reason as the sibling test above (dig_ecosystem#524).
+/// for the same reason as the sibling test above (dig_ecosystem#524);
+/// `--no-auto-update` keeps this scoped to the firewall feature alone (#514).
 #[test]
 fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
     let out = bin()
@@ -232,6 +249,7 @@ fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
             "--no-digstore",
             "--no-dig-dns",
             "--no-open-firewall",
+            "--no-auto-update",
             "--dig-node-version",
             PINNED_DIG_NODE_VERSION,
             "--dry-run",
@@ -242,6 +260,67 @@ fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert!(v["result"]["firewall"].is_null());
+}
+
+/// #514: a dry-run with the beacon selected (the default) reports its daily
+/// scheduler-registration intent in the `--json` payload, and BOTH the broker
+/// and its `dig-updater-worker` sibling resolve. Pins `--dig-updater-version`
+/// for the same dig_ecosystem#524 reason the dig-node tests above do —
+/// resolution runs regardless of `--dry-run`.
+#[test]
+fn dry_run_reports_the_beacon_intent_by_default() {
+    let out = bin()
+        .args([
+            "--no-digstore",
+            "--no-dig-node",
+            "--no-dig-dns",
+            "--dig-updater-version",
+            PINNED_DIG_UPDATER_VERSION,
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    let note = v["result"]["beacon"]["note"]
+        .as_str()
+        .expect("beacon result present by default");
+    assert!(note.contains("would run"), "got: {note}");
+    assert_eq!(v["result"]["beacon"]["applied"], false);
+    let names: Vec<&str> = v["result"]["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["component"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"dig-updater"));
+    assert!(names.contains(&"dig-updater-worker"));
+}
+
+/// `--no-auto-update` must leave the report's `beacon` field entirely absent
+/// (`null`) — mirrors `no_open_firewall_flag_skips_the_firewall_section_entirely`.
+#[test]
+fn no_auto_update_flag_skips_the_beacon_section_entirely() {
+    let out = bin()
+        .args([
+            "--no-digstore",
+            "--no-dig-node",
+            "--no-dig-dns",
+            "--no-auto-update",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(v["result"]["beacon"].is_null());
+    assert!(
+        v["result"]["components"].as_array().unwrap().is_empty(),
+        "no component is selected once every default-on toggle is off"
+    );
 }
 
 /// #301: the machine contract must advertise the universal-installer default —
@@ -266,6 +345,10 @@ fn help_json_advertises_all_three_core_components_as_default() {
     assert!(default_of("digstore"), "digstore default: true");
     assert!(default_of("dig-node"), "dig-node default: true (#301)");
     assert!(default_of("dig-dns"), "dig-dns default: true (#301)");
+    assert!(
+        default_of("dig-updater"),
+        "dig-updater default: true (#514)"
+    );
     assert!(!default_of("dig-relay"), "dig-relay stays opt-in");
     assert!(!default_of("browser"), "browser stays opt-in");
 }
@@ -287,9 +370,10 @@ fn help_prose_frames_the_universal_all_three_default() {
     );
 }
 
-/// #301: opting out of ALL THREE components is a valid, network-free, side-
-/// effect-free run — proving the `--no-<component>` opt-outs parse and fully
-/// disable the default stack (nothing to resolve, so no HTTP call is made).
+/// #301/#514: opting out of every default-on component is a valid,
+/// network-free, side-effect-free run — proving the `--no-<component>`
+/// opt-outs parse and fully disable the default stack (nothing to resolve, so
+/// no HTTP call is made).
 #[test]
 fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
     let out = bin()
@@ -297,6 +381,7 @@ fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
             "--no-digstore",
             "--no-dig-node",
             "--no-dig-dns",
+            "--no-auto-update",
             "--dry-run",
             "--json",
         ])
@@ -398,6 +483,25 @@ fn uninstall_dig_node_dry_run_is_side_effect_free_and_succeeds() {
     assert_eq!(v["ok"], true);
     assert_eq!(v["result"]["uninstalled"], false);
     assert_eq!(v["result"]["dig_local_removed"], false);
+    assert!(v["result"]["note"].as_str().unwrap().contains("would run"));
+}
+
+/// `--uninstall-dig-updater --dry-run` must be network-free, side-effect-free,
+/// and always succeed (issue #514: a missing binary/elevation issue is
+/// reported via the result `note`, never a process failure) — mirrors
+/// `uninstall_dig_node_dry_run_is_side_effect_free_and_succeeds`.
+#[test]
+fn uninstall_dig_updater_dry_run_is_side_effect_free_and_succeeds() {
+    let out = bin()
+        .arg("--uninstall-dig-updater")
+        .arg("--dry-run")
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["applied"], false);
     assert!(v["result"]["note"].as_str().unwrap().contains("would run"));
 }
 

@@ -338,6 +338,51 @@ mod tests {
     }
 
     #[test]
+    fn matches_dig_updater_and_its_worker_sibling_despite_the_stem_prefix_collision() {
+        // Issue #514: the beacon `dig-updater` and its unprivileged sibling
+        // `dig-updater-worker` publish from the SAME release, and — exactly like
+        // digs/digstore above — "dig-updater" is a literal string PREFIX of
+        // "dig-updater-worker", so both names satisfy the stem_rank tie for a
+        // query of stem "dig-updater". The tie is broken by shortest-name, which
+        // always favors the non-worker binary; querying stem "dig-updater-worker"
+        // instead wins purely on stem_rank (only the worker name starts with the
+        // full "dig-updater-worker" prefix), regardless of length.
+        let names = vec![
+            "dig-updater-0.6.0-linux-x64".to_string(),
+            "dig-updater-worker-0.6.0-linux-x64".to_string(),
+            "dig-updater-0.6.0-windows-x64.exe".to_string(),
+            "dig-updater-worker-0.6.0-windows-x64.exe".to_string(),
+        ];
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-updater"
+            ),
+            Some("dig-updater-0.6.0-linux-x64".to_string())
+        );
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-updater-worker"
+            ),
+            Some("dig-updater-worker-0.6.0-linux-x64".to_string())
+        );
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Windows, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-updater"
+            ),
+            Some("dig-updater-0.6.0-windows-x64.exe".to_string())
+        );
+    }
+
+    #[test]
     fn macos_arm64_does_not_match_x64_asset() {
         // The x64 token must NOT satisfy an arm64 request (and vice-versa) — a
         // wrong-arch binary would crash at runtime.

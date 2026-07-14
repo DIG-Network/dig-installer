@@ -3,6 +3,20 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## Auto-update beacon registration (#514): `dig-updater schedule install` is idempotent — unlike dig-node's `install`
+
+dig-node's own `install` verb is NOT idempotent (task #232's whole reason for the stop-before-write/
+Skip-doesn't-reinstall dance): re-running it over an already-registered service hard-fails on
+Windows SCM / macOS launchd ("already exists"), so `register_dig_node` tolerates that failure and
+relies on `start` as the real signal. `dig-updater schedule install`/`schedule uninstall` are the
+OPPOSITE: `schtasks /Create … /F` always overwrites, `systemctl enable --now` is idempotent, and
+launchd's own registration path bootouts any prior registration before rebootstrapping — so a
+re-install always succeeds cleanly. This installer's `beacon::register`/`unregister` therefore call
+the scheduler unconditionally on every Install/Update/Skip decision for `dig-updater` (never
+gated on the version-decide outcome the way dig-node/dig-dns's registration is) — a genuinely
+different, simpler contract than every other delegated-subcommand component in this crate, worth
+keeping in mind before copying the dig-node pattern onto a new component by reflex.
+
 ## Version-aware updater (#309): a stub executable must match the REAL exe-name convention
 
 Testing the detect→compare→decide pipeline (`src/update.rs`) end-to-end (not just the pure

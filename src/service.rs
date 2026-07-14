@@ -392,7 +392,11 @@ fn run_dig_node(bin: &Path, args: &[String], env: &BTreeMap<String, String>) -> 
 /// zero exit (the captured output is discarded — nothing useful is lost, see
 /// [`run_dig_node`]); `Err` on a spawn failure or non-zero exit, with the
 /// captured output (trimmed, or "(no output)") folded into the message.
-fn run_capturing(
+///
+/// `pub(crate)`: [`crate::beacon`] reuses this exact spawn-capture convention
+/// to delegate to dig-updater's own `schedule install`/`schedule uninstall`
+/// verbs (#514), rather than re-implementing the same stdio-capture care.
+pub(crate) fn run_capturing(
     bin: &Path,
     args: &[String],
     env: &BTreeMap<String, String>,

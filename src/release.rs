@@ -77,6 +77,30 @@ impl Repo {
         Repo::new("DIG-Network", "dig-dns", "dig-dns")
     }
 
+    /// The DIG auto-update beacon's release source (`DIG-Network/dig-updater`,
+    /// issue #514). Publishes a raw per-OS/arch binary
+    /// `dig-updater-<ver>-<os_arch>[.exe]` (matched as an
+    /// [`AssetKind::RawBinary`](crate::asset::AssetKind::RawBinary)) — a
+    /// privileged broker that registers itself as a daily OS-scheduled task/
+    /// timer/LaunchDaemon (see [`crate::beacon`]) checking for + installing new
+    /// signed DIG releases. Its unprivileged fetch/verify sibling is published
+    /// in the SAME release under its own stem — see [`Repo::dig_updater_worker`].
+    pub fn dig_updater() -> Repo {
+        Repo::new("DIG-Network", "dig-updater", "dig-updater")
+    }
+
+    /// The beacon's unprivileged fetch/verify worker (issue #514): the
+    /// privileged broker (`dig-updater`) spawns this sibling process to do all
+    /// network fetching + signature/checksum verification with NO install
+    /// privilege. Published in the **SAME** `DIG-Network/dig-updater` release as
+    /// [`Repo::dig_updater`], under its own asset stem
+    /// (`dig-updater-worker-<ver>-<os_arch>[.exe]`) — resolved via the identical
+    /// asset matcher, parameterized on stem `"dig-updater-worker"` instead of
+    /// `"dig-updater"` (mirrors [`Repo::digs`]'s alongside-the-primary pattern).
+    pub fn dig_updater_worker() -> Repo {
+        Repo::new("DIG-Network", "dig-updater", "dig-updater-worker")
+    }
+
     /// The `digs` alias binary's release source (issue #434): `digs <args>`
     /// behaves IDENTICALLY to `digstore <args>` (same entrypoint, digstore's
     /// `SPEC.md` § "CLI binaries") and is published in the **SAME**
@@ -201,6 +225,41 @@ mod tests {
             Repo::new("DIG-Network", "dig-dns", "dig-dns")
         );
         assert_eq!(Repo::digs(), Repo::new("DIG-Network", "digstore", "digs"));
+        assert_eq!(
+            Repo::dig_updater(),
+            Repo::new("DIG-Network", "dig-updater", "dig-updater")
+        );
+        assert_eq!(
+            Repo::dig_updater_worker(),
+            Repo::new("DIG-Network", "dig-updater", "dig-updater-worker")
+        );
+    }
+
+    #[test]
+    fn dig_updater_worker_shares_the_dig_updater_repo_with_its_own_stem() {
+        // The worker (issue #514) is published in the SAME dig-updater release,
+        // just under a different asset stem — same owner/name as Repo::dig_updater().
+        let worker = Repo::dig_updater_worker();
+        let broker = Repo::dig_updater();
+        assert_eq!(worker.owner, broker.owner);
+        assert_eq!(worker.name, broker.name);
+        assert_eq!(worker.stem, "dig-updater-worker");
+    }
+
+    #[test]
+    fn dig_updater_binary_url_matches_published_asset_naming() {
+        assert_eq!(
+            Repo::dig_updater().binary_url("v0.6.0", "0.6.0", &lin()),
+            "https://github.com/DIG-Network/dig-updater/releases/download/v0.6.0/dig-updater-0.6.0-linux-x64"
+        );
+        assert_eq!(
+            Repo::dig_updater().binary_url("v0.6.0", "0.6.0", &win()),
+            "https://github.com/DIG-Network/dig-updater/releases/download/v0.6.0/dig-updater-0.6.0-windows-x64.exe"
+        );
+        assert_eq!(
+            Repo::dig_updater_worker().binary_url("v0.6.0", "0.6.0", &lin()),
+            "https://github.com/DIG-Network/dig-updater/releases/download/v0.6.0/dig-updater-worker-0.6.0-linux-x64"
+        );
     }
 
     #[test]
