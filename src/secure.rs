@@ -55,16 +55,29 @@ pub fn grants_write(rights: i64) -> bool {
 
 /// The PowerShell one-liner that emits the directory's access ACEs as SID-based
 /// `ACE;<sid>;<rightsInt>;<Allow|Deny>` lines for [`parse_acl_write_grants`].
-/// SID-based (translating each identity to its `SecurityIdentifier`), so parsing
-/// is locale-independent — never the localized `BUILTIN\Users` display name.
+///
+/// SID-based (so parsing is locale-independent — never the localized
+/// `BUILTIN\Users` display name), read DIRECTLY in SID form via
+/// `GetAccessRules($true, $true, [SecurityIdentifier])` — NOT by resolving each
+/// ACE's identity NAME to a SID with `.Translate([SecurityIdentifier])`. The
+/// default protected root (`%ProgramFiles%\DIG\bin`) inherits Program Files'
+/// DACL, which carries AppContainer capability ACEs (`APPLICATION PACKAGE
+/// AUTHORITY\ALL APPLICATION PACKAGES` = S-1-15-2-1, `...\ALL RESTRICTED
+/// APPLICATION PACKAGES` = S-1-15-2-2) whose reverse name→SID lookup throws
+/// `IdentityNotMappedException`; under `$ErrorActionPreference='Stop'` that one
+/// untranslatable (benign read/execute) ACE aborted the entire probe, so
+/// [`verify_windows`] recorded a false-negative `checked:false` on a genuinely
+/// admin-only root (#565). Enumerating the rules already in SID form reads the
+/// same explicit+inherited DACL without ever translating a name.
+///
 /// Pure (single quotes in `dir` are doubled for PowerShell literal safety).
 pub fn acl_write_probe_ps_command(dir: &str) -> String {
     let dir = dir.replace('\'', "''");
     format!(
         "$ErrorActionPreference='Stop'; \
          $acl = Get-Acl -LiteralPath '{dir}'; \
-         foreach ($a in $acl.Access) {{ \
-           'ACE;' + $a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value \
+         foreach ($a in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {{ \
+           'ACE;' + $a.IdentityReference.Value \
              + ';' + [int64]$a.FileSystemRights + ';' + $a.AccessControlType \
          }}"
     )
@@ -367,6 +380,60 @@ mod tests {
         assert!(cmd.contains("FileSystemRights"));
         assert!(cmd.contains("AccessControlType"));
         assert!(cmd.contains("ACE;"));
+    }
+
+    /// Regression for #565 (the seeded-legacy e2e `checked:false` on the default
+    /// protected root): the probe MUST read each ACE's SID DIRECTLY (via
+    /// `GetAccessRules(..., [SecurityIdentifier])`) and MUST NOT resolve identity
+    /// NAMES to SIDs (`.Translate([SecurityIdentifier])`). Program Files inherits
+    /// AppContainer capability ACEs (`APPLICATION PACKAGE AUTHORITY\ALL
+    /// APPLICATION PACKAGES` = S-1-15-2-1, `...\ALL RESTRICTED APPLICATION
+    /// PACKAGES` = S-1-15-2-2) whose name→SID translation throws
+    /// `IdentityNotMappedException`; under `$ErrorActionPreference='Stop'` that
+    /// terminating error aborted the whole probe → `verify_windows` recorded a
+    /// false-negative `checked:false` on a genuinely admin-only root. Enumerating
+    /// in SID form never translates a name, so those benign read/execute ACEs no
+    /// longer break the read-back.
+    #[test]
+    fn acl_probe_reads_sids_directly_without_name_translation() {
+        let cmd = acl_write_probe_ps_command(r"C:\Program Files\DIG\bin");
+        assert!(
+            !cmd.contains("Translate"),
+            "the probe must not name→SID Translate (throws on Program Files' \
+             inherited AppContainer ACEs): {cmd}"
+        );
+        assert!(
+            cmd.contains("GetAccessRules"),
+            "the probe must enumerate the DACL already in SID form: {cmd}"
+        );
+    }
+
+    /// The faithful mechanism reproduction (Windows-only): verifying a real
+    /// directory that inherits Program Files' DACL — every Windows box has
+    /// `C:\Program Files\Common Files` with the untranslatable AppContainer ACEs —
+    /// must actually RUN the read-back (`checked == true`), not fall into the
+    /// indeterminate arm. With the pre-fix `.Translate` probe this was
+    /// `checked:false`; with SID-form enumeration it reads the DACL and, since
+    /// Program Files denies unprivileged write, reports `secure: true`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_verify_runs_on_a_program_files_dir_with_appcontainer_aces() {
+        let dir = std::path::Path::new(r"C:\Program Files\Common Files");
+        if !dir.is_dir() {
+            return; // extraordinarily rare, but never fail on a nonstandard box
+        }
+        let v = verify_install_root(Os::Windows, dir);
+        assert!(
+            v.checked,
+            "the ACL read-back must run on a Program Files dir (inherited \
+             AppContainer ACEs must not abort it): {}",
+            v.note
+        );
+        assert!(
+            v.secure,
+            "Program Files denies unprivileged write, so it must verify secure: {}",
+            v.note
+        );
     }
 
     #[test]
