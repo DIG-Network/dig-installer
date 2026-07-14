@@ -75,6 +75,36 @@ fn clean_remove_existing(label: &str) {
         std::fs::remove_file(Path::new("/Library/LaunchDaemons").join(format!("{label}.plist")));
 }
 
+/// Stop the running dig-dns LaunchDaemon so it releases the lock on its binary
+/// before an upgrade overwrites it (#544), then bounded-wait for it to leave
+/// RUNNING. Called only when [`crate::svc::service_run_state`] already observed
+/// it RUNNING; any error is surfaced for the caller to record (the write's
+/// delayed-replace fallback is the safety net).
+pub fn stop_service() -> Result<(), String> {
+    let mgr = service_manager::LaunchdServiceManager::system();
+    mgr.stop(ServiceStopCtx {
+        label: service_label(),
+    })
+    .map_err(|e| format!("launchctl stop {}: {e}", plan::SERVICE_LABEL))?;
+    wait_until_not_running(Duration::from_secs(10));
+    Ok(())
+}
+
+/// Poll until the dig-dns service leaves RUNNING (or `max_wait` elapses) — the
+/// daemon's process exiting is what releases the binary. A bounded poll lets a
+/// fast stop proceed immediately.
+fn wait_until_not_running(max_wait: Duration) {
+    let start = std::time::Instant::now();
+    while crate::svc::service_run_state(crate::svc::DIG_DNS_SERVICE_ID)
+        == crate::svc::ServiceRunState::Running
+    {
+        if start.elapsed() >= max_wait {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Is this process running as root? Writing `/etc/resolver/dig`, a
 /// LaunchDaemon under `/Library/LaunchDaemons`, or the Chrome managed plist
 /// all require it.

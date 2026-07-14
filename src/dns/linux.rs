@@ -64,6 +64,36 @@ fn clean_remove_existing_unit() {
     });
 }
 
+/// Stop the running dig-dns systemd unit so it releases the lock on its binary
+/// before an upgrade overwrites it (#544), then bounded-wait for it to leave
+/// RUNNING. Called only when [`crate::svc::service_run_state`] already observed
+/// it RUNNING; any error is surfaced for the caller to record (the write's
+/// delayed-replace fallback is the safety net).
+pub fn stop_service() -> Result<(), String> {
+    let mgr = service_manager::SystemdServiceManager::system();
+    mgr.stop(ServiceStopCtx {
+        label: service_label(),
+    })
+    .map_err(|e| format!("systemctl stop {}: {e}", plan::service_script_name()))?;
+    wait_until_not_running(Duration::from_secs(10));
+    Ok(())
+}
+
+/// Poll until the dig-dns service leaves RUNNING (or `max_wait` elapses) — the
+/// unit's process exiting is what releases the binary. A bounded poll lets a
+/// fast stop proceed immediately.
+fn wait_until_not_running(max_wait: Duration) {
+    let start = std::time::Instant::now();
+    while crate::svc::service_run_state(crate::svc::DIG_DNS_SERVICE_ID)
+        == crate::svc::ServiceRunState::Running
+    {
+        if start.elapsed() >= max_wait {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Is this process running as root? Creating the dedicated service user,
 /// writing the systemd unit, and wiring split-DNS all require it.
 pub fn is_root() -> bool {

@@ -250,9 +250,9 @@ both read as `serving: false`; this installer treats "no binary at the destinati
 "first install, nothing to stop" case instead of relying on that distinction.
 
 **digstore** (not a service) and the downloaded **DIG Browser** native installer file are not
-service-managed; if writing either destination fails because the file already exists and is
-locked by a running process, the write error is annotated with a hint that the destination may be
-in use by a running process, rather than a raw OS error code. DIG Browser's OWN native installer
+service-managed; like every component their bytes are written through the resilient
+`download::replace_binary` (§2.3), so a destination locked by a running process on Windows is staged
+for a reboot-time replace rather than failing with a raw sharing-violation error. DIG Browser's OWN native installer
 (NSIS/equivalent) is responsible for closing a running browser instance before it overwrites the
 installed application — this installer only downloads DIG Browser's installer artifact, it never
 runs it or overwrites the installed application itself.
@@ -316,6 +316,50 @@ plain re-`install` produced on a second run:
 An absent registration is a no-op at the detect step (nothing to remove); the removal itself is
 best-effort (errors are noted but never abort the install — the subsequent create attempt is the
 authoritative outcome).
+
+### 2.3 dig-dns stop-before-replace + the locked-binary fallback (#544)
+
+dig-dns is brought to parity with dig-node/dig-relay's §2 stop-before-write. Because dig-dns ships
+NO `stop` verb of its own, the installer stops the OS service it registered — through the service
+manager, keyed by the canonical id `net.dignetwork.dig-dns` — rather than delegating to a CLI verb.
+On an Install/Update (not on Skip), BEFORE the new binary is written:
+
+1. If no binary exists at the destination (first install) → skip (nothing to stop).
+2. Else probe `svc::service_run_state(net.dignetwork.dig-dns)`. Only when it reports **RUNNING** is
+   the service stopped (`dns::stop_before_replace` → per-OS `stop_service`: `ScServiceManager` stop
+   on Windows, `SystemdServiceManager` stop on Linux, `LaunchdServiceManager` stop on macOS), then a
+   bounded poll waits for it to leave RUNNING so its process exits and releases the binary's file
+   handle. A Stopped/NotFound/Unknown state → skip.
+3. Unlike dig-node/dig-relay (whose stop FAILURE aborts the write with `SERVICE_STOP_FAILED`), a
+   dig-dns stop failure is **non-fatal** — it is recorded and the install continues. On **Windows**
+   the locked-binary write fallback below is the safety net (a still-running dig-dns just stages a
+   reboot-time replace). On Linux there is NO such net: if the service is still running, the write
+   fails hard with `ETXTBSY` and the destination is left intact (fail-closed) — the failure surfaces
+   loudly rather than corrupting the binary.
+
+**Locked-binary write fallback (all components).** Every component binary is written through
+`download::replace_binary`, which is resilient to a destination held open by a running process:
+
+- The ordinary case writes the bytes in place (`WriteOutcome::Replaced`).
+- On Windows, a running executable cannot be opened for writing, so an in-place overwrite fails with
+  a sharing violation (`ERROR_SHARING_VIOLATION`, "os error 32" — the exact reported #544 failure).
+  This is an OPEN-time failure (`File::create`), raised BEFORE any truncation, so the destination is
+  provably untouched. ONLY then is the new binary STAGED beside the destination and an atomic replace
+  scheduled for the next reboot via `MoveFileExW(staging, dest, MOVEFILE_REPLACE_EXISTING |
+  MOVEFILE_DELAY_UNTIL_REBOOT)` (`WriteOutcome::ScheduledForReboot`); the destination is NEVER left
+  half-written and the old binary keeps running until the reboot applies the swap. A WRITE-time error
+  — including `ERROR_LOCK_VIOLATION` (33) — is NOT treated as recoverable: reaching it means the file
+  was already opened + truncated, so it propagates as a hard failure rather than staging over a
+  half-written destination. The caller LOUDLY logs that a **restart is required** to finish the update.
+- On Linux, opening a RUNNING binary for write fails hard AT OPEN with `ETXTBSY` (errno 26): the write
+  aborts with the destination intact (fail-closed, never half-written), and this reboot-time staging
+  fallback does NOT apply — it is a **Windows-only** guarantee. (A genuine atomic write-temp +
+  `rename(2)` replace on unix is a RECOMMENDED FUTURE follow-up, separately ticketed.)
+
+This covers all three run-states idempotently: **running-as-service** (stopped at step 2 → in-place
+write), **running-as-foreground-process** (step 2 skips — no registered running service — so on
+Windows the write fallback stages a reboot-time replace, while on Linux the write fails closed with
+`ETXTBSY`, dest intact), and **not-running** (skip → in-place write).
 
 ## 3. `InstallReport` (the `--json` payload)
 

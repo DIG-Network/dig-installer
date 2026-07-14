@@ -25,6 +25,19 @@ instead of blindly redownloading — point `--bin-dir` at a directory with an ex
 `dig-dns`/`digstore`/`dig-updater` binary to exercise Update/Skip locally; an empty dir always
 decides Install.
 
+**Upgrading over a RUNNING service — locked binary (#544):** before overwriting a component binary
+on an Update, a running service is stopped first so it releases its executable (Windows locks a
+running `.exe`, so overwriting it in place otherwise fails with "os error 32"). dig-node/dig-relay
+delegate this to their own `stop` verb; dig-dns has no such verb, so the installer stops the OS
+service it registered (`net.dignetwork.dig-dns`) via the service manager, then writes. If a binary
+is STILL locked after that (e.g. a stray foreground `dig-dns serve` process, not the registered
+service), the write does not fail: the new binary is staged and an atomic replace is scheduled for
+the next reboot (Windows `MoveFileEx …DELAY_UNTIL_REBOOT`), and the run LOUDLY logs that a restart
+is required. To reproduce locally on Windows: install once, leave the dig-dns service running, then
+re-run with `--force-reinstall` against the same `--bin-dir` — the log shows `stopped the running
+dig-dns service before replacing its binary`. If you ever see the "will apply on the next REBOOT"
+notice, restart the machine to finish the update.
+
 **Auto-update beacon (#514):** the beacon (`dig-updater` + its `dig-updater-worker` sibling) is
 default-on like dig-node/dig-dns, so a bare `--dry-run` still resolves ITS latest release over the
 real network too (resolution runs regardless of `--dry-run` — only the download is skipped). Add
