@@ -52,6 +52,7 @@ pub mod error;
 pub mod firewall;
 pub mod health;
 pub mod hosts;
+pub mod manifest;
 pub mod migrate;
 pub mod pathcheck;
 pub mod paths;
@@ -415,6 +416,10 @@ pub struct InstallReport {
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
     /// when no legacy install was detected.
     pub migration: Option<migrate::MigrationResult>,
+    /// The authoritative install-root record written to `install.json` (#581):
+    /// the single source of truth the auto-update beacon reads for the install
+    /// root. `None` on dry-run or when no privileged component was placed.
+    pub install_manifest: Option<manifest::ManifestResult>,
     /// The AGGREGATE verdict (#493): `true` iff EVERY selected component
     /// installed AND its service is verified RUNNING. Only when this is `true`
     /// may a caller print "✓ DIG is ready". Always `true` on a dry-run (nothing
@@ -668,6 +673,7 @@ fn run_report_gated(
         daemon_dirs: Vec::new(),
         install_root_security: None,
         migration: None,
+        install_manifest: None,
         ready: true,
         failures: Vec::new(),
     };
@@ -1147,6 +1153,23 @@ fn run_report_gated(
             verdict.note
         ));
         report.install_root_security = Some(verdict);
+
+        // #581: record the authoritative install root in install.json so the
+        // auto-update beacon has a single source of truth for where DIG lives
+        // (coherent with the beacon's own current_exe-derived root, now that its
+        // binary lives in the protected root).
+        let m = manifest::write_install_manifest(
+            target.os,
+            &paths::protected_bin_dir(),
+            env!("CARGO_PKG_VERSION"),
+            plan.dry_run,
+        );
+        log(&format!(
+            "    {} {}",
+            if m.written { "✓" } else { "·" },
+            m.note
+        ));
+        report.install_manifest = Some(m);
     }
 
     // Aggregate readiness verdict (#493 + @mt-dev firm directive): "if
@@ -3324,6 +3347,7 @@ mod tests {
             daemon_dirs: Vec::new(),
             install_root_security: None,
             migration: None,
+            install_manifest: None,
             ready: true,
             failures: Vec::new(),
         }
