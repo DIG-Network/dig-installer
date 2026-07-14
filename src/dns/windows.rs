@@ -80,6 +80,36 @@ fn wait_for_removal(service_name: &str, max_wait: Duration) {
     }
 }
 
+/// Stop the running dig-dns Windows service (SCM) so it releases the lock on
+/// its `dig-dns.exe` before an upgrade overwrites it (#544), then bounded-wait
+/// for it to leave RUNNING (its process must exit to release the file handle).
+/// Called only when [`crate::svc::service_run_state`] already observed it
+/// RUNNING, so a "service not started" error is not expected; any error is
+/// surfaced for the caller to record (the write's delayed-replace fallback is
+/// the safety net).
+pub fn stop_service() -> Result<(), String> {
+    let mgr = service_manager::ScServiceManager::system();
+    mgr.stop(ServiceStopCtx { label: label() })
+        .map_err(|e| format!("sc stop {}: {e}", plan::SERVICE_LABEL))?;
+    wait_until_not_running(Duration::from_secs(10));
+    Ok(())
+}
+
+/// Poll until the dig-dns service leaves RUNNING (or `max_wait` elapses) — a
+/// stopped service's process exiting is what releases the exe's file handle. A
+/// bounded poll (not a fixed sleep) lets a fast stop proceed at once.
+fn wait_until_not_running(max_wait: Duration) {
+    let start = std::time::Instant::now();
+    while crate::svc::service_run_state(crate::svc::DIG_DNS_SERVICE_ID)
+        == crate::svc::ServiceRunState::Running
+    {
+        if start.elapsed() >= max_wait {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Set the Windows Service's human-friendly DISPLAY name (task #494) via
 /// `sc config`. `service-manager`'s `ScServiceManager::install` always sets
 /// `displayname=` to the qualified service name at create time (no

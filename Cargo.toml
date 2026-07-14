@@ -28,7 +28,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.15.0"
+version = "0.15.1"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -88,6 +88,10 @@ windows-sys = { version = "0.59", features = [
     # machine-wide daemon state dir (daemon_dir.rs). CoTaskMemFree frees its buffer.
     "Win32_UI_Shell",
     "Win32_System_Com",
+    # MoveFileExW(…, MOVEFILE_DELAY_UNTIL_REBOOT) — the locked-binary fallback
+    # (#544): stage + schedule a reboot-time replace when a running service still
+    # holds its exe open (download.rs::schedule_replace_on_reboot).
+    "Win32_Storage_FileSystem",
 ] }
 # NOTE: the `windows-service` crate (the SCM service-protocol dispatcher) was
 # removed with the host-shim (#499): the dig-dns Windows service now runs

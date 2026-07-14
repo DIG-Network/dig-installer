@@ -225,9 +225,124 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     }
 }
 
+/// The outcome of stopping a running dig-dns OS service before an upgrade
+/// replaces its binary (#544) — the dig-dns counterpart to
+/// [`crate::service::StopOutcome`].
+///
+/// dig-node/dig-relay delegate this to their OWN `stop` subcommand; dig-dns
+/// ships no such verb, so the installer stops the OS service it registered
+/// (SCM / systemd / launchd, via the per-OS modules). Unlike dig-node — which
+/// ABORTS the write if its stop fails — a dig-dns stop failure is NON-fatal:
+/// the resilient write ([`crate::download::replace_binary`]) still stages a
+/// reboot-time replace if the binary turns out to be locked, so the install
+/// never wedges on a stop that could not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsStopOutcome {
+    /// A binary already existed at the destination — i.e. this is an upgrade
+    /// over a prior install, not a first install.
+    pub bin_existed: bool,
+    /// The service was found RUNNING and a stop was attempted.
+    pub attempted: bool,
+    /// The attempted stop succeeded (the service left RUNNING). Always `false`
+    /// when `attempted` is `false`.
+    pub stopped: bool,
+    /// Human-readable detail — never silent (mirrors the crate's `note` convention).
+    pub note: String,
+}
+
+/// Stop a currently-running dig-dns OS service BEFORE this run overwrites its
+/// binary (#544). On Windows a running executable is locked against being
+/// opened for writing, so overwriting `dig-dns.exe` in place while the service
+/// runs fails with a sharing violation ("os error 32") — the exact reported
+/// bug. This brings dig-dns to parity with dig-node/dig-relay's stop-before-
+/// write (task #232), stopping through the OS service manager since dig-dns has
+/// no `stop` subcommand of its own.
+///
+/// Skip-when-absent (first install) and skip-when-not-running are not failures.
+/// A stop FAILURE is recorded but not fatal (see [`DnsStopOutcome`]).
+pub fn stop_before_replace(dig_dns_bin: &Path) -> DnsStopOutcome {
+    stop_before_replace_with(
+        dig_dns_bin,
+        || crate::svc::service_run_state(crate::svc::DIG_DNS_SERVICE_ID),
+        stop_service_now,
+    )
+}
+
+/// [`stop_before_replace`] with the "current service state" probe and the
+/// "stop it" action injected — production passes the real
+/// [`crate::svc::service_run_state`] + [`stop_service_now`]; tests inject fixed
+/// answers so the skip-vs-attempt branching across the three run-states
+/// (running-as-service / running-as-foreground / not-running) is exercised
+/// without a real service manager.
+fn stop_before_replace_with(
+    dig_dns_bin: &Path,
+    state: impl Fn() -> crate::svc::ServiceRunState,
+    stop: impl Fn() -> Result<(), String>,
+) -> DnsStopOutcome {
+    if !dig_dns_bin.exists() {
+        return DnsStopOutcome {
+            bin_existed: false,
+            attempted: false,
+            stopped: false,
+            note: "no existing dig-dns binary — first install, nothing to stop".to_string(),
+        };
+    }
+    if state() != crate::svc::ServiceRunState::Running {
+        return DnsStopOutcome {
+            bin_existed: true,
+            attempted: false,
+            stopped: false,
+            note: "dig-dns is not running as a registered service — nothing to stop (a foreground \
+                   dig-dns process, if any, is covered by the delayed-replace fallback)"
+                .to_string(),
+        };
+    }
+    match stop() {
+        Ok(()) => DnsStopOutcome {
+            bin_existed: true,
+            attempted: true,
+            stopped: true,
+            note: "stopped the running dig-dns service before replacing its binary".to_string(),
+        },
+        Err(e) => DnsStopOutcome {
+            bin_existed: true,
+            attempted: true,
+            stopped: false,
+            note: format!(
+                "could not stop the running dig-dns service ({e}); continuing — the \
+                 delayed-replace fallback stages the new binary if it is still locked"
+            ),
+        },
+    }
+}
+
+/// Stop the dig-dns OS service on the current platform, waiting (bounded) for
+/// it to leave RUNNING so its process exits and releases the binary's file
+/// handle. Dispatches to the per-OS service manager the install registered it
+/// with; a no-op on unsupported platforms.
+fn stop_service_now() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows::stop_service()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::stop_service()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::stop_service()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::svc::ServiceRunState;
 
     const OK_DOCTOR_JSON: &str = r#"{"ok":true,"path_a":true,"path_b":true,"checks":[{"id":"loopback_ip","name":"Loopback IP is up","status":"pass","detail":"up"}]}"#;
     const PAC_JSON: &str = r#"{"loopback_ip":"127.0.0.5","port":80,"tld":"dig","pac":"function FindProxyForURL(url, host) { return \"DIRECT\"; }"}"#;
@@ -319,5 +434,98 @@ mod tests {
         assert!(result.paths_live.is_empty());
         assert_eq!(result.bound_port, None);
         assert_eq!(result.pac_url, None);
+    }
+
+    // -- #544: stop-before-replace decision across the three run-states --------
+    //
+    // These inject the "current service state" + "stop" action, so the
+    // skip-vs-attempt branching is exercised on every OS without a real service
+    // manager or elevation.
+
+    fn existing_bin(tag: &str) -> std::path::PathBuf {
+        let dir = tmp_subdir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("dig-dns");
+        std::fs::write(&p, b"binary").unwrap();
+        p
+    }
+
+    #[test]
+    fn stop_before_replace_skips_when_the_binary_is_absent() {
+        // First install: no prior binary, so nothing to stop even if the probe
+        // (nonsensically) claims RUNNING — must be a skip, never an attempt.
+        let missing = std::env::temp_dir().join(format!(
+            "dig-installer-dns-stop-absent-{}",
+            std::process::id()
+        ));
+        let outcome = stop_before_replace_with(
+            &missing,
+            || ServiceRunState::Running,
+            || panic!("must not attempt a stop when there is no prior binary"),
+        );
+        assert!(!outcome.bin_existed);
+        assert!(!outcome.attempted);
+        assert!(!outcome.stopped);
+    }
+
+    #[test]
+    fn stop_before_replace_stops_a_running_service() {
+        // running-as-service: the binary exists and the OS reports it RUNNING,
+        // so the service is stopped before the write.
+        let bin = existing_bin("stop-running");
+        let outcome = stop_before_replace_with(&bin, || ServiceRunState::Running, || Ok(()));
+        assert!(outcome.bin_existed);
+        assert!(outcome.attempted);
+        assert!(outcome.stopped);
+        let _ = std::fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn stop_before_replace_skips_when_no_service_is_running() {
+        // not-running AND running-as-foreground both present as "no RUNNING
+        // registered service": the stop is skipped (a foreground process is
+        // handled by the resilient write's delayed-replace fallback, not here).
+        for state in [
+            ServiceRunState::Stopped,
+            ServiceRunState::NotFound,
+            ServiceRunState::Unknown,
+        ] {
+            let bin = existing_bin("stop-skip");
+            let outcome = stop_before_replace_with(
+                &bin,
+                move || state,
+                || panic!("must not attempt a stop when no service is RUNNING"),
+            );
+            assert!(outcome.bin_existed);
+            assert!(!outcome.attempted, "state {state:?} must skip the stop");
+            assert!(!outcome.stopped);
+            let _ = std::fs::remove_dir_all(bin.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn stop_before_replace_records_a_stop_failure_without_aborting() {
+        // Unlike dig-node (which aborts), a dig-dns stop failure is non-fatal:
+        // the write's delayed-replace fallback is the safety net. The outcome
+        // records the attempt + points at the fallback, never an Err.
+        let bin = existing_bin("stop-fail");
+        let outcome = stop_before_replace_with(
+            &bin,
+            || ServiceRunState::Running,
+            || Err("access denied".to_string()),
+        );
+        assert!(outcome.attempted);
+        assert!(!outcome.stopped);
+        assert!(
+            outcome.note.contains("could not stop"),
+            "note: {}",
+            outcome.note
+        );
+        assert!(
+            outcome.note.contains("fallback"),
+            "the note must point at the delayed-replace fallback: {}",
+            outcome.note
+        );
+        let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 }

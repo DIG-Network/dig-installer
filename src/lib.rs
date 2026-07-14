@@ -456,21 +456,40 @@ fn apply_update_decision(
     decision
 }
 
-/// Download a resolved component to its dest (no-op on dry-run).
-fn download_component(c: &ComponentResult, dry_run: bool) -> Result<(), InstallError> {
+/// Download a resolved component to its dest (no-op on dry-run). Returns how
+/// the binary was written ([`download::WriteOutcome`]) so a service component's
+/// caller can LOUDLY flag the rare locked-destination reboot-replace fallback
+/// (#544); most callers simply propagate errors with `?` and ignore the Ok.
+fn download_component(
+    c: &ComponentResult,
+    dry_run: bool,
+) -> Result<download::WriteOutcome, InstallError> {
     if dry_run {
-        return Ok(());
+        return Ok(download::WriteOutcome::Replaced);
     }
     download::download_binary(&c.url, std::path::Path::new(&c.dest), None).map_err(|e| {
         // Distinguish a 404 (asset gone) from a transport error from a disk error.
         if e.contains("404") || e.contains("Not Found") {
             InstallError::asset_not_found(e)
-        } else if e.contains("write") || e.contains("create") {
+        } else if e.contains("write") || e.contains("create") || e.contains("stage") {
             InstallError::io(e)
         } else {
             InstallError::network(e)
         }
     })
+}
+
+/// LOUDLY flag the locked-destination reboot-replace fallback (#544): when a
+/// running binary was still held open at write time, its update was staged and
+/// will apply on the next reboot — the user must restart to finish it. A plain
+/// in-place [`download::WriteOutcome::Replaced`] logs nothing extra.
+fn log_write_outcome(log: &mut dyn FnMut(&str), component: &str, outcome: download::WriteOutcome) {
+    if outcome == download::WriteOutcome::ScheduledForReboot {
+        log(&format!(
+            "    ! {component} was still running and locked its binary, so the update was staged \
+             and will apply on the next REBOOT — restart your computer to finish updating {component}."
+        ));
+    }
 }
 
 /// Run the install plan end-to-end, returning a structured [`InstallReport`].
@@ -673,7 +692,8 @@ fn run_report_gated(
                     stop.note
                 ));
             }
-            download_component(&c, plan.dry_run)?;
+            let outcome = download_component(&c, plan.dry_run)?;
+            log_write_outcome(log, "dig-node", outcome);
         }
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
@@ -721,7 +741,23 @@ fn run_report_gated(
                 // than the full clean-reinstall path when Skip.
                 let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
                 if decision.action != update::UpdateAction::Skip {
-                    download_component(&c, plan.dry_run)?;
+                    // #544: stop a running dig-dns service BEFORE overwriting its
+                    // binary — parity with dig-node/dig-relay's #232 stop-before-
+                    // write. dig-dns has no `stop` verb of its own, so the
+                    // installer stops the OS service it registered. A stop
+                    // failure is non-fatal: the resilient write below falls back
+                    // to a reboot-time replace if the binary is still locked.
+                    if !plan.dry_run {
+                        let dest = std::path::Path::new(&c.dest);
+                        let stop = dns::stop_before_replace(dest);
+                        log(&format!(
+                            "    {} {}",
+                            if stop.attempted { "✓" } else { "·" },
+                            stop.note
+                        ));
+                    }
+                    let outcome = download_component(&c, plan.dry_run)?;
+                    log_write_outcome(log, "dig-dns", outcome);
                 }
                 if !plan.dry_run {
                     report.installed.push(c.dest.clone());
@@ -844,7 +880,8 @@ fn run_report_gated(
                 stop.note
             ));
         }
-        download_component(&c, plan.dry_run)?;
+        let outcome = download_component(&c, plan.dry_run)?;
+        log_write_outcome(log, "dig-relay", outcome);
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
         }

@@ -187,6 +187,25 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// The result of writing a component binary to its destination.
+///
+/// Distinguishes the ordinary in-place write from the locked-destination
+/// fallback (#544), so the caller can LOUDLY tell the user when a restart is
+/// required before the new binary takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The bytes were written to the destination — the new binary is live now.
+    Replaced,
+    /// The destination was still locked by a running service/process (on
+    /// Windows a running executable cannot be opened for writing → a sharing
+    /// violation, "os error 32"), so the new binary was STAGED beside it and an
+    /// atomic replace was scheduled for the next reboot
+    /// (`MoveFileEx … MOVEFILE_DELAY_UNTIL_REBOOT`). The old binary keeps
+    /// running until then; the destination is NEVER left half-written. The
+    /// caller must tell the user a restart is required to finish the update.
+    ScheduledForReboot,
+}
+
 /// Download a binary to `dest`, making it executable on unix. If
 /// `expected_sha256` is `Some`, the download is verified before writing and a
 /// mismatch is a hard error (nothing is written).
@@ -194,21 +213,21 @@ pub fn download_binary(
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
-) -> Result<(), String> {
+) -> Result<WriteOutcome, String> {
     let bytes = fetch_bytes(url)?;
     verify_and_write(&bytes, dest, expected_sha256).map_err(|e| e.replace("the artifact", url))
 }
 
 /// Verify `bytes` against `expected_sha256` (if given) and write them to `dest`,
-/// creating the parent dir and marking the file executable on unix. Split out
-/// from [`download_binary`] (which adds the network fetch) so the checksum +
-/// write + perms logic is unit-tested WITHOUT a network. On a checksum mismatch
-/// nothing is written.
+/// creating the parent dir. Split out from [`download_binary`] (which adds the
+/// network fetch) so the checksum + write logic is unit-tested WITHOUT a
+/// network. On a checksum mismatch nothing is written. The write itself goes
+/// through [`replace_binary`], which is resilient to a locked destination.
 fn verify_and_write(
     bytes: &[u8],
     dest: &Path,
     expected_sha256: Option<&str>,
-) -> Result<(), String> {
+) -> Result<WriteOutcome, String> {
     if let Some(expected) = expected_sha256 {
         let got = sha256_hex(bytes);
         if !got.eq_ignore_ascii_case(expected.trim()) {
@@ -220,17 +239,148 @@ fn verify_and_write(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(dest, bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    replace_binary(dest, bytes)
+}
+
+/// Write `bytes` to `dest`, resilient to `dest` being held open by a running
+/// service/process (#544).
+///
+/// On Windows a running executable is locked against being opened for writing,
+/// so a plain in-place write fails with a sharing violation ("os error 32") —
+/// the exact failure a running `dig-dns` service produced when an upgrade tried
+/// to overwrite `dig-dns.exe`. When that happens the new binary is staged beside
+/// `dest` and an atomic replace is scheduled for the next reboot, rather than
+/// aborting with a half-written or missing binary. On unix, replacing a busy
+/// binary in place is permitted, so the write always applies immediately.
+pub fn replace_binary(dest: &Path, bytes: &[u8]) -> Result<WriteOutcome, String> {
+    replace_binary_with(dest, bytes, schedule_replace_on_reboot)
+}
+
+/// [`replace_binary`] with an injectable "schedule the delayed replace" action
+/// — production passes [`schedule_replace_on_reboot`] (the real
+/// `MoveFileEx`-until-reboot staging); tests inject a recorder so the
+/// locked-destination fallback is exercised without touching the system's
+/// pending-rename registry or needing a real reboot.
+fn replace_binary_with(
+    dest: &Path,
+    bytes: &[u8],
+    schedule_on_reboot: impl Fn(&Path, &[u8]) -> Result<(), String>,
+) -> Result<WriteOutcome, String> {
+    match std::fs::write(dest, bytes) {
+        Ok(()) => {
+            set_executable(dest);
+            Ok(WriteOutcome::Replaced)
+        }
+        Err(e) if is_sharing_violation(&e) => {
+            schedule_on_reboot(dest, bytes)?;
+            Ok(WriteOutcome::ScheduledForReboot)
+        }
+        Err(e) => Err(format!("write {}: {e}", dest.display())),
+    }
+}
+
+/// Does this write error mean the destination is locked by another process?
+/// `ERROR_SHARING_VIOLATION` (32) is exactly the "the process cannot access the
+/// file because it is being used by another process" a running Windows service
+/// produces; `ERROR_LOCK_VIOLATION` (33) is its byte-range sibling. Never true
+/// on non-Windows, where a busy binary can be replaced in place.
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(e.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// Mark `dest` executable (owner/group/other) on unix; a no-op on Windows,
+/// where executability is by extension, not a permission bit.
+fn set_executable(dest: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(dest)
-            .map_err(|e| e.to_string())?
-            .permissions();
-        perms.set_mode(0o755);
-        let _ = std::fs::set_permissions(dest, perms);
+        if let Ok(meta) = std::fs::metadata(dest) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(dest, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dest;
+    }
+}
+
+/// The sibling path new bytes are staged to before a delayed replace — a
+/// hidden, pid-tagged neighbour of `dest` so concurrent runs never collide and
+/// a stale stage is recognizable. Windows-only: the delayed-replace fallback it
+/// serves ([`schedule_replace_on_reboot`]) never runs on other platforms.
+#[cfg(windows)]
+fn staging_path(dest: &Path) -> std::path::PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "binary".to_string());
+    dest.with_file_name(format!(".{name}.pending-{}", std::process::id()))
+}
+
+/// Stage `bytes` beside `dest` and schedule an atomic replace of `dest` on the
+/// next reboot. Windows: write the staging file, then `MoveFileExW(staging,
+/// dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT)` so the OS
+/// swaps in the new binary before any process can re-open the still-running old
+/// one. Requires the elevation the install already holds (it records the rename
+/// under `HKLM\SYSTEM\…\PendingFileRenameOperations`).
+#[cfg(windows)]
+fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING,
+    };
+
+    let staging = staging_path(dest);
+    std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
+
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let existing = wide(&staging);
+    let target = wide(dest);
+    // SAFETY: both pointers are NUL-terminated UTF-16 buffers kept alive across
+    // the call; the flags are the documented reboot-replace pair.
+    let ok = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+    };
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!(
+            "could not schedule the reboot-time replace of {} (Win32 error {code})",
+            dest.display()
+        ));
     }
     Ok(())
+}
+
+/// Non-Windows never reaches the delayed-replace fallback ([`is_sharing_violation`]
+/// is always `false` off Windows, since a busy binary is replaceable in place),
+/// so this exists only to satisfy the injection seam's signature.
+#[cfg(not(windows))]
+fn schedule_replace_on_reboot(dest: &Path, _bytes: &[u8]) -> Result<(), String> {
+    Err(format!(
+        "unexpected locked destination replacing {} on a non-Windows host",
+        dest.display()
+    ))
 }
 
 #[cfg(test)]
@@ -388,7 +538,8 @@ mod tests {
     fn verify_and_write_writes_bytes_when_no_checksum_given() {
         let dir = std::env::temp_dir().join(format!("dig-dl-nohash-{}", std::process::id()));
         let dest = dir.join("nested").join("artifact.bin");
-        verify_and_write(b"hello dig", &dest, None).expect("write ok");
+        let outcome = verify_and_write(b"hello dig", &dest, None).expect("write ok");
+        assert_eq!(outcome, WriteOutcome::Replaced);
         // The nested parent dir was created and the bytes round-trip.
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello dig");
     }
@@ -518,5 +669,94 @@ mod tests {
         // itself is covered token-injected above, never via a real env
         // mutation (parallel-test-safe).
         assert_eq!(GITHUB_TOKEN_ENV, "GITHUB_TOKEN");
+    }
+
+    // -- #544: replacing a binary whose file is locked by a running service ----
+    //
+    // The reported P1: an upgrade over a RUNNING dig-dns held `dig-dns.exe`
+    // open, so overwriting it in place failed with "os error 32" (a Windows
+    // sharing violation). `replace_binary` must convert that into a safe,
+    // staged, reboot-time replace instead of a hard error — and never leave a
+    // half-written binary.
+
+    #[test]
+    fn replace_binary_writes_in_place_when_the_destination_is_free() {
+        let dir = std::env::temp_dir().join(format!("dig-dl-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dig-dns-free.bin");
+        let outcome = replace_binary(&dest, b"NEW").expect("an unlocked write applies in place");
+        assert_eq!(outcome, WriteOutcome::Replaced);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_sharing_violation_only_flags_the_lock_error_on_windows() {
+        // A plain not-found error is never a sharing violation on any OS.
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!is_sharing_violation(&not_found));
+    }
+
+    /// The exact user-reported failure, reproduced end-to-end: a running
+    /// service holds its exe open (a handle that shares READ but not WRITE —
+    /// how Windows keeps a running image locked), a naive in-place write hits
+    /// `os error 32`, and `replace_binary_with` instead stages the new bytes +
+    /// reports a reboot is required, leaving the old binary intact. Once the
+    /// holder releases (the service stopped), the in-place write applies.
+    #[cfg(windows)]
+    #[test]
+    fn replace_binary_falls_back_to_a_scheduled_replace_when_the_destination_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        let dir = std::env::temp_dir().join(format!("dig-dl-locked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dig-dns.exe");
+        std::fs::write(&dest, b"OLD BINARY").unwrap();
+
+        // Simulate the running service's lock: a handle sharing only READ, so a
+        // second open requesting WRITE is refused with a sharing violation.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&dest)
+            .expect("open the locked holder handle");
+
+        // The reported bug: a naive in-place write hits ERROR_SHARING_VIOLATION (32).
+        let naive = std::fs::write(&dest, b"NEW BINARY");
+        assert_eq!(
+            naive.unwrap_err().raw_os_error(),
+            Some(32),
+            "must reproduce the exact os error 32 the user reported"
+        );
+        assert!(
+            is_sharing_violation(&std::fs::write(&dest, b"x").unwrap_err()),
+            "the classifier must recognise a real sharing violation"
+        );
+
+        // The fix: stage + schedule instead of erroring, never half-writing dest.
+        let scheduled = std::cell::Cell::new(false);
+        let outcome = replace_binary_with(&dest, b"NEW BINARY", |_dest, _bytes| {
+            scheduled.set(true);
+            Ok(())
+        })
+        .expect("resilient replace must not error on a locked destination");
+        assert_eq!(outcome, WriteOutcome::ScheduledForReboot);
+        assert!(
+            scheduled.get(),
+            "the delayed replace must have been scheduled"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"OLD BINARY",
+            "the destination must be left intact (never half-written) while locked"
+        );
+
+        // Stopping the service releases the handle → the fast in-place path applies.
+        drop(holder);
+        let outcome = replace_binary(&dest, b"NEW BINARY").expect("write succeeds once unlocked");
+        assert_eq!(outcome, WriteOutcome::Replaced);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW BINARY");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
