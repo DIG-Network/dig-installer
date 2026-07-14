@@ -57,6 +57,7 @@ pub mod paths;
 pub mod proc;
 pub mod release;
 pub mod scheme;
+pub mod secure;
 pub mod service;
 pub mod svc;
 pub mod target;
