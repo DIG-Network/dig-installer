@@ -510,21 +510,25 @@ mod tests {
 
     #[test]
     fn legacy_windows_roots_are_the_old_user_writable_appdata_dirs() {
+        // Compare by path COMPONENTS (separator-agnostic) so the test is correct
+        // whether it runs on a Windows or a unix CI host: `legacy_privileged_roots`
+        // is host-based, so on a unix runner the same call yields a forward-slash
+        // `<data_local>/Programs/DIG/bin` — the components are what matter.
         let roots = legacy_privileged_roots(Os::Windows);
         assert_eq!(
             roots.len(),
             2,
             "both the DIG and older DigStore AppData dirs"
         );
-        let joined = roots
-            .iter()
-            .map(|p| p.to_string_lossy().to_lowercase())
-            .collect::<Vec<_>>()
-            .join("|");
-        assert!(joined.contains("programs") && joined.contains(r"dig\bin"));
         assert!(
-            joined.contains(r"digstore\bin"),
-            "must include the older DigStore location: {joined}"
+            roots[0].ends_with("Programs/DIG/bin"),
+            "first legacy root must be …/Programs/DIG/bin: {}",
+            roots[0].display()
+        );
+        assert!(
+            roots[1].ends_with("Programs/DigStore/bin"),
+            "must include the older DigStore location: {}",
+            roots[1].display()
         );
     }
 
