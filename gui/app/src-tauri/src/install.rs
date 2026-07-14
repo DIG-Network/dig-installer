@@ -31,6 +31,8 @@ use tauri::{AppHandle, Emitter};
 #[cfg(not(embed_digstore))]
 use tauri::Manager;
 
+use dig_installer::proc::HideConsole;
+
 // ---- Embedded payload (single-file install) ----------------------------------
 // When the release build staged a `digstore` binary, build.rs embedded it (and
 // its SHA-256) so the installer is a single self-contained executable with no
@@ -416,6 +418,7 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     emit_pct(app, 92.0, Some("digstore --version"));
     let out = Command::new(&dest_bin)
         .arg("--version")
+        .hide_console()
         .output()
         .map_err(|e| {
             let msg = format!("verify failed: could not run {}: {e}", dest_bin.display());

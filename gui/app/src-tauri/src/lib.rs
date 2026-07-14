@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
+
+use dig_installer::proc::HideConsole;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Serialize)]
@@ -68,7 +70,11 @@ fn bundled_version(app: &AppHandle) -> Option<String> {
             .join("bin")
             .join(install::bin_name())
     };
-    let out = Command::new(&bin).arg("--version").output().ok()?;
+    let out = Command::new(&bin)
+        .arg("--version")
+        .hide_console()
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     // "digstore 0.1.0" → "0.1.0"
     s.split_whitespace().nth(1).map(|v| v.to_string())

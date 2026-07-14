@@ -497,13 +497,18 @@ Close · Launch Terminal) always fits without clipping the primary action.
 
 ### 6.1 No flashing console windows (Windows)
 
-Every child process the installer spawns — the Windows console helpers (`sc`, `net`, `netsh`,
-`powershell`, `icacls`, `whoami`, `cmd`) and the delegated `dig-node`/`dig-dns`/`dig-updater` verbs —
-is launched with the Win32 `CREATE_NO_WINDOW` (`0x08000000`) creation flag so no console window
-flashes on screen or steals focus during an install. This is applied crate-wide through the single
-`proc::HideConsole::hide_console()` helper (a no-op on non-Windows targets) rather than a flag
-sprinkled at each call site. The flag suppresses only the console: stdio capture (`.output()`) and
-child exit codes are unchanged.
+Every non-interactive child process the installer spawns is launched with the Win32 `CREATE_NO_WINDOW`
+(`0x08000000`) creation flag so no console window flashes on screen or steals focus during an install.
+This includes the library crate's Windows console helpers (`sc`, `net`, `netsh`, `powershell`, `icacls`,
+`whoami`, `cmd`), delegated `dig-node`/`dig-dns`/`dig-updater` verbs, and the GUI backend's internal
+version-probe spawns (checking the bundled digstore binary version during startup and verification
+post-install). This is applied consistently through the single `proc::HideConsole::hide_console()` helper
+(a no-op on non-Windows targets) rather than a flag sprinkled at each call site.
+
+User-initiated spawns — the `launch_terminal()` command that opens a terminal at the install directory —
+are intentionally launched with visible console windows so the user can interact with the terminal.
+
+The flag suppresses only the console: stdio capture (`.output()`) and child exit codes are unchanged.
 
 ## 7. Version-aware updater (issue #309)
 
