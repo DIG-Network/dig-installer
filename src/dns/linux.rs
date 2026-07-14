@@ -17,6 +17,7 @@ use service_manager::{
 
 use super::plan;
 use super::{doctor, DnsInstallConfig, DnsInstallResult, DnsUninstallResult};
+use crate::proc::HideConsole;
 
 const RESOLVED_DROPIN: &str = "/etc/systemd/resolved.conf.d/dig.conf";
 const NM_DNSMASQ_CONF: &str = "/etc/NetworkManager/dnsmasq.d/dig.conf";
@@ -99,6 +100,7 @@ fn wait_until_not_running(max_wait: Duration) {
 pub fn is_root() -> bool {
     Command::new("id")
         .arg("-u")
+        .hide_console()
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
         .unwrap_or(false)
@@ -165,6 +167,7 @@ fn user_exists(user: &str) -> bool {
         .arg(user)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .hide_console()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -183,6 +186,7 @@ fn ensure_service_user(user: &str) -> Result<bool, String> {
             "/usr/sbin/nologin",
             user,
         ])
+        .hide_console()
         .status()
         .map_err(|e| format!("useradd {user}: {e}"))?;
     if status.success() {
@@ -230,6 +234,7 @@ fn configure_split_dns(ip: &str) -> (Vec<String>, Vec<String>) {
                 Ok(true) | Ok(false) => {
                     let _ = Command::new("systemctl")
                         .args(["reload-or-restart", "systemd-resolved"])
+                        .hide_console()
                         .status();
                     notes.push(format!(
                         "configured systemd-resolved split-DNS ({RESOLVED_DROPIN})"
@@ -247,6 +252,7 @@ fn configure_split_dns(ip: &str) -> (Vec<String>, Vec<String>) {
                 Ok(true) | Ok(false) => {
                     let _ = Command::new("systemctl")
                         .args(["reload", "NetworkManager"])
+                        .hide_console()
                         .status();
                     notes.push(format!(
                         "configured NetworkManager-dnsmasq split-DNS ({NM_DNSMASQ_CONF})"
@@ -272,12 +278,14 @@ fn remove_split_dns() -> Vec<String> {
     if let Ok(true) = remove_if_ours(Path::new(RESOLVED_DROPIN)) {
         let _ = Command::new("systemctl")
             .args(["reload-or-restart", "systemd-resolved"])
+            .hide_console()
             .status();
         removed.push(RESOLVED_DROPIN.to_string());
     }
     if let Ok(true) = remove_if_ours(Path::new(NM_DNSMASQ_CONF)) {
         let _ = Command::new("systemctl")
             .args(["reload", "NetworkManager"])
+            .hide_console()
             .status();
         removed.push(NM_DNSMASQ_CONF.to_string());
     }
@@ -489,6 +497,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     if user_exists(plan::LINUX_SERVICE_USER)
         && Command::new("userdel")
             .arg(plan::LINUX_SERVICE_USER)
+            .hide_console()
             .status()
             .map(|s| s.success())
             .unwrap_or(false)

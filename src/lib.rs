@@ -48,6 +48,7 @@ pub mod health;
 pub mod hosts;
 pub mod pathcheck;
 pub mod paths;
+pub mod proc;
 pub mod release;
 pub mod scheme;
 pub mod service;

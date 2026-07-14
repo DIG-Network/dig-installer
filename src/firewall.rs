@@ -293,8 +293,10 @@ pub fn close(program: &Path, dry_run: bool) -> FirewallResult {
 
 #[cfg(windows)]
 fn run_netsh(args: &[String]) -> Result<String, String> {
+    use crate::proc::HideConsole;
     let out = std::process::Command::new("netsh")
         .args(args)
+        .hide_console()
         .output()
         .map_err(|e| format!("spawn netsh: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -351,8 +353,10 @@ fn windows_close(port: u16) -> FirewallResult {
 
 #[cfg(target_os = "macos")]
 fn run_socketfilterfw(args: &[String]) -> Result<String, String> {
+    use crate::proc::HideConsole;
     let out = std::process::Command::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
         .args(args)
+        .hide_console()
         .output()
         .map_err(|e| format!("spawn socketfilterfw: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

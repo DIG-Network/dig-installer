@@ -30,6 +30,7 @@
 //! Layering: the per-OS output PARSERS are pure + unit-tested; the spawns live
 //! in [`service_run_state`].
 
+use crate::proc::HideConsole;
 use crate::target::Os;
 
 /// Canonical dig-node service id (reverse-DNS) and human display name (#494).
@@ -156,6 +157,7 @@ pub fn service_display_name(id: &str) -> Option<String> {
         let out = std::process::Command::new("sc")
             .arg("qc")
             .arg(id)
+            .hide_console()
             .output()
             .ok()?;
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -208,7 +210,11 @@ fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
     use std::process::Command;
     match os {
         Os::Windows => {
-            let out = Command::new("sc").arg("query").arg(id).output();
+            let out = Command::new("sc")
+                .arg("query")
+                .arg(id)
+                .hide_console()
+                .output();
             match out {
                 Ok(o) => {
                     let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -228,6 +234,7 @@ fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
             let out = Command::new("launchctl")
                 .arg("print")
                 .arg(format!("system/{id}"))
+                .hide_console()
                 .output();
             match out {
                 Ok(o) if o.status.success() => {
@@ -322,6 +329,7 @@ fn linux_unit_name(id: &str) -> String {
 fn query_systemctl_is_active(extra_args: &[&str]) -> ServiceRunState {
     match std::process::Command::new("systemctl")
         .args(extra_args)
+        .hide_console()
         .output()
     {
         Ok(o) => parse_systemctl_is_active(&String::from_utf8_lossy(&o.stdout)),

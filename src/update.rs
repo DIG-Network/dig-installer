@@ -26,6 +26,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::proc::HideConsole;
 use crate::release::Repo;
 
 /// What a version probe found at a component's install destination.
@@ -230,7 +231,11 @@ pub fn decide_with_force(
 /// probe instead of spawning a real process (mirrors
 /// `service::stop_running_dig_node_with`'s injectable "is serving" pattern).
 fn spawn_version_probe(bin_path: &Path) -> Option<String> {
-    let out = Command::new(bin_path).arg("--version").output().ok()?;
+    let out = Command::new(bin_path)
+        .arg("--version")
+        .hide_console()
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

@@ -165,6 +165,28 @@ export async function openDocs() {
   }
 }
 
+/* closeWindow — close the installer window (the Finish-view Close button, so
+ * the user always has a one-click way out once the install is done). In Tauri
+ * it asks the current window to close (the same `getCurrentWindow().close()`
+ * the title-bar close control uses); in a plain browser (dev/preview) it falls
+ * back to `window.close()` so the button is still demonstrable. */
+export async function closeWindow() {
+  if (_tauri) {
+    try {
+      const win = await import("@tauri-apps/api/window");
+      await win.getCurrentWindow().close();
+      return;
+    } catch {
+      /* fall through to the web fallback */
+    }
+  }
+  try {
+    window.close();
+  } catch {
+    /* nothing else to do outside a closable window */
+  }
+}
+
 /* runInstall — drives the real pipeline. Resolves when the install finishes
  * (success or error). Streams updates through the callbacks. */
 export async function runInstall(opts, { onProgress, onError, onDone }) {

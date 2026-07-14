@@ -44,6 +44,7 @@
 
 use std::path::PathBuf;
 
+use crate::proc::HideConsole;
 use crate::target::Os;
 
 /// Well-known SIDs (locale-independent — icacls/Get-Acl accept + emit these).
@@ -330,6 +331,7 @@ pub fn parse_acl_verify(output: &str, user_sid: &str) -> Result<(), String> {
 fn current_user_sid() -> Result<String, String> {
     let out = std::process::Command::new("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
+        .hide_console()
         .output()
         .map_err(|e| format!("whoami /user failed to run: {e}"))?;
     if !out.status.success() {
@@ -354,6 +356,7 @@ fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
     );
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .hide_console()
         .output()
         .ok()?;
     if !out.status.success() {
@@ -372,6 +375,7 @@ fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
 fn run_icacls(args: &[String]) -> Result<(), String> {
     let out = std::process::Command::new("icacls")
         .args(args)
+        .hide_console()
         .output()
         .map_err(|e| format!("icacls failed to run: {e}"))?;
     if out.status.success() {
@@ -394,6 +398,7 @@ fn read_and_verify_acl(path: &std::path::Path, user_sid: &str) -> Result<(), Str
     let ps = acl_verify_ps_command(&path.to_string_lossy());
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .hide_console()
         .output()
         .map_err(|e| format!("Get-Acl read-back failed to run: {e}"))?;
     if !out.status.success() {
@@ -592,6 +597,7 @@ fn ensure_one_unix(
         if !user.is_empty() {
             let _ = std::process::Command::new("setfacl")
                 .args(["-m", &format!("u:{user}:rx"), &d.path.to_string_lossy()])
+                .hide_console()
                 .status();
         }
     }

@@ -26,6 +26,7 @@ use service_manager::{
 
 use super::plan;
 use super::{doctor, DnsInstallConfig, DnsInstallResult, DnsUninstallResult};
+use crate::proc::HideConsole;
 
 const RESOLVER_PATH: &str = "/etc/resolver/dig";
 /// Where an org's MDM-provisioned Chrome managed preferences normally live —
@@ -55,6 +56,7 @@ fn service_registered(label: &str) -> bool {
         .args(["print", &format!("system/{label}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .hide_console()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -70,6 +72,7 @@ fn clean_remove_existing(label: &str) {
         .args(["bootout", &format!("system/{label}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .hide_console()
         .status();
     let _ =
         std::fs::remove_file(Path::new("/Library/LaunchDaemons").join(format!("{label}.plist")));
@@ -111,6 +114,7 @@ fn wait_until_not_running(max_wait: Duration) {
 pub fn is_root() -> bool {
     Command::new("id")
         .arg("-u")
+        .hide_console()
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
         .unwrap_or(false)
@@ -138,6 +142,7 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
 fn ensure_lo0_alias_now(ip: &str) -> Result<bool, String> {
     let out = Command::new("ifconfig")
         .arg("lo0")
+        .hide_console()
         .output()
         .map_err(|e| format!("ifconfig lo0: {e}"))?;
     if String::from_utf8_lossy(&out.stdout).contains(ip) {
@@ -145,6 +150,7 @@ fn ensure_lo0_alias_now(ip: &str) -> Result<bool, String> {
     }
     let status = Command::new("ifconfig")
         .args(["lo0", "alias", ip, "up"])
+        .hide_console()
         .status()
         .map_err(|e| format!("ifconfig lo0 alias {ip} up: {e}"))?;
     if status.success() {
@@ -159,6 +165,7 @@ fn ensure_lo0_alias_now(ip: &str) -> Result<bool, String> {
 fn remove_lo0_alias_now(ip: &str) -> Result<bool, String> {
     let out = Command::new("ifconfig")
         .arg("lo0")
+        .hide_console()
         .output()
         .map_err(|e| format!("ifconfig lo0: {e}"))?;
     if !String::from_utf8_lossy(&out.stdout).contains(ip) {
@@ -166,6 +173,7 @@ fn remove_lo0_alias_now(ip: &str) -> Result<bool, String> {
     }
     let status = Command::new("ifconfig")
         .args(["lo0", "-alias", ip])
+        .hide_console()
         .status()
         .map_err(|e| format!("ifconfig lo0 -alias {ip}: {e}"))?;
     Ok(status.success())

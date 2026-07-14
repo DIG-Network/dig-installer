@@ -489,6 +489,22 @@ including the §2 stop/write/start lifecycle and the beacon's own scheduler-regi
 via a pure `plan_from_selection(selected, bin_dir) -> InstallPlan` mapping (`install.rs`) — the GUI
 never reimplements release resolution, download, service, or scheduler control.
 
+The Done screen exposes a **Close** action (`bridge.js` `closeWindow` → Tauri `getCurrentWindow().close()`,
+the same window op the title-bar close control uses) beside the primary **Launch Terminal**, so the
+user always has a one-click exit on the final step (never trapped). The window opens at 1080×720 and
+enforces a minimum of **980×600** — 980 wide so the three-action Done footer (Open Documentation ·
+Close · Launch Terminal) always fits without clipping the primary action.
+
+### 6.1 No flashing console windows (Windows)
+
+Every child process the installer spawns — the Windows console helpers (`sc`, `net`, `netsh`,
+`powershell`, `icacls`, `whoami`, `cmd`) and the delegated `dig-node`/`dig-dns`/`dig-updater` verbs —
+is launched with the Win32 `CREATE_NO_WINDOW` (`0x08000000`) creation flag so no console window
+flashes on screen or steals focus during an install. This is applied crate-wide through the single
+`proc::HideConsole::hide_console()` helper (a no-op on non-Windows targets) rather than a flag
+sprinkled at each call site. The flag suppresses only the console: stdio capture (`.output()`) and
+child exit codes are unchanged.
+
 ## 7. Version-aware updater (issue #309)
 
 `dig-installer` is not just an installer — a bare re-run is a version-aware UPDATER: for each of

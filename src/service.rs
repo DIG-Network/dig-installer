@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use crate::proc::HideConsole;
+
 /// Configuration for the dig-node service the installer will register.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceConfig {
@@ -153,6 +155,7 @@ fn parse_dig_node_serving(status_stdout: &[u8]) -> Option<bool> {
 fn dig_node_is_serving(bin: &Path) -> bool {
     Command::new(bin)
         .args(status_json_args())
+        .hide_console()
         .output()
         .ok()
         .and_then(|out| parse_dig_node_serving(&out.stdout))
@@ -311,6 +314,7 @@ fn parse_dig_relay_serving(status_stdout: &[u8]) -> Option<bool> {
 fn dig_relay_is_serving(bin: &Path) -> bool {
     Command::new(bin)
         .args(status_json_args())
+        .hide_console()
         .output()
         .ok()
         .and_then(|out| parse_dig_relay_serving(&out.stdout))
@@ -407,6 +411,7 @@ pub(crate) fn run_capturing(
         cmd.env(k, v);
     }
     let output = cmd
+        .hide_console()
         .output()
         .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
     if !output.status.success() {
