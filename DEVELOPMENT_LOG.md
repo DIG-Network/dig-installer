@@ -3,6 +3,23 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## #565: a security-relevant predicate swap must sweep EVERY gate, not one
+
+Closing the #565 LPE decoupled the ACL verify from `installs_a_protected_component`
+(which is `false` under any `--bin-dir` override) onto `privileged_install_root`.
+The first pass applied that ONLY to the verify and left the legacy-root MIGRATION
+and the post-install binPath AUDIT still gated on the old predicate — so on a
+`--bin-dir`/GUI install (the exact path the GUI passes + the e2e uses) both were
+SILENTLY skipped, and a pre-#565 legacy-bound service/beacon registration was never
+vacated or flagged: readiness reported ready and the escalation survived. Lesson:
+when a security fix changes WHICH predicate a decision keys on, grep every call
+site of the old predicate and move them together (or funnel them through one named
+gate — here `InstallPlan::installs_a_privileged_binary`), then prove it with a test
+that a custom-`--bin-dir` privileged install still migrates + audits. A CI leg that
+only ever runs with `--bin-dir` can also make a "no legacy registration" assertion
+VACUOUS (empty audit list) — assert the audit array is non-empty (it actually ran)
+and add a seeded-legacy default-root leg so the migration path is exercised for real.
+
 ## Auto-update beacon registration (#514): `dig-updater schedule install` is idempotent — unlike dig-node's `install`
 
 dig-node's own `install` verb is NOT idempotent (task #232's whole reason for the stop-before-write/

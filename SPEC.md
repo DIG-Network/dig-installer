@@ -271,13 +271,19 @@ scheduled task via `schtasks /Query /XML` / systemd / launchd (`regaudit::audit`
 id / task path — never by executing the binary) — and REFUSES ready if any still resolves UNDER a
 legacy/user-writable root. This catches a service a tolerated "already exists" re-install left
 pointing at the writable legacy path, and an orphaned registration a component opt-out stranded.
-Recorded in `InstallReport.registration_audit`.
+Like the ACL verify, this audit runs whenever the plan installs a privileged binary ANYWHERE
+(`InstallPlan::installs_a_privileged_binary`, DECOUPLED from `installs_a_protected_component`), so it
+fires on a `--bin-dir`/GUI privileged install too — not only the default protected root. Recorded in
+`InstallReport.registration_audit`.
 
-**Migration (existing installs).** On a re-run that detects DIG binaries in a legacy user-writable
-root (`%LOCALAPPDATA%\Programs\{DIG,DigStore}\bin` on Windows; the privileged binaries in `~/.dig/bin`
-on unix) OR a privileged registration still pointing under one, the installer re-points the install
-onto the protected root (`migrate` module): it deregisters EVERY privileged registration whose binary
-resolves under a legacy root — INDEPENDENT of the current plan — the dig-node/dig-relay/dig-dns
+**Migration (existing installs).** Gated on the SAME `installs_a_privileged_binary` predicate as the
+audit (so it runs on a `--bin-dir`/GUI privileged install too, not only the default protected root;
+the migration only ever ACTS on legacy roots, never the chosen dir): on a re-run that detects DIG
+binaries in a legacy user-writable root (`%LOCALAPPDATA%\Programs\{DIG,DigStore}\bin` on Windows; the
+privileged binaries in `~/.dig/bin` on unix) OR a privileged registration still pointing under one,
+the installer re-points the install onto the protected root (`migrate` module): it deregisters EVERY
+privileged registration whose binary resolves under a legacy root — INDEPENDENT of the current plan —
+the dig-node/dig-relay/dig-dns
 services BY ID *and the SYSTEM auto-update beacon scheduled task* by its own scheduler tool
 (`schtasks /Delete` / systemd-timer disable / launchd bootout), so a component OMITTED from the run
 cannot keep an auto-start service or daily SYSTEM task registered against a replaceable legacy

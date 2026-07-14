@@ -219,6 +219,12 @@ pub fn regs_pointing_under_legacy(os: Os) -> Vec<PrivilegedReg> {
 /// Compares the leading directory prefix, case-insensitively + separator-agnostic
 /// on Windows (matching [`paths::path_append`]), so `<root>\x.exe run` is caught
 /// regardless of trailing args. Pure.
+///
+// #565 follow-up (Fable N1): this is a BLOCKLIST of known legacy roots. A stronger
+// posture is an ALLOWLIST — "a privileged binPath MUST resolve under
+// `protected_bin_dir`" — which also refuses a binPath under an unknown
+// user-writable path (a junction / 8.3 short-name / non-DIG dir). Deferred to keep
+// this fix scoped; tracked as a follow-up hardening ticket.
 pub fn bin_path_under_any(bin_path: &str, roots: &[PathBuf], os: Os) -> bool {
     let field = strip_leading_quote(bin_path);
     roots.iter().any(|root| path_has_prefix(field, root, os))

@@ -212,10 +212,17 @@ impl InstallPlan {
         self.bin_dir != paths::default_bin_dir()
     }
 
-    /// Will this plan place at least one binary into the admin-only
+    /// Will this plan place at least one binary into the DEFAULT admin-only
     /// [`paths::protected_bin_dir`] (#565)? True when a selected component is
     /// [`paths::is_privileged_component`] AND no `--bin-dir` override redirected
-    /// it. Gates creating/hardening + verifying the protected root.
+    /// it — so it is `false` under any `--bin-dir` override.
+    ///
+    /// This answers "does a privileged binary land in the built-in protected
+    /// root?" — NOT "does this plan install a privileged binary at all?" The
+    /// #565 gates (migration + audit + ACL verify) must fire on a `--bin-dir`
+    /// privileged install too, so they gate on [`Self::installs_a_privileged_binary`]
+    /// / [`Self::privileged_install_root`] instead; this predicate is retained to
+    /// express the narrower default-root question.
     pub fn installs_a_protected_component(&self, os: target::Os) -> bool {
         if self.has_custom_bin_dir() {
             return false;
@@ -242,6 +249,27 @@ impl InstallPlan {
             .into_iter()
             .find(|c| paths::is_privileged_component(os, c))?;
         Some(self.bin_dir_for(component, os))
+    }
+
+    /// Whether this plan installs a privileged/service-executed binary ANYWHERE —
+    /// the admin-only protected root by default OR a custom `--bin-dir`/GUI dir
+    /// (`true` exactly when [`Self::privileged_install_root`] is `Some`). This is
+    /// the ONE gate for the #565 privileged-registration maintenance both the
+    /// legacy-root migration (§ [`migrate::migrate_from_legacy_roots`]) and the
+    /// post-install binPath audit (§ [`regaudit::audit`]) run under.
+    ///
+    /// Deliberately DECOUPLED from [`Self::installs_a_protected_component`] — the
+    /// same decoupling H3 applied to the ACL verify. That predicate is `false`
+    /// under a `--bin-dir` override (the path the GUI passes + the e2e uses), so
+    /// gating on it SKIPPED the migration + audit there: a pre-#565 legacy-bound
+    /// service/beacon registration was never vacated or flagged, readiness
+    /// reported ready, and a non-admin could overwrite the legacy binary to run
+    /// code as SYSTEM. Gating on this predicate closes that residual — the
+    /// maintenance runs whenever a privileged binary is placed, on every path.
+    /// (Both the migration and the audit only ever ACT on legacy roots, never the
+    /// custom dir, so running them on a `--bin-dir` install is safe.)
+    pub fn installs_a_privileged_binary(&self, os: target::Os) -> bool {
+        self.privileged_install_root(os).is_some()
     }
 
     /// The component ids this plan will install (before per-OS availability
@@ -712,8 +740,12 @@ fn run_report_gated(
     //    0755`; Windows inherits Program Files' admin-only DACL) — BEFORE placing
     //    any privileged binary in it. The migration stops + re-points services by
     //    canonical id via the OS service manager; it NEVER executes a binary from
-    //    the (possibly attacker-replaced) legacy user-writable dir.
-    if !plan.dry_run && plan.installs_a_protected_component(target.os) {
+    //    the (possibly attacker-replaced) legacy user-writable dir. Gated on
+    //    `installs_a_privileged_binary` — DECOUPLED from
+    //    `installs_a_protected_component` so it runs on a `--bin-dir`/GUI
+    //    privileged install too (the migration only acts on legacy roots, never
+    //    the custom dir): otherwise a legacy-bound registration would survive.
+    if !plan.dry_run && plan.installs_a_privileged_binary(target.os) {
         let migration = migrate::migrate_from_legacy_roots(&target, log);
         if migration.migrated {
             report.migration = Some(migration);
@@ -1212,9 +1244,11 @@ fn run_report_gated(
         //    the binary). A registration still resolving under a legacy/
         //    user-writable root — a service the tolerated re-install left there, or
         //    an orphaned SYSTEM beacon task a component opt-out stranded — makes the
-        //    install NOT ready ([`evaluate_readiness`]). Runs on the migration path
-        //    (a privileged component into the default protected root).
-        if plan.installs_a_protected_component(target.os) {
+        //    install NOT ready ([`evaluate_readiness`]). Gated on
+        //    `installs_a_privileged_binary` (the SAME gate as the migration above),
+        //    so it fires whenever a privileged binary is placed — including on a
+        //    `--bin-dir`/GUI install, not only the default protected root.
+        if plan.installs_a_privileged_binary(target.os) {
             log("Auditing that every privileged registration runs from the protected root:");
             report.registration_audit = regaudit::audit(target.os);
             for a in &report.registration_audit {
@@ -3733,6 +3767,96 @@ mod tests {
         assert!(
             failures.iter().any(|f| f.contains("install root")),
             "a privileged install into a user-writable custom dir must refuse ready: {failures:?}"
+        );
+    }
+
+    /// #565 residual — H3 was HALF-applied. The prior fix decoupled the ACL VERIFY
+    /// (above) from `installs_a_protected_component`, but left the legacy-root
+    /// MIGRATION and the post-install binPath AUDIT gated on it — so on a
+    /// `--bin-dir` privileged install (the path the GUI passes + the e2e uses) both
+    /// were SKIPPED: a pre-#565 legacy-bound service/beacon registration was never
+    /// vacated or flagged, readiness reported ready, and a non-admin could overwrite
+    /// the legacy binary to run code as SYSTEM. Both gates now fire whenever a
+    /// privileged binary is installed anywhere (`installs_a_privileged_binary`), so
+    /// the audit populates the report and `evaluate_readiness` REFUSES ready.
+    /// A privileged install into a custom `--bin-dir`, host-INDEPENDENT: dig-dns is
+    /// a privileged (service-executed) component on EVERY OS (unlike dig-node, which
+    /// is user-level on unix), so `installs_a_privileged_binary` is true on any CI
+    /// host. `base_plan` already uses a custom temp bin dir (`has_custom_bin_dir`).
+    fn custom_bin_dir_privileged_plan() -> InstallPlan {
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        plan.dry_run = false;
+        plan
+    }
+
+    #[test]
+    fn custom_bin_dir_install_still_migrates_and_audits_legacy_registrations() {
+        let host = Target::current().expect("supported host").os;
+        let plan = custom_bin_dir_privileged_plan();
+        assert!(
+            plan.has_custom_bin_dir(),
+            "test premise: a --bin-dir override"
+        );
+
+        // RED DRIVER: the migration + binPath-audit gate MUST fire on this path …
+        assert!(
+            plan.installs_a_privileged_binary(host),
+            "a --bin-dir privileged install must run the #565 migration + binPath audit"
+        );
+        // … even though the default-root-only predicate stays off for a custom dir
+        // (documenting the exact half-applied H3 hole this closes).
+        assert!(
+            !plan.installs_a_protected_component(host),
+            "installs_a_protected_component is false under --bin-dir — why the old gate wrongly skipped"
+        );
+
+        // Consequence, now that the audit runs on this path: a legacy-bound
+        // registration it surfaces refuses ready. (Pre-fix the gate was OFF, so the
+        // audit never ran, `registration_audit` stayed empty, and readiness wrongly
+        // reported ready — the SYSTEM-code-exec the residual left open.) The dig-dns
+        // service itself is healthy, so the legacy audit is the SOLE failure.
+        let mut report = report_shell();
+        report.dns = Some(dns::DnsInstallResult {
+            installed: true,
+            started: true,
+            service_running: true,
+            needs_elevation: false,
+            note: "registered".to_string(),
+            doctor: None,
+            paths_live: vec!["dns".to_string()],
+            bound_port: None,
+            pac_url: None,
+            fallback_instruction: None,
+        });
+        report.registration_audit = vec![regaudit::RegistrationAudit {
+            registration: "dig-dns".to_string(),
+            bin_path: Some("/home/me/.dig/bin/dig-dns".to_string()),
+            under_legacy_root: true,
+            note: "dig-dns runs a binary under a user-writable legacy root".to_string(),
+        }];
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-dns") && failures[0].contains("legacy"));
+    }
+
+    /// #565 residual — the migration must NOT be skipped on a `--bin-dir` privileged
+    /// install. The migration gate is `!dry_run && installs_a_privileged_binary(os)`:
+    /// assert it fires for the custom-dir privileged non-dry-run case (it did not
+    /// before this fix) and is still (correctly) skipped on a dry-run.
+    #[test]
+    fn custom_bin_dir_privileged_install_does_not_skip_migration() {
+        let host = Target::current().expect("supported host").os;
+        let mut plan = custom_bin_dir_privileged_plan();
+        let migration_runs = |p: &InstallPlan| !p.dry_run && p.installs_a_privileged_binary(host);
+        assert!(
+            migration_runs(&plan),
+            "the #565 migration must run on a --bin-dir privileged install"
+        );
+        plan.dry_run = true;
+        assert!(
+            !migration_runs(&plan),
+            "a dry-run installs nothing, so it must never run the migration"
         );
     }
 
