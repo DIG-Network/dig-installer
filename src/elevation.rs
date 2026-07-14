@@ -14,6 +14,7 @@
 //! [`reason`]/[`remedy`] so both the CLI and the GUI surface identical copy.
 
 use crate::error::InstallError;
+use crate::proc::HideConsole;
 use crate::target::{Os, Target};
 
 /// The per-OS runtime elevation probe.
@@ -43,6 +44,7 @@ fn is_elevated_windows() -> bool {
         .arg("session")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .hide_console()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -52,6 +54,7 @@ fn is_elevated_windows() -> bool {
 fn is_elevated_unix() -> bool {
     std::process::Command::new("id")
         .arg("-u")
+        .hide_console()
         .output()
         .ok()
         .and_then(|o| parse_id_u(&o.stdout))
@@ -148,7 +151,11 @@ pub fn guard(elevated: bool, is_system: bool, target: &Target) -> Result<(), Ins
 pub fn is_system() -> bool {
     #[cfg(windows)]
     {
-        match std::process::Command::new("whoami").arg("/user").output() {
+        match std::process::Command::new("whoami")
+            .arg("/user")
+            .hide_console()
+            .output()
+        {
             Ok(o) if o.status.success() => parse_whoami_is_system(&o.stdout),
             // FAIL CLOSED: if the identity cannot be determined (whoami failed to
             // spawn or exited non-zero) we must NOT proceed as an interactive user

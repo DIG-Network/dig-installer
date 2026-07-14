@@ -11,6 +11,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use super::plan::{self, DoctorSummary, PacInfo};
+use crate::proc::HideConsole;
 
 /// Run `<dig_dns_bin> doctor --json`, capturing stdout regardless of the
 /// child's exit code (a non-zero exit is dig-dns's OWN "not fully live"
@@ -20,6 +21,7 @@ pub fn run_doctor(dig_dns_bin: &Path) -> Result<DoctorSummary, String> {
     let output = Command::new(dig_dns_bin)
         .arg("doctor")
         .arg("--json")
+        .hide_console()
         .output()
         .map_err(|e| format!("could not run {} doctor: {e}", dig_dns_bin.display()))?;
     plan::parse_doctor_json(&String::from_utf8_lossy(&output.stdout))
@@ -31,6 +33,7 @@ pub fn run_pac(dig_dns_bin: &Path) -> Result<PacInfo, String> {
     let output = Command::new(dig_dns_bin)
         .arg("pac")
         .arg("--json")
+        .hide_console()
         .output()
         .map_err(|e| format!("could not run {} pac: {e}", dig_dns_bin.display()))?;
     plan::parse_pac_json(&String::from_utf8_lossy(&output.stdout))

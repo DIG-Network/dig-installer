@@ -16,6 +16,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::proc::HideConsole;
+
 /// The result of verifying one CLI resolves on PATH.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CliPathCheck {
@@ -67,6 +69,7 @@ pub fn cli_resolves(bin_dir: &Path, exe_name: &str) -> Result<String, String> {
     let out = Command::new(exe_name)
         .arg("--version")
         .env("PATH", &path)
+        .hide_console()
         .output()
         .map_err(|e| format!("`{exe_name}` did not resolve on PATH ({e})"))?;
     if !out.status.success() {

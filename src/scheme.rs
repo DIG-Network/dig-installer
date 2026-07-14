@@ -352,6 +352,7 @@ fn desktop_file_path() -> Option<std::path::PathBuf> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn register_linux(bin: &Path, schemes: &[String]) -> SchemeResult {
+    use crate::proc::HideConsole;
     use std::process::Command;
     let refs: Vec<&str> = schemes.iter().map(String::as_str).collect();
     let body = linux_desktop_contents(bin, &refs);
@@ -384,7 +385,10 @@ fn register_linux(bin: &Path, schemes: &[String]) -> SchemeResult {
     let desktop_name = path.file_name().unwrap().to_string_lossy().into_owned();
     // Best-effort: refresh the desktop DB + set as default for each scheme.
     if let Some(dir) = path.parent() {
-        let _ = Command::new("update-desktop-database").arg(dir).status();
+        let _ = Command::new("update-desktop-database")
+            .arg(dir)
+            .hide_console()
+            .status();
     }
     for scheme in schemes {
         let _ = Command::new("xdg-mime")
@@ -393,6 +397,7 @@ fn register_linux(bin: &Path, schemes: &[String]) -> SchemeResult {
                 &desktop_name,
                 &format!("x-scheme-handler/{scheme}"),
             ])
+            .hide_console()
             .status();
     }
     SchemeResult {
@@ -468,6 +473,7 @@ fn base_reachable(base: &str) -> bool {
 
 /// Open a URL in the OS default browser.
 fn open_in_browser(url: &str) -> Result<(), String> {
+    use crate::proc::HideConsole;
     use std::process::Command;
     #[cfg(windows)]
     let mut cmd = {
@@ -492,7 +498,8 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         let _ = url;
         return Err("cannot open a browser on this OS".to_string());
     };
-    cmd.status()
+    cmd.hide_console()
+        .status()
         .map_err(|e| format!("could not open the browser: {e}"))
         .and_then(|s| {
             if s.success() {

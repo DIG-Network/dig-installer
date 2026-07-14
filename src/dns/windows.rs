@@ -26,6 +26,7 @@ use winreg::RegKey;
 
 use super::plan;
 use super::{doctor, DnsInstallConfig, DnsInstallResult, DnsUninstallResult};
+use crate::proc::HideConsole;
 
 fn label() -> ServiceLabel {
     plan::SERVICE_LABEL
@@ -42,6 +43,7 @@ pub fn is_elevated() -> bool {
         .arg("session")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .hide_console()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -57,6 +59,7 @@ fn service_exists(service_name: &str) -> bool {
         .args(["query", service_name])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .hide_console()
         .output();
     match output {
         Ok(out) => !plan::sc_query_means_not_registered(out.status.code()),
@@ -120,6 +123,7 @@ fn set_display_name(service_name: &str, display_name: &str) -> Result<(), String
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .hide_console()
         .status()
         .map_err(|e| format!("spawn sc config: {e}"))?;
     if status.success() {
@@ -155,6 +159,7 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
 fn run_ps(command: &str) -> Result<(), String> {
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .hide_console()
         .status()
         .map_err(|e| format!("spawn powershell: {e}"))?;
     if status.success() {

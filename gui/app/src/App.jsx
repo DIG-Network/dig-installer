@@ -16,6 +16,7 @@ import {
   cancelInstall,
   launchTerminal,
   openDocs,
+  closeWindow,
   copyText,
   getMeta,
   bundledDigstoreVersion,
@@ -307,10 +308,17 @@ export function App() {
               </button>
             )}
 
-            {/* Done step gets the "Open Documentation" secondary */}
+            {/* Done step gets the "Open Documentation" secondary + a Close
+                escape hatch beside the primary Launch Terminal — the user is
+                never trapped on the final screen (§6.1). */}
             {step === 4 && (
               <button className="btn btn-secondary" onClick={openDocs}>
                 Open Documentation
+              </button>
+            )}
+            {step === 4 && (
+              <button className="btn btn-secondary" onClick={closeWindow}>
+                Close
               </button>
             )}
 

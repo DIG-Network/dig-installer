@@ -420,3 +420,22 @@ the existing mocked-resolver/mocked-service-backend unit suite:
   e2e CI job itself now applies). This is a genuine cross-repo design gap (dig-installer + dig-node),
   not merely a CI artifact — filed as dig_ecosystem#526 rather than silently worked around in
   production code.
+- **Child `Command`s flash a console window on Windows unless `CREATE_NO_WINDOW` is set (#564).**
+  A GUI/no-console parent (the Tauri installer) that spawns a console-subsystem child (`sc`, `net`,
+  `netsh`, `powershell`, `icacls`, `whoami`, `cmd`, or a delegated dig-node/dig-dns/dig-updater verb)
+  gets a brand-new console allocated for that child, which flashes on screen + steals focus for the
+  child's lifetime — a storm of blinking boxes across a 15+-spawn install. Fix: the Win32
+  `CREATE_NO_WINDOW` (`0x08000000`) creation flag on EVERY spawn, applied crate-wide via the one
+  `proc::HideConsole::hide_console()` helper (no-op off Windows) rather than a literal per site. The
+  flag hides ONLY the console — `.output()` stdio capture and exit codes are untouched — and
+  `std::process::Command` exposes no getter for its creation flags, so the helper is tested
+  behaviourally (a hidden child still runs + its stdout is still captured), not by reading the flag
+  back. Same defect lives in `dig-updater-broker`'s own schtasks/service spawns — its own lane.
+- **Adding a footer action can clip the primary at the window's min width (#564).** The Done screen's
+  footer is a fixed-height flex row; adding the Close button pushed its content to ~567px, which
+  overflowed (and clipped Launch Terminal) at the old 880px `minWidth` even though it was perfect at
+  the 1080px default. `overflow` upstream hid the clip rather than scrolling, so `documentElement`
+  showed no horizontal scroll — measure `footer.scrollWidth > footer.clientWidth`, not the document,
+  to catch it. Fix: raise `tauri.conf.json` `minWidth` 880 → 980 so the three-action footer always
+  has room. Lesson: a new nav/footer control must be re-verified at the window's MINIMUM size, not
+  just its default.
