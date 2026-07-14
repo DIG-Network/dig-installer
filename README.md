@@ -185,10 +185,19 @@ dig-installer --uninstall-dig-updater # remove the auto-update beacon's daily sc
 | `--json` | off | Emit a single structured JSON result to stdout (prose → stderr, no prompts). |
 | `--help-json` | — | Print the full machine-readable invocation contract (commands, flags, exit codes). |
 
-Default install location (`--bin-dir`):
+Default install location (override with `--bin-dir <DIR>`):
 
-- Windows: `%LOCALAPPDATA%\Programs\DIG\bin`
-- macOS / Linux: `~/.dig/bin`
+- **Windows:** `%ProgramFiles%\DIG\bin` — the whole stack (services + CLIs) lives in this
+  admin-only directory, so a non-admin cannot replace a binary a LocalSystem service or the
+  auto-update beacon runs as SYSTEM (a local privilege escalation; #565). Installing there needs
+  elevation (the installer prompts / re-run as Administrator).
+- **macOS / Linux:** the user CLIs (`digstore`/`digs`/`digd`) stay in the elevation-free
+  `~/.dig/bin`; the machine-wide service binaries (`dig-dns`, the `dig-updater` beacon) install
+  into the root-owned `/opt/dig/bin`.
+
+An explicit `--bin-dir <DIR>` overrides both for the whole stack. Upgrading an install that predates
+this (binaries in `%LOCALAPPDATA%\Programs\...` / `~/.dig/bin`) migrates them to the protected root
+automatically and re-points the services — no manual steps.
 
 ---
 

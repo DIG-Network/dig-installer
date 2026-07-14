@@ -222,6 +222,64 @@ same as digstore/dig-node/dig-dns. `dig-updater-worker` is not independently tra
 Declining the beacon (or a registration failure) is always safe: DIG simply never auto-updates, and
 the user re-runs the installer manually to pick up new versions.
 
+### 1.6 Install locations — the protected install root (#565)
+
+A binary that a PRIVILEGED identity later executes MUST live in a directory an unprivileged user
+cannot write. Otherwise a non-admin could replace it and get code execution as that privileged
+identity on the next service start / scheduled run — a local privilege escalation. The installer
+therefore places binaries into two roots, chosen per component:
+
+- **Protected root** — admin-only-writable, for every binary a service/scheduled-task runs:
+  - **Windows:** `%ProgramFiles%\DIG\bin`, resolved via the known-folder API
+    (`SHGetKnownFolderPath(FOLDERID_ProgramFiles)`, never the spoofable `%ProgramFiles%` env). Program
+    Files' inherited DACL is admin-write / user-read+execute, so no custom ACL is applied. The ENTIRE
+    Windows stack (services + user CLIs + the installer self-copy) installs here — one root.
+  - **macOS/Linux:** `/opt/dig/bin`, root-owned `0755` (owner root writes; group/other read+execute).
+- **User root** — the elevation-free per-user `~/.dig/bin` (unix only), for user-run binaries that no
+  privileged service executes: `digstore`/`digs`/`digd` and the user-level `dig-node`/`dig-relay`.
+  (On Windows there is no separate user root — everything is in the one protected root.)
+
+The component→root map is `paths::is_privileged_component`: on Windows every component is protected;
+on unix the protected set is exactly `dig-dns`, `dig-updater`, and `dig-updater-worker` (the
+machine-wide / root-run binaries). An explicit `--bin-dir <DIR>` OVERRIDE wins for the whole stack
+(the user's chosen dir, their responsibility). `InstallPlan::bin_dir_for(component, os)` is the
+single resolver.
+
+**Elevation.** Writing into the protected root requires elevation, so even a CLI-only install
+elevates on Windows (the CLI lands in Program Files); a CLI-only unix install into `~/.dig/bin` does
+not (`InstallPlan::requires_elevation`, §4.1).
+
+**Verification (fail-loud).** After placement the installer reads the protected root's effective
+permissions back (`secure::verify_install_root`): Windows parses `Get-Acl` SID-based output and
+REFUSES any Allow-write ACE for a well-known unprivileged principal (`S-1-5-32-545` Users, `S-1-1-0`
+Everyone, `S-1-5-11` Authenticated Users, `S-1-5-4` INTERACTIVE); unix requires root ownership with
+no group/other write bit. A DEFINITIVE breach makes the install NOT ready (`InstallReport
+.install_root_security`, readiness §4.2); an inconclusive read is a warning only (the admin-only
+LOCATION remains the primary guarantee). The service binary MUST NEVER be executed to control it —
+the installer stops/deregisters services by canonical id via the OS service manager
+(`svc::stop_service`/`deregister_service`), so an elevated installer can never be tricked into
+running an attacker-replaced binary.
+
+**Migration (existing installs).** On a re-run that detects DIG binaries in a legacy user-writable
+root (`%LOCALAPPDATA%\Programs\{DIG,DigStore}\bin` on Windows; the privileged binaries in `~/.dig/bin`
+on unix), the installer re-points the install onto the protected root (`migrate` module): it
+deregisters the moving self-registering services (dig-node/dig-relay on Windows) BY ID so the normal
+install re-registers them fresh from the protected path; removes the legacy binaries by KNOWN
+filename (never a recursive walk that could follow a planted junction/reparse point — all on Windows,
+only the privileged ones on unix); and drops the legacy dir from the user PATH on Windows. It never
+executes a legacy-dir binary. A re-registration failure surfaces fail-loud via the readiness verdict
+(never a service left registered against the writable legacy path). Recorded in
+`InstallReport.migration`.
+
+**Authoritative install-root record (`install.json`, #581).** The installer writes
+`<install-home>/install.json` (`%ProgramFiles%\DIG\install.json` / `/opt/dig/install.json` — the
+protected root's parent, admin-only-writable by inheritance) with `{ "schema": 1, "bin_dir": <the
+protected root>, "installer_version": <version> }`. This is the single machine-readable source of
+truth for the install root the auto-update beacon consumes; it is coherent with the beacon's own
+`current_exe().parent()`-derived root by construction now that the beacon binary lives in the
+protected root. A consumer MUST verify the file is admin-only-writable before trusting it. Recorded
+in `InstallReport.install_manifest`.
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/
@@ -229,11 +287,16 @@ For the two components this installer registers as OS services with their OWN `i
 (re-)install follows this order per component, never reversed:
 
 1. **Resolve** the release + asset for the target OS/arch (network).
-2. **Stop-if-serving** (task #232): if a binary already exists at the destination path (i.e. this
-   is an upgrade, not a first install), probe `<dest> status --json` and, if it reports
-   `serving: true`, run `<dest> stop`. Skip-when-absent/not-serving: neither is an error. **A stop
-   FAILURE while serving aborts this component's write** (`SERVICE_STOP_FAILED`, exit code 10) —
-   the binary is NEVER overwritten out from under a still-running process.
+2. **Stop-if-running** (task #232 / #565): if a binary already exists at the destination path (i.e.
+   this is an upgrade, not a first install), query the OS service manager for the service's run
+   state BY CANONICAL ID (`svc::service_run_state`, `net.dignetwork.dig-node` /
+   `net.dignetwork.dig-relay`) and, if RUNNING, stop it BY ID (`svc::stop_service` — `sc stop` /
+   `systemctl stop` / `launchctl bootout`). The service binary is **NEVER executed** to control it
+   (the pre-#565 `<dest> status --json` / `<dest> stop` path had the elevated installer run a binary
+   a non-admin could have replaced in the legacy user-writable dir → user→SYSTEM escalation; #565).
+   Skip-when-absent/not-running: neither is an error. **A stop FAILURE while running aborts this
+   component's write** (`SERVICE_STOP_FAILED`, exit code 10) — the binary is NEVER overwritten out
+   from under a still-running process.
 3. **Write** the newly downloaded binary to the destination path (only reached once step 2
    succeeds or was a no-op).
 4. **Register + start**: run `<dest> install` (tolerated if it fails — an already-registered
@@ -417,8 +480,11 @@ the plan registers an OS service (dig-node / dig-dns / dig-relay), the auto-upda
 scheduler artifact (dig-updater, §1.5), or writes the `dig.local` hosts entry
 (`InstallPlan::requires_elevation()`). The check runs **FIRST**, before resolving/downloading/
 writing anything: an un-elevated run of such a plan fails immediately with `NOT_ELEVATED` (exit 11)
-and leaves NO partial state. A `--dry-run` or a digstore-only (per-user) install never trips the
-gate. The per-OS elevation probe is `elevation::is_elevated` (Windows `net session`, Unix `id -u`);
+and leaves NO partial state. It ALSO trips when a CLI-only install writes into the admin-only
+protected root (#565, §1.6) — so a Windows CLI-only install (which lands in `%ProgramFiles%\DIG\bin`)
+elevates, while a unix CLI-only install into `~/.dig/bin` does not. A `--dry-run`, or a CLI-only
+install into a `--bin-dir` override or the unix user root, never trips the gate. The per-OS
+elevation probe is `elevation::is_elevated` (Windows `net session`, Unix `id -u`);
 the pure decision + per-OS remedy is `elevation::gate` (unit-tested). The GUI enforces the same gate
 before its first write.
 
