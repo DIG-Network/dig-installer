@@ -1,0 +1,242 @@
+# The ONE place dig-installer's cross-OS build lives. It is a REUSABLE workflow
+# (`on: workflow_call` only — it never fires on its own): both release paths call it, so the
+# universal-CLI matrix + the Tauri GUI build are defined exactly once (DRY, CLAUDE.md §2.5):
+#
+#   * release.yml          — the STABLE `vX.Y.Z` tag builder, and
+#   * nightly-release.yml   — the NIGHTLY pre-release channel.
+#
+# The caller passes the version string stamped into each artifact's filename and, optionally, the
+# git ref to build. The job builds:
+#   * the universal `dig-installer` CLI (the artifact install.sh/install.ps1 downloads) — per OS/arch
+#       dig-installer-<ver>-<os_arch>[.exe]
+#   * the Tauri GUI installer (embeds the LATEST released digstore) —
+#       DIG-Installer-Setup-<ver>-{windows-x64.exe | macos.dmg | linux-x86_64.AppImage}
+# and uploads them as run artifacts the caller's publish job attaches to a GitHub Release.
+#
+# The gate runs fmt + clippy only — a PR's own CI (ci.yml) already ran the full
+# fmt/clippy/test/coverage set (+ the cross-OS build matrix) against the merged tree before merge
+# (§2.4a); re-running the suite on the release path is redundant flake-exposure (#489/#488).
+name: Build binaries (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string stamped into each artifact filename (e.g. `1.2.3` or `1.2.3-nightly.20260714.abc1234`)."
+        type: string
+        required: true
+      ref:
+        description: "Git ref (tag / branch / SHA) to check out and build. Empty = the caller run's commit."
+        type: string
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Gate: fmt + clippy once. The merged tree already passed the full release-gate suite (incl the
+  # cross-OS build matrix) on the PR before merge (§2.4a); this is a fast sanity check. See header.
+  check:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust (stable + components)
+        run: |
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-check-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Build the universal CLI installer binary per OS/arch.
+  # ---------------------------------------------------------------------------
+  build-cli:
+    name: build cli (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: dig-installer.exe
+            out_name: windows-x64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: dig-installer
+            out_name: linux-x64
+          # Both macOS arches build on the fast Apple-silicon macos-14 runner; the Intel binary is
+          # CROSS-COMPILED there. The only C/asm dep in the macOS graph is `ring` (via rustls, used
+          # by ureq); there is no `openssl-sys` (ureq is rustls-only), so no vendored-openssl
+          # cross-compile. Artifact names are unchanged so install.sh/install.ps1 still resolve them.
+          - os: macos-14 # Apple silicon (arm64)
+            target: aarch64-apple-darwin
+            bin: dig-installer
+            out_name: macos-arm64
+          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
+            target: x86_64-apple-darwin
+            bin: dig-installer
+            out_name: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust + target
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-installer-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-installer-build-${{ matrix.target }}-
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-installer
+      - name: Stage artifact
+        id: stage
+        # The caller's `version` is stamped into the filename verbatim: a plain `1.2.3` for a stable
+        # tag, or the synthesized `1.2.3-nightly.YYYYMMDD.<shortsha>` for a nightly.
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+          DEST="dist/dig-installer-${VER}-${{ matrix.out_name }}"
+          cp "$SRC" "$DEST"
+          ls -la dist
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-installer-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Build the Tauri GUI installer per OS. It embeds the LATEST released digstore
+  # binary (downloaded here), so each artifact is a single self-contained file.
+  # ---------------------------------------------------------------------------
+  build-gui:
+    name: build gui (${{ matrix.os }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            digstore_asset_os: windows-x64.exe
+            digstore_bin: digstore.exe
+            build_args: "--no-bundle"
+            artifact_glob: "src-tauri/target/release/*.exe"
+            out_name: "windows-x64.exe"
+          - os: macos-latest
+            digstore_asset_os: macos-arm64
+            digstore_bin: digstore
+            build_args: "--bundles dmg"
+            artifact_glob: "src-tauri/target/release/bundle/dmg/*.dmg"
+            out_name: "macos.dmg"
+          - os: ubuntu-22.04
+            digstore_asset_os: linux-x64
+            digstore_bin: digstore
+            build_args: "--bundles appimage"
+            artifact_glob: "src-tauri/target/release/bundle/appimage/*.AppImage"
+            out_name: "linux-x86_64.AppImage"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+      - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gui/app/src-tauri/target
+          key: ${{ runner.os }}-installer-gui-${{ hashFiles('gui/app/src-tauri/Cargo.lock', 'gui/app/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-installer-gui-
+      - name: Resolve version
+        # The caller's `version` stamps the GUI installer filename (full nightly string on a nightly).
+        shell: bash
+        run: echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+      # Download the LATEST released digstore CLI for this OS so the GUI installer can embed it
+      # (single-file install). dig-installer does NOT build digstore.
+      - name: Fetch latest released digstore binary
+        shell: bash
+        env:
+          # Authenticate the release lookup + asset download via `gh` (preinstalled on runners);
+          # anonymous curl hit GitHub's unauthenticated REST rate limit (60/hour per source IP) and
+          # 403'd on the FIRST call. `GH_TOKEN` raises that to the authenticated quota.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/DIG-Network/digstore/releases/latest --jq .tag_name)"
+          dver="${tag#v}"
+          asset="digstore-${dver}-${{ matrix.digstore_asset_os }}"
+          echo "fetching ${asset} from digstore release ${tag}"
+          mkdir -p _digstore
+          gh release download "$tag" -R DIG-Network/digstore -p "$asset" -O "_digstore/${{ matrix.digstore_bin }}"
+          chmod +x "_digstore/${{ matrix.digstore_bin }}" || true
+      - name: Install frontend deps
+        working-directory: gui/app
+        run: npm ci || npm install
+      - name: Stage bundled digstore binary
+        working-directory: gui/app
+        run: node scripts/stage-binary.mjs --src ../../_digstore/${{ matrix.digstore_bin }}
+      - name: Build the GUI installer
+        working-directory: gui/app
+        run: npx tauri build ${{ matrix.build_args }}
+      - name: Collect single installer artifact
+        shell: bash
+        working-directory: gui/app
+        run: |
+          mkdir -p ../../dist-gui
+          artifact="$(ls -1 ${{ matrix.artifact_glob }} | head -n1)"
+          [ -n "$artifact" ] || { echo "no artifact matched ${{ matrix.artifact_glob }}"; exit 1; }
+          cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
+          ls -la ../../dist-gui
+      - name: Upload GUI installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digstore-gui-installer-${{ matrix.os }}
+          path: dist-gui/*
+          if-no-files-found: error

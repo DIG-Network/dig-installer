@@ -1,36 +1,26 @@
+# STABLE release. On a `vX.Y.Z` tag (cut by the nightly-release orchestrator's stable job —
+# nightly-release.yml — either from the midnight cron detecting a version bump or from a manual
+# `workflow_dispatch`), this workflow builds the universal `dig-installer` CLI for every OS/arch AND
+# the Tauri GUI installers (via the reusable build workflow) and publishes them to a STABLE GitHub
+# Release: `prerelease: false`, marked `latest`. The changelog is already inside the tag (the
+# orchestrator committed it before tagging), so the notes carry the shipped changelog.
+#
+# This is intentionally tag-ONLY: merges to main no longer build or release here (dig_ecosystem
+# #590 batches releases to the nightly cron + manual dispatch). Pre-merge coverage comes from ci.yml
+# (fmt/clippy/test/coverage + the cross-OS CLI + GUI build matrix on every PR); daily main-HEAD
+# build coverage comes from the nightly channel. A `workflow_dispatch` is kept as a manual "does
+# main still build?" canary — it builds but does not publish (publish is gated on a tag ref).
 name: Release dig-installer
 
-# Tag-driven release (mirrors digstore's / dig-node's pattern). On a version tag
-# (v*) build the universal `dig-installer` CLI binary for every supported OS/arch
-# AND the Tauri GUI installers, then attach them all to one GitHub Release.
-#
-# Universal CLI (the canonical artifact the install.sh/install.ps1 bootstrap
-# downloads):
-#   * windows-x64  → dig-installer-<ver>-windows-x64.exe
-#   * linux-x64    → dig-installer-<ver>-linux-x64
-#   * macos-arm64  → dig-installer-<ver>-macos-arm64
-#   * macos-x64    → dig-installer-<ver>-macos-x64
-#
-# GUI installer (migrated from digstore; embeds the released digstore binary):
-#   * windows → DIG-Installer-Setup-<ver>-windows-x64.exe   (raw Tauri exe)
-#   * macos   → DIG-Installer-Setup-<ver>-macos.dmg
-#   * linux   → DIG-Installer-Setup-<ver>-linux-x86_64.AppImage
-#
-# A push to main also builds the CLI (no publish) so a broken build is caught
-# before tagging.
 on:
   push:
     tags:
       - "v*"
-    branches: [main]
-    paths:
-      - "src/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "gui/**"
-      - ".github/workflows/release.yml"
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -40,273 +30,42 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Gate: fmt + clippy + tests once, on a plain push to main only (i.e. BEFORE
-  # a version tag is cut) so a broken build/regression is caught pre-tag. This
-  # job deliberately does NOT run on the tag push itself: the PR's own CI
-  # gates (ci.yml) already ran this full fmt+clippy+test+coverage suite
-  # against this exact merged tree before it was allowed to merge, so
-  # re-running the whole suite again at tag/deploy time is redundant and is
-  # pure flake-exposure surface on the release path with no new signal (#489,
-  # dig_ecosystem #488 — a flaky re-run at deploy time blocked a release).
-  # The tag-triggered deploy path (build-cli/build-gui/publish below) is
-  # build + package + publish only.
-  check:
-    name: fmt + clippy + test + coverage
-    if: github.ref_type != 'tag'
+  # Resolve the version string the artifacts are stamped with: `X.Y.Z` from a `vX.Y.Z` tag, or a
+  # `g<shortsha>` build id for the manual canary (which never publishes).
+  meta:
+    name: Resolve version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install Rust (stable + components)
+      - id: v
+        shell: bash
         run: |
-          rustup toolchain install stable --component rustfmt --component clippy --component llvm-tools-preview
-          rustup default stable
-          rustc --version
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-installer-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-installer-check-
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      # Unit + integration tests WITH coverage, gated at >=80% lines, run under
-      # nextest with retries so a flaky test is retried + surfaced rather than
-      # failing the job outright (#489). main.rs is excluded: it is thin
-      # binary glue (arg-parse -> run_report -> stdout/exit code) whose only
-      # paths require the network; all agent-facing logic (help_json/
-      # error_json) was moved into the library and is unit-tested there. The
-      # pure logic + the run_report orchestration (via an injected release
-      # resolver) + the file/service I/O wrappers are all covered.
-      - name: Test with coverage (gate >=80% lines, nextest retries flaky failures)
-        run: cargo llvm-cov nextest --locked --fail-under-lines 80 --ignore-filename-regex 'main\.rs$' --retries 2
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
 
-  # ---------------------------------------------------------------------------
-  # Build the universal CLI installer binary per OS/arch. Runs on both a plain
-  # main push (gated behind `check` above) and a version-tag push (deploy path
-  # — no test re-run, see `check`'s `if` above; `always()` + the result check
-  # lets this job proceed when `check` was skipped because this run IS the tag
-  # push, while still blocking on an actual `check` failure on a main push).
-  # ---------------------------------------------------------------------------
-  build-cli:
-    name: build cli (${{ matrix.out_name }})
-    needs: check
-    if: always() && (needs.check.result == 'success' || needs.check.result == 'skipped')
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: dig-installer.exe
-            out_name: windows-x64.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: dig-installer
-            out_name: linux-x64
-          # Both macOS arches build on the fast Apple-silicon macos-14 runner.
-          # The Intel binary is CROSS-COMPILED there (host arm64 → target
-          # x86_64-apple-darwin) rather than on a native macos-13 (Intel)
-          # runner: that Intel runner pool is chronically backlogged, so the
-          # macos-x64 job used to hang for hours (pending, never failing) and
-          # the release never completed. Cross-compiling needs no extra
-          # toolchain here — Apple's clang (Xcode on macos-14) targets both
-          # arches and the build steps are already `--target`-parameterized
-          # (rustup target add + cargo build --target). The only C/asm
-          # dependency in the macOS build graph is `ring` (via rustls, used by
-          # ureq), which the Apple toolchain assembles for x86_64 natively from
-          # an arm host. There is no `openssl-sys` in the graph at all (ureq is
-          # rustls-only — default-features off), so there is no vendored-openssl
-          # cross-compile to worry about. Artifact names (out_name, upload name,
-          # staged filename) are unchanged so the install.sh/install.ps1 thin
-          # shim + apt asset matchers still resolve the assets.
-          - os: macos-14 # Apple silicon (arm64)
-            target: aarch64-apple-darwin
-            bin: dig-installer
-            out_name: macos-arm64
-          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
-            target: x86_64-apple-darwin
-            bin: dig-installer
-            out_name: macos-x64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install Rust + target
-        shell: bash
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-          rustc --version
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-installer-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-installer-build-${{ matrix.target }}-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-installer
-      - name: Stage artifact
-        id: stage
-        shell: bash
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
-          mkdir -p dist
-          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
-          DEST="dist/dig-installer-${VER}-${{ matrix.out_name }}"
-          cp "$SRC" "$DEST"
-          ls -la dist
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dig-installer-${{ matrix.out_name }}
-          path: dist/*
-          if-no-files-found: error
+  # Build the CLI (per OS/arch) + the Tauri GUI installers through the shared reusable workflow —
+  # the same build the nightly channel uses, so the two release paths can never diverge.
+  build:
+    name: Build
+    needs: meta
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+      # Empty ref => build the tag/commit this run is on.
+      ref: ""
 
-  # ---------------------------------------------------------------------------
-  # Build the Tauri GUI installer per OS. It embeds the LATEST released digstore
-  # binary (downloaded here), so each artifact is a single self-contained file.
-  # Only runs on a tag (the GUI is heavier; main pushes just gate the CLI).
-  # ---------------------------------------------------------------------------
-  build-gui:
-    name: build gui (${{ matrix.os }})
-    needs: check
-    if: always() && github.ref_type == 'tag' && (needs.check.result == 'success' || needs.check.result == 'skipped')
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            digstore_asset_os: windows-x64.exe
-            digstore_bin: digstore.exe
-            build_args: "--no-bundle"
-            artifact_glob: "src-tauri/target/release/*.exe"
-            out_name: "windows-x64.exe"
-          - os: macos-latest
-            digstore_asset_os: macos-arm64
-            digstore_bin: digstore
-            build_args: "--bundles dmg"
-            artifact_glob: "src-tauri/target/release/bundle/dmg/*.dmg"
-            out_name: "macos.dmg"
-          - os: ubuntu-22.04
-            digstore_asset_os: linux-x64
-            digstore_bin: digstore
-            build_args: "--bundles appimage"
-            artifact_glob: "src-tauri/target/release/bundle/appimage/*.AppImage"
-            out_name: "linux-x86_64.AppImage"
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install Rust (stable)
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-          rustc --version
-      - name: Install Linux Tauri deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            gui/app/src-tauri/target
-          key: ${{ runner.os }}-installer-gui-${{ hashFiles('gui/app/src-tauri/Cargo.lock', 'gui/app/package-lock.json') }}
-          restore-keys: ${{ runner.os }}-installer-gui-
-      - name: Derive version from tag
-        shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-      # Download the LATEST released digstore CLI for this OS so the GUI installer
-      # can embed it (single-file install). dig-installer does NOT build digstore.
-      - name: Fetch latest released digstore binary
-        shell: bash
-        env:
-          # Authenticate both the release lookup and the asset download via
-          # `gh` (preinstalled on GitHub-hosted runners). Anonymous curl hit
-          # GitHub's unauthenticated REST rate limit (60 req/hour per source
-          # IP, shared across the runner pool) and got a 403 on the FIRST
-          # call (the `releases/latest` lookup) before the asset URL was even
-          # constructed. `GH_TOKEN` raises that to the authenticated quota
-          # and is far less likely to be exhausted by other jobs on the same
-          # runner IP range.
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="$(gh api repos/DIG-Network/digstore/releases/latest --jq .tag_name)"
-          dver="${tag#v}"
-          asset="digstore-${dver}-${{ matrix.digstore_asset_os }}"
-          echo "fetching ${asset} from digstore release ${tag}"
-          mkdir -p _digstore
-          gh release download "$tag" -R DIG-Network/digstore -p "$asset" -O "_digstore/${{ matrix.digstore_bin }}"
-          chmod +x "_digstore/${{ matrix.digstore_bin }}" || true
-      - name: Install frontend deps
-        working-directory: gui/app
-        run: npm ci || npm install
-      - name: Stage bundled digstore binary
-        working-directory: gui/app
-        run: node scripts/stage-binary.mjs --src ../../_digstore/${{ matrix.digstore_bin }}
-      - name: Build the GUI installer
-        working-directory: gui/app
-        run: npx tauri build ${{ matrix.build_args }}
-      - name: Collect single installer artifact
-        shell: bash
-        working-directory: gui/app
-        run: |
-          mkdir -p ../../dist-gui
-          artifact="$(ls -1 ${{ matrix.artifact_glob }} | head -n1)"
-          [ -n "$artifact" ] || { echo "no artifact matched ${{ matrix.artifact_glob }}"; exit 1; }
-          cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
-          ls -la ../../dist-gui
-      - name: Upload GUI installer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: digstore-gui-installer-${{ matrix.os }}
-          path: dist-gui/*
-          if-no-files-found: error
-
-  # ---------------------------------------------------------------------------
-  # One publish job after all builds — no race to create the Release. Tag only.
-  # ---------------------------------------------------------------------------
+  # Publish ONLY for a real tag — the manual-dispatch canary builds but stops here.
   publish:
     name: Publish GitHub Release
-    needs: [build-cli, build-gui]
-    # `build-cli`/`build-gui` themselves depend on `check`, which is SKIPPED on
-    # a tag push (by design — see `check`'s own `if`). Without `always()`, a
-    # skip anywhere upstream in the transitive `needs` graph propagates down
-    # and skips this job by default too, even though build-cli/build-gui both
-    # completed with conclusion `success` (observed: v0.7.0/v0.7.1/v0.8.0 all
-    # built binaries successfully but NEVER actually published a GitHub
-    # Release — `gh release view` 404s for every one of them). Mirrors the
-    # exact `always() && (needs.X.result == …)` pattern `build-cli`/`build-gui`
-    # already use to escape this same transitive-skip gotcha.
-    if: >-
-      always() && github.ref_type == 'tag' &&
-      needs.build-cli.result == 'success' &&
-      needs.build-gui.result == 'success'
+    needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -320,9 +79,14 @@ jobs:
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
-      - name: Create / update the release and attach assets
+      - name: Create / update the STABLE release and attach assets
         uses: softprops/action-gh-release@v2
         with:
+          # `prerelease: false` + `make_latest: true`: a stable release is the one that moves
+          # `latest`. Nightlies (nightly-release.yml) are always prerelease + never latest, so a
+          # nightly can never masquerade as this stable download.
+          prerelease: false
+          make_latest: "true"
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
