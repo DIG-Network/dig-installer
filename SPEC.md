@@ -606,3 +606,88 @@ to date"; a resolution failure (e.g. offline) reads "update check unavailable" r
 components, §7.3) but the Components screen renders no row for the beacon (it is an OPTIONS
 checkbox, not a COMPONENTS entry, §1.5) — that entry is simply unused by the current UI rather than
 displayed.
+
+## 8. Release pipeline — nightly cron + manual dispatch
+
+How the universal `dig-installer` CLI + the Tauri GUI installers are built and released. The shape
+is copied from the ecosystem's reference nightlies implementation (`dig-updater`); the ops runbook
+is `runbooks/release.md`.
+
+Releases are **batched to a nightly cron plus manual dispatch** — NOT cut on every merge to `main`.
+Two channels ship from one orchestrator (`.github/workflows/nightly-release.yml`):
+
+### 8.1 Trigger
+
+The orchestrator triggers ONLY on:
+
+- `schedule: cron '0 0 * * *'` — **midnight UTC** (GitHub Actions cron is always UTC; a top-of-hour
+  cron MAY be delayed under load — acceptable, since both channels are idempotent), and
+- `workflow_dispatch` with two inputs: `channel` (`both` | `stable` | `nightly`, default `both`) and
+  `force` (boolean, default `false`).
+
+It MUST NOT trigger on `push` to `main`. A schedule run exercises BOTH channels; a dispatch runs the
+selected channel(s).
+
+**60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
+repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic
+release trigger, a quiet repo can silently stop releasing with no error. Detect it with
+`gh api repos/DIG-Network/dig-installer/actions/workflows/nightly-release.yml --jq .state` (a value
+of `disabled_inactivity` means it was auto-disabled) and recover with `gh workflow enable
+nightly-release.yml` (see `runbooks/release.md`). Any repo activity resets the 60-day counter.
+
+### 8.2 Stable channel
+
+Cuts a semver `vX.Y.Z` **stable** release when — and only when — the version in the root
+`Cargo.toml` (`[package].version`) has advanced beyond the newest `vX.Y.Z` tag (the
+skip-if-already-tagged check IS the version-changed check). Cutting a release means: `git-cliff`
+regenerates `CHANGELOG.md`, commits it to `main` as `chore(release): vX.Y.Z`, tags THAT commit (so
+the changelog is inside the tag), and pushes commit + tag with `RELEASE_TOKEN`. The pushed `v*` tag
+fires `release.yml`, which builds the CLI (every OS/arch) + the Tauri GUI installers and publishes a
+GitHub Release with `prerelease: false` + `make_latest: true` — the ONLY release that moves `latest`.
+
+**Root version + the GUI sub-lockfile (path-dep trap).** The GUI crate `gui/app/src-tauri` depends
+on the root `dig-installer` crate by path (`dig-installer = { path = "../../.." }`), so its
+`gui/app/src-tauri/Cargo.lock` carries a `dig-installer` entry. A root version bump MUST sync BOTH
+lockfiles (`cargo update -p dig-installer` at the root AND with
+`--manifest-path gui/app/src-tauri/Cargo.toml`), or the GUI's `--locked` build fails.
+
+`force: true` on a manual dispatch bypasses the skip-if-tagged guard and re-cuts the current version
+(moving the tag onto a fresh changelog commit — `main` is never force-pushed).
+
+**Force is guarded against mutating a published release (supply-chain invariant).** A force re-cut
+MUST be refused — non-zero exit, clear error — when BOTH: (a) a PUBLISHED (non-draft) GitHub Release
+already exists at the version's `vX.Y.Z` tag, AND (b) that tag currently points at a commit
+DIFFERENT from the commit this run would build. Force MAY proceed when either is false: a
+same-commit re-cut (a failed-build retry) or a tag with no published release (a tag repair). A
+version that needs new code released MUST bump `Cargo.toml`, not force-move a tag.
+
+### 8.3 Nightly channel
+
+Every night (and on demand) builds `main` HEAD (CLI + GUI) and publishes a GitHub **pre-release** —
+so a fresh nightly always exists regardless of a version bump. It:
+
+- **Synthesizes the version at build time** (nothing is committed): `X.Y.Z-nightly.YYYYMMDD.<shortsha>`.
+  As a semver prerelease it sorts BELOW the plain `X.Y.Z`.
+- Publishes under a **dated tag `nightly-YYYYMMDD`** AND force-moves a **rolling `nightly` tag**,
+  with `prerelease: true` and **never** `latest`. Idempotent: a same-day re-run refreshes today's
+  dated release + the rolling pointer.
+- **Retention:** keeps the newest **14** dated nightlies plus the rolling `nightly`, pruning older
+  dated pre-releases AND their tags together (`gh release delete --cleanup-tag`). `v*` stable
+  tags/releases and the rolling `nightly` are NEVER pruned.
+
+The nightly GUI installer embeds the LATEST **stable** released digstore (the GUI's fetch step is
+unchanged) — correct for a nightly installer.
+
+### 8.4 Reusable build
+
+The cross-OS build lives once in `.github/workflows/build-binaries.yml` (`on: workflow_call`, inputs
+`version` + `ref`). Both `release.yml` (stable) and the nightly channel call it, so the two paths
+can never diverge. It builds the `dig-installer` CLI for `windows-x64`, `linux-x64`, `macos-arm64`,
+`macos-x64`, and the Tauri GUI installer (`.exe`/`.dmg`/`.AppImage`), stamping the caller's
+`version` into each artifact filename.
+
+### 8.5 RELEASE_TOKEN posture
+
+Releasing uses the `RELEASE_TOKEN` org PAT, not `GITHUB_TOKEN`. If `RELEASE_TOKEN` is absent, EVERY
+channel NO-OPS with a clear `::warning::` — never a half-release. A `concurrency: nightly-release`
+group (cancel-in-progress `false`) serializes runs so an overlapping cron + dispatch cannot race.
