@@ -39,6 +39,10 @@ pub const DIG_NODE_SERVICE_DISPLAY: &str = "DIG NETWORK: NODE";
 /// Canonical dig-dns service id and human display name (#494).
 pub const DIG_DNS_SERVICE_ID: &str = "net.dignetwork.dig-dns";
 pub const DIG_DNS_SERVICE_DISPLAY: &str = "DIG NETWORK: DNS";
+/// Canonical dig-relay service id (reverse-DNS) — the id dig-relay's own
+/// `install` verb registers under, and the id the installer stops/deregisters by
+/// (never by executing the relay binary, #565).
+pub const DIG_RELAY_SERVICE_ID: &str = "net.dignetwork.dig-relay";
 
 /// The state of a named OS service, as reported by the service manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,156 @@ pub fn wait_for_service_running(
         }
     }
     last
+}
+
+/// Poll [`service_run_state`] until it leaves RUNNING (any of Stopped/NotFound/
+/// Unknown) or `max_wait` elapses — a `stop`/`delete` the SCM/systemd/launchd
+/// completes asynchronously, so its process must exit (releasing any file
+/// handle) before the state settles. Returns the LAST observed state.
+fn wait_until_not_running(id: &str, max_wait: std::time::Duration) -> ServiceRunState {
+    let start = std::time::Instant::now();
+    loop {
+        let state = service_run_state(id);
+        if state != ServiceRunState::Running || start.elapsed() >= max_wait {
+            return state;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// `sc stop <id>` argv (excluding the `sc` executable). Pure. Windows only.
+pub fn sc_stop_args(id: &str) -> Vec<String> {
+    vec!["stop".to_string(), id.to_string()]
+}
+
+/// `sc delete <id>` argv (excluding the `sc` executable). Pure. Windows only.
+pub fn sc_delete_args(id: &str) -> Vec<String> {
+    vec!["delete".to_string(), id.to_string()]
+}
+
+/// The `launchctl bootout system/<id>` target string — deregisters + stops a
+/// system-domain LaunchDaemon by its label. Pure.
+pub fn launchctl_system_target(id: &str) -> String {
+    format!("system/{id}")
+}
+
+/// STOP the service `id` via the OS service manager — WITHOUT ever executing the
+/// service's own binary (#565: the installer must never elevate-spawn a binary
+/// that a non-admin could have replaced in the legacy user-writable dir). Issues
+/// the OS stop command by canonical id, then bounded-waits for it to leave
+/// RUNNING (its process exiting is what releases the binary's file handle).
+/// `Ok(())` when the service is not RUNNING afterward (including "was already
+/// stopped" / "not registered"); `Err` only when it is STILL running.
+pub fn stop_service(id: &str) -> Result<(), String> {
+    let final_state = stop_service_command(id);
+    // Whatever the command reported, the authority is the observed state.
+    let _ = final_state;
+    match wait_until_not_running(id, std::time::Duration::from_secs(10)) {
+        ServiceRunState::Running => Err(format!("service '{id}' is still RUNNING after a stop")),
+        _ => Ok(()),
+    }
+}
+
+/// DEREGISTER (stop + delete/disable) the service `id` via the OS service
+/// manager — again WITHOUT executing the service binary (#565). Used by the
+/// migration to re-point a service off the legacy user-writable install root:
+/// the deregistration is done here by id, then the service is re-registered from
+/// the new protected path (by that binary's own `install` verb, executed from
+/// the safe location). `Ok(())` when the service is no longer registered.
+pub fn deregister_service(id: &str) -> Result<(), String> {
+    let _ = stop_service(id);
+    deregister_service_command(id);
+    match wait_until_not_running(id, std::time::Duration::from_secs(10)) {
+        ServiceRunState::Running => Err(format!(
+            "service '{id}' is still RUNNING after deregistration"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Issue the OS "stop this service by id" command. Windows `sc stop`; Linux
+/// `systemctl [--user] stop` (BOTH scopes, since dig-node registers user-level
+/// while dig-dns is machine-wide — [`service_run_state_on`]); macOS `launchctl
+/// bootout`. Best-effort — the authoritative signal is the state poll in
+/// [`stop_service`], never these exit codes (a stop of an already-stopped
+/// service exits non-zero on Windows, which is not a failure).
+fn stop_service_command(id: &str) {
+    #[cfg(windows)]
+    {
+        let _ = run_svc_tool("sc", &sc_stop_args(id));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let unit = linux_unit_name(id);
+        let _ = run_svc_tool("systemctl", &["--user".into(), "stop".into(), unit.clone()]);
+        let _ = run_svc_tool("systemctl", &["stop".into(), unit]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_svc_tool(
+            "launchctl",
+            &["bootout".into(), launchctl_system_target(id)],
+        );
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = id;
+    }
+}
+
+/// Issue the OS "deregister this service by id" command. Windows `sc delete`;
+/// Linux `systemctl [--user] disable`; macOS `launchctl bootout` (which both
+/// stops AND deregisters). Best-effort — [`deregister_service`] polls the state.
+fn deregister_service_command(id: &str) {
+    #[cfg(windows)]
+    {
+        let _ = run_svc_tool("sc", &sc_delete_args(id));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let unit = linux_unit_name(id);
+        let _ = run_svc_tool(
+            "systemctl",
+            &[
+                "--user".into(),
+                "disable".into(),
+                "--now".into(),
+                unit.clone(),
+            ],
+        );
+        let _ = run_svc_tool("systemctl", &["disable".into(), "--now".into(), unit]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_svc_tool(
+            "launchctl",
+            &["bootout".into(), launchctl_system_target(id)],
+        );
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = id;
+    }
+}
+
+/// Spawn an OS service-control tool, discarding its output (the authoritative
+/// signal is always the subsequent [`service_run_state`] poll, not the tool's
+/// exit code — a stop of an already-stopped service exits non-zero). `Ok(())`
+/// iff the tool exited 0.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn run_svc_tool(tool: &str, args: &[String]) -> Result<(), String> {
+    std::process::Command::new(tool)
+        .args(args)
+        .hide_console()
+        .output()
+        .map_err(|e| format!("spawn {tool}: {e}"))
+        .and_then(|o| {
+            if o.status.success() {
+                Ok(())
+            } else {
+                Err(format!("{tool} exited non-zero"))
+            }
+        })
 }
 
 /// The result of verifying a Windows service's Services-panel DISPLAY name
@@ -649,5 +803,48 @@ mod tests {
         assert!(!is_service_running(
             "net.dignetwork.definitely-not-a-real-dig-service-xyz"
         ));
+    }
+
+    // -- #565: stop/deregister BY ID (never by executing the service binary) ---
+
+    #[test]
+    fn sc_control_argv_is_by_id_and_never_a_binary_path() {
+        // The whole point: control the service by its canonical id via `sc`,
+        // NOT by spawning the (possibly attacker-replaced) service binary.
+        assert_eq!(
+            sc_stop_args("net.dignetwork.dig-node"),
+            vec!["stop".to_string(), "net.dignetwork.dig-node".to_string()]
+        );
+        assert_eq!(
+            sc_delete_args("net.dignetwork.dig-node"),
+            vec!["delete".to_string(), "net.dignetwork.dig-node".to_string()]
+        );
+        // No argument is ever a path to a binary (no ".exe", no path separators).
+        for a in sc_stop_args(DIG_NODE_SERVICE_ID)
+            .into_iter()
+            .chain(sc_delete_args(DIG_NODE_SERVICE_ID))
+        {
+            assert!(
+                !a.contains(".exe") && !a.contains('\\') && !a.contains('/'),
+                "got: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn launchctl_target_is_the_system_domain_label() {
+        assert_eq!(
+            launchctl_system_target("net.dignetwork.dig-dns"),
+            "system/net.dignetwork.dig-dns"
+        );
+    }
+
+    #[test]
+    fn stop_and_deregister_an_unregistered_service_are_ok_noops() {
+        // Nothing registered → not RUNNING → stop/deregister succeed (idempotent
+        // no-op), never an error, and never spawn a binary.
+        let ghost = "net.dignetwork.definitely-not-a-real-dig-service-xyz";
+        assert!(stop_service(ghost).is_ok());
+        assert!(deregister_service(ghost).is_ok());
     }
 }
