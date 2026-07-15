@@ -121,9 +121,27 @@ jobs:
             # 0750 permissions that account cannot traverse (systemd reports
             # this as `status=203/EXEC`, a bare exec failure — found via this
             # job). `/opt` is world-traversable, matching what a real Linux
-            # package (`.deb`) would install into.
+            # package (`.deb`) would install into. Root-owned 0755 also satisfies
+            # the #565 H3 install-root ACL verify (no group/other write).
             sudo mkdir -p /opt/dig-bin && sudo chmod 755 /opt/dig-bin
             echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            # #565 H3: a privileged (service-executed) install into a custom
+            # --bin-dir is now ACL-verified fail-loud, exactly like the protected
+            # root — a LocalSystem service must not run a binary from a
+            # user-writable dir. `${{ runner.temp }}` inherits a Users-writable
+            # ACE, so harden this custom dir admin-only FIRST (mirror Program
+            # Files' DACL + the root-owned Linux /opt/dig-bin above): SYSTEM +
+            # Administrators full, Users read+execute, inheritance removed.
+            # `MSYS_NO_PATHCONV=1` keeps git-bash from mangling icacls's
+            # `/inheritance:r`/`/grant:r` flags (same pitfall as `schtasks /Query`).
+            BIN_DIR="${{ runner.temp }}/dig-bin"
+            mkdir -p "$BIN_DIR"
+            MSYS_NO_PATHCONV=1 icacls "$(cygpath -w "$BIN_DIR")" /inheritance:r \
+              /grant:r '*S-1-5-18:(OI)(CI)F' \
+              /grant:r '*S-1-5-32-544:(OI)(CI)F' \
+              /grant:r '*S-1-5-32-545:(OI)(CI)RX'
+            echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
           else
             echo "BIN_DIR=${{ runner.temp }}/dig-bin" >> "$GITHUB_ENV"
           fi
@@ -203,6 +221,21 @@ jobs:
           jq -e '.ok == true' install.json
           jq -e '.result.ready == true' install.json
           jq -e '.result.failures == []' install.json
+
+      # #565: the install root a privileged service runs from was actually
+      # ACL-verified admin-only (not merely assumed), and no privileged
+      # registration's binPath resolves under a legacy/user-writable root.
+      # The audit + migration now run on this `--bin-dir` privileged leg too
+      # (#565 H3 completion — the gate is `installs_a_privileged_binary`, not the
+      # `--bin-dir`-false `installs_a_protected_component`), so the audit array is
+      # NON-EMPTY here: assert that explicitly so the `under_legacy_root` check is
+      # meaningful, not vacuously true over an empty list.
+      - name: Assert the #565 install-root is verified admin-only + the audit ran with no legacy-bound registration
+        run: |
+          jq -e '.result.install_root_security.checked == true' install.json
+          jq -e '.result.install_root_security.secure == true' install.json
+          jq -e '(.result.registration_audit | length) > 0' install.json
+          jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
 
       - name: Assert dig-node registered + RUNNING by canonical id, dig.local resolves
         run: |
@@ -353,4 +386,145 @@ jobs:
             uninstall-node.json
             uninstall-dns.json
             uninstall-updater.json
+          if-no-files-found: ignore
+
+  # #565 H3 — the seeded-legacy MIGRATION + DEFAULT-protected-root proof.
+  #
+  # The `e2e` job above installs with a custom `--bin-dir`, so it verifies the
+  # audit/ACL on a CUSTOM dir and starts from a clean runner (nothing to migrate).
+  # Two things that leaves uncovered — and both are the heart of #565: (1) the
+  # DEFAULT protected root's own ACL (`%ProgramFiles%\DIG\bin`), and (2) the
+  # MIGRATION of a pre-#565 install whose privileged registration still points at
+  # a user-writable legacy root. This job covers both on Windows — the canonical
+  # #565 threat surface the issue names (the SYSTEM `\DIG\dig-updater` beacon task
+  # executing a binary a non-admin can replace).
+  #
+  # It SEEDS that exact pre-#565 shape (a SYSTEM beacon task whose binPath is under
+  # `%LOCALAPPDATA%\Programs\DIG\bin`), installs the beacon into the DEFAULT
+  # protected root with NO `--bin-dir`, and asserts the installer DEREGISTERED the
+  # legacy-bound task, verified the default root admin-only, and re-registered the
+  # beacon under the protected root. Beacon-only keeps it light + deterministic
+  # (no long-running network services). This is what makes the migration + audit
+  # assertions NON-VACUOUS — there is a real legacy registration to vacate.
+  migrate-e2e:
+    name: seeded-legacy migration into the default protected root (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      DIG_UPDATER_VERSION: "0.6.0"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: Windows-migrate-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            Windows-migrate-e2e-
+            Windows-installer-e2e-
+
+      - name: Build dig-installer (release)
+        run: cargo build --release --locked --bin dig-installer
+
+      - name: Resolve the built binary
+        run: echo "INSTALLER=$(pwd)/target/release/dig-installer.exe" >> "$GITHUB_ENV"
+
+      # Seed a PRE-#565 install shape: a SYSTEM beacon scheduled task whose binary
+      # lives in the user-writable legacy root (%LOCALAPPDATA%\Programs\DIG\bin) —
+      # exactly the escalation #565 fixes (a non-admin could replace that
+      # dig-updater.exe and the SYSTEM task would run it). The task id + legacy root
+      # are the canonical ones the installer's migration reads back and vacates
+      # (`regaudit::BEACON_WINDOWS_TASK` / `paths::legacy_privileged_roots`).
+      # `MSYS_NO_PATHCONV=1` stops git-bash mangling schtasks's `/`-flags (the same
+      # pitfall the beacon steps in the `e2e` job document).
+      - name: Seed a legacy-bound SYSTEM beacon task (pre-#565 shape)
+        run: |
+          LEGACY_DIR="$LOCALAPPDATA/Programs/DIG/bin"
+          mkdir -p "$LEGACY_DIR"
+          # A dummy stand-in binary at the legacy path — never executed by the
+          # installer (#565); only its PRESENCE + the task's binPath matter.
+          printf '@echo off\r\n' > "$LEGACY_DIR/dig-updater.exe"
+          LEGACY_WIN="$(cygpath -w "$LEGACY_DIR")\\dig-updater.exe"
+          echo "LEGACY_DIR=$LEGACY_DIR" >> "$GITHUB_ENV"
+          MSYS_NO_PATHCONV=1 schtasks.exe /Create /TN '\DIG\dig-updater' \
+            /TR "\"$LEGACY_WIN\" run" /SC DAILY /ST 03:00 /RU SYSTEM /RL HIGHEST /F
+          echo "Seeded task now resolves to:"
+          MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater' /XML \
+            | tee seeded-task.xml | grep -qi 'Programs.DIG.bin'
+
+      # Install the beacon into the DEFAULT protected root (NO --bin-dir). The
+      # hosted Windows runner is already Administrator (see the `e2e` job's note),
+      # so no elevation dance is needed. The migration runs FIRST (it now gates on
+      # `installs_a_privileged_binary`, which is true here), deregisters the seeded
+      # legacy task, then the install re-registers the beacon from Program Files.
+      - name: Install the auto-update beacon into the default protected root (no --bin-dir)
+        run: |
+          "$INSTALLER" \
+            --no-digstore --no-dig-node --no-dig-dns \
+            --dig-updater-version "$DIG_UPDATER_VERSION" \
+            --json | tee install.json
+
+      - name: Assert ready + the DEFAULT protected root is ACL-verified admin-only (#565)
+        run: |
+          jq -e '.ok == true' install.json
+          jq -e '.result.ready == true' install.json
+          jq -e '.result.failures == []' install.json
+          jq -e '.result.install_root_security.checked == true' install.json
+          jq -e '.result.install_root_security.secure == true' install.json
+          # The verified root is the built-in Program Files root, not a custom dir.
+          jq -e '.result.install_root_security.root | ascii_downcase | contains("program files")' install.json
+
+      - name: Assert the migration DEREGISTERED the legacy-bound beacon task (#565 H1)
+        run: |
+          jq -e '.result.migration.migrated == true' install.json
+          jq -e '[.result.migration.deregistered[] | select(ascii_downcase | contains("beacon"))] | length > 0' install.json
+          jq -e '(.result.migration.deregister_failures | length) == 0' install.json
+
+      - name: Assert the audit ran + no privileged registration resolves under a legacy root (#565 H2b)
+        run: |
+          jq -e '(.result.registration_audit | length) > 0' install.json
+          jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
+          jq -e '.result.beacon.applied == true' install.json
+
+      # The re-registered SYSTEM task now points UNDER Program Files, and the
+      # migration removed the legacy dummy binary — the escalation is closed.
+      - name: Assert the re-registered task points at the protected root + the legacy binary is gone
+        run: |
+          MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater' /XML \
+            | tee migrated-task.xml | grep -qi 'Program Files.DIG.bin'
+          test ! -f "$LEGACY_DIR/dig-updater.exe"
+
+      - name: Cleanup — uninstall the beacon
+        if: always()
+        run: |
+          "$INSTALLER" --uninstall-dig-updater --json | tee uninstall-updater.json || true
+          MSYS_NO_PATHCONV=1 schtasks.exe /Delete /TN '\DIG\dig-updater' /F || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-migrate-e2e-windows
+          path: |
+            install.json
+            uninstall-updater.json
+            seeded-task.xml
+            migrated-task.xml
           if-no-files-found: ignore

@@ -15,6 +15,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::proc::HideConsole;
+use crate::svc;
 
 /// Configuration for the dig-node service the installer will register.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,16 +63,6 @@ pub fn start_args() -> Vec<String> {
 /// needs to invoke the one subcommand.
 pub fn uninstall_args() -> Vec<String> {
     vec!["uninstall".to_string()]
-}
-
-/// The subcommand to stop a running service (task #232 — stop-before-write).
-pub fn stop_args() -> Vec<String> {
-    vec!["stop".to_string()]
-}
-
-/// The subcommand to query service state (task #232).
-fn status_json_args() -> Vec<String> {
-    vec!["status".to_string(), "--json".to_string()]
 }
 
 /// Environment variables to pass to `dig-node install` so the registered
@@ -137,76 +128,71 @@ pub struct StopOutcome {
     pub note: String,
 }
 
-/// Parse a dig-node `status --json` response for its flat top-level
-/// `"serving"` boolean. Pure — unit-tested without spawning anything. `None`
-/// means "could not determine" (malformed/unexpected JSON, or the binary
-/// predates the `status` verb); callers treat that as "not serving", the
-/// safe default when there is no evidence otherwise.
-fn parse_dig_node_serving(status_stdout: &[u8]) -> Option<bool> {
-    serde_json::from_slice::<serde_json::Value>(status_stdout)
-        .ok()?
-        .get("serving")?
-        .as_bool()
-}
-
-/// Spawn `<bin> status --json` and read whether dig-node is currently
-/// serving. Never hard-fails: a spawn failure or unparseable output resolves
-/// to "not serving" (see [`parse_dig_node_serving`]).
-fn dig_node_is_serving(bin: &Path) -> bool {
-    Command::new(bin)
-        .args(status_json_args())
-        .hide_console()
-        .output()
-        .ok()
-        .and_then(|out| parse_dig_node_serving(&out.stdout))
-        .unwrap_or(false)
-}
-
-/// Stop a currently-serving dig-node service before its binary is
-/// overwritten (task #232). Delegates to dig-node's own `stop` verb — never
-/// hand-rolls OS service control. Skip-when-absent (no error) when `bin`
-/// doesn't exist yet (first install) or `status` reports it isn't serving.
-/// If it IS serving and the stop attempt itself fails, this returns `Err` so
-/// the caller ABORTS this artifact's write rather than risk a half-written
-/// binary underneath a still-running service.
+/// Stop a currently-running dig-node service before its binary is overwritten
+/// (task #232). Stops it via the OS service manager by canonical id
+/// ([`crate::svc::stop_service`], `net.dignetwork.dig-node`) — it MUST NEVER
+/// execute the on-disk binary to stop it (#565: the installer runs elevated, and
+/// the pre-#565 `<bin> stop`/`<bin> status` path would elevate-spawn a binary a
+/// non-admin could have replaced in the legacy user-writable dir → user→SYSTEM
+/// escalation). Skip-when-absent (no error) when `bin` doesn't exist yet (first
+/// install) or the service isn't running. If it IS running and the stop fails,
+/// returns `Err` so the caller ABORTS the write rather than overwrite a binary
+/// underneath a still-running service.
 pub fn stop_running_dig_node(bin: &Path) -> Result<StopOutcome, String> {
-    stop_running_dig_node_with(bin, dig_node_is_serving)
+    stop_running_service_by_id_with(
+        bin,
+        "dig-node",
+        || svc::service_run_state(svc::DIG_NODE_SERVICE_ID),
+        || svc::stop_service(svc::DIG_NODE_SERVICE_ID),
+    )
 }
 
-/// [`stop_running_dig_node`] with an injectable "is currently serving" check
-/// — production code passes [`dig_node_is_serving`] (a real `status --json`
-/// probe); tests inject a fixed answer so the skip-vs-attempt branching is
-/// exercised without a JSON-emitting stub process.
-fn stop_running_dig_node_with(
+/// The shared stop-before-write for the self-registering services
+/// (dig-node/dig-relay), with the "current state" probe and the "stop it" action
+/// injected — production passes the real [`crate::svc::service_run_state`] +
+/// [`crate::svc::stop_service`] (both BY canonical id, never executing `bin`);
+/// tests inject fixed answers so the skip-vs-attempt-vs-abort branching is
+/// exercised without a real service manager (and without depending on whatever
+/// DIG services the test host happens to have). Mirrors
+/// [`crate::dns::stop_before_replace_with`].
+///
+/// The #565 guarantee lives in what this does NOT do: it never runs `bin`, so
+/// an elevated installer can never be tricked into executing a binary a
+/// non-admin replaced in the legacy user-writable dir.
+fn stop_running_service_by_id_with(
     bin: &Path,
-    is_serving: impl Fn(&Path) -> bool,
+    label: &str,
+    state: impl Fn() -> svc::ServiceRunState,
+    stop: impl Fn() -> Result<(), String>,
 ) -> Result<StopOutcome, String> {
     if !bin.exists() {
         return Ok(StopOutcome {
             bin_existed: false,
             attempted: false,
             stopped: false,
-            note: "no existing dig-node binary — first install, nothing to stop".to_string(),
+            note: format!("no existing {label} binary — first install, nothing to stop"),
         });
     }
-    if !is_serving(bin) {
+    if state() != svc::ServiceRunState::Running {
         return Ok(StopOutcome {
             bin_existed: true,
             attempted: false,
             stopped: false,
-            note: "existing dig-node service is not currently serving — nothing to stop"
-                .to_string(),
+            note: format!("existing {label} service is not currently running — nothing to stop"),
         });
     }
-    run_dig_node(bin, &stop_args(), &BTreeMap::new())
+    stop()
         .map(|()| StopOutcome {
             bin_existed: true,
             attempted: true,
             stopped: true,
-            note: "stopped the running dig-node service before replacing its binary".to_string(),
+            note: format!(
+                "stopped the running {label} service (by id, via the service manager) before \
+                 replacing its binary"
+            ),
         })
         .map_err(|e| {
-            format!("could not stop the running dig-node service before replacing its binary: {e}")
+            format!("could not stop the running {label} service before replacing its binary: {e}")
         })
 }
 
@@ -296,72 +282,18 @@ pub fn install_relay_service(bin: &Path, cfg: &RelayServiceConfig) -> Result<Str
     Ok(note)
 }
 
-/// Parse a dig-relay `status --json` response for its NESTED
-/// `result.serving` boolean (dig-relay's envelope shape differs from
-/// dig-node's flat `serving` — see [`parse_dig_node_serving`]). Pure —
-/// unit-tested without spawning anything.
-fn parse_dig_relay_serving(status_stdout: &[u8]) -> Option<bool> {
-    serde_json::from_slice::<serde_json::Value>(status_stdout)
-        .ok()?
-        .get("result")?
-        .get("serving")?
-        .as_bool()
-}
-
-/// Spawn `<bin> status --json` and read whether dig-relay is currently
-/// serving. Never hard-fails: a spawn failure or unparseable output resolves
-/// to "not serving".
-fn dig_relay_is_serving(bin: &Path) -> bool {
-    Command::new(bin)
-        .args(status_json_args())
-        .hide_console()
-        .output()
-        .ok()
-        .and_then(|out| parse_dig_relay_serving(&out.stdout))
-        .unwrap_or(false)
-}
-
-/// Stop a currently-serving dig-relay service before its binary is
-/// overwritten (task #232) — the dig-relay counterpart to
-/// [`stop_running_dig_node`]; same skip-when-absent / skip-when-not-serving /
-/// abort-on-stop-failure contract.
+/// Stop a currently-running dig-relay service before its binary is overwritten
+/// (task #232) — the dig-relay counterpart to [`stop_running_dig_node`], same
+/// contract and the same #565 rule: stop it via the OS service manager by
+/// canonical id ([`crate::svc::DIG_RELAY_SERVICE_ID`]), NEVER by executing the
+/// on-disk relay binary.
 pub fn stop_running_dig_relay(bin: &Path) -> Result<StopOutcome, String> {
-    stop_running_dig_relay_with(bin, dig_relay_is_serving)
-}
-
-/// [`stop_running_dig_relay`] with an injectable "is currently serving" check
-/// (mirrors [`stop_running_dig_node_with`]).
-fn stop_running_dig_relay_with(
-    bin: &Path,
-    is_serving: impl Fn(&Path) -> bool,
-) -> Result<StopOutcome, String> {
-    if !bin.exists() {
-        return Ok(StopOutcome {
-            bin_existed: false,
-            attempted: false,
-            stopped: false,
-            note: "no existing dig-relay binary — first install, nothing to stop".to_string(),
-        });
-    }
-    if !is_serving(bin) {
-        return Ok(StopOutcome {
-            bin_existed: true,
-            attempted: false,
-            stopped: false,
-            note: "existing dig-relay service is not currently serving — nothing to stop"
-                .to_string(),
-        });
-    }
-    run_relay(bin, &stop_args(), &BTreeMap::new())
-        .map(|()| StopOutcome {
-            bin_existed: true,
-            attempted: true,
-            stopped: true,
-            note: "stopped the running dig-relay service before replacing its binary".to_string(),
-        })
-        .map_err(|e| {
-            format!("could not stop the running dig-relay service before replacing its binary: {e}")
-        })
+    stop_running_service_by_id_with(
+        bin,
+        "dig-relay",
+        || svc::service_run_state(svc::DIG_RELAY_SERVICE_ID),
+        || svc::stop_service(svc::DIG_RELAY_SERVICE_ID),
+    )
 }
 
 /// Spawn the dig-relay binary with args + env, CAPTURING its stdio (never
@@ -704,12 +636,7 @@ mod tests {
         assert!(!note.contains("and started"));
     }
 
-    // -- task #232: stop-before-write --------------------------------------
-
-    #[test]
-    fn stop_args_is_the_stop_verb() {
-        assert_eq!(stop_args(), vec!["stop".to_string()]);
-    }
+    // -- task #232 / #565: stop-before-write, by service id ----------------
 
     /// #301 boot-start guarantee (dig-node). The installer registers dig-node by
     /// delegating to its own `install` verb, which registers a boot-start
@@ -730,128 +657,99 @@ mod tests {
             .any(|a| a.contains("manual") || a.contains("no-boot") || a.contains("no-autostart")));
     }
 
-    #[test]
-    fn parse_dig_node_serving_reads_the_flat_field() {
-        assert_eq!(
-            parse_dig_node_serving(br#"{"ok":true,"serving":true,"addr":"127.0.0.1:9778"}"#),
-            Some(true)
-        );
-        assert_eq!(
-            parse_dig_node_serving(br#"{"ok":true,"serving":false}"#),
-            Some(false)
-        );
+    /// An on-disk binary the stop path may see (its CONTENT is irrelevant —
+    /// #565's whole point is that it is NEVER executed). A plain file is enough.
+    fn existing_bin(tag: &str) -> std::path::PathBuf {
+        let dir = tmp_subdir(tag);
+        let p = dir.join("dig-bin");
+        std::fs::write(&p, b"not executed").unwrap();
+        p
     }
 
     #[test]
-    fn parse_dig_node_serving_is_none_on_malformed_or_missing_field() {
-        assert_eq!(parse_dig_node_serving(b"not json"), None);
-        assert_eq!(parse_dig_node_serving(b""), None);
-        assert_eq!(parse_dig_node_serving(br#"{"ok":true}"#), None);
-    }
-
-    #[test]
-    fn parse_dig_relay_serving_reads_the_nested_field() {
-        assert_eq!(
-            parse_dig_relay_serving(br#"{"ok":true,"result":{"serving":true,"health_url":"x"}}"#),
-            Some(true)
-        );
-        assert_eq!(
-            parse_dig_relay_serving(br#"{"ok":true,"result":{"serving":false}}"#),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn parse_dig_relay_serving_is_none_on_malformed_or_missing_field() {
-        assert_eq!(parse_dig_relay_serving(b"not json"), None);
-        assert_eq!(parse_dig_relay_serving(br#"{"ok":true}"#), None);
-        // Flat "serving" (dig-node's shape) at the top level does NOT satisfy
-        // dig-relay's nested contract — proves the two parsers aren't
-        // accidentally interchangeable.
-        assert_eq!(parse_dig_relay_serving(br#"{"serving":true}"#), None);
-    }
-
-    #[test]
-    fn stop_running_dig_node_skips_when_binary_is_absent() {
-        // First install: no prior binary at this path, so there is nothing to
-        // stop — must succeed (not an error) with attempted:false.
-        let missing = std::env::temp_dir().join(format!(
-            "dig-installer-stop-node-absent-{}",
-            std::process::id()
-        ));
-        let outcome = stop_running_dig_node_with(&missing, |_| true).expect("skip is not an error");
+    fn stop_before_write_skips_when_binary_is_absent() {
+        // First install: no prior binary, so nothing to stop — a skip (not an
+        // error), even if the (injected) service state claims RUNNING; and the
+        // stop action must NEVER be invoked.
+        let missing =
+            std::env::temp_dir().join(format!("dig-installer-stop-absent-{}", std::process::id()));
+        let outcome = stop_running_service_by_id_with(
+            &missing,
+            "dig-node",
+            || svc::ServiceRunState::Running,
+            || panic!("must not stop when there is no prior binary"),
+        )
+        .expect("skip is not an error");
         assert!(!outcome.bin_existed);
         assert!(!outcome.attempted);
         assert!(!outcome.stopped);
     }
 
     #[test]
-    fn stop_running_dig_node_skips_when_not_serving() {
-        let dir = tmp_subdir("stop-node-not-serving");
-        let bin = stub_exit(&dir, true); // exists on disk; injected as not-serving
-        let outcome =
-            stop_running_dig_node_with(&bin, |_| false).expect("not serving is not an error");
-        assert!(outcome.bin_existed);
-        assert!(!outcome.attempted);
-        assert!(!outcome.stopped);
+    fn stop_before_write_skips_when_the_service_is_not_running() {
+        // The binary exists but the service manager reports it is not RUNNING
+        // (stopped / not registered) → skip, and NEVER call the stop action
+        // (which, crucially, is never "execute the binary").
+        for state in [
+            svc::ServiceRunState::Stopped,
+            svc::ServiceRunState::NotFound,
+            svc::ServiceRunState::Unknown,
+        ] {
+            let bin = existing_bin("stop-not-running");
+            let outcome = stop_running_service_by_id_with(
+                &bin,
+                "dig-relay",
+                move || state,
+                || panic!("must not stop when the service is not RUNNING"),
+            )
+            .expect("not running is not an error");
+            assert!(outcome.bin_existed);
+            assert!(!outcome.attempted, "state {state:?} must skip the stop");
+            let _ = std::fs::remove_dir_all(bin.parent().unwrap());
+        }
     }
 
     #[test]
-    fn stop_running_dig_node_stops_when_serving_and_stop_succeeds() {
-        let dir = tmp_subdir("stop-node-serving-ok");
-        let bin = stub_exit(&dir, true); // `stop` (any arg) exits 0 on this stub
-        let outcome = stop_running_dig_node_with(&bin, |_| true).expect("stop succeeds");
-        assert!(outcome.bin_existed);
+    fn stop_before_write_stops_by_id_when_the_service_is_running() {
+        let bin = existing_bin("stop-running");
+        let outcome = stop_running_service_by_id_with(
+            &bin,
+            "dig-node",
+            || svc::ServiceRunState::Running,
+            || Ok(()),
+        )
+        .expect("stop succeeds");
         assert!(outcome.attempted);
         assert!(outcome.stopped);
+        assert!(outcome.note.contains("by id"), "got: {}", outcome.note);
+        let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 
     #[test]
-    fn stop_running_dig_node_aborts_when_serving_and_stop_fails() {
-        let dir = tmp_subdir("stop-node-serving-fail");
-        let bin = stub_exit(&dir, false); // `stop` exits non-zero on this stub
-        let err = stop_running_dig_node_with(&bin, |_| true).unwrap_err();
+    fn stop_before_write_aborts_when_a_running_service_cannot_be_stopped() {
+        // A stop failure ABORTS the write (dig-node/dig-relay must not overwrite
+        // a binary underneath a still-running service).
+        let bin = existing_bin("stop-fail");
+        let err = stop_running_service_by_id_with(
+            &bin,
+            "dig-node",
+            || svc::ServiceRunState::Running,
+            || Err("access denied".to_string()),
+        )
+        .unwrap_err();
         assert!(err.contains("could not stop"), "got: {err}");
+        let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 
     #[test]
-    fn stop_running_dig_relay_skips_when_binary_is_absent() {
-        let missing = std::env::temp_dir().join(format!(
-            "dig-installer-stop-relay-absent-{}",
-            std::process::id()
-        ));
-        let outcome =
-            stop_running_dig_relay_with(&missing, |_| true).expect("skip is not an error");
-        assert!(!outcome.bin_existed);
-        assert!(!outcome.attempted);
-    }
-
-    #[test]
-    fn stop_running_dig_relay_skips_when_not_serving() {
-        let dir = tmp_subdir("stop-relay-not-serving");
-        let bin = stub_exit(&dir, true);
-        let outcome =
-            stop_running_dig_relay_with(&bin, |_| false).expect("not serving is not an error");
-        assert!(outcome.bin_existed);
-        assert!(!outcome.attempted);
-    }
-
-    #[test]
-    fn stop_running_dig_relay_stops_when_serving_and_stop_succeeds() {
-        let dir = tmp_subdir("stop-relay-serving-ok");
-        let bin = stub_exit(&dir, true);
-        let outcome = stop_running_dig_relay_with(&bin, |_| true).expect("stop succeeds");
-        assert!(outcome.bin_existed);
-        assert!(outcome.attempted);
-        assert!(outcome.stopped);
-    }
-
-    #[test]
-    fn stop_running_dig_relay_aborts_when_serving_and_stop_fails() {
-        let dir = tmp_subdir("stop-relay-serving-fail");
-        let bin = stub_exit(&dir, false);
-        let err = stop_running_dig_relay_with(&bin, |_| true).unwrap_err();
-        assert!(err.contains("could not stop"), "got: {err}");
+    fn public_stop_wrappers_skip_a_first_install_without_touching_a_binary() {
+        // The public entrypoints (real svc probes) must at least handle the
+        // first-install case cleanly on any host — the branch that never
+        // consults the service manager or a binary.
+        let missing =
+            std::env::temp_dir().join(format!("dig-installer-stop-pub-{}", std::process::id()));
+        assert!(!stop_running_dig_node(&missing).unwrap().attempted);
+        assert!(!stop_running_dig_relay(&missing).unwrap().attempted);
     }
 
     // -- run_capturing: stdio is CAPTURED, never inherited (dig_ecosystem#502/#524) --

@@ -151,5 +151,3 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Gui
 - Correct stage-binary error hint for the new home
-
-

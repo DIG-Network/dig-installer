@@ -52,11 +52,15 @@ pub mod error;
 pub mod firewall;
 pub mod health;
 pub mod hosts;
+pub mod manifest;
+pub mod migrate;
 pub mod pathcheck;
 pub mod paths;
 pub mod proc;
+pub mod regaudit;
 pub mod release;
 pub mod scheme;
+pub mod secure;
 pub mod service;
 pub mod svc;
 pub mod target;
@@ -162,12 +166,132 @@ impl InstallPlan {
     /// Registering an OS service (dig-node, dig-dns, dig-relay), a daily
     /// update-scheduler artifact (dig-updater, #514), or writing the
     /// `dig.local` hosts entry needs elevation; a `--dry-run` changes nothing
-    /// so never does. This gates the pre-install elevation check (#492) — a
-    /// digstore-only install to a per-user dir does not force elevation, but the
-    /// default full-stack install (which registers services) does.
-    pub fn requires_elevation(&self) -> bool {
-        !self.dry_run
-            && (self.with_dig_node || self.with_dig_dns || self.with_relay || self.auto_update)
+    /// so never does. Additionally (#565): writing into the admin-only protected
+    /// install root itself needs elevation — so even a CLI-only install elevates
+    /// on Windows (where the whole stack lives under `%ProgramFiles%\DIG\bin`),
+    /// while a CLI-only unix install into the per-user `~/.dig/bin` still does
+    /// not. An explicit `--bin-dir` override is treated as the user's own
+    /// (possibly-writable) choice and does not, by itself, force elevation.
+    /// This gates the pre-install elevation check (#492).
+    pub fn requires_elevation(&self, os: target::Os) -> bool {
+        if self.dry_run {
+            return false;
+        }
+        if self.with_dig_node || self.with_dig_dns || self.with_relay || self.auto_update {
+            return true;
+        }
+        // #565: a CLI-only install still writes binaries into the protected root
+        // on a platform where that root is admin-only (Windows Program Files).
+        let places_a_binary = self.with_digstore || self.with_browser;
+        places_a_binary
+            && !self.has_custom_bin_dir()
+            && self.bin_dir_for("digstore", os) == paths::protected_bin_dir()
+    }
+
+    /// The directory a given `component` is installed into on `os` (#565).
+    ///
+    /// A PRIVILEGED component (one a service/scheduled-task executes — see
+    /// [`paths::is_privileged_component`]) goes into the admin-only
+    /// [`paths::protected_bin_dir`]; every other (user-run) component goes into
+    /// [`Self::bin_dir`]. An explicit `--bin-dir` override wins for the WHOLE
+    /// stack ([`Self::has_custom_bin_dir`]) — the user chose one dir and takes
+    /// responsibility for it. On Windows the two roots coincide (Program Files),
+    /// so the whole stack lands there either way.
+    pub fn bin_dir_for(&self, component: &str, os: target::Os) -> PathBuf {
+        if paths::is_privileged_component(os, component) && !self.has_custom_bin_dir() {
+            paths::protected_bin_dir()
+        } else {
+            self.bin_dir.clone()
+        }
+    }
+
+    /// Did the user pick a bin dir explicitly (rather than the built-in default)?
+    /// When they did, that one dir is used for every component (the override
+    /// wins over the per-component protected-root routing, #565).
+    pub fn has_custom_bin_dir(&self) -> bool {
+        self.bin_dir != paths::default_bin_dir()
+    }
+
+    /// Will this plan place at least one binary into the DEFAULT admin-only
+    /// [`paths::protected_bin_dir`] (#565)? True when a selected component is
+    /// [`paths::is_privileged_component`] AND no `--bin-dir` override redirected
+    /// it — so it is `false` under any `--bin-dir` override.
+    ///
+    /// This answers "does a privileged binary land in the built-in protected
+    /// root?" — NOT "does this plan install a privileged binary at all?" The
+    /// #565 gates (migration + audit + ACL verify) must fire on a `--bin-dir`
+    /// privileged install too, so they gate on [`Self::installs_a_privileged_binary`]
+    /// / [`Self::privileged_install_root`] instead; this predicate is retained to
+    /// express the narrower default-root question.
+    pub fn installs_a_protected_component(&self, os: target::Os) -> bool {
+        if self.has_custom_bin_dir() {
+            return false;
+        }
+        self.selected_components()
+            .iter()
+            .any(|c| paths::is_privileged_component(os, c))
+    }
+
+    /// The directory a PRIVILEGED/service-executed component will actually land
+    /// in — the admin-only [`paths::protected_bin_dir`] by default, OR the
+    /// user's `--bin-dir` when an override redirected the whole stack (#565 H3).
+    /// `None` when no privileged component is selected (nothing to gate).
+    ///
+    /// This is the dir the fail-loud ACL verify (`secure::verify_install_root`)
+    /// must run on — DECOUPLED from [`Self::installs_a_protected_component`] so a
+    /// privileged install into a NON-admin-only custom dir (the CLI `--bin-dir`
+    /// case, and the shipped GUI's user-writable `bin_dir`) STILL gets verified
+    /// and REFUSES ready if the dir grants unprivileged write, instead of
+    /// silently shipping the escalation.
+    pub fn privileged_install_root(&self, os: target::Os) -> Option<PathBuf> {
+        let component = self
+            .selected_components()
+            .into_iter()
+            .find(|c| paths::is_privileged_component(os, c))?;
+        Some(self.bin_dir_for(component, os))
+    }
+
+    /// Whether this plan installs a privileged/service-executed binary ANYWHERE —
+    /// the admin-only protected root by default OR a custom `--bin-dir`/GUI dir
+    /// (`true` exactly when [`Self::privileged_install_root`] is `Some`). This is
+    /// the ONE gate for the #565 privileged-registration maintenance both the
+    /// legacy-root migration (§ [`migrate::migrate_from_legacy_roots`]) and the
+    /// post-install binPath audit (§ [`regaudit::audit`]) run under.
+    ///
+    /// Deliberately DECOUPLED from [`Self::installs_a_protected_component`] — the
+    /// same decoupling H3 applied to the ACL verify. That predicate is `false`
+    /// under a `--bin-dir` override (the path the GUI passes + the e2e uses), so
+    /// gating on it SKIPPED the migration + audit there: a pre-#565 legacy-bound
+    /// service/beacon registration was never vacated or flagged, readiness
+    /// reported ready, and a non-admin could overwrite the legacy binary to run
+    /// code as SYSTEM. Gating on this predicate closes that residual — the
+    /// maintenance runs whenever a privileged binary is placed, on every path.
+    /// (Both the migration and the audit only ever ACT on legacy roots, never the
+    /// custom dir, so running them on a `--bin-dir` install is safe.)
+    pub fn installs_a_privileged_binary(&self, os: target::Os) -> bool {
+        self.privileged_install_root(os).is_some()
+    }
+
+    /// The component ids this plan will install (before per-OS availability
+    /// gating), so placement/elevation/verification decisions share one list.
+    fn selected_components(&self) -> Vec<&'static str> {
+        let mut c = Vec::new();
+        if self.with_digstore {
+            c.extend(["digstore", "digs"]);
+        }
+        if self.with_dig_node {
+            c.extend(["dig-node", "dign"]);
+        }
+        if self.with_dig_dns {
+            c.extend(["dig-dns", "digd"]);
+        }
+        if self.auto_update {
+            c.extend(["dig-updater", "dig-updater-worker"]);
+        }
+        if self.with_relay {
+            c.push("dig-relay");
+        }
+        c
     }
 }
 
@@ -329,6 +453,29 @@ pub struct InstallReport {
     /// identity-independent control/auth dirs the dig-node/dig-dns daemons +
     /// the operator CLI share. Empty on dry-run / when no daemon is installed.
     pub daemon_dirs: Vec<daemon_dir::DaemonDirResult>,
+    /// The post-install verification that the PROTECTED install root denies
+    /// unprivileged write (#565): the machine-checkable form of "no service
+    /// binary lives where a non-admin could replace it". `None` on dry-run or
+    /// when no privileged component was placed (nothing to verify). A definitive
+    /// `checked && !secure` makes the install NOT ready ([`evaluate_readiness`]).
+    pub install_root_security: Option<secure::InstallRootSecurity>,
+    /// The record of migrating an existing install off the legacy user-writable
+    /// root onto the protected root (#565): services deregistered/re-pointed,
+    /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
+    /// when no legacy install was detected.
+    pub migration: Option<migrate::MigrationResult>,
+    /// The post-registration binPath audit of every privileged DIG registration
+    /// (#565 review — H1 backstop + H2b): each service / the SYSTEM beacon task's
+    /// ACTUAL configured binary, read back from the OS, and whether it still
+    /// resolves under a legacy/user-writable root. An entry with
+    /// `under_legacy_root == true` makes the install NOT ready
+    /// ([`evaluate_readiness`]). Empty on dry-run / when no privileged component
+    /// was placed.
+    pub registration_audit: Vec<regaudit::RegistrationAudit>,
+    /// The authoritative install-root record written to `install.json` (#581):
+    /// the single source of truth the auto-update beacon reads for the install
+    /// root. `None` on dry-run or when no privileged component was placed.
+    pub install_manifest: Option<manifest::ManifestResult>,
     /// The AGGREGATE verdict (#493): `true` iff EVERY selected component
     /// installed AND its service is verified RUNNING. Only when this is `true`
     /// may a caller print "✓ DIG is ready". Always `true` on a dry-run (nothing
@@ -560,7 +707,7 @@ fn run_report_gated(
     // un-elevated run (#492). Only enforced when the plan actually needs
     // elevation (registers a service / writes hosts); a dry-run or digstore-only
     // run does not trip it.
-    if plan.requires_elevation() {
+    if plan.requires_elevation(target.os) {
         elevation::guard(is_elevated(), elevation::is_system(), &target)?;
     }
 
@@ -580,9 +727,38 @@ fn run_report_gated(
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
+        install_root_security: None,
+        migration: None,
+        registration_audit: Vec::new(),
+        install_manifest: None,
         ready: true,
         failures: Vec::new(),
     };
+
+    // #565: MIGRATE any existing user-writable install off the legacy root, then
+    //    ensure the admin-only protected root exists + is hardened (unix `chmod
+    //    0755`; Windows inherits Program Files' admin-only DACL) — BEFORE placing
+    //    any privileged binary in it. The migration stops + re-points services by
+    //    canonical id via the OS service manager; it NEVER executes a binary from
+    //    the (possibly attacker-replaced) legacy user-writable dir. Gated on
+    //    `installs_a_privileged_binary` — DECOUPLED from
+    //    `installs_a_protected_component` so it runs on a `--bin-dir`/GUI
+    //    privileged install too (the migration only acts on legacy roots, never
+    //    the custom dir): otherwise a legacy-bound registration would survive.
+    if !plan.dry_run && plan.installs_a_privileged_binary(target.os) {
+        let migration = migrate::migrate_from_legacy_roots(&target, log);
+        if migration.migrated {
+            report.migration = Some(migration);
+        }
+        let protected = paths::protected_bin_dir();
+        if let Err(e) = secure::ensure_protected_dir(target.os, &protected) {
+            log(&format!(
+                "    ! could not pre-create the protected install root {} ({e}); the per-binary \
+                 write will create it",
+                protected.display()
+            ));
+        }
+    }
 
     // 0. Machine-wide daemon state directories (#501/#499). Created BEFORE any
     //    daemon starts so dig-node/dig-dns write their control-token into a
@@ -608,7 +784,7 @@ fn run_report_gated(
             &plan.digstore_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("digstore", target.os),
         )?;
         log_component(log, &c);
         // #309 version-aware updater: detect what's already at this
@@ -632,7 +808,7 @@ fn run_report_gated(
             &plan.digstore_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("digs", target.os),
         )?;
         log_component(log, &digs);
         download_component(&digs, plan.dry_run)?;
@@ -681,7 +857,13 @@ fn run_report_gated(
     //    dig.local hosts entry.
     if plan.with_dig_node {
         log("Installing the dig-node local node:");
-        let mut c = resolve_dig_node(resolve, &plan.dig_node_version, &target, &plan.bin_dir, log)?;
+        let mut c = resolve_dig_node(
+            resolve,
+            &plan.dig_node_version,
+            &target,
+            &plan.bin_dir_for("dig-node", target.os),
+            log,
+        )?;
         log_component(log, &c);
         // #309 version-aware updater: decide Install/Update/Skip BEFORE
         // touching anything. Only Install/Update proceed to the #232
@@ -737,7 +919,7 @@ fn run_report_gated(
             &plan.dig_node_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("dign", target.os),
         ) {
             Ok(dign) => {
                 log_component(log, &dign);
@@ -786,7 +968,7 @@ fn run_report_gated(
             &plan.dig_dns_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("dig-dns", target.os),
         ) {
             Ok(mut c) => {
                 log_component(log, &c);
@@ -841,7 +1023,7 @@ fn run_report_gated(
                     &plan.dig_dns_version,
                     &target,
                     AssetKind::RawBinary,
-                    &plan.bin_dir,
+                    &plan.bin_dir_for("digd", target.os),
                 )?;
                 log_component(log, &digd);
                 download_component(&digd, plan.dry_run)?;
@@ -896,7 +1078,7 @@ fn run_report_gated(
             &plan.dig_updater_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("dig-updater", target.os),
         )?;
         log_component(log, &c);
         // #309 version-aware updater, extended to the beacon (#514): same
@@ -920,7 +1102,7 @@ fn run_report_gated(
             &plan.dig_updater_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("dig-updater-worker", target.os),
         )?;
         log_component(log, &worker);
         download_component(&worker, plan.dry_run)?;
@@ -949,7 +1131,7 @@ fn run_report_gated(
             &plan.relay_version,
             &target,
             AssetKind::RawBinary,
-            &plan.bin_dir,
+            &plan.bin_dir_for("dig-relay", target.os),
         )?;
         log_component(log, &c);
         // Task #232: stop a currently-running dig-relay before overwriting
@@ -985,7 +1167,7 @@ fn run_report_gated(
             &plan.browser_version,
             &target,
             AssetKind::Installer,
-            &plan.bin_dir,
+            &plan.bin_dir_for("browser", target.os),
         )?;
         log_component(log, &c);
         download_component(&c, plan.dry_run)?;
@@ -1011,6 +1193,72 @@ fn run_report_gated(
     // immediately. Non-dry-run only (dry-run installs nothing to resolve).
     if !plan.dry_run {
         verify_clis_on_path(&target, &mut report, log);
+    }
+
+    // #565: VERIFY the dir every privileged/service-executed binary landed in
+    //    denies unprivileged write, now that all are in place. This is the
+    //    machine-checkable "no service binary sits where a non-admin could
+    //    replace it" gate; a DEFINITIVE breach (an unprivileged Allow-write ACE /
+    //    group-writable mode) makes the install NOT ready. The dir is the
+    //    admin-only protected root by default OR the `--bin-dir` / GUI-chosen dir
+    //    when an override redirected the stack (#565 H3): the verify follows the
+    //    binaries so a privileged install into a user-writable custom dir can
+    //    NEVER silently succeed.
+    if !plan.dry_run {
+        if let Some(root) = plan.privileged_install_root(target.os) {
+            log("Verifying the install root denies unprivileged write:");
+            let verdict = secure::verify_install_root(target.os, &root);
+            log(&format!(
+                "    {} {}",
+                if verdict.checked && !verdict.secure {
+                    "!"
+                } else {
+                    "✓"
+                },
+                verdict.note
+            ));
+            report.install_root_security = Some(verdict);
+
+            // #581: record the authoritative install root in install.json so the
+            // auto-update beacon has a single source of truth for where DIG lives
+            // (coherent with the beacon's own current_exe-derived root). Only for
+            // the DEFAULT protected root — a custom override is the user's own dir.
+            if root == paths::protected_bin_dir() {
+                let m = manifest::write_install_manifest(
+                    target.os,
+                    &paths::protected_bin_dir(),
+                    env!("CARGO_PKG_VERSION"),
+                    plan.dry_run,
+                );
+                log(&format!(
+                    "    {} {}",
+                    if m.written { "✓" } else { "·" },
+                    m.note
+                ));
+                report.install_manifest = Some(m);
+            }
+        }
+
+        // #565 (review — H1 backstop + H2b): AUDIT every privileged registration's
+        //    ACTUAL configured binPath, read back from the OS (never by executing
+        //    the binary). A registration still resolving under a legacy/
+        //    user-writable root — a service the tolerated re-install left there, or
+        //    an orphaned SYSTEM beacon task a component opt-out stranded — makes the
+        //    install NOT ready ([`evaluate_readiness`]). Gated on
+        //    `installs_a_privileged_binary` (the SAME gate as the migration above),
+        //    so it fires whenever a privileged binary is placed — including on a
+        //    `--bin-dir`/GUI install, not only the default protected root.
+        if plan.installs_a_privileged_binary(target.os) {
+            log("Auditing that every privileged registration runs from the protected root:");
+            report.registration_audit = regaudit::audit(target.os);
+            for a in &report.registration_audit {
+                log(&format!(
+                    "    {} {}",
+                    if a.under_legacy_root { "!" } else { "✓" },
+                    a.note
+                ));
+            }
+        }
     }
 
     // Aggregate readiness verdict (#493 + @mt-dev firm directive): "if
@@ -1222,6 +1470,44 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
             ));
         }
     }
+
+    // #565: the install root MUST deny unprivileged write. A DEFINITIVE breach
+    // (the ACL/mode read back and an unprivileged principal CAN write) is a hard
+    // failure — a service binary a non-admin can replace is the exact local
+    // privilege escalation this family closes. This now covers a privileged
+    // install into a user-writable `--bin-dir`/GUI dir too (#565 H3), since the
+    // verify runs on whichever dir the privileged binaries landed in. An
+    // inconclusive read (`checked == false`) is only a warning (logged above),
+    // never a false failure: the admin-only LOCATION remains the primary guarantee.
+    if let Some(sec) = &report.install_root_security {
+        if sec.checked && !sec.secure {
+            failures.push(format!(
+                "install root {}: {} — a non-admin could replace a privileged service binary; \
+                 re-run elevated / repair the directory permissions",
+                sec.root, sec.note
+            ));
+        }
+    }
+
+    // #565 (review — H2a): a privileged registration that could NOT be
+    // deregistered off the legacy root during migration is FATAL — continuing
+    // into a tolerated re-install could leave the service/task pointing at the
+    // writable legacy binPath.
+    if let Some(m) = &report.migration {
+        for f in &m.deregister_failures {
+            failures.push(format!(
+                "migration: {f}; re-run elevated so the privileged registration is re-pointed \
+                 into the protected root"
+            ));
+        }
+    }
+
+    // #565 (review — H1 backstop + H2b): any privileged registration whose ACTUAL
+    // binPath still resolves under a legacy/user-writable root is a hard failure —
+    // an orphaned auto-start service / SYSTEM beacon task a non-admin could replant
+    // and run as SYSTEM. This catches both a component opt-out that stranded a
+    // registration and a tolerated re-install that never re-pointed it.
+    failures.extend(regaudit::audit_failures(&report.registration_audit));
 
     // PATH resolution (#496): any required CLI that does not resolve by bare
     // name from a fresh shell makes the install NOT ready — the user could not
@@ -3170,6 +3456,10 @@ mod tests {
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
+            install_root_security: None,
+            migration: None,
+            registration_audit: Vec::new(),
+            install_manifest: None,
             ready: true,
             failures: Vec::new(),
         }
@@ -3192,20 +3482,402 @@ mod tests {
 
     #[test]
     fn requires_elevation_tracks_privileged_actions() {
-        // A service/hosts install needs elevation; a dry-run or digstore-only
-        // (per-user) run does not.
-        assert!(dig_node_service_plan().requires_elevation());
+        use target::Os;
+        // A service/hosts install needs elevation; a dry-run or a digstore-only
+        // run into a CUSTOM (user-chosen) bin dir does not — an explicit
+        // --bin-dir is the user's own choice (base_plan uses a custom temp dir).
+        assert!(dig_node_service_plan().requires_elevation(Os::Linux));
         let mut digstore_only = base_plan();
         digstore_only.with_digstore = true;
         digstore_only.dry_run = false;
         assert!(
-            !digstore_only.requires_elevation(),
-            "digstore-only (no service) does not force elevation"
+            !digstore_only.requires_elevation(Os::Windows),
+            "digstore-only into a custom --bin-dir does not force elevation"
         );
         assert!(
-            !base_plan().requires_elevation(),
+            !base_plan().requires_elevation(Os::Windows),
             "a dry-run never requires elevation"
         );
+    }
+
+    /// #565: a DEFAULT (no `--bin-dir` override) CLI-only install needs
+    /// elevation exactly when the CLI lands in the admin-only protected root.
+    /// The path helpers are HOST-based (the `os` arg drives only the
+    /// privileged-component classification; in production it is always the host
+    /// os), so this asserts the real host posture: on Windows the whole stack —
+    /// even the CLI — installs into `%ProgramFiles%\DIG\bin` (→ elevation); on
+    /// unix the CLI stays in the elevation-free per-user `~/.dig/bin` (→ none).
+    #[test]
+    fn cli_only_install_elevation_matches_the_protected_root_posture() {
+        let host = Target::current().expect("supported host").os;
+        let cli_only = InstallPlan {
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            dry_run: false,
+            ..InstallPlan::default() // default bin_dir → NOT a custom override
+        };
+        assert!(
+            !cli_only.has_custom_bin_dir(),
+            "the default plan must not look like a --bin-dir override"
+        );
+        match host {
+            target::Os::Windows => assert!(
+                cli_only.requires_elevation(host),
+                "a Windows CLI-only install writes into admin-only Program Files"
+            ),
+            target::Os::Linux | target::Os::MacOs => assert!(
+                !cli_only.requires_elevation(host),
+                "a unix CLI-only install stays in ~/.dig/bin (no elevation)"
+            ),
+        }
+    }
+
+    /// #565: the per-component protected-root routing. On unix the privileged
+    /// service binaries route to `/opt/dig/bin`; the user CLIs stay in the user
+    /// root. On Windows the whole stack shares the one Program Files root. An
+    /// explicit `--bin-dir` override wins for every component.
+    #[test]
+    fn bin_dir_for_routes_privileged_components_to_the_protected_root() {
+        use target::Os;
+        let plan = InstallPlan::default(); // no override
+                                           // unix: dig-dns/dig-updater/worker → protected; user CLIs → user root.
+        assert_eq!(
+            plan.bin_dir_for("dig-dns", Os::Linux),
+            paths::protected_bin_dir()
+        );
+        assert_eq!(
+            plan.bin_dir_for("dig-updater", Os::Linux),
+            paths::protected_bin_dir()
+        );
+        assert_eq!(
+            plan.bin_dir_for("digstore", Os::Linux),
+            paths::default_bin_dir()
+        );
+        assert_eq!(
+            plan.bin_dir_for("dign", Os::Linux),
+            paths::default_bin_dir()
+        );
+        // Windows: every component lands in the single protected root.
+        for c in ["digstore", "dig-node", "dig-dns", "dig-updater"] {
+            assert_eq!(plan.bin_dir_for(c, Os::Windows), paths::protected_bin_dir());
+        }
+        // An explicit override wins for the WHOLE stack, on every OS.
+        let overridden = InstallPlan {
+            bin_dir: std::path::PathBuf::from("/custom/dig"),
+            ..InstallPlan::default()
+        };
+        assert!(overridden.has_custom_bin_dir());
+        assert_eq!(
+            overridden.bin_dir_for("dig-dns", Os::Linux),
+            std::path::PathBuf::from("/custom/dig")
+        );
+        assert_eq!(
+            overridden.bin_dir_for("dig-updater", Os::Windows),
+            std::path::PathBuf::from("/custom/dig")
+        );
+    }
+
+    /// #565: a definitive install-root ACL breach (an unprivileged principal
+    /// CAN write where a privileged service binary lives) makes the install NOT
+    /// ready; an inconclusive read is only a warning, never a false failure.
+    #[test]
+    fn readiness_fails_on_a_definitive_install_root_write_breach() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        // Definitive breach → NOT ready, with a clear reason.
+        let mut report = report_shell();
+        report.install_root_security = Some(secure::InstallRootSecurity {
+            root: r"C:\Program Files\DIG\bin".to_string(),
+            checked: true,
+            secure: false,
+            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("install root")),
+            "a definitive write breach must fail readiness: {failures:?}"
+        );
+        // Inconclusive read → NOT a failure (the admin-only location still holds).
+        let mut report = report_shell();
+        report.install_root_security = Some(secure::InstallRootSecurity {
+            root: r"C:\Program Files\DIG\bin".to_string(),
+            checked: false,
+            secure: false,
+            note: "could not read the ACL back".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            !failures.iter().any(|f| f.contains("install root")),
+            "an inconclusive ACL read must not fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H1: a re-run that leaves the SYSTEM auto-update beacon task
+    /// (or any privileged registration) pointing at a binary inside the
+    /// user-writable legacy root is a residual local privilege escalation — a
+    /// non-admin replants that path and runs as SYSTEM on the next daily fire.
+    /// The post-registration audit MUST make such an install NOT ready.
+    #[test]
+    fn readiness_fails_when_a_privileged_registration_is_orphaned_under_the_legacy_root() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        let mut report = report_shell();
+        report.registration_audit = vec![
+            regaudit::RegistrationAudit {
+                registration: "dig-updater beacon task".to_string(),
+                bin_path: Some(
+                    r"C:\Users\me\AppData\Local\Programs\DIG\bin\dig-updater.exe".to_string(),
+                ),
+                under_legacy_root: true,
+                note: "beacon runs a binary under a user-writable legacy root".to_string(),
+            },
+            regaudit::RegistrationAudit {
+                registration: "dig-node".to_string(),
+                bin_path: Some(r"C:\Program Files\DIG\bin\dig-node.exe".to_string()),
+                under_legacy_root: false,
+                note: "dig-node runs from a protected location".to_string(),
+            },
+        ];
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("beacon")),
+            "an orphaned SYSTEM beacon task under the legacy root must fail readiness: {failures:?}"
+        );
+        // The already-protected dig-node registration must NOT be flagged.
+        assert!(
+            !failures.iter().any(|f| f.contains("dig-node")),
+            "a protected registration must not fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H2a: a privileged registration that could NOT be
+    /// deregistered off the legacy root during migration is FATAL — the installer
+    /// must not silently continue into a tolerated re-install that leaves the
+    /// service at the writable legacy binPath.
+    #[test]
+    fn readiness_fails_when_a_migration_deregister_failed() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        let mut report = report_shell();
+        report.migration = Some(migrate::MigrationResult {
+            migrated: true,
+            deregister_failures: vec![
+                "could not deregister dig-node off the legacy root (access denied)".to_string(),
+            ],
+            ..Default::default()
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("migration") && f.contains("dig-node")),
+            "a failed migration deregister must fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H2b: a service whose ACTUAL binPath resolves under the legacy
+    /// root — the tolerated-re-install case that left it un-re-pointed — must fail
+    /// readiness even though the protected DIR's ACL looks fine.
+    #[test]
+    fn readiness_fails_when_a_service_binpath_still_points_at_the_legacy_root() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service()); // installed + RUNNING
+        report.registration_audit = vec![regaudit::RegistrationAudit {
+            registration: "dig-node".to_string(),
+            bin_path: Some(
+                r"C:\Users\me\AppData\Local\Programs\DIG\bin\dig-node.exe run".to_string(),
+            ),
+            under_legacy_root: true,
+            note: "dig-node runs a binary under a user-writable legacy root".to_string(),
+        }];
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("dig-node")),
+            "a service still pointing at the legacy binPath must fail readiness: {failures:?}"
+        );
+    }
+
+    /// #565 review — H3: a PRIVILEGED component routed into a user-writable custom
+    /// `--bin-dir` (the CLI override and the shipped GUI both do this) must STILL
+    /// be ACL-verified. `installs_a_protected_component` is false for a custom dir,
+    /// but `privileged_install_root` returns that custom dir so the verify runs —
+    /// and a definitive write breach on it refuses ready.
+    #[test]
+    fn custom_bin_dir_privileged_install_is_still_acl_verified_and_can_refuse_ready() {
+        use target::Os;
+        let host = Target::current().expect("supported host").os;
+        let custom = std::path::PathBuf::from(if host == Os::Windows {
+            r"C:\Users\me\AppData\Local\Programs\DIG\bin"
+        } else {
+            "/home/me/.local/dig/bin"
+        });
+        let plan = InstallPlan {
+            bin_dir: custom.clone(),
+            with_dig_node: true, // a privileged (service-executed) component
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        assert!(plan.has_custom_bin_dir());
+        // The OLD gate is OFF for a custom dir …
+        assert!(
+            !plan.installs_a_protected_component(host),
+            "installs_a_protected_component stays false for a --bin-dir override"
+        );
+        // … but the verify gate is DECOUPLED: the custom dir is what gets checked.
+        assert_eq!(
+            plan.privileged_install_root(host),
+            Some(custom.clone()),
+            "a privileged component into a custom dir must still be routed through the verify"
+        );
+        // A definitive write breach on that custom dir refuses ready.
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.install_root_security = Some(secure::InstallRootSecurity {
+            root: custom.to_string_lossy().into_owned(),
+            checked: true,
+            secure: false,
+            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("install root")),
+            "a privileged install into a user-writable custom dir must refuse ready: {failures:?}"
+        );
+    }
+
+    /// #565 residual — H3 was HALF-applied. The prior fix decoupled the ACL VERIFY
+    /// (above) from `installs_a_protected_component`, but left the legacy-root
+    /// MIGRATION and the post-install binPath AUDIT gated on it — so on a
+    /// `--bin-dir` privileged install (the path the GUI passes + the e2e uses) both
+    /// were SKIPPED: a pre-#565 legacy-bound service/beacon registration was never
+    /// vacated or flagged, readiness reported ready, and a non-admin could overwrite
+    /// the legacy binary to run code as SYSTEM. Both gates now fire whenever a
+    /// privileged binary is installed anywhere (`installs_a_privileged_binary`), so
+    /// the audit populates the report and `evaluate_readiness` REFUSES ready.
+    /// A privileged install into a custom `--bin-dir`, host-INDEPENDENT: dig-dns is
+    /// a privileged (service-executed) component on EVERY OS (unlike dig-node, which
+    /// is user-level on unix), so `installs_a_privileged_binary` is true on any CI
+    /// host. `base_plan` already uses a custom temp bin dir (`has_custom_bin_dir`).
+    fn custom_bin_dir_privileged_plan() -> InstallPlan {
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        plan.dry_run = false;
+        plan
+    }
+
+    #[test]
+    fn custom_bin_dir_install_still_migrates_and_audits_legacy_registrations() {
+        let host = Target::current().expect("supported host").os;
+        let plan = custom_bin_dir_privileged_plan();
+        assert!(
+            plan.has_custom_bin_dir(),
+            "test premise: a --bin-dir override"
+        );
+
+        // RED DRIVER: the migration + binPath-audit gate MUST fire on this path …
+        assert!(
+            plan.installs_a_privileged_binary(host),
+            "a --bin-dir privileged install must run the #565 migration + binPath audit"
+        );
+        // … even though the default-root-only predicate stays off for a custom dir
+        // (documenting the exact half-applied H3 hole this closes).
+        assert!(
+            !plan.installs_a_protected_component(host),
+            "installs_a_protected_component is false under --bin-dir — why the old gate wrongly skipped"
+        );
+
+        // Consequence, now that the audit runs on this path: a legacy-bound
+        // registration it surfaces refuses ready. (Pre-fix the gate was OFF, so the
+        // audit never ran, `registration_audit` stayed empty, and readiness wrongly
+        // reported ready — the SYSTEM-code-exec the residual left open.) The dig-dns
+        // service itself is healthy, so the legacy audit is the SOLE failure.
+        let mut report = report_shell();
+        report.dns = Some(dns::DnsInstallResult {
+            installed: true,
+            started: true,
+            service_running: true,
+            needs_elevation: false,
+            note: "registered".to_string(),
+            doctor: None,
+            paths_live: vec!["dns".to_string()],
+            bound_port: None,
+            pac_url: None,
+            fallback_instruction: None,
+        });
+        report.registration_audit = vec![regaudit::RegistrationAudit {
+            registration: "dig-dns".to_string(),
+            bin_path: Some("/home/me/.dig/bin/dig-dns".to_string()),
+            under_legacy_root: true,
+            note: "dig-dns runs a binary under a user-writable legacy root".to_string(),
+        }];
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-dns") && failures[0].contains("legacy"));
+    }
+
+    /// #565 residual — the migration must NOT be skipped on a `--bin-dir` privileged
+    /// install. The migration gate is `!dry_run && installs_a_privileged_binary(os)`:
+    /// assert it fires for the custom-dir privileged non-dry-run case (it did not
+    /// before this fix) and is still (correctly) skipped on a dry-run.
+    #[test]
+    fn custom_bin_dir_privileged_install_does_not_skip_migration() {
+        let host = Target::current().expect("supported host").os;
+        let mut plan = custom_bin_dir_privileged_plan();
+        let migration_runs = |p: &InstallPlan| !p.dry_run && p.installs_a_privileged_binary(host);
+        assert!(
+            migration_runs(&plan),
+            "the #565 migration must run on a --bin-dir privileged install"
+        );
+        plan.dry_run = true;
+        assert!(
+            !migration_runs(&plan),
+            "a dry-run installs nothing, so it must never run the migration"
+        );
+    }
+
+    /// #565 review — H3 (negative): with NO privileged component selected there is
+    /// nothing to gate, so `privileged_install_root` is `None` (the verify is
+    /// skipped rather than run against an irrelevant dir).
+    #[test]
+    fn privileged_install_root_is_none_without_a_privileged_component() {
+        use target::Os;
+        // digstore-only into a custom dir on unix: digstore is NOT privileged
+        // there, so there is no service-executed binary to protect.
+        let plan = InstallPlan {
+            bin_dir: std::path::PathBuf::from("/home/me/.local/dig/bin"),
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            auto_update: false,
+            with_relay: false,
+            ..InstallPlan::default()
+        };
+        assert_eq!(plan.privileged_install_root(Os::Linux), None);
     }
 
     #[test]
