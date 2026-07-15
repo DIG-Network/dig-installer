@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.18.0] - 2026-07-15
+
+### Bug Fixes
+- **security:** Run privileged services from a protected install root (#25)
+
 ## [0.17.1] - 2026-07-15
 
 ### CI
@@ -151,3 +156,5 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Gui
 - Correct stage-binary error hint for the new home
+
+
