@@ -222,18 +222,29 @@ jobs:
       - name: Stage bundled digstore binary
         working-directory: gui/app
         run: node scripts/stage-binary.mjs --src ../../_digstore/${{ matrix.digstore_bin }}
-      # Keep BUILDING the GUI (compile/bundle CI coverage) but do NOT stage or
-      # upload it as a release artifact — dig_ecosystem#610: the Tauri GUI
-      # re-opens the #565 user->SYSTEM LPE (asInvoker + a user-writable bin_dir
-      # routes LocalSystem services into a dir a non-admin can write). The
-      # `DIG-Installer-Setup-*` artifact is WITHHELD from every release until
-      # #610 fixes the GUI's elevation + protected-root routing. Re-enable the
-      # stage + upload steps below (drop the `if: false`) when #610 lands.
+      # dig_ecosystem#610 (FIXED on WINDOWS): the Windows Tauri GUI now requests
+      # Administrator up front (`requireAdministrator` manifest) and routes every
+      # privileged/service-executed component through the admin-only protected
+      # root via the library's `default_bin_dir()` — closing the #565 user->SYSTEM
+      # LPE the earlier `asInvoker` + user-writable bin-dir combination re-opened.
+      # The Windows `DIG-Installer-Setup-*.exe` artifact is therefore restored to
+      # releases.
+      #
+      # macOS + Linux stay WITHHELD (still built below for CI compile/bundle
+      # coverage, but NOT collected/uploaded as release assets): the GUI has no
+      # native elevation UX there yet (Authorization Services / pkexec-polkit).
+      # It fails CLOSED — the plan-driven elevation gate refuses a privileged
+      # install when not run as root, so no LPE ships — but a double-clicked
+      # .dmg/.AppImage cannot complete the default full-stack install, so shipping
+      # one is a broken experience, not a safe install. Un-withhold each once its
+      # elevation UX lands (dig_ecosystem#610 follow-ups). The CLI (install.sh) is
+      # the supported unix path meanwhile.
       - name: Build the GUI installer
         working-directory: gui/app
         run: npx tauri build ${{ matrix.build_args }}
       - name: Collect single installer artifact
-        if: false # dig_ecosystem#610 — do not publish the GUI installer (LPE); re-enable when #610 lands
+        # Windows only (see the note above): macOS/Linux GUI lack an elevation UX.
+        if: matrix.os == 'windows-latest'
         shell: bash
         working-directory: gui/app
         run: |
@@ -243,7 +254,7 @@ jobs:
           cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
           ls -la ../../dist-gui
       - name: Upload GUI installer artifact
-        if: false # dig_ecosystem#610 — do not publish the GUI installer (LPE); re-enable when #610 lands
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: digstore-gui-installer-${{ matrix.os }}

@@ -590,8 +590,22 @@ component — see `gui/app/src-tauri/src/install.rs` phases 1–6). Every OTHER 
 (`dig-node`/`dig-dns`/`dig-relay`/`browser`/the auto-update beacon, §1.5) is installed by delegating
 to this repo's OWN `dig_installer::run_report` (the same thin-shim orchestration the CLI uses,
 including the §2 stop/write/start lifecycle and the beacon's own scheduler-registration delegation)
-via a pure `plan_from_selection(selected, bin_dir) -> InstallPlan` mapping (`install.rs`) — the GUI
-never reimplements release resolution, download, service, or scheduler control.
+via a pure `plan_from_selection(selected) -> InstallPlan` mapping (`install.rs`) — the GUI never
+reimplements release resolution, download, service, or scheduler control.
+
+The GUI plan MUST NOT set a user-chosen custom `bin_dir`: it sets `bin_dir = paths::default_bin_dir()`
+so `has_custom_bin_dir()` is false and every privileged/service-executed component routes through the
+admin-only `protected_bin_dir()` (§1.6), re-arming the §5 migration + fail-loud ACL verify + binPath
+audit on the GUI path exactly as on the CLI. A user-chosen install path affects only the GUI-owned
+`digstore` CLI (unpacked into `<install_dir>/bin`), never a service binary — a service binary in a
+user-writable dir under a LocalSystem service / SYSTEM beacon task is the user→SYSTEM local privilege
+escalation (#565/#610). On Windows the GUI's embedded manifest requests `requireAdministrator` (not
+`asInvoker`) so the elevation needed to write the protected root + register services is obtained up
+front via a UAC elevation of the same interactive user (the `elevation::guard` SYSTEM check still
+rejects a service/`psexec -s` relaunch); on macOS/Linux the pre-install `elevation::guard` fails loud
+with a "re-run elevated" remedy rather than performing a silent unprivileged install of a privileged
+component. The pre-install elevation decision uses `InstallPlan::requires_elevation` (which also
+covers the default-on SYSTEM auto-update beacon), not a hand-maintained component-id list.
 
 The Done screen exposes a **Close** action (`bridge.js` `closeWindow` → Tauri `getCurrentWindow().close()`,
 the same window op the title-bar close control uses) beside the primary **Launch Terminal**, so the

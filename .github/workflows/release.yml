@@ -77,10 +77,14 @@ jobs:
       - name: Flatten
         run: |
           mkdir -p release
-          # dig_ecosystem#610: never attach the Tauri GUI installer to a release —
-          # it re-opens the #565 LPE. Belt-and-braces beside build-binaries.yml's
-          # withheld upload: exclude any DIG-Installer-Setup-* even if one appears.
-          find artifacts -type f ! -name 'DIG-Installer-Setup-*' -exec cp {} release/ \;
+          # dig_ecosystem#610 (FIXED): the Tauri GUI installer
+          # (`DIG-Installer-Setup-*`) now routes every privileged/service-executed
+          # component through the admin-only protected root and obtains elevation
+          # (Windows requireAdministrator manifest; macOS/Linux fail loud with a
+          # "re-run elevated" guard) — closing the #565 user->SYSTEM LPE. The GUI
+          # artifacts are attached to releases again on every OS, so flatten
+          # everything present — no GUI exclude needed.
+          find artifacts -type f -exec cp {} release/ \;
           ls -la release
       - name: Create / update the STABLE release and attach assets
         uses: softprops/action-gh-release@v2

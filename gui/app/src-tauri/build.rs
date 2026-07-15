@@ -78,11 +78,18 @@ fn main() {
         println!("cargo:rustc-cfg=embed_digstore");
     }
 
-    // Build with an explicit asInvoker manifest. Tauri embeds a manifest by
-    // default but does NOT set a requestedExecutionLevel, so Windows Installer
-    // Detection heuristically auto-elevates this exe (it sees "installer" in the
-    // file/version info) and forces a UAC prompt. This install is per-user
-    // (%LOCALAPPDATA% + HKCU only) and needs no elevation, so pin asInvoker.
+    // Build with an explicit `requireAdministrator` manifest (#610). The DIG
+    // installer places binaries a LocalSystem service / the SYSTEM auto-update
+    // beacon task later executes into the admin-only protected root
+    // (`%ProgramFiles%\DIG\bin`) and registers those services — all of which
+    // require Administrator. A non-elevated (`asInvoker`) run cannot write there
+    // or register a service; worse, the earlier `asInvoker` + user-writable
+    // bin-dir combination re-opened the #565 user→SYSTEM local privilege
+    // escalation. Requesting elevation up front means Windows raises a UAC prompt
+    // that elevates the SAME interactive user (never SYSTEM — the `is_system`
+    // guard still rejects a service/psexec relaunch), so the privileged
+    // components always land in the protected root. A user who declines UAC never
+    // starts the install (no partial, unprivileged state).
     let manifest = r#"<?xml version="1.0" encoding="utf-8"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
@@ -102,7 +109,7 @@ fn main() {
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
