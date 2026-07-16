@@ -2363,6 +2363,17 @@ impl<'a> SystemActions<'a> {
     }
 }
 
+/// Did the dig-dns service teardown FAIL to remove the service registration —
+/// so its binaries (dig-dns + the digd alias) must be left in place (never
+/// deleted) to avoid orphaning a still-registered service (blocker #4)? Gates on
+/// the explicit [`dns::DnsUninstallResult::service_removed`] signal — NOT on
+/// `uninstalled`, which is `true` when merely a non-service artifact (NRPT rule
+/// / browser policy) was removed even though the service deregister itself
+/// failed on an elevated run. Pure.
+fn dns_service_teardown_failed(dns: &dns::DnsUninstallResult) -> bool {
+    !dns.service_removed
+}
+
 /// Does a service-teardown `Err` indicate the LAUNCHER BINARY could not be run
 /// (missing/unspawnable), rather than the service manager replying? A spawn
 /// failure surfaces through [`service::run_capturing`]'s stable `"could not run
@@ -2449,13 +2460,17 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
             }
         }
-        // dig-dns has its own teardown (service + DNS wiring); it reports a
-        // permission problem via `needs_elevation` (not a hard error). When it
-        // could NOT deregister, its binaries (dig-dns + the digd alias) must be
-        // left in place — deleting them would orphan a live dig-dns service.
+        // dig-dns has its own teardown (service + DNS wiring). Gate on the
+        // explicit `service_removed` signal — NOT `uninstalled` (which is true
+        // when ANY artifact, e.g. an NRPT rule or browser policy, was removed
+        // even if the SERVICE deregister itself failed). When the service is not
+        // confirmed gone (a failed deregister, or an unelevated run), its
+        // binaries (dig-dns + the digd alias) must be left in place — deleting
+        // them would orphan a still-registered service pointing at a missing
+        // ImagePath (the blocker-#4 orphan).
         let dns = dns::uninstall(false);
         notes.push(format!("dig-dns: {}", dns.note));
-        if dns.needs_elevation {
+        if dns_service_teardown_failed(&dns) {
             ok = false;
             failed.push("dig-dns".to_string());
             failed.push("digd".to_string());
@@ -4090,6 +4105,7 @@ mod tests {
         let result = dns::DnsUninstallResult {
             uninstalled: true,
             needs_elevation: false,
+            service_removed: true,
             note: "removed: Windows service \"net.dignetwork.dig-dns\"".to_string(),
             residue_removed: vec!["Windows service \"net.dignetwork.dig-dns\"".to_string()],
         };
@@ -4100,6 +4116,47 @@ mod tests {
             v["result"]["residue_removed"][0],
             "Windows service \"net.dignetwork.dig-dns\""
         );
+    }
+
+    #[test]
+    fn dns_teardown_failed_when_service_survives_even_if_other_artifacts_removed() {
+        // Blocker #4 residual: an ELEVATED dig-dns uninstall where the SERVICE
+        // deregister FAILED but the NRPT rule / browser policy WAS removed —
+        // `uninstalled == true`, `needs_elevation == false`, but the service is
+        // still registered. This MUST be treated as a failed teardown so the
+        // dig-dns binary is NOT deleted (which would orphan the live service).
+        let service_survived = dns::DnsUninstallResult {
+            uninstalled: true, // an artifact WAS removed …
+            needs_elevation: false,
+            service_removed: false, // … but the service registration survived.
+            note: "removed: .dig NRPT rule".to_string(),
+            residue_removed: vec![".dig NRPT rule".to_string()],
+        };
+        assert!(
+            dns_service_teardown_failed(&service_survived),
+            "a surviving service registration is a failed teardown even when uninstalled==true"
+        );
+
+        // A clean teardown (service confirmed gone) is NOT a failure.
+        let clean = dns::DnsUninstallResult {
+            uninstalled: true,
+            needs_elevation: false,
+            service_removed: true,
+            note: "removed: Windows service".to_string(),
+            residue_removed: vec!["Windows service".to_string()],
+        };
+        assert!(!dns_service_teardown_failed(&clean));
+
+        // An already-absent service (nothing to remove, but confirmed gone) is
+        // also NOT a failure — a second uninstall stays a clean no-op.
+        let absent = dns::DnsUninstallResult {
+            uninstalled: false,
+            needs_elevation: false,
+            service_removed: true,
+            note: "nothing to remove".to_string(),
+            residue_removed: Vec::new(),
+        };
+        assert!(!dns_service_teardown_failed(&absent));
     }
 
     #[test]

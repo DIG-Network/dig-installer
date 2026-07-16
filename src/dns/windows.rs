@@ -415,6 +415,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,
+            service_removed: false,
             note: "would stop + remove the dig-dns Windows service, the .dig NRPT rule, \
                    and any Chrome/Edge policy this installer created"
                 .to_string(),
@@ -425,6 +426,9 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: true,
+            // Not elevated → we did not (could not) touch the service, so its
+            // registration state is unconfirmed — never treat it as gone.
+            service_removed: false,
             note: "uninstalling the dig-dns Windows service requires an elevated \
                    (Administrator) console"
                 .to_string(),
@@ -441,6 +445,11 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     {
         removed.push(format!("Windows service \"{}\"", plan::SERVICE_LABEL));
     }
+    // The authoritative signal for the #568 binary-delete gate: is the SERVICE
+    // registration actually gone now? True whether we just removed it OR it was
+    // already absent; FALSE only when a deregister failed and it still exists
+    // (deleting the binary then would orphan it — blocker #4).
+    let service_removed = !service_exists(plan::SERVICE_LABEL);
     if run_ps(&plan::nrpt_remove_ps_command()).is_ok() {
         removed.push(".dig NRPT rule".to_string());
     }
@@ -456,6 +465,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     DnsUninstallResult {
         uninstalled: !removed.is_empty(),
         needs_elevation: false,
+        service_removed,
         note: if removed.is_empty() {
             "nothing to remove (dig-dns was not registered by this installer)".to_string()
         } else {

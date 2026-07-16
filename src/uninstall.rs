@@ -330,6 +330,27 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_dig_dns_service_teardown_skips_dig_dns_and_digd_binaries() {
+        // Blocker #4 residual (dig-dns): an elevated uninstall where the dig-dns
+        // SERVICE deregister failed (its binaries dig-dns + the digd alias are
+        // reported in failed_components) must skip deleting BOTH binaries and
+        // leave the run not-yet-complete.
+        let mut a = FakeActions {
+            service_failed: vec!["dig-dns".into(), "digd".into()],
+            residue: vec!["/opt/dig/bin/dig-dns".into(), "/opt/dig/bin/digd".into()],
+            ..Default::default()
+        };
+        let r = orchestrate(&mut a, false);
+        assert_eq!(
+            a.delete_skip.as_deref(),
+            Some(&["dig-dns".to_string(), "digd".to_string()][..]),
+            "both dig-dns and digd must be skipped when the dig-dns service teardown failed"
+        );
+        assert!(!r.steps.iter().find(|s| s.id == "services").unwrap().ok);
+        assert!(!r.complete());
+    }
+
+    #[test]
     fn a_clean_service_teardown_deletes_everything_no_skip() {
         let mut a = FakeActions::default();
         let r = orchestrate(&mut a, false);

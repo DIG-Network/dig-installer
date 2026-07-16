@@ -417,6 +417,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,
+            service_removed: false,
             note: format!(
                 "would stop + remove the dig-dns and lo0-alias LaunchDaemons, {RESOLVER_PATH}, \
                  the lo0 alias, and the Chrome managed plist if this installer wrote it"
@@ -428,6 +429,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: true,
+            service_removed: false,
             note: "uninstalling the dig-dns LaunchDaemon requires root (run with sudo)".to_string(),
             residue_removed: Vec::new(),
         };
@@ -438,12 +440,12 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     let _ = svc_mgr.stop(ServiceStopCtx {
         label: service_label(),
     });
-    if svc_mgr
+    let service_removed = svc_mgr
         .uninstall(ServiceUninstallCtx {
             label: service_label(),
         })
-        .is_ok()
-    {
+        .is_ok();
+    if service_removed {
         removed.push(format!("dig-dns LaunchDaemon \"{}\"", plan::SERVICE_LABEL));
     }
 
@@ -469,6 +471,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     DnsUninstallResult {
         uninstalled: !removed.is_empty(),
         needs_elevation: false,
+        service_removed,
         note: if removed.is_empty() {
             "nothing to remove (dig-dns was not registered by this installer)".to_string()
         } else {

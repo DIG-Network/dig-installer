@@ -459,6 +459,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,
+            service_removed: false,
             note: format!(
                 "would stop + remove the dig-dns systemd unit, its split-DNS drop-in, the \
                  Chrome/Chromium policy files, and the {} user",
@@ -471,6 +472,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: true,
+            service_removed: false,
             note: "uninstalling the dig-dns systemd service requires root (run with sudo)"
                 .to_string(),
             residue_removed: Vec::new(),
@@ -482,12 +484,12 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     let _ = mgr.stop(ServiceStopCtx {
         label: service_label(),
     });
-    if mgr
+    let service_removed = mgr
         .uninstall(ServiceUninstallCtx {
             label: service_label(),
         })
-        .is_ok()
-    {
+        .is_ok();
+    if service_removed {
         removed.push(format!("systemd unit \"{}\"", plan::service_script_name()));
     }
 
@@ -508,6 +510,7 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
     DnsUninstallResult {
         uninstalled: !removed.is_empty(),
         needs_elevation: false,
+        service_removed,
         note: if removed.is_empty() {
             "nothing to remove (dig-dns was not registered by this installer)".to_string()
         } else {
