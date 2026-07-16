@@ -227,10 +227,12 @@ struct Cli {
     /// Force-install the DIG extension into every DETECTED Chromium browser by
     /// writing its `ExtensionInstallForcelist` managed policy for the given
     /// channel (`stable` — the default — or `nightly`), then exit (#612). A
-    /// channel change is performed as a clean per-browser reinstall (a nightly
-    /// build outranks stable, so a naive rewrite would not downgrade). Merges
-    /// beside any org forcelist; requires elevation. Use `--json` for a machine
-    /// result. Runs standalone — ignores every other install flag.
+    /// channel change writes the per-browser remove->re-add primitive in one
+    /// pass (a nightly build outranks stable, so a naive value rewrite would not
+    /// downgrade). Note: actually crossing a downgrade needs the uninstall staged
+    /// across a policy-refresh cycle before the re-add — that staging is #613's
+    /// job. Merges beside any org forcelist; requires elevation. Use `--json` for
+    /// a machine result. Runs standalone — ignores every other install flag.
     #[arg(long = "set-ext-forcelist-channel", value_name = "CHANNEL")]
     set_ext_forcelist_channel: Option<String>,
 

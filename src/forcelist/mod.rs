@@ -186,21 +186,65 @@ pub fn remove(targets: &[PolicyTarget]) -> Vec<ForcelistOutcome> {
 /// This is the per-browser primitive the beacon-follow job (#613) drives; #613
 /// owns staging the remove and the re-add across policy-refresh cycles so the
 /// browser actually observes the uninstall before the reinstall.
+///
+/// A FAILED re-add is never masked as success. If the remove succeeded but the
+/// re-add failed, the browser is left in the dangerous "extension removed, not
+/// restored" state — this MUST surface as [`ForcelistAction::Failed`] so the
+/// exit-code / `ok` contract ([`crate::forcelist_json`], the CLI verb) reports
+/// the failure. Only a genuinely successful re-add is relabelled `Updated`.
 pub fn reinstall(targets: &[PolicyTarget], channel: Channel) -> Vec<ForcelistOutcome> {
-    targets
-        .iter()
-        .map(|t| {
-            let _ = remove_one(t);
-            let mut out = apply_one(t, channel);
-            out.action = ForcelistAction::Updated;
-            out.note = format!(
-                "channel reinstall (removed then re-added at {}): {}",
-                channel.as_str(),
-                out.note
-            );
-            out
-        })
-        .collect()
+    targets.iter().map(|t| reinstall_one(t, channel)).collect()
+}
+
+fn reinstall_one(target: &PolicyTarget, channel: Channel) -> ForcelistOutcome {
+    let removed = remove_one(target);
+    let applied = apply_one(target, channel);
+    combine_reinstall(&removed, applied, channel)
+}
+
+/// Fold a reinstall's `removed` + `applied` outcomes into the reported result,
+/// never masking a failed re-add. PURE — separated from the OS-dispatching
+/// [`reinstall_one`] so the "remove succeeded but re-add failed" path (which is
+/// hard to provoke through real registry/plist I/O) is directly unit-tested.
+fn combine_reinstall(
+    removed: &ForcelistOutcome,
+    mut applied: ForcelistOutcome,
+    channel: Channel,
+) -> ForcelistOutcome {
+    let re_add_ok = matches!(
+        applied.action,
+        ForcelistAction::Wrote | ForcelistAction::AlreadyPresent
+    );
+
+    if re_add_ok {
+        // Successful transition — report it as an in-place channel update.
+        applied.action = ForcelistAction::Updated;
+        applied.note = format!(
+            "channel reinstall (removed then re-added at {}): {}",
+            channel.as_str(),
+            applied.note
+        );
+    } else if removed.action == ForcelistAction::Removed {
+        // The dangerous state: our entry was removed (the browser will
+        // uninstall the extension) but the re-add did not succeed. Surface it
+        // as a hard failure, never a silent success.
+        applied.action = ForcelistAction::Failed;
+        applied.note = format!(
+            "channel reinstall LEFT THE EXTENSION REMOVED (re-add did not succeed at {}): {}",
+            channel.as_str(),
+            applied.note
+        );
+    } else {
+        // Nothing was removed AND the re-add did not write (e.g. macOS Skipped
+        // on a pre-existing org plist). Preserve apply_one's own action
+        // verbatim — no masking either way.
+        applied.note = format!(
+            "channel reinstall no-op/skip at {}: {}",
+            channel.as_str(),
+            applied.note
+        );
+    }
+    applied
 }
 
 fn apply_one(target: &PolicyTarget, channel: Channel) -> ForcelistOutcome {
@@ -295,6 +339,59 @@ mod tests {
         ));
         // A superstring of the id (not id-then-semicolon) is not ours.
         assert!(!is_our_entry("mlibddmbhlgogepnjdienclhnkfpkfahEXTRA"));
+    }
+
+    fn outcome(action: ForcelistAction) -> ForcelistOutcome {
+        ForcelistOutcome {
+            location: "loc".to_string(),
+            action,
+            note: "n".to_string(),
+        }
+    }
+
+    #[test]
+    fn reinstall_reports_failure_when_remove_succeeds_but_re_add_fails() {
+        // The dangerous state #613's exit-code contract must catch: the entry
+        // was removed (browser uninstalls the extension) but the re-add failed
+        // — MUST surface as Failed, never a masked Updated/success.
+        let removed = outcome(ForcelistAction::Removed);
+        let applied = outcome(ForcelistAction::Failed);
+        let out = combine_reinstall(&removed, applied, Channel::Stable);
+        assert_eq!(out.action, ForcelistAction::Failed);
+        assert!(out.note.contains("LEFT THE EXTENSION REMOVED"));
+
+        // And the success gates report the failure.
+        let json = crate::forcelist_json(std::slice::from_ref(&out));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ok"], false, "forcelist_json must report not-ok");
+    }
+
+    #[test]
+    fn reinstall_relabels_a_successful_re_add_as_updated() {
+        let out = combine_reinstall(
+            &outcome(ForcelistAction::Removed),
+            outcome(ForcelistAction::Wrote),
+            Channel::Nightly,
+        );
+        assert_eq!(out.action, ForcelistAction::Updated);
+        let out2 = combine_reinstall(
+            &outcome(ForcelistAction::NothingToRemove),
+            outcome(ForcelistAction::AlreadyPresent),
+            Channel::Stable,
+        );
+        assert_eq!(out2.action, ForcelistAction::Updated);
+    }
+
+    #[test]
+    fn reinstall_preserves_a_skip_when_nothing_was_removed() {
+        // macOS non-DIG plist: nothing removed, apply Skipped → stays Skipped,
+        // not masked as Updated and not escalated to Failed.
+        let out = combine_reinstall(
+            &outcome(ForcelistAction::NothingToRemove),
+            outcome(ForcelistAction::Skipped),
+            Channel::Stable,
+        );
+        assert_eq!(out.action, ForcelistAction::Skipped);
     }
 
     #[test]

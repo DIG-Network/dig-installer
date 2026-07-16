@@ -416,7 +416,10 @@ are skipped. A `policy_target` for a non-host OS is reported `skipped`, never wr
   honest about MDM).
 - **Marker-owned.** On Windows/macOS the entry value itself is the marker — it begins with the
   canonical extension id, which no other tool emits; on Linux the marker is the dedicated filename.
-  `remove` deletes only what carries the marker.
+  `remove` deletes only what carries the marker. (Acknowledged edge: an org independently
+  force-installing the SAME DIG extension id with a different `update_url` would be recognized as
+  ours and its entry removed/replaced. This is negligible — the id is DIG's own, so any such entry is
+  force-installing the DIG extension regardless of which `update_url` it points at.)
 - **Idempotent + no half-write.** Re-running with the same channel is a no-op (no duplicate entry); a
   partial failure leaves no half-registered policy; removal is complete (zero residue).
 - **Channel-switch semantics = clean reinstall (not a rewrite).** The extension id is identical across
