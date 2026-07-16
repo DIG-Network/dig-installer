@@ -89,7 +89,21 @@ npm install
 npm run dev            # vite dev server only (browser-simulated install, no Tauri backend)
 npm run build           # vite production bundle (dist/) — sanity-checks the frontend compiles
 npx tauri dev            # the REAL Tauri window, wired to the Rust backend (gui/app/src-tauri)
+npx tauri build --bundles appimage   # produce the release .AppImage (Linux)
 ```
+
+**Linux GUI elevation (#638).** The `.AppImage` launches UNELEVATED. When the selection needs
+privilege (services / the auto-update beacon / a protected-root binary), the GUI relaunches ITSELF as
+root via `pkexec` for the privileged step only — polkit renders the native admin-auth dialog — then
+finishes the unprivileged parts (incl. the `digstore --version` verify) back in the unelevated parent.
+To exercise it end-to-end you need `polkit`/`pkexec` installed (`sudo apt install policykit-1`) and a
+desktop session that can show the polkit prompt; run the built `.AppImage` and approve the dialog. If
+polkit is absent the install fails CLOSED with a "install polkit or run `sudo dig-installer`" message
+(the per-user `~/.dig/bin` + PATH artifacts still install; only the system-wide `/opt/dig/bin` step is
+skipped). The headless root child is the SAME executable (under an AppImage, `$APPIMAGE` — the
+root-readable `.AppImage` file, not the FUSE mount) re-invoked with a fixed `__dig-elevated-install`
+argv (never a shell); the install selection is streamed to it over stdin (no plan file), so you will
+not see a second GUI window.
 
 `npm run dev`/`vite preview` alone (no `tauri dev`) runs the GUI in a plain browser tab with
 `bridge.js`'s **simulated** install (no real Tauri commands available — `window.__TAURI_INTERNALS__`

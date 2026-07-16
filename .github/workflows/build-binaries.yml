@@ -230,21 +230,26 @@ jobs:
       # The Windows `DIG-Installer-Setup-*.exe` artifact is therefore restored to
       # releases.
       #
-      # macOS + Linux stay WITHHELD (still built below for CI compile/bundle
-      # coverage, but NOT collected/uploaded as release assets): the GUI has no
-      # native elevation UX there yet (Authorization Services / pkexec-polkit).
-      # It fails CLOSED — the plan-driven elevation gate refuses a privileged
-      # install when not run as root, so no LPE ships — but a double-clicked
-      # .dmg/.AppImage cannot complete the default full-stack install, so shipping
-      # one is a broken experience, not a safe install. Un-withhold each once its
-      # elevation UX lands (dig_ecosystem#610 follow-ups). The CLI (install.sh) is
-      # the supported unix path meanwhile.
+      # Linux (#638) now has native elevation: the unelevated AppImage GUI
+      # relaunches its own executable as root via `pkexec` (polkit's built-in
+      # `org.freedesktop.policykit.exec` action) for the privileged step only,
+      # routing every privileged binary to the admin-only protected root
+      # (`/opt/dig/bin`) and failing CLOSED when polkit is absent. So Windows +
+      # Linux are collected/uploaded as release assets.
+      #
+      # macOS stays WITHHELD (still built below for CI compile/bundle coverage,
+      # but NOT collected/uploaded): the GUI has no native elevation UX there yet
+      # (Authorization Services, dig_ecosystem#639). It fails CLOSED — the
+      # plan-driven elevation gate refuses a privileged install when not root — but
+      # a double-clicked .dmg cannot complete the default full-stack install, so
+      # shipping one is a broken experience. Un-withhold it once #639 lands. The
+      # CLI (install.sh) is the supported macOS path meanwhile.
       - name: Build the GUI installer
         working-directory: gui/app
         run: npx tauri build ${{ matrix.build_args }}
       - name: Collect single installer artifact
-        # Windows only (see the note above): macOS/Linux GUI lack an elevation UX.
-        if: matrix.os == 'windows-latest'
+        # Windows + Linux (see the note above): macOS GUI still lacks an elevation UX.
+        if: matrix.os == 'windows-latest' || matrix.os == 'ubuntu-22.04'
         shell: bash
         working-directory: gui/app
         run: |
@@ -254,7 +259,7 @@ jobs:
           cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
           ls -la ../../dist-gui
       - name: Upload GUI installer artifact
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' || matrix.os == 'ubuntu-22.04'
         uses: actions/upload-artifact@v4
         with:
           name: digstore-gui-installer-${{ matrix.os }}

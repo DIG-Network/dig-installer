@@ -583,9 +583,11 @@ and leaves NO partial state. It ALSO trips when a CLI-only install writes into t
 protected root (#565, §1.6) — so a Windows CLI-only install (which lands in `%ProgramFiles%\DIG\bin`)
 elevates, while a unix CLI-only install into `~/.dig/bin` does not. A `--dry-run`, or a CLI-only
 install into a `--bin-dir` override or the unix user root, never trips the gate. The per-OS
-elevation probe is `elevation::is_elevated` (Windows `net session`, Unix `id -u`);
-the pure decision + per-OS remedy is `elevation::gate` (unit-tested). The GUI enforces the same gate
-before its first write.
+elevation probe is `elevation::is_elevated` (Windows `net session`; Unix `id -u`, where `id` is
+resolved to an ABSOLUTE path from a fixed set of trusted system directories — never `$PATH` — so a
+`$PATH`-shadowed `id` can never flip the write-then-exec gate that trusts it, #638); the pure
+decision + per-OS remedy is `elevation::gate` (unit-tested). The GUI enforces the same gate before
+its first write.
 
 ## 4.1a GUI write-then-exec invariant — never exec a user-writable binary under elevation (#610/#637)
 
@@ -612,7 +614,47 @@ foundation for the mac/linux GUI elevation #638/#639) is:
   unelevated) runs `update-mime-database` / `gtk-update-icon-cache` from a fixed allowlist of trusted
   system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) via `resolve_system_tool`, never as a bare
   command name resolved through `$PATH` — removing the root-`PATH`-hijack / pwnkit-class surface if the
-  path is ever reached under elevation. A missing tool fails soft (the refresh is best-effort).
+  path is ever reached under elevation. A missing tool fails soft (the refresh is best-effort). The
+  resolver is `elevation::resolve_system_tool` (the single source of truth, in the `dig-installer`
+  library; the GUI no longer keeps a duplicate).
+
+## 4.1b Linux GUI elevation — one-shot `pkexec` root relaunch (#638)
+
+The Linux GUI ships as an unelevated `.AppImage`; unlike Windows (which elevates itself at launch via
+a `requireAdministrator` manifest) it must obtain privilege at install time. When the plan
+`needs_elevation` and the GUI is not already root, it relaunches its OWN executable as root for the
+privileged step ONLY, keeping the WebView unelevated:
+
+- **Mechanism.** `pkexec <abs-installer> __dig-elevated-install`, spawned via
+  `elevation::relaunch_elevated`. `pkexec` falls back to polkit's built-in
+  `org.freedesktop.policykit.exec` action, so NO custom `.policy` file need be pre-installed (portable
+  from a read-only AppImage). The root child runs the headless privileged install
+  (`run_elevated_privileged_install_from_stdin`) — `dig_installer::run_report`, routing every privileged
+  binary to the protected root `/opt/dig/bin` — and exits; it NEVER starts the WebView (no GUI ever runs
+  as root) and NEVER execs a user-writable binary.
+- **The selection is streamed over the child's STDIN, never a plan file.** There is no shared-namespace
+  file, so the plan-file TOCTOU class is ELIMINATED (a co-located local user has nothing to pre-seed,
+  symlink-swap, or race). The payload is a small JSON `InstallOpts` (a component-id → bool map + the
+  chosen install path); it is non-secret AND the privileged routing is independent of it (every
+  privileged binary routes to `/opt/dig/bin` via `bin_dir_for`, never the user path), so it can only
+  toggle which official components install.
+- **AppImage-aware relaunch target.** The re-exec target is `elevation::relaunch_target($APPIMAGE,
+  current_exe)`: under an AppImage, `current_exe()` points inside the FUSE mount, which is NOT readable
+  by root (`allow_other` off) — so root's `pkexec` could not exec it. `$APPIMAGE` (the absolute path of
+  the `.AppImage` FILE, a normal root-readable on-disk file) is preferred, so the AppImage bootstrap
+  re-mounts as root and runs the binary with the token. A bare (non-AppImage) binary uses `current_exe`.
+- **Dropped-privilege verify.** The `digstore --version` verify (Phase 6) runs in the still-unelevated
+  GUI parent — a genuinely dropped-privilege context — because `pkexec` elevates only the child, so the
+  §4.1a invariant holds (no root-exec of `~/.dig/bin/digstore`).
+- **pwnkit (CVE-2021-4034) immunity — structural.** The argv is built by `elevation::pkexec_argv`:
+  a real `argv[0]` (`std::process::Command` guarantees `argc >= 1`), a fixed 2-element argv (`[<abs
+  installer>, <token>]`, no plan argument), an ABSOLUTE program path (a relative path returns `None`,
+  fail-closed), no shell, no user-controlled `argv[0]`; and `pkexec` itself resets the environment
+  (sanitised `PATH`, `LD_*` stripped). No setuid shim is ever used.
+- **Fail-closed.** `pkexec`/polkit absent (not found under the trusted system dirs) → the install
+  refuses BEFORE any write with `elevation::pkexec_unavailable_message` ("install polkit, or run
+  `sudo dig-installer` in a terminal"); a dismissed auth prompt (non-zero child status) is surfaced as
+  an error. Either way: NO partial state, NO setuid workaround.
 
 ## 4.2 Readiness verdict — fail loud (#493)
 

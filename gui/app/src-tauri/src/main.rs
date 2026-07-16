@@ -2,5 +2,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Linux privileged-install child (#638): when this executable is relaunched
+    // as root via `pkexec` with the fixed elevation token, run ONLY the headless
+    // privileged install (the selection arrives over STDIN) and exit — NEVER start
+    // the Tauri WebView (so no GUI ever runs as root). This branch is reached only
+    // via `dig_installer::elevation::relaunch_elevated`, which builds a fixed,
+    // pwnkit-safe argv (an absolute program path, the token, no shell).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref()
+            == Some(std::ffi::OsStr::new(
+                dig_installer::elevation::ELEVATED_INSTALL_ARG,
+            ))
+        {
+            match digstore_installer_lib::run_elevated_privileged_install_from_stdin() {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     digstore_installer_lib::run()
 }
