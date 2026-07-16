@@ -285,16 +285,31 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     //     runs in THIS still-unelevated parent (Phase 6) — a genuinely
     //     dropped-privilege context, never a root-exec of a user-writable binary
     //     (the #637 MUST-HONOR).
-    //   * macOS (#639) — no GUI elevation UX yet → fail closed below.
+    //   * macOS (#639) — the unelevated `.app` GUI relaunches its OWN executable
+    //     as root ONE-SHOT via `osascript … with administrator privileges` for the
+    //     privileged step only (Phase 7), keeping the WebView unelevated. As on
+    //     Linux, the `digstore --version` verify (Phase 6) runs in THIS still-
+    //     unelevated parent — a genuinely dropped-privilege context (the #637
+    //     MUST-HONOR), never a root-exec of a user-writable binary.
     #[cfg(all(unix, not(target_os = "macos")))]
     let relaunch_privileged_via_pkexec = needs_elevation && !elevated;
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     let relaunch_privileged_via_pkexec = false;
+    #[cfg(target_os = "macos")]
+    let relaunch_privileged_via_osascript = needs_elevation && !elevated;
+    #[cfg(not(target_os = "macos"))]
+    let relaunch_privileged_via_osascript = false;
+
+    // The privileged portion is run by relaunching THIS process elevated (Linux
+    // pkexec / macOS osascript) rather than in-process, whenever either native
+    // relaunch path applies. One name so the fail-closed gate stays OS-agnostic.
+    let relaunch_privileged = relaunch_privileged_via_pkexec || relaunch_privileged_via_osascript;
 
     // Fail-closed gate (nothing partial). We only PROCEED unprivileged when the
-    // privileged step will be elevated by a Linux pkexec relaunch; otherwise an
-    // unprivileged run that needs elevation is the historical hard stop (#492).
-    if needs_elevation && !elevated && !relaunch_privileged_via_pkexec {
+    // privileged step will be elevated by a native relaunch (Linux pkexec / macOS
+    // osascript); otherwise an unprivileged run that needs elevation is the
+    // historical hard stop (#492).
+    if needs_elevation && !elevated && !relaunch_privileged {
         let msg = format!(
             "elevation required: {}. Re-run the installer as Administrator (Windows) / with sudo \
              (macOS/Linux). Nothing was changed.",
@@ -317,6 +332,24 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         && dig_installer::elevation::resolve_system_tool("pkexec").is_none()
     {
         let msg = dig_installer::elevation::pkexec_unavailable_message().to_string();
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
+        return Err(msg);
+    }
+
+    // macOS elevation-gate FIRST (mirrors the Linux polkit check): if the
+    // privileged step WILL need osascript but osascript is somehow absent, refuse
+    // NOW — before any unpack/write — so no half-install is ever left (#639,
+    // fail-closed).
+    #[cfg(target_os = "macos")]
+    if relaunch_privileged_via_osascript
+        && dig_installer::elevation::resolve_system_tool("osascript").is_none()
+    {
+        let msg = dig_installer::elevation::osascript_unavailable_message().to_string();
         let _ = app.emit(
             "install://error",
             InstallError {
@@ -609,7 +642,15 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         } else {
             run_report_in_process(app, &extra_plan)
         };
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        #[cfg(target_os = "macos")]
+        let privileged_result = if relaunch_privileged_via_osascript {
+            run_privileged_via_osascript(app, &opts)
+        } else {
+            run_report_in_process(app, &extra_plan)
+        };
+        // Windows (+ any non-unix): the process elevated itself at launch, so the
+        // privileged orchestration always runs in-process.
+        #[cfg(not(unix))]
         let privileged_result = run_report_in_process(app, &extra_plan);
 
         if let Err(msg) = privileged_result {
@@ -633,10 +674,11 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         //   * otherwise (Windows requireAdministrator, already-root unix, macOS) —
         //     THIS process is the elevated context, so it does the write in-process.
         if wants_extension_forcelist(&opts) {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            let handled_in_child = relaunch_privileged_via_pkexec;
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
-            let handled_in_child = false;
+            // The privileged forcelist write is performed by the root relaunch
+            // child on both native-relaunch platforms (Linux pkexec / macOS
+            // osascript); Windows (already elevated) does it in-process below.
+            let handled_in_child =
+                relaunch_privileged_via_pkexec || relaunch_privileged_via_osascript;
 
             if handled_in_child {
                 emit_line(
@@ -958,6 +1000,109 @@ pub fn run_elevated_privileged_install_from_stdin() -> Result<(), String> {
         // succeed; a Failed forcelist write fails the whole privileged step (a
         // non-zero exit the parent surfaces), so the install never reports "ready"
         // while a force-install silently failed.
+        Ok(_) => configure_extension_forcelist_step(&opts, &mut |line| println!("{line}")),
+        Err(e) => Err(format!("privileged install failed: {e}")),
+    }
+}
+
+/// Run the privileged orchestration as ROOT via a one-shot `osascript` relaunch
+/// of THIS installer (macOS, #639).
+///
+/// The unelevated `.app` GUI relaunches its OWN executable with the fixed
+/// [`ELEVATED_INSTALL_ARG`](dig_installer::elevation::ELEVATED_INSTALL_ARG) token
+/// through `osascript … with administrator privileges` (Authorization Services
+/// renders the native admin-auth dialog — works UNSIGNED, so it is NOT gated on
+/// code-signing #536). The selection is handed to the root child through a PRIVATE
+/// `0700`/`0600` temp file (Authorization Services does not inherit the caller's
+/// stdin, so the Linux stdin channel is unavailable); see
+/// [`relaunch_elevated_macos`](dig_installer::elevation::relaunch_elevated_macos)
+/// for the TOCTOU/symlink reasoning. The root child runs
+/// [`run_elevated_privileged_install_from_file`] (headless — it never starts the
+/// WebView) and exits.
+///
+/// Unlike the Linux AppImage, a macOS `.app` binary lives on a normal
+/// root-readable path (`/Applications`, `~/Applications`, `~/Downloads`), so
+/// `current_exe()` is used directly — no FUSE/`$APPIMAGE` indirection is needed.
+///
+/// Fail-closed: a missing `osascript`, a declined prompt, or a non-zero child
+/// status is surfaced as an error with no "ready".
+#[cfg(target_os = "macos")]
+fn run_privileged_via_osascript(app: &AppHandle, opts: &InstallOpts) -> Result<(), String> {
+    let current = std::env::current_exe()
+        .map_err(|e| format!("cannot resolve the installer executable path: {e}"))?;
+
+    // The selection is written to a private temp file the root child reads (never
+    // spliced into the osascript command). It is non-secret (a component-id → bool
+    // map + the chosen install path) and, regardless, the privileged routing is
+    // INDEPENDENT of it: `plan_from_selection` sends every privileged binary to the
+    // protected root (`/opt/dig/bin`) via `bin_dir_for`, never the user path, so it
+    // can only toggle which official components install.
+    let plan_json = serde_json::to_vec(opts).map_err(|e| format!("serialize plan: {e}"))?;
+
+    emit_line(
+        app,
+        r#"<span class="dim">·</span> Requesting administrator authorization <span class="dim">(osascript)</span>"#,
+    );
+
+    match dig_installer::elevation::relaunch_elevated_macos(&current, &plan_json) {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!(
+            "the privileged install did not complete (osascript child exited with {}). \
+             If you dismissed the authorization prompt, re-run and approve it. Your \
+             per-user files (the digstore CLI in ~/.dig/bin and PATH entry) were \
+             installed; only the system-wide step (services + /opt/dig/bin) did not run.",
+            s.code().unwrap_or(-1)
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The headless privileged-install entrypoint the root `osascript` child runs
+/// (macOS, #639). Reads the plan the unelevated GUI staged into a private
+/// `0700`/`0600` temp file — opened `O_NOFOLLOW` so a swapped symlink cannot
+/// redirect the root read — asserts it is genuinely running as root, and executes
+/// ONLY the privileged component orchestration ([`dig_installer::run_report`]) +
+/// (when selected) the enterprise force-install, routing every privileged binary
+/// to the protected root (`/opt/dig/bin`). It NEVER starts the Tauri WebView (so
+/// no GUI ever runs as root) and NEVER execs a user-writable binary. Progress is
+/// written to stdout for the parent/logs.
+#[cfg(target_os = "macos")]
+pub fn run_elevated_privileged_install_from_file(plan_path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Defence in depth: the child MUST actually be root. `relaunch_elevated_macos`
+    // only ever spawns this via osascript's `with administrator privileges`, but
+    // assert it here so a mis-invocation can never run the "privileged" path
+    // unprivileged and silently no-op.
+    if !dig_installer::elevation::is_elevated() {
+        return Err("the elevated install child is not running as root — refusing".to_string());
+    }
+
+    // O_NOFOLLOW: refuse to traverse a final-component symlink — defence in depth
+    // on top of the private 0700 dir the parent created (a different local user
+    // cannot enter it to plant one).
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(plan_path)
+        .map_err(|e| format!("open plan {}: {e}", plan_path.display()))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .map_err(|e| format!("read plan {}: {e}", plan_path.display()))?;
+    let opts: InstallOpts =
+        serde_json::from_str(&raw).map_err(|e| format!("parse plan from file: {e}"))?;
+    let extra_plan = plan_from_selection(&opts.selected);
+    match dig_installer::run_report(&extra_plan, &mut |line| println!("{line}")) {
+        Ok(report) if !report.ready => Err(format!(
+            "DIG is NOT ready — {} component(s) failed: {}",
+            report.failures.len(),
+            report.failures.join("; ")
+        )),
+        // #648: the enterprise extension force-install is a privileged managed-
+        // policy write into `/Library/Managed Preferences`, so it belongs to THIS
+        // root child — never the unelevated GUI parent. A Failed forcelist write
+        // fails the whole privileged step (a non-zero exit the parent surfaces).
         Ok(_) => configure_extension_forcelist_step(&opts, &mut |line| println!("{line}")),
         Err(e) => Err(format!("privileged install failed: {e}")),
     }

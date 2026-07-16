@@ -21,6 +21,16 @@ mod install;
 #[cfg(all(unix, not(target_os = "macos")))]
 pub use install::run_elevated_privileged_install_from_stdin;
 
+/// The headless privileged-install entrypoint the root `osascript` child runs on
+/// macOS (#639). Re-exported so `main.rs` can dispatch to it — BEFORE any Tauri
+/// WebView is created — when this process is relaunched with the fixed
+/// [`dig_installer::elevation::ELEVATED_INSTALL_ARG`] token. The install selection
+/// arrives via a private temp-file path (the second positional argument), because
+/// Authorization Services does not inherit the caller's stdin. See
+/// [`install::run_elevated_privileged_install_from_file`].
+#[cfg(target_os = "macos")]
+pub use install::run_elevated_privileged_install_from_file;
+
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

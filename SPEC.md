@@ -773,6 +773,55 @@ privileged step ONLY, keeping the WebView unelevated:
   `sudo dig-installer` in a terminal"); a dismissed auth prompt (non-zero child status) is surfaced as
   an error. Either way: NO partial state, NO setuid workaround.
 
+## 4.1c macOS GUI elevation — one-shot `osascript` root relaunch (#639)
+
+The macOS GUI ships as an unelevated `.app` inside a `.dmg`; like Linux (and unlike Windows, which
+elevates itself at launch) it must obtain privilege at install time. When the plan `needs_elevation`
+and the GUI is not already root, it relaunches its OWN executable as root for the privileged step
+ONLY, keeping the WebView unelevated:
+
+- **Mechanism.** `osascript -e 'on run argv' -e '<do shell script … with administrator privileges>'
+  -e 'end run' <abs installer> __dig-elevated-install <abs plan file>`, spawned via
+  `elevation::relaunch_elevated_macos`. `with administrator privileges` routes through Authorization
+  Services (`security_authtrampoline`), which renders the native admin-auth dialog. This is the
+  standard macOS one-shot escalation and — critically — **works UNSIGNED**: there is NO persistent
+  SMJobBless/SMAppService helper daemon (which WOULD require Developer ID code-signing, #536), so
+  elevation is NOT gated on #536. The root child runs the headless privileged install
+  (`run_elevated_privileged_install_from_file`) — `dig_installer::run_report`, routing every
+  privileged binary to the protected root `/opt/dig/bin` — and exits; it NEVER starts the WebView (no
+  GUI ever runs as root) and NEVER execs a user-writable binary.
+- **The selection is handed over a PRIVATE temp file, not stdin.** Authorization Services does NOT
+  inherit the caller's stdin or environment, so the Linux stdin channel (§4.1b) is unavailable on
+  macOS. The safest equivalent is used: the JSON `InstallOpts` is written to a `0600` file inside a
+  freshly `mkdtemp`'d `0700` directory (via `tempfile`, which sets `0700` on unix) in the per-user
+  temp location, created `O_EXCL` (no pre-existing object to hijack); the root child reads it
+  `O_NOFOLLOW`. A DIFFERENT unprivileged local user cannot traverse the `0700` dir and the file name
+  is unpredictable, so the plan-file TOCTOU/symlink class is closed. The plan is non-secret (a
+  component-id → bool map + the chosen install path) AND the privileged routing is INDEPENDENT of it
+  (every privileged binary routes to `/opt/dig/bin` via `bin_dir_for`, never the user path), so it can
+  only toggle which official components install — never redirect a privileged write. The private dir
+  is removed when `relaunch_elevated_macos` returns.
+- **Relaunch target.** A macOS `.app` binary lives on a normal root-readable path (`/Applications`,
+  `~/Applications`, `~/Downloads`), so `current_exe()` is re-exec'd directly — no FUSE/`$APPIMAGE`
+  indirection is needed (contrast the Linux AppImage, §4.1b).
+- **Dropped-privilege verify.** The `digstore --version` verify (Phase 6) runs in the still-unelevated
+  GUI parent — a genuinely dropped-privilege context — because `osascript` elevates only the child, so
+  the §4.1a invariant holds (no root-exec of `~/.dig/bin/digstore`).
+- **Command-injection immunity — structural.** The argv is built by `elevation::osascript_argv`: the
+  three `-e` lines are FIXED literals; the three data tokens (the absolute installer path, the fixed
+  elevation token, the absolute plan-file path) are passed as `osascript` command-line arguments and
+  reach the script ONLY as `item N of argv`, each wrapped in AppleScript `quoted form of` (a shell-safe
+  single-quoted string) before it reaches the `/bin/sh -c` that `do shell script` invokes. No path is
+  ever interpolated into the script source, there is no string concatenation of external input, and no
+  shell metacharacter reaches the shell unquoted. Both paths MUST be ABSOLUTE (a relative path returns
+  `None`, fail-closed) — the child is exec'd by a root shell with an unknown cwd.
+- **Fail-closed.** `osascript` absent from the trusted system dirs → the install refuses BEFORE any
+  write with `elevation::osascript_unavailable_message` ("re-run with `sudo dig-installer`"); a
+  dismissed auth dialog (AppleScript error `-128`, a non-zero child status) is surfaced as an error.
+  Either way: NO partial state.
+- **#536 (Developer ID code-signing) is NOT a blocker.** Elevation works unsigned; Gatekeeper's
+  first-open warning is a distribution-polish issue (bypass via right-click → Open) deferred to #536.
+
 ## 4.2 Readiness verdict — fail loud (#493)
 
 A run does not report success merely because downloads succeeded. `InstallReport` carries an

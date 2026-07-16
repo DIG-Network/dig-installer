@@ -83,17 +83,17 @@ jobs:
           # (Windows requireAdministrator manifest; macOS/Linux fail loud with a
           # "re-run elevated" guard) — closing the #565 user->SYSTEM LPE.
           #
-          # build-binaries.yml uploads the GUI installer for Windows (#610) + Linux
-          # (#638 — pkexec/polkit native elevation); macOS is withheld at the upload
-          # gate pending its elevation UX (dig_ecosystem#639). As defense-in-depth we
-          # do NOT rest on that gate: the scope guard below positively includes ONLY
-          # the Windows-x64 `.exe` and the Linux-x86_64 `.AppImage` GUI setups, so a
-          # future macOS GUI upload cannot silently ship an installer without an
-          # elevation path.
-          # Copy everything EXCEPT a GUI setup that is neither the Windows-x64 .exe
-          # nor the Linux-x86_64 .AppImage.
+          # build-binaries.yml uploads the GUI installer for Windows (#610), Linux
+          # (#638 — pkexec/polkit) AND macOS (#639 — osascript/Authorization
+          # Services): every GUI platform now has native elevation, so none is
+          # withheld. As defense-in-depth we do NOT rest on the upload gate: the
+          # scope guard below positively includes ONLY the three GUI setups that
+          # have a vetted elevation path — the Windows-x64 `.exe`, the Linux-x86_64
+          # `.AppImage`, and the macOS `.dmg` — so a NEW/unvetted GUI target could
+          # never silently ship an installer without one.
+          # Copy everything EXCEPT a GUI setup that is none of those three.
           find artifacts -type f \
-            ! \( -name 'DIG-Installer-Setup-*' ! -name 'DIG-Installer-Setup-*-windows-x64.exe' ! -name 'DIG-Installer-Setup-*-linux-x86_64.AppImage' \) \
+            ! \( -name 'DIG-Installer-Setup-*' ! -name 'DIG-Installer-Setup-*-windows-x64.exe' ! -name 'DIG-Installer-Setup-*-linux-x86_64.AppImage' ! -name 'DIG-Installer-Setup-*-macos.dmg' \) \
             -exec cp {} release/ \;
           ls -la release
       - name: Create / update the STABLE release and attach assets

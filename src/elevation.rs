@@ -235,6 +235,173 @@ impl std::fmt::Display for RelaunchError {
     }
 }
 
+// ---- #639: macOS GUI elevation — one-shot `osascript` root relaunch ----------
+//
+// The macOS `.app` GUI is unelevated; when the selection needs privilege it
+// relaunches its OWN executable as root ONE-SHOT via
+// `osascript … do shell script … with administrator privileges` — the standard,
+// UNSIGNED-safe macOS privilege escalation (Authorization Services renders the
+// native admin-auth dialog). Mirrors the Linux `pkexec` model (#638): only the
+// privileged child is elevated (it routes binaries to `/opt/dig/bin` and exits),
+// while the GUI parent stays unelevated and runs the dropped-privilege
+// `digstore --version` verify (§4.1a). NO persistent SMJobBless/SMAppService
+// helper (which would need code-signing #536) — this works unsigned.
+
+/// The FIXED AppleScript body `osascript` runs: escalate the command whose
+/// tokens arrive as the script's `argv`, via Authorization Services.
+///
+/// Injection immunity is STRUCTURAL: the three data tokens (the absolute
+/// installer path, the elevation token, the plan-file path) are NEVER spliced
+/// into this source — they are passed as `osascript` command-line arguments and
+/// reach the script only as `item N of argv`. Each is wrapped in AppleScript's
+/// `quoted form of`, which emits a shell-safe single-quoted string, so the
+/// `/bin/sh -c` that `do shell script` invokes can never interpret user text as
+/// syntax. There is no `-e` line containing a path, no string concatenation of
+/// external input, and no shell metacharacter reaches the shell unquoted.
+const OSASCRIPT_ELEVATE_BODY: &str = "do shell script (quoted form of (item 1 of argv)) & \" \" \
+     & (quoted form of (item 2 of argv)) & \" \" \
+     & (quoted form of (item 3 of argv)) with administrator privileges";
+
+/// Build the FIXED argument vector handed to `osascript` to relaunch
+/// `installer_exe` as root, running ONLY the headless privileged install with
+/// the plan read from `plan_path`.
+///
+/// The returned vector is everything AFTER the `osascript` program name:
+/// `[-e "on run argv", -e <elevate body>, -e "end run", <abs installer>,
+/// <token>, <abs plan path>]`. The `-e` lines are fixed literals; the three
+/// trailing items are the ONLY variable data and are consumed by the script
+/// exclusively as `item N of argv` (never interpolated — see
+/// [`OSASCRIPT_ELEVATE_BODY`]). Both paths MUST be ABSOLUTE (a relative path
+/// returns `None`, fail-closed) — the child is exec'd by a root shell with an
+/// unknown cwd, and both begin with `/`, so `osascript` never mistakes a data
+/// token for an option.
+///
+/// Pure and cross-platform (path + string logic only) so every hygiene property
+/// is unit-tested on every OS the crate builds on.
+pub fn osascript_argv(installer_exe: &Path, plan_path: &Path) -> Option<Vec<OsString>> {
+    if !installer_exe.is_absolute() || !plan_path.is_absolute() {
+        return None;
+    }
+    Some(vec![
+        OsString::from("-e"),
+        OsString::from("on run argv"),
+        OsString::from("-e"),
+        OsString::from(OSASCRIPT_ELEVATE_BODY),
+        OsString::from("-e"),
+        OsString::from("end run"),
+        installer_exe.as_os_str().to_os_string(),
+        OsString::from(ELEVATED_INSTALL_ARG),
+        plan_path.as_os_str().to_os_string(),
+    ])
+}
+
+/// The fail-closed message shown when native elevation is unavailable on macOS
+/// (`osascript` not found under the trusted system dirs). No partial state is
+/// left; the user is pointed at the terminal recovery.
+pub fn osascript_unavailable_message() -> &'static str {
+    "native elevation is unavailable: osascript was not found. Re-run the installer from a \
+     terminal with sudo (`sudo dig-installer`). Nothing was changed."
+}
+
+/// Relaunch this installer as root via `osascript` to run the headless
+/// privileged install, handing the plan to the root child through a PRIVATE
+/// temp file, and block until it exits.
+///
+/// Why a private file rather than the Linux stdin hand-off: `do shell script …
+/// with administrator privileges` runs the command through Authorization
+/// Services' `security_authtrampoline`, which does NOT inherit the caller's
+/// stdin or environment — so the #638 stdin channel is unavailable on macOS. The
+/// safest equivalent is used instead: the plan is written to a `0600` file inside
+/// a freshly `mkdtemp`'d `0700` directory (via `tempfile`, which sets `0700` on
+/// unix) in the per-user temp location, created `O_EXCL` (no pre-existing target
+/// to hijack); the root child reads it `O_NOFOLLOW`. A DIFFERENT unprivileged
+/// local user cannot traverse the `0700` dir, and the file name is
+/// unpredictable — so the plan-file TOCTOU/symlink class is closed. The plan is
+/// non-secret (a component-id → bool map + the chosen install path) AND the
+/// privileged routing is INDEPENDENT of it (every privileged binary routes to
+/// `/opt/dig/bin` via `bin_dir_for`, never the user path), so it can only toggle
+/// which official components install — never redirect a privileged write.
+///
+/// Fail-closed: [`MacElevateError::OsascriptMissing`] when `osascript` is absent
+/// from the [trusted system dirs](TRUSTED_SYSTEM_DIRS) (NO fallback),
+/// [`MacElevateError::BadPath`] when a path is not absolute,
+/// [`MacElevateError::TempFile`] when the private plan file cannot be created,
+/// [`MacElevateError::Spawn`] when `osascript` cannot be spawned. On a clean run
+/// it returns the child's [`std::process::ExitStatus`] — a non-zero status (e.g.
+/// the user dismissing the auth dialog, AppleScript error `-128`) is a normal,
+/// honest failure the caller surfaces. The private temp dir is removed when this
+/// function returns (the [`tempfile::TempDir`] guard is dropped after `wait`).
+#[cfg(target_os = "macos")]
+pub fn relaunch_elevated_macos(
+    installer_exe: &Path,
+    plan_json: &[u8],
+) -> Result<std::process::ExitStatus, MacElevateError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let osascript = resolve_system_tool("osascript").ok_or(MacElevateError::OsascriptMissing)?;
+    if !installer_exe.is_absolute() {
+        return Err(MacElevateError::BadPath);
+    }
+
+    // Private 0700 dir (mkdtemp semantics) in the per-user temp location; the
+    // plan file is 0600 and created O_EXCL (`create_new`) so there is no
+    // pre-existing object — symlink or otherwise — to hijack.
+    let dir = tempfile::Builder::new()
+        .prefix("dig-install-")
+        .tempdir()
+        .map_err(|e| MacElevateError::TempFile(e.to_string()))?;
+    let plan_path = dir.path().join("plan.json");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&plan_path)
+            .map_err(|e| MacElevateError::TempFile(e.to_string()))?;
+        file.write_all(plan_json)
+            .map_err(|e| MacElevateError::TempFile(e.to_string()))?;
+    }
+
+    let argv = osascript_argv(installer_exe, &plan_path).ok_or(MacElevateError::BadPath)?;
+    std::process::Command::new(osascript)
+        .args(&argv)
+        .status()
+        .map_err(|e| MacElevateError::Spawn(e.to_string()))
+    // `dir` (TempDir) is dropped here → the private dir + plan file are removed.
+}
+
+/// Why a [`relaunch_elevated_macos`] attempt could not even start the root child.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub enum MacElevateError {
+    /// `osascript` is not installed under the trusted system dirs — fail closed.
+    OsascriptMissing,
+    /// A path (installer or plan) was not absolute (a root shell has an unknown cwd).
+    BadPath,
+    /// The private plan file could not be created/written.
+    TempFile(String),
+    /// The `osascript` process could not be spawned.
+    Spawn(String),
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for MacElevateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MacElevateError::OsascriptMissing => f.write_str(osascript_unavailable_message()),
+            MacElevateError::BadPath => {
+                f.write_str("internal error: the installer or plan path was not absolute")
+            }
+            MacElevateError::TempFile(e) => {
+                write!(f, "could not stage the elevated install plan: {e}")
+            }
+            MacElevateError::Spawn(e) => write!(f, "could not start osascript: {e}"),
+        }
+    }
+}
+
 /// Parse the numeric uid printed by `id -u` (e.g. `0\n` for root). Pure — split
 /// out so the "am I root" decision is unit-tested without spawning `id`.
 /// `None` when the output is not a bare integer.
@@ -611,6 +778,77 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    // ---- #639: macOS osascript relaunch mechanism -------------------------
+
+    // Unix-only: absolute-path semantics (a POSIX `/…` path is only recognised as
+    // absolute on unix — the only platform osascript ever runs on).
+    #[cfg(unix)]
+    #[test]
+    fn osascript_argv_has_the_fixed_injection_safe_shape() {
+        // The argv is exactly the three `-e` script lines followed by the three
+        // data tokens: [<abs installer>, <token>, <abs plan>]. The tokens are the
+        // LAST three elements and are the ONLY variable data.
+        let installer = Path::new("/Applications/DIG Installer.app/Contents/MacOS/dig-installer");
+        let plan = Path::new("/var/folders/ab/xyz/T/dig-install-1234/plan.json");
+        let argv = osascript_argv(installer, plan).expect("absolute paths must build an argv");
+
+        assert_eq!(argv.len(), 9, "3× (-e, script) + 3 data tokens");
+        assert_eq!(argv[0], OsString::from("-e"));
+        assert_eq!(argv[1], OsString::from("on run argv"));
+        assert_eq!(argv[2], OsString::from("-e"));
+        assert_eq!(argv[3], OsString::from(OSASCRIPT_ELEVATE_BODY));
+        assert_eq!(argv[4], OsString::from("-e"));
+        assert_eq!(argv[5], OsString::from("end run"));
+        // The three data tokens are passed verbatim as trailing argv — NEVER
+        // spliced into an `-e` script line.
+        assert_eq!(argv[6], installer.as_os_str());
+        assert_eq!(argv[7], OsString::from(ELEVATED_INSTALL_ARG));
+        assert_eq!(argv[8], plan.as_os_str());
+    }
+
+    #[test]
+    fn osascript_body_never_interpolates_the_data_tokens() {
+        // The elevate body is a FIXED literal: it references the data only as
+        // `item N of argv`, wraps each in `quoted form of` (shell-safe), and
+        // escalates via `with administrator privileges`. A path spliced into the
+        // script would show up here — assert it never can by construction.
+        let body = OSASCRIPT_ELEVATE_BODY;
+        assert!(body.contains("do shell script"));
+        assert!(body.contains("with administrator privileges"));
+        assert_eq!(
+            body.matches("quoted form of (item").count(),
+            3,
+            "each of the 3 tokens must be shell-quoted via `quoted form of`"
+        );
+        // No installer/plan path text is ever embedded in the script body.
+        assert!(
+            !body.contains('/'),
+            "the body must carry no filesystem path: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osascript_argv_fails_closed_on_a_relative_path() {
+        // A root shell has an unknown cwd, so both paths MUST be absolute; a
+        // relative one (which a hostile cwd could influence) is rejected.
+        let abs = Path::new("/Applications/DIG.app/Contents/MacOS/dig-installer");
+        assert!(osascript_argv(Path::new("relative/installer"), abs).is_none());
+        assert!(osascript_argv(abs, Path::new("relative/plan.json")).is_none());
+        assert!(osascript_argv(abs, abs).is_some());
+    }
+
+    #[test]
+    fn osascript_unavailable_message_is_fail_closed_and_actionable() {
+        let m = osascript_unavailable_message();
+        assert!(m.contains("osascript"), "names the missing tool: {m}");
+        assert!(m.contains("sudo"), "offers the terminal recovery: {m}");
+        assert!(
+            m.contains("Nothing was changed"),
+            "promises no partial state: {m}"
+        );
     }
 
     #[cfg(unix)]

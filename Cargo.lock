@@ -515,13 +515,14 @@ dependencies = [
 
 [[package]]
 name = "dig-installer"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "assert_cmd",
  "clap",
  "dig-constants",
  "dirs 5.0.1",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "service-manager",
