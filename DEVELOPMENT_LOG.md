@@ -474,3 +474,7 @@ returning `None`; it can only be exercised by making the WHOLE release lookup fa
 `Repo::dign()`). Two tests that assumed the former (giving a release with only primary-stem assets
 and asserting the alias resolves to `None`) were flawed and had to be deleted — asset name matching
 in this crate is genuinely permissive by design, not per-stem-strict.
+
+## Cross-browser extension auto-update acceptance (#645)
+
+_WIP stub — see `runbooks/cross-browser-ext-acceptance.md` (added in this branch)._
