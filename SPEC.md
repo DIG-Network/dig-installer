@@ -470,6 +470,32 @@ component install, and NEVER in an unelevated parent:
 `--uninstall-ext-forcelist` CLI verb today; the aggregate GUI uninstall #568 wires the same call) so
 no `ExtensionInstallForcelist` residue survives a full removal.
 
+### 1.10 Cross-browser auto-update — the same mechanism for every brand (#645)
+
+The force-install auto-updates the extension across EVERY supported Chromium-family browser
+(Chrome, Edge, Brave, Chromium, Vivaldi, Opera) with NO browser-specific workaround. Every brand
+reads the SAME `ExtensionInstallForcelist` managed policy and runs the SAME built-in Chromium
+auto-updater, which polls the pinned `update_url` on its own background schedule and pulls the
+latest CRX. The ONLY per-brand difference is the managed-policy LOCATION (§1.9 table) — never the
+entry value, the manifest format, or the update mechanism. So the force-install is armed for
+auto-update identically for all of them, and this is a normative acceptance property, verified in
+three tiers (see `runbooks/cross-browser-ext-acceptance.md` for the full browser × OS × automated|
+manual matrix):
+
+- **Tier 1 — configuration matrix (automated, `cargo test`).** For every supported browser on every
+  OS, the installer resolves the correct managed-policy location and writes the exact entry
+  `mlibddmbhlgogepnjdienclhnkfpkfah;https://updates.dig.net/ext/<channel>/updates.xml`
+  (`tests/cross_browser_forcelist.rs`), and the per-writer unit tests
+  (`src/forcelist/{windows,macos,linux}.rs`) prove the write mechanics at each location kind.
+- **Tier 2 — live update source (automated CI, `cross-browser-ext-acceptance.yml`).** The
+  `update_url` every browser polls actually serves a valid Omaha `gupdate` manifest for the DIG
+  extension id with a fetchable CRX (stable); the nightly channel is served + armed even before its
+  first build.
+- **Tier 3 — real end-to-end (automated Linux smoke + documented manual).** The shipped binary
+  writes a real Chrome managed-policy file on Linux CI; the other brands' full install→appears→
+  auto-updates flow is documented manual acceptance in the runbook (a real browser reading managed
+  policy off the network is not reliably CI-drivable headless).
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/

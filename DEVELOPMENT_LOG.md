@@ -474,3 +474,17 @@ returning `None`; it can only be exercised by making the WHOLE release lookup fa
 `Repo::dign()`). Two tests that assumed the former (giving a release with only primary-stem assets
 and asserting the alias resolves to `None`) were flawed and had to be deleted — asset name matching
 in this crate is genuinely permissive by design, not per-stem-strict.
+
+## Cross-browser extension auto-update acceptance (#645)
+
+Every Chromium-family browser (Chrome, Edge, Brave, Chromium, Vivaldi, Opera) force-installs +
+auto-updates the DIG extension via the SAME `ExtensionInstallForcelist` policy + the SAME built-in
+Chromium auto-updater polling the SAME `update_url` — the ONLY per-brand difference is the
+managed-policy location (registry key / plist domain / JSON dir). Acceptance is tiered honestly:
+Tier 1 (`tests/cross_browser_forcelist.rs`) proves the location + entry for every browser × OS
+deterministically; Tier 2 (CI) proves the live `updates.dig.net` source serves a valid Omaha
+manifest + fetchable CRX (stable full; nightly served-but-may-be-empty until its first build);
+Tier 3 automates a real Chrome policy-file write on Linux CI, with the in-browser "installs +
+auto-updates" step documented manual per `runbooks/cross-browser-ext-acceptance.md`. Force-install
+via managed policy + a live `update_url` needs a REAL browser reading enterprise policy off the
+network — not reliably CI-drivable headless for most brands, hence the honest auto-vs-manual split.
