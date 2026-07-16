@@ -44,6 +44,7 @@
 
 pub mod asset;
 pub mod beacon;
+pub mod browsers;
 pub mod daemon_dir;
 pub mod dns;
 pub mod download;
