@@ -12,3 +12,6 @@ src-tauri/gen/
 src-tauri/resources/bin/digstore
 src-tauri/resources/bin/digstore.exe
 src-tauri/resources/bin/*.sha256
+
+# Vitest coverage output
+coverage/

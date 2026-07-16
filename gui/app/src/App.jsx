@@ -3,9 +3,11 @@ import { TitleBar } from "./TitleBar.jsx";
 import { Welcome } from "./steps/Welcome.jsx";
 import { License } from "./steps/License.jsx";
 import { Components } from "./steps/Components.jsx";
+import { Browsers } from "./steps/Browsers.jsx";
 import { Installing } from "./steps/Installing.jsx";
 import { Finish } from "./steps/Finish.jsx";
-import { STEPS, NOW_FILES } from "./data.jsx";
+import { NOW_FILES } from "./data.jsx";
+import { computeSteps } from "./steps.js";
 import glowD from "./assets/logos/D-glow-logo.svg";
 import nebula from "./assets/logos/galaxy-background.webp";
 import {
@@ -21,6 +23,7 @@ import {
   getMeta,
   bundledDigstoreVersion,
   componentUpdateStatus,
+  detectBrowsers,
 } from "./bridge.js";
 
 const DEFAULT_META = { version: "1.0.0", compiler: "1.0.0" };
@@ -53,10 +56,14 @@ export function App() {
   // offered (hidden in `data.jsx`), so it is absent here entirely. `open-firewall`
   // (#424) and `auto-update` (#514) default ON, mirroring the CLI's default-on
   // `open_firewall`/`auto_update`.
+  // The extension (#602/#611) is pre-checked; keeping it selected reveals the
+  // conditional Browsers step (see `steps` below) where the user picks which
+  // detected browsers get the managed extension.
   const [sel, setSel] = useState({
     "dig-node": true,
     "dig-dns": true,
     "dig-relay": false,
+    extension: true,
     "open-firewall": true,
     "auto-update": true,
   });
@@ -71,6 +78,23 @@ export function App() {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState(null);
 
+  // Conditional Browsers step (#611): `browsers` is the detected list (`null`
+  // until the host answers), `browserSel` the per-browser opt-in map (every
+  // detected browser defaults ON), plus the loading/error async states and a
+  // token that re-runs detection on Retry.
+  const [browsers, setBrowsers] = useState(null);
+  const [browserSel, setBrowserSel] = useState({});
+  const [browsersLoading, setBrowsersLoading] = useState(false);
+  const [browsersError, setBrowsersError] = useState(null);
+  const [detectToken, setDetectToken] = useState(0);
+
+  // The visible steps for the current selection: the Browsers step appears only
+  // while the extension component is selected. Everything (rail, dots, nav, the
+  // install trigger) keys off this one computed list rather than magic indices.
+  const steps = computeSteps(sel);
+  const cur = steps[step]?.id ?? "welcome";
+  const nextId = steps[step + 1]?.id;
+
   const installToken = useRef(0); // bump to cancel/ignore stale install streams
 
   // Latest install inputs, read at call time so `startInstall` can stay stable
@@ -78,12 +102,20 @@ export function App() {
   // startInstall mid-install, re-running the effect → token bump → frozen UI.
   const installPathRef = useRef(installPath);
   const selRef = useRef(sel);
+  const browsersRef = useRef(browsers);
+  const browserSelRef = useRef(browserSel);
   useEffect(() => {
     installPathRef.current = installPath;
   }, [installPath]);
   useEffect(() => {
     selRef.current = sel;
   }, [sel]);
+  useEffect(() => {
+    browsersRef.current = browsers;
+  }, [browsers]);
+  useEffect(() => {
+    browserSelRef.current = browserSel;
+  }, [browserSel]);
 
   // No step persistence across runs: clear any key written by older builds so a
   // stale "dig_step" can never reopen the wizard mid-flow / on the Done screen.
@@ -116,7 +148,7 @@ export function App() {
   // Components screen is shown, against whatever install path is current —
   // a fresh check per visit rather than a stale one from an earlier path.
   useEffect(() => {
-    if (step !== 2) return;
+    if (cur !== "components") return;
     let alive = true;
     setComponentStatus(null);
     (async () => {
@@ -126,7 +158,43 @@ export function App() {
     return () => {
       alive = false;
     };
-  }, [step, installPath]);
+  }, [cur, installPath]);
+
+  // Detect the installed browsers whenever the Browsers step is shown (and on
+  // Retry, via `detectToken`). Every detected browser defaults to opted-IN;
+  // a prior opt-out is preserved across a re-detect. All four async states
+  // (loading / error / empty / success) are surfaced to the step (§6.1).
+  useEffect(() => {
+    if (cur !== "browsers") return;
+    let alive = true;
+    setBrowsersLoading(true);
+    setBrowsersError(null);
+    (async () => {
+      try {
+        const list = await detectBrowsers();
+        if (!alive) return;
+        setBrowsers(list);
+        setBrowserSel((prev) => {
+          const next = {};
+          for (const b of list) next[b.id] = prev[b.id] ?? true;
+          return next;
+        });
+      } catch (e) {
+        if (alive) setBrowsersError(e?.message || String(e));
+      } finally {
+        if (alive) setBrowsersLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [cur, detectToken]);
+
+  // Keep the step index valid if the visible-step count shrinks (e.g. the
+  // extension is deselected on Components, removing the Browsers step).
+  useEffect(() => {
+    if (step >= steps.length) setStep(steps.length - 1);
+  }, [steps.length, step]);
 
   // ---- the real install (replaces the prototype's rAF animation) ----
   const startInstall = useCallback(async () => {
@@ -136,8 +204,21 @@ export function App() {
     setError(null);
     setNowFile(NOW_FILES[0]);
 
+    // The browser selection #612 consumes: the ids of the detected browsers the
+    // user kept checked (empty when the extension is deselected). Read from refs
+    // at call time so `startInstall` stays dependency-free.
+    const selectedBrowsers = selRef.current.extension
+      ? (browsersRef.current || [])
+          .filter((b) => browserSelRef.current[b.id])
+          .map((b) => b.id)
+      : [];
+
     await runInstall(
-      { installPath: installPathRef.current, selected: { digstore: true, ...selRef.current } },
+      {
+        installPath: installPathRef.current,
+        selected: { digstore: true, ...selRef.current },
+        selectedBrowsers,
+      },
       {
         onProgress: (p) => {
           if (token !== installToken.current) return;
@@ -163,17 +244,25 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (step === 3) startInstall();
-    // leaving step 3 cancels any in-flight stream
+    if (cur === "installing") startInstall();
+    // leaving the Installing step cancels any in-flight stream
     return () => {
-      if (step === 3) {
+      if (cur === "installing") {
         installToken.current++;
         cancelInstall();
       }
     };
-  }, [step, startInstall]);
+  }, [cur, startInstall]);
 
   const toggle = (id) => setSel((s) => ({ ...s, [id]: !s[id] }));
+  const toggleBrowser = (id) => setBrowserSel((s) => ({ ...s, [id]: !s[id] }));
+  // Retry detection: clear the prior result and bump the token so the effect
+  // above re-runs against the host.
+  const retryDetect = () => {
+    setBrowsers(null);
+    setBrowsersError(null);
+    setDetectToken((t) => t + 1);
+  };
 
   const onChangeFolder = async () => {
     const dir = await pickFolder(installPath);
@@ -194,35 +283,40 @@ export function App() {
     startInstall();
   };
 
-  const installDone = step === 3 && pct >= 100 && !error;
-  const canContinue = step === 1 ? agreed : step === 3 ? installDone : true;
+  const installing = cur === "installing";
+  const installDone = installing && pct >= 100 && !error;
+  const canContinue = cur === "license" ? agreed : installing ? installDone : true;
 
   // Welcome/Finish "version" chips should show the bundled digstore CLI version
   // being installed, not the installer app's own version.
   const digstoreMeta = { ...meta, version: digstoreVersion };
 
+  // The primary button's label follows the CURRENT step's role in the flow:
+  // the last step before Installing reads "Install" (whether that's Components
+  // or, when the extension is selected, Browsers), so the label is correct
+  // regardless of the conditional step.
   const primaryLabel =
-    step === 0
+    cur === "welcome"
       ? "Install DIG"
-      : step === 2
-      ? "Install"
-      : step === 3
+      : installing
       ? error
         ? "Retry"
         : installDone
         ? "Continue"
         : "Installing…"
-      : step === 4
+      : cur === "finish"
       ? "Launch Terminal"
+      : nextId === "installing"
+      ? "Install"
       : "Continue";
 
   const go = (n) => {
-    if (n >= 0 && n < STEPS.length) setStep(n);
+    if (n >= 0 && n < steps.length) setStep(n);
   };
 
   const next = async () => {
-    if (step === 3 && error) return retry();
-    if (step === 4) return launchTerminal(installPath);
+    if (installing && error) return retry();
+    if (cur === "finish") return launchTerminal(installPath);
     if (canContinue) go(step + 1);
   };
 
@@ -233,8 +327,8 @@ export function App() {
         {/* rail — gains `installing` while the pipeline runs so the brand glow
             intensifies with progress (--rail-pct drives the glow strength). */}
         <div
-          className={"rail" + (step === 3 && !error ? " installing" : "")}
-          style={{ "--rail-pct": step === 3 ? pct / 100 : 0 }}
+          className={"rail" + (installing && !error ? " installing" : "")}
+          style={{ "--rail-pct": installing ? pct / 100 : 0 }}
         >
           <div className="nebula" style={{ backgroundImage: `url(${nebula})` }}></div>
           <div className="rail-top">
@@ -248,11 +342,11 @@ export function App() {
             </div>
           </div>
           <div className="steps">
-            {STEPS.map((s, i) => (
+            {steps.map((s, i) => (
               <div
-                key={s}
+                key={s.id}
                 className={"step" + (i === step ? " active" : i < step ? " done" : "")}
-                onClick={() => i < step && step !== 3 && go(i)}
+                onClick={() => i < step && !installing && go(i)}
               >
                 <span className="idx">
                   {i < step ? (
@@ -263,7 +357,7 @@ export function App() {
                     i + 1
                   )}
                 </span>
-                {s}
+                {s.label}
               </div>
             ))}
           </div>
@@ -278,31 +372,41 @@ export function App() {
         {/* content */}
         <div className="content">
           <div className="pane" key={step}>
-            {step === 0 && <Welcome meta={digstoreMeta} />}
-            {step === 1 && <License agreed={agreed} setAgreed={setAgreed} />}
-            {step === 2 && (
+            {cur === "welcome" && <Welcome meta={digstoreMeta} />}
+            {cur === "license" && <License agreed={agreed} setAgreed={setAgreed} />}
+            {cur === "components" && (
               <Components sel={sel} toggle={toggle} path={installPath} onChange={onChangeFolder} status={componentStatus} />
             )}
-            {step === 3 && <Installing pct={pct} lines={lines} nowFile={nowFile} error={error} />}
-            {step === 4 && <Finish path={installPath} onCopy={copyCmds} copied={copied} meta={digstoreMeta} />}
+            {cur === "browsers" && (
+              <Browsers
+                browsers={browsers}
+                sel={browserSel}
+                loading={browsersLoading}
+                error={browsersError}
+                onToggle={toggleBrowser}
+                onRetry={retryDetect}
+              />
+            )}
+            {cur === "installing" && <Installing pct={pct} lines={lines} nowFile={nowFile} error={error} />}
+            {cur === "finish" && <Finish path={installPath} onCopy={copyCmds} copied={copied} meta={digstoreMeta} />}
           </div>
           <div className="footer">
             <div className="dots">
-              {STEPS.map((s, i) => (
-                <span key={i} className={"d" + (i === step ? " on" : "")}></span>
+              {steps.map((s, i) => (
+                <span key={s.id} className={"d" + (i === step ? " on" : "")}></span>
               ))}
             </div>
             <div className="foot-spacer"></div>
 
-            {/* Back: hidden on steps 0, 3, 4 */}
-            {step > 0 && step !== 3 && step !== 4 && (
+            {/* Back: hidden on the first step and while installing/finishing. */}
+            {step > 0 && !installing && cur !== "finish" && (
               <button className="btn btn-secondary" onClick={() => go(step - 1)}>
                 Back
               </button>
             )}
 
-            {/* Error state on step 3 gets a "View log" secondary action */}
-            {step === 3 && error && (
+            {/* Error state while installing gets a "View log" secondary action */}
+            {installing && error && (
               <button className="btn btn-secondary" onClick={() => openLog(lines)}>
                 View log
               </button>
@@ -311,21 +415,21 @@ export function App() {
             {/* Done step gets the "Open Documentation" secondary + a Close
                 escape hatch beside the primary Launch Terminal — the user is
                 never trapped on the final screen (§6.1). */}
-            {step === 4 && (
+            {cur === "finish" && (
               <button className="btn btn-secondary" onClick={openDocs}>
                 Open Documentation
               </button>
             )}
-            {step === 4 && (
+            {cur === "finish" && (
               <button className="btn btn-secondary" onClick={closeWindow}>
                 Close
               </button>
             )}
 
             <button
-              className={"btn " + (step === 3 && error ? "btn-danger" : "btn-primary")}
+              className={"btn " + (installing && error ? "btn-danger" : "btn-primary")}
               onClick={next}
-              disabled={!canContinue && !(step === 3 && error)}
+              disabled={!canContinue && !(installing && error)}
             >
               {primaryLabel}
             </button>

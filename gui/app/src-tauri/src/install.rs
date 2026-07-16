@@ -59,6 +59,14 @@ pub struct InstallOpts {
     pub install_path: String,
     /// componentId -> enabled (cli is always true)
     pub selected: HashMap<String, bool>,
+    /// The per-browser extension selection captured on the conditional Browsers
+    /// step (#611): the `id`s of the detected Chromium browsers the user kept
+    /// checked (e.g. `["chrome", "brave"]`), empty when the extension component
+    /// is deselected. This is the selection the enterprise force-install writer
+    /// (#612) consumes to decide which browsers' `ExtensionInstallForcelist`
+    /// policy to write; the #611 pipeline only carries it, it does not act on it.
+    #[serde(default)]
+    pub selected_browsers: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -571,6 +579,23 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         }
     }
 
+    // Record the per-browser extension selection the user made on the Browsers
+    // step (#611). The enterprise force-install into each of these browsers is
+    // performed by #612's managed-policy writer; here the pipeline only carries
+    // the selection and surfaces it in the log so the choice is visible and
+    // auditable. Nothing is written to a browser policy in this step.
+    if opts.selected.get("extension").copied().unwrap_or(false) && !opts.selected_browsers.is_empty()
+    {
+        emit_line(
+            app,
+            format!(
+                r#"<span class="ok">✓</span> DIG extension selected for {} browser(s): {}"#,
+                opts.selected_browsers.len(),
+                opts.selected_browsers.join(", ")
+            ),
+        );
+    }
+
     // Every selected component installed AND its service is verified RUNNING.
     emit_pct(app, 100.0, Some("done"));
     emit_line(app, r#"<span class="ok">✓</span> DIG is ready."#);
@@ -1016,7 +1041,7 @@ fn broadcast_environment_change() {
 
 #[cfg(test)]
 mod plan_from_selection_tests {
-    use super::plan_from_selection;
+    use super::{plan_from_selection, InstallOpts};
     use dig_installer::paths;
     use dig_installer::target::Os;
     use std::collections::HashMap;
@@ -1024,6 +1049,27 @@ mod plan_from_selection_tests {
     // task #234: the selection→plan mapping is pure (no I/O), so every
     // selected/deselected/absent branch is asserted directly without mocking
     // the network or a service manager.
+
+    // #611: the Browsers-step selection rides `InstallOpts.selected_browsers`.
+    // It is optional on the wire (older frontends omit it) and defaults to an
+    // empty list, and it round-trips the per-browser opt-in the GUI captured
+    // for #612 to consume.
+    #[test]
+    fn install_opts_defaults_selected_browsers_to_empty_when_absent() {
+        let opts: InstallOpts =
+            serde_json::from_str(r#"{"install_path":"/opt/dig","selected":{"digstore":true}}"#)
+                .expect("opts without selected_browsers should deserialize");
+        assert!(opts.selected_browsers.is_empty());
+    }
+
+    #[test]
+    fn install_opts_carries_the_selected_browser_ids() {
+        let opts: InstallOpts = serde_json::from_str(
+            r#"{"install_path":"/opt/dig","selected":{"extension":true},"selected_browsers":["chrome","brave"]}"#,
+        )
+        .expect("opts with selected_browsers should deserialize");
+        assert_eq!(opts.selected_browsers, vec!["chrome", "brave"]);
+    }
 
     #[test]
     fn nothing_selected_installs_nothing_extra() {

@@ -1396,6 +1396,132 @@ body {
 }
 
 /* ============================================================
+   Browsers step (#611) — the conditional, scrollable, per-browser
+   opt-out extension checklist. Reuses the `.comp` row look; adds a
+   scroll container so a long browser list never pushes the wizard
+   footer off-screen, plus the four async-state blocks.
+   ============================================================ */
+.browser-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 6px;
+  /* room so the last row's focus ring / border isn't clipped by the scrollbox */
+  margin-bottom: 4px;
+}
+.browser-list::-webkit-scrollbar {
+  width: 10px;
+}
+.browser-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+/* The row reuses `.comp`; as a <label> it stays fully clickable + keyboard-
+   operable via its real checkbox (a11y §6.6), unlike the div-rows elsewhere. */
+.browser-row {
+  cursor: pointer;
+}
+.browser-row .browser-meta {
+  min-width: 0;
+}
+.browser-row .cd {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A real checkbox, styled to match the `.check` tile so the checklist reads
+   consistently with the Components step while staying natively accessible. */
+.browser-check {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  border-radius: 7px;
+  border: 1.5px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.03);
+  display: inline-grid;
+  place-content: center;
+  cursor: pointer;
+  transition: 0.16s;
+}
+.browser-check::after {
+  content: "";
+  width: 11px;
+  height: 6px;
+  border-left: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  transform: rotate(-45deg) scale(0.5);
+  opacity: 0;
+  transition: 0.16s;
+  margin-top: -2px;
+}
+.browser-check:checked {
+  background: var(--accent-grad);
+  border-color: transparent;
+  box-shadow: 0 0 16px rgba(255, 0, 222, 0.35);
+}
+.browser-check:checked::after {
+  opacity: 1;
+  transform: rotate(-45deg) scale(1);
+}
+.browser-check:focus-visible {
+  outline: 2px solid var(--dig-pink);
+  outline-offset: 2px;
+}
+
+/* Async states: loading / error / empty. All sit inside the same content pad
+   and keep the footer (Back/Continue) reachable — the step never traps. */
+.browser-detect {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--fg3);
+  font-size: 14px;
+  padding: 26px 0;
+}
+.browser-detect .spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--border-soft);
+  border-top-color: var(--dig-pink);
+  animation: browser-spin 0.8s linear infinite;
+}
+@keyframes browser-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.browser-error,
+.browser-empty {
+  max-width: 560px;
+  padding: 22px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.018);
+}
+.browser-error p,
+.browser-empty p {
+  margin: 0 0 8px;
+  color: var(--fg2);
+  font-size: 14px;
+}
+.browser-error .cd,
+.browser-empty .cd {
+  color: var(--fg3);
+  font-size: 12.5px;
+}
+.browser-error .btn {
+  margin-top: 12px;
+}
+
+/* ============================================================
    Reduced-motion: honor the user's preference. Disable all
    decorative motion (loops, sheens, pops); keep final states.
    ============================================================ */
@@ -1415,7 +1541,8 @@ body {
   .finish .seal .ring,
   .finish .seal svg,
   .finish .seal svg path,
-  .finish h2 .gt {
+  .finish h2 .gt,
+  .browser-detect .spinner {
     animation: none !important;
   }
   /* keep the drawn check fully visible without the draw animation */

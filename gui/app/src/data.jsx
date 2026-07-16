@@ -55,6 +55,12 @@ export const COMPONENTS = [
     on: true,
   },
   {
+    id: "extension",
+    name: "DIG browser extension",
+    desc: "Installs the DIG extension as a managed extension in your Chromium browsers, so chia:// and dig:// links resolve through your node. Next you'll choose which browsers — uncheck any to skip.",
+    on: true,
+  },
+  {
     id: "dig-relay",
     name: "dig-relay (advanced)",
     desc: "Run your own NAT-traversal relay. Optional — every node already uses the canonical relay.dig.net by default.",
