@@ -244,9 +244,7 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // artifacts (completions, example store, the .dig icon) — data this process
     // never executes, so no escalation window exists there. The user runs
     // digstore via PATH regardless of where the binary physically lives.
-    let bin_dir = os
-        .map(|os| extra_plan.bin_dir_for("digstore", os))
-        .unwrap_or_else(dig_installer::paths::default_bin_dir);
+    let bin_dir = digstore_write_exec_dir(&extra_plan, os);
 
     // Elevation is required when the extra components need it (services / beacon
     // / hosts entry — the library's authoritative `requires_elevation`) OR the
@@ -454,46 +452,65 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     }
 
     // ---- Phase 6: verify ----
+    // #635 item 2 / #610: NEVER exec a user-writable binary under elevation — a
+    // future root child (unix GUI elevation, #638/#639) must not root-exec
+    // `~/.dig/bin/digstore`, which a lower-privileged process could swap. The
+    // exec-verify runs here only when it is safe (unelevated, OR the CLI sits in
+    // the admin-only protected root — see `should_exec_verify`); otherwise it is
+    // DEFERRED to the unelevated GUI after the privileged step returns.
     emit_pct(app, 92.0, Some("digstore --version"));
-    let out = Command::new(&dest_bin)
-        .arg("--version")
-        .hide_console()
-        .output()
-        .map_err(|e| {
-            let msg = format!("verify failed: could not run {}: {e}", dest_bin.display());
+    let bin_in_protected_root = bin_dir == dig_installer::paths::protected_bin_dir();
+    if should_exec_verify(
+        dig_installer::elevation::is_elevated(),
+        bin_in_protected_root,
+    ) {
+        let out = Command::new(&dest_bin)
+            .arg("--version")
+            .hide_console()
+            .output()
+            .map_err(|e| {
+                let msg = format!("verify failed: could not run {}: {e}", dest_bin.display());
+                let _ = app.emit(
+                    "install://error",
+                    InstallError {
+                        message: msg.clone(),
+                    },
+                );
+                msg
+            })?;
+        if !out.status.success() {
+            let msg = format!(
+                "verify failed: `digstore --version` exited with {}",
+                out.status.code().unwrap_or(-1)
+            );
             let _ = app.emit(
                 "install://error",
                 InstallError {
                     message: msg.clone(),
                 },
             );
-            msg
-        })?;
-    if !out.status.success() {
-        let msg = format!(
-            "verify failed: `digstore --version` exited with {}",
-            out.status.code().unwrap_or(-1)
+            return Err(msg);
+        }
+        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        emit_line(
+            app,
+            format!(
+                r#"<span class="ok">✓</span> Verifying install · <span class="ac">{}</span>"#,
+                if ver.is_empty() {
+                    "digstore --version".into()
+                } else {
+                    ver
+                }
+            ),
         );
-        let _ = app.emit(
-            "install://error",
-            InstallError {
-                message: msg.clone(),
-            },
+    } else {
+        // Elevated + a user-writable CLI: verification is deferred, NOT run here,
+        // so no privileged process execs a user-writable binary (#635 item 2).
+        emit_line(
+            app,
+            r#"<span class="dim">·</span> Deferring <span class="ac">digstore --version</span> to the unprivileged step <span class="dim">(no elevated exec of a user-writable binary)</span>"#,
         );
-        return Err(msg);
     }
-    let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    emit_line(
-        app,
-        format!(
-            r#"<span class="ok">✓</span> Verifying install · <span class="ac">{}</span>"#,
-            if ver.is_empty() {
-                "digstore --version".into()
-            } else {
-                ver
-            }
-        ),
-    );
 
     // ---- Phase 7: the other selected DIG components (task #234) ----
     // digstore itself was just unpacked from the bundled/embedded payload
@@ -644,6 +661,61 @@ fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::Insta
 /// branch is asserted directly.
 fn places_digstore_in_protected_root(os: Os) -> bool {
     dig_installer::paths::is_privileged_component(os, "digstore")
+}
+
+/// The directory `run()` both WRITES and EXECUTES the bundled `digstore` CLI
+/// from — the #610 write→exec dir.
+///
+/// This MUST come from the vetted #565 routing ([`InstallPlan::bin_dir_for`]),
+/// NEVER an ad-hoc user-writable path, so a future elevated (root) run never
+/// write-then-execs a binary a lower-privileged process could swap. On Windows
+/// that is the admin-only protected root (`%ProgramFiles%\DIG\bin`); on unix it
+/// is the elevation-free per-user `~/.dig/bin` (digstore runs AS the user — not
+/// an escalation). An unresolved OS falls back to the library default bin dir
+/// (which is the protected root on Windows) — never a bespoke directory.
+///
+/// Extracted as a pure fn so the routing is test-locked: a revert to a
+/// hardcoded user-writable dir fails
+/// [`digstore_write_exec_dir_uses_the_565_routing`].
+fn digstore_write_exec_dir(plan: &dig_installer::InstallPlan, os: Option<Os>) -> PathBuf {
+    os.map(|os| plan.bin_dir_for("digstore", os))
+        .unwrap_or_else(dig_installer::paths::default_bin_dir)
+}
+
+/// Should Phase-6 exec-verification (`digstore --version`) run in THIS process,
+/// given whether the process is `elevated` and whether the CLI was written into
+/// the admin-only protected root (`bin_in_protected_root`)?
+///
+/// The #610 invariant: an elevated process MUST NOT `exec` a binary from a
+/// user-writable directory — a lower-privileged attacker could swap it in the
+/// write→exec window and inherit the freshly-granted privilege (the LPE class
+/// the Windows fix closed, and the foundation the unix GUI elevation #638/#639
+/// builds on). Verification is therefore SAFE — and runs here — iff either the
+/// process is UNELEVATED (execing its own user binary is no escalation) OR the
+/// binary sits in the protected root (root-owned, not user-writable, so
+/// unswappable by a lower-privileged process). Otherwise it is DEFERRED to the
+/// unelevated GUI (a future root child returns, and the GUI verifies) — the root
+/// child never execs `~/.dig/bin/digstore`.
+fn should_exec_verify(elevated: bool, bin_in_protected_root: bool) -> bool {
+    !elevated || bin_in_protected_root
+}
+
+/// Resolve a well-known system tool to an ABSOLUTE path from a fixed set of
+/// trusted system directories — NEVER via `$PATH`.
+///
+/// Running a cache-refresh tool as a bare command name (`update-mime-database`)
+/// resolves it through `$PATH`, a root-`PATH`-hijack / pwnkit-class surface if
+/// the code path is ever reached under elevation. Resolving against a fixed
+/// allowlist of standard absolute locations removes that surface. Returns
+/// `None` (fail-soft) when the tool is absent, so the best-effort refresh
+/// simply skips rather than failing the install.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn resolve_system_tool(name: &str) -> Option<PathBuf> {
+    const TRUSTED_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
+    TRUSTED_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| path.is_file())
 }
 
 /// One component's live Install/Update/Skip status (issue #309), shaped for
@@ -860,14 +932,20 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
         fs::write(icon_dir.join("application-x-dig.png"), DIG_ICON_PNG)
             .map_err(|e| format!("write icon: {e}"))?;
 
-        // Refresh caches (best-effort; ignore failures / missing tools).
-        let _ = Command::new("update-mime-database")
-            .arg(share.join("mime"))
-            .status();
-        let _ = Command::new("gtk-update-icon-cache")
-            .arg("-f")
-            .arg(share.join("icons").join("hicolor"))
-            .status();
+        // Refresh caches (best-effort; ignore failures / missing tools). Each
+        // tool is resolved to an ABSOLUTE path from a trusted system directory,
+        // never via `$PATH` — no root-`PATH`-hijack / pwnkit-class surface if
+        // this path is ever reached under elevation (#635 item 3). Fail-soft:
+        // a missing tool simply skips its refresh.
+        if let Some(tool) = resolve_system_tool("update-mime-database") {
+            let _ = Command::new(tool).arg(share.join("mime")).status();
+        }
+        if let Some(tool) = resolve_system_tool("gtk-update-icon-cache") {
+            let _ = Command::new(tool)
+                .arg("-f")
+                .arg(share.join("icons").join("hicolor"))
+                .status();
+        }
         Ok("~/.local/share MIME + icon".to_string())
     }
     #[cfg(target_os = "macos")]
@@ -1130,6 +1208,77 @@ mod plan_from_selection_tests {
                 plan.bin_dir_for("digstore", os),
                 paths::default_bin_dir(),
                 "unix digstore is a user-run CLI in ~/.dig/bin, not the protected root"
+            );
+        }
+    }
+
+    // #637 run()-layer test-lock (#635 item 1): the dir run() WRITES AND
+    // EXECUTES digstore from is resolved SOLELY via the vetted #565
+    // `bin_dir_for` routing — never a bespoke user-writable path. This locks the
+    // routing so a revert (e.g. hardcoding `~/.dig/bin` or an AppData dir back
+    // into `run()`) fails a test rather than silently reopening the #610 LPE for
+    // the future elevated unix run.
+    #[test]
+    fn digstore_write_exec_dir_uses_the_565_routing() {
+        let plan = plan_from_selection(&HashMap::new());
+        // The resolver's output MUST equal the library routing, verbatim, per OS.
+        for os in [Os::Windows, Os::Linux, Os::MacOs] {
+            assert_eq!(
+                super::digstore_write_exec_dir(&plan, Some(os)),
+                plan.bin_dir_for("digstore", os),
+                "the write+exec dir must come from bin_dir_for on {os:?}"
+            );
+        }
+        // Windows: the admin-only protected root — never a user-writable dir.
+        let win = super::digstore_write_exec_dir(&plan, Some(Os::Windows));
+        assert_eq!(win, paths::protected_bin_dir());
+        for legacy in paths::legacy_privileged_roots(Os::Windows) {
+            assert_ne!(
+                win, legacy,
+                "the elevated Windows write+exec dir must never be user-writable"
+            );
+        }
+        // Unresolved OS falls back to the library default — never a bespoke path.
+        assert_eq!(
+            super::digstore_write_exec_dir(&plan, None),
+            paths::default_bin_dir(),
+            "an unresolved OS falls back to the vetted default bin dir"
+        );
+    }
+
+    // #637 / #635 item 2 / #610: an elevated process must NOT exec a binary from
+    // a user-writable dir. `should_exec_verify` is the pure gate `run()`'s
+    // Phase-6 verify keys off; the truth table is locked here.
+    #[test]
+    fn exec_verify_is_gated_on_elevation_and_the_binary_location() {
+        // Unelevated: always safe to exec our own binary (no escalation).
+        assert!(super::should_exec_verify(false, false));
+        assert!(super::should_exec_verify(false, true));
+        // Elevated + protected-root binary (root-owned, unswappable): safe.
+        assert!(super::should_exec_verify(true, true));
+        // Elevated + user-writable binary: DEFERRED — the exact LPE this closes.
+        assert!(
+            !super::should_exec_verify(true, false),
+            "an elevated run must never exec a user-writable binary"
+        );
+    }
+
+    // #637 / #635 item 3: association cache-refresh tools resolve to ABSOLUTE
+    // paths from trusted system dirs, never `$PATH` — a missing tool fails soft.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn system_tools_resolve_to_absolute_trusted_paths_or_none() {
+        // A tool that cannot exist anywhere resolves to None (fail-soft skip).
+        assert!(super::resolve_system_tool("definitely-not-a-real-tool-xyz").is_none());
+        // Any resolved tool is an absolute path under a trusted system dir.
+        if let Some(path) = super::resolve_system_tool("sh") {
+            assert!(path.is_absolute(), "resolved tool must be an absolute path");
+            assert!(
+                ["/usr/bin", "/bin", "/usr/local/bin"]
+                    .iter()
+                    .any(|dir| path.starts_with(dir)),
+                "resolved tool must live under a trusted system dir, not $PATH: {}",
+                path.display()
             );
         }
     }

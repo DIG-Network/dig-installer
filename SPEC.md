@@ -558,6 +558,33 @@ elevation probe is `elevation::is_elevated` (Windows `net session`, Unix `id -u`
 the pure decision + per-OS remedy is `elevation::gate` (unit-tested). The GUI enforces the same gate
 before its first write.
 
+## 4.1a GUI write-then-exec invariant — never exec a user-writable binary under elevation (#610/#637)
+
+The GUI install pipeline (`gui/app/src-tauri/src/install.rs::run`) both WRITES binaries and, in
+places, EXECUTES them. Under elevation this is a local-privilege-escalation surface: a lower-
+privileged process could swap a binary in the write→exec window and inherit the freshly-granted
+privilege. The invariant (established for Windows in #610, generalized to unix in #637 as the
+foundation for the mac/linux GUI elevation #638/#639) is:
+
+- **Elevation gate FIRST.** `run()` resolves the plan and decides `needs_elevation`
+  (`InstallPlan::requires_elevation` OR the digstore placement lands in the protected root) BEFORE
+  any write; a required-but-absent elevation fails closed with `install://error` and no partial state.
+- **The digstore write+exec dir comes SOLELY from the vetted #565 routing.** `run()` resolves the
+  directory it unpacks AND runs digstore from via `digstore_write_exec_dir` → `InstallPlan::bin_dir_for`
+  — the admin-only protected root on Windows (`%ProgramFiles%\DIG\bin`), the elevation-free per-user
+  `~/.dig/bin` on unix (digstore runs AS the user — not an escalation). NEVER an ad-hoc user-writable
+  path. This routing is test-locked (a revert to a hardcoded user dir fails a unit test).
+- **The `digstore --version` verify (Phase 6) never execs a user-writable binary under elevation.**
+  The exec-verify runs in-process only when it is safe — `should_exec_verify`: the process is
+  UNELEVATED, OR the binary sits in the root-owned protected root (unswappable). Otherwise (an
+  elevated run whose binary is user-writable — the future unix root child) it is DEFERRED to the
+  unelevated GUI; the privileged process never execs `~/.dig/bin/digstore`.
+- **Association cache-refresh tools resolve to ABSOLUTE paths.** `register_dig_association` (per-user,
+  unelevated) runs `update-mime-database` / `gtk-update-icon-cache` from a fixed allowlist of trusted
+  system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) via `resolve_system_tool`, never as a bare
+  command name resolved through `$PATH` — removing the root-`PATH`-hijack / pwnkit-class surface if the
+  path is ever reached under elevation. A missing tool fails soft (the refresh is best-effort).
+
 ## 4.2 Readiness verdict — fail loud (#493)
 
 A run does not report success merely because downloads succeeded. `InstallReport` carries an
