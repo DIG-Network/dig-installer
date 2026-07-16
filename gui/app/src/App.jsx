@@ -6,6 +6,7 @@ import { Components } from "./steps/Components.jsx";
 import { Browsers } from "./steps/Browsers.jsx";
 import { Installing } from "./steps/Installing.jsx";
 import { Finish } from "./steps/Finish.jsx";
+import { LanguageSelector } from "./i18n/LanguageSelector.jsx";
 import { NOW_FILES } from "./data.jsx";
 import { computeSteps } from "./steps.js";
 import glowD from "./assets/logos/D-glow-logo.svg";
@@ -408,6 +409,7 @@ export function App() {
             )}
           </div>
           <div className="footer">
+            <LanguageSelector />
             <div className="dots">
               {steps.map((s, i) => (
                 <span key={s.id} className={"d" + (i === step ? " on" : "")}></span>
