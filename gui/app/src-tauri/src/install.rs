@@ -584,7 +584,8 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // performed by #612's managed-policy writer; here the pipeline only carries
     // the selection and surfaces it in the log so the choice is visible and
     // auditable. Nothing is written to a browser policy in this step.
-    if opts.selected.get("extension").copied().unwrap_or(false) && !opts.selected_browsers.is_empty()
+    if opts.selected.get("extension").copied().unwrap_or(false)
+        && !opts.selected_browsers.is_empty()
     {
         emit_line(
             app,
