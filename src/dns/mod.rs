@@ -101,6 +101,14 @@ pub struct DnsUninstallResult {
     /// (Administrator/root) — see [`DnsInstallResult::needs_elevation`].
     #[serde(default)]
     pub needs_elevation: bool,
+    /// `true` only when the dig-dns SERVICE registration itself is confirmed
+    /// gone (deregistered OR already absent) — distinct from `uninstalled`,
+    /// which is `true` when ANY artifact (NRPT rule, browser policy, …) was
+    /// removed. The whole-stack uninstall (#568) gates deleting the dig-dns
+    /// binary on THIS: a still-registered service whose binary was deleted is
+    /// the blocker-#4 orphan (a service pointing at a missing ImagePath).
+    #[serde(default)]
+    pub service_removed: bool,
     pub note: String,
     /// Every artifact (service, rule, file, registry key) this run removed.
     pub residue_removed: Vec<String>,
@@ -219,6 +227,9 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,
+            // No service is ever registered on an unsupported platform, so there
+            // is nothing to orphan — the service is trivially "gone".
+            service_removed: true,
             note: "dig-dns OS-service uninstall is not supported on this platform".to_string(),
             residue_removed: Vec::new(),
         }

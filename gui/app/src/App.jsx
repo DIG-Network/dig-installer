@@ -6,6 +6,7 @@ import { Components } from "./steps/Components.jsx";
 import { Browsers } from "./steps/Browsers.jsx";
 import { Installing } from "./steps/Installing.jsx";
 import { Finish } from "./steps/Finish.jsx";
+import { LanguageSelector } from "./i18n/LanguageSelector.jsx";
 import { NOW_FILES } from "./data.jsx";
 import { computeSteps } from "./steps.js";
 import glowD from "./assets/logos/D-glow-logo.svg";
@@ -42,6 +43,9 @@ export function App() {
   });
 
   const [meta, setMeta] = useState(DEFAULT_META);
+  // #562: set when the install stages a reboot-deferred replace of a running
+  // binary — the Finish step then shows a restart-required notice.
+  const [restartRequired, setRestartRequired] = useState(false);
   // The bundled digstore CLI version this installer will install — shown on the
   // badge and the Welcome/Finish "version" chips (distinct from the installer
   // app's own version in `meta.version`).
@@ -224,7 +228,13 @@ export function App() {
           if (token !== installToken.current) return;
           if (typeof p.pct === "number") setPct(p.pct);
           if (p.nowFile) setNowFile(p.nowFile);
-          if (p.line) setLines((prev) => [...prev, p.line]);
+          if (p.line) {
+            setLines((prev) => [...prev, p.line]);
+            // #562: the CLI emits a "RESTART REQUIRED" verdict when a running
+            // binary's update was staged for a reboot. Surface it on Finish so a
+            // reboot-deferred install never reads as fully done.
+            if (/RESTART REQUIRED/i.test(p.line)) setRestartRequired(true);
+          }
         },
         onError: (err) => {
           if (token !== installToken.current) return;
@@ -388,9 +398,18 @@ export function App() {
               />
             )}
             {cur === "installing" && <Installing pct={pct} lines={lines} nowFile={nowFile} error={error} />}
-            {cur === "finish" && <Finish path={installPath} onCopy={copyCmds} copied={copied} meta={digstoreMeta} />}
+            {cur === "finish" && (
+              <Finish
+                path={installPath}
+                onCopy={copyCmds}
+                copied={copied}
+                meta={digstoreMeta}
+                restartRequired={restartRequired}
+              />
+            )}
           </div>
           <div className="footer">
+            <LanguageSelector />
             <div className="dots">
               {steps.map((s, i) => (
                 <span key={s.id} className={"d" + (i === step ? " on" : "")}></span>

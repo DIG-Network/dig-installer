@@ -354,13 +354,43 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      # No lint/test suite exists yet for gui/app (runbooks/local-running.md
-      # notes this explicitly) — standing up one is out of scope here; a
-      # green install + production build is the correctly-sized JS gate for
-      # this task (task #238 dig_ecosystem issue).
       - name: Install frontend deps
         working-directory: gui/app
         run: npm ci || npm install
       - name: Build frontend
         working-directory: gui/app
         run: npm run build
+
+  # GUI frontend ESLint (#643): strict lint (react + react-hooks), zero errors.
+  gui-js-lint:
+    name: gui js lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install + lint the frontend
+        working-directory: gui/app
+        run: |
+          npm ci || npm install
+          npm run lint
+
+  # Version-source-agreement gate (#644 — the #648 drift guard). Every version
+  # source that MUST move in lockstep is asserted equal, so a PR that bumps one
+  # and forgets another fails with a clear message rather than shipping a
+  # mismatched build. Two independent version tracks are checked:
+  #   * the root CLI crate: Cargo.toml <-> Cargo.lock (dig-installer entry);
+  #   * the Tauri GUI quad: gui/app/package.json <-> tauri.conf.json <->
+  #     src-tauri/Cargo.toml <-> package-lock.json <-> src-tauri/Cargo.lock.
+  version-agreement:
+    name: version-source agreement (#648 drift guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Assert every version source agrees
+        run: bash .github/scripts/check-version-agreement.sh
