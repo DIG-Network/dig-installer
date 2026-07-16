@@ -66,6 +66,7 @@ pub mod secure;
 pub mod service;
 pub mod svc;
 pub mod target;
+pub mod uninstall;
 pub mod update;
 
 use std::path::PathBuf;
@@ -2085,6 +2086,250 @@ pub fn uninstall_beacon(
         result.note
     ));
     result
+}
+
+/// The production [`uninstall::UninstallActions`] — wires the real per-component
+/// teardown functions behind the injectable action interface so the whole-stack
+/// `uninstall` orchestration ([`uninstall::orchestrate`]) can drive them while
+/// its ordering + residue accounting stay purely unit-tested.
+struct SystemActions<'a> {
+    bin_dir: std::path::PathBuf,
+    dry_run: bool,
+    browser_ids: Vec<String>,
+    log: &'a mut dyn FnMut(&str),
+}
+
+impl<'a> SystemActions<'a> {
+    /// Resolve an installed component binary path (either bin root) for the
+    /// current target, preferring the protected root when the component lives
+    /// there. Returns the first existing candidate, else the default-root path.
+    fn component_bin(&self, target: &Target, stem: &str) -> std::path::PathBuf {
+        let name = target.exe_name(stem);
+        let candidates = [
+            paths::protected_bin_dir().join(&name),
+            self.bin_dir.join(&name),
+        ];
+        candidates
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| self.bin_dir.join(&name))
+    }
+}
+
+/// Is a service-teardown `Err` actually the idempotent "nothing was installed"
+/// case (a clean no-op), rather than a real failure? Absent is success. Pure.
+fn service_absent_is_ok(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("does not exist")
+        || e.contains("not exist")
+        || e.contains("not installed")
+        || e.contains("not found")
+        || e.contains("no such")
+        || e.contains("absent")
+}
+
+impl uninstall::UninstallActions for SystemActions<'_> {
+    fn stop_services(&mut self) -> (bool, String) {
+        let target = match Target::current() {
+            Ok(t) => t,
+            Err(e) => return (false, format!("could not detect target: {e}")),
+        };
+        if self.dry_run {
+            return (
+                true,
+                "would stop + deregister the dig-node, dig-relay, and dig-dns services".into(),
+            );
+        }
+        let mut ok = true;
+        let mut notes = Vec::new();
+        for stem in ["dig-node", "dig-relay"] {
+            let bin = self.component_bin(&target, stem);
+            match service::uninstall_service(&bin) {
+                Ok(n) => notes.push(format!("{stem}: {n}")),
+                Err(e) if service_absent_is_ok(&e) => notes.push(format!("{stem}: already absent")),
+                Err(e) => {
+                    ok = false;
+                    notes.push(format!("{stem}: {e}"));
+                }
+            }
+        }
+        // dig-dns has its own teardown (service + DNS wiring); it reports
+        // permission issues via a flag, never a hard error.
+        let dns = dns::uninstall(false);
+        notes.push(format!("dig-dns: {}", dns.note));
+        (ok, notes.join("; "))
+    }
+
+    fn remove_beacon(&mut self) -> (bool, String) {
+        // Idempotent: an absent scheduler registration is a clean no-op.
+        let r = uninstall_beacon(&self.bin_dir, self.dry_run, &mut *self.log);
+        (true, r.note)
+    }
+
+    fn unregister_scheme(&mut self) -> (bool, String) {
+        // Only DIG-owned handlers are removed; absent is a clean no-op.
+        let r = scheme::unregister(self.dry_run);
+        (true, r.note)
+    }
+
+    fn remove_network_config(&mut self) -> (bool, String) {
+        if self.dry_run {
+            return (
+                true,
+                "would remove the dig.local hosts entry + the peer firewall rule".into(),
+            );
+        }
+        let mut ok = true;
+        let mut notes = Vec::new();
+        match hosts::remove_dig_local() {
+            Ok(Some(n)) => notes.push(n),
+            Ok(None) => notes.push("dig.local: already absent".into()),
+            Err(e) => {
+                ok = false;
+                notes.push(format!("dig.local: {e} (re-run elevated)"));
+            }
+        }
+        if let Ok(target) = Target::current() {
+            let node_bin = self.component_bin(&target, "dig-node");
+            let fw = firewall::close(&node_bin, false);
+            notes.push(fw.note);
+        }
+        (ok, notes.join("; "))
+    }
+
+    fn delete_binaries(&mut self) -> (bool, String) {
+        let target = match Target::current() {
+            Ok(t) => t,
+            Err(e) => return (false, format!("could not detect target: {e}")),
+        };
+        let current = std::env::current_exe().ok();
+        let roots = [self.bin_dir.clone(), paths::protected_bin_dir()];
+        if self.dry_run {
+            return (true, "would delete all installed DIG binaries".into());
+        }
+        let mut ok = true;
+        let mut removed = 0usize;
+        let mut errs = Vec::new();
+        for stem in uninstall::COMPONENT_STEMS {
+            for root in &roots {
+                let path = root.join(target.exe_name(stem));
+                if !path.exists() {
+                    continue;
+                }
+                // The running installer cannot delete its own image on Windows;
+                // leave it for OS cleanup rather than fail the whole uninstall.
+                if current.as_deref() == Some(path.as_path()) {
+                    continue;
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) => {
+                        ok = false;
+                        errs.push(format!("{}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+        let note = if errs.is_empty() {
+            format!("deleted {removed} binary(ies)")
+        } else {
+            format!("deleted {removed}; failed: {}", errs.join(", "))
+        };
+        (ok, note)
+    }
+
+    fn unconfigure_forcelist(&mut self) -> (bool, String) {
+        if self.dry_run {
+            return (true, "would unconfigure the extension forcelist".into());
+        }
+        let outcomes = unconfigure_extension_forcelist(&self.browser_ids);
+        let failed: Vec<_> = outcomes
+            .iter()
+            .filter(|o| o.action == forcelist::ForcelistAction::Failed)
+            .map(|o| o.note.clone())
+            .collect();
+        if failed.is_empty() {
+            (
+                true,
+                "extension forcelist unconfigured (DIG entry only)".into(),
+            )
+        } else {
+            (false, format!("forcelist: {}", failed.join(", ")))
+        }
+    }
+
+    fn scan_residue(&mut self) -> Vec<String> {
+        if self.dry_run {
+            return Vec::new();
+        }
+        let target = match Target::current() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let current = std::env::current_exe().ok();
+        let roots = [self.bin_dir.clone(), paths::protected_bin_dir()];
+        let mut residue = Vec::new();
+        for stem in uninstall::COMPONENT_STEMS {
+            for root in &roots {
+                let path = root.join(target.exe_name(stem));
+                // The running installer image is exempt (self-delete is impossible
+                // while running; OS cleanup handles it).
+                if current.as_deref() == Some(path.as_path()) {
+                    continue;
+                }
+                if path.exists() {
+                    residue.push(path.display().to_string());
+                }
+            }
+        }
+        residue
+    }
+}
+
+/// Run the first-class whole-stack `uninstall` (#568): stop + deregister ALL
+/// services, remove ALL config, delete ALL binaries, unconfigure the extension
+/// forcelist — idempotent, and leaving zero residue. Never deletes pre-existing
+/// org policy the installer did not create (each step is DIG-scoped). Reports a
+/// structured [`uninstall::UninstallReport`]; on a real run
+/// [`uninstall::UninstallReport::complete`] proves the zero-residue outcome.
+pub fn uninstall_all(
+    bin_dir: &std::path::Path,
+    browser_ids: &[String],
+    dry_run: bool,
+    log: &mut dyn FnMut(&str),
+) -> uninstall::UninstallReport {
+    log(if dry_run {
+        "Planning a full DIG uninstall (dry-run — nothing will be removed):"
+    } else {
+        "Uninstalling the entire DIG install (services, config, binaries):"
+    });
+    let mut actions = SystemActions {
+        bin_dir: bin_dir.to_path_buf(),
+        dry_run,
+        browser_ids: browser_ids.to_vec(),
+        log,
+    };
+    let report = uninstall::orchestrate(&mut actions, dry_run);
+    for step in &report.steps {
+        (actions.log)(&format!(
+            "    {} {}: {}",
+            if step.ok { "✓" } else { "!" },
+            step.id,
+            step.note
+        ));
+    }
+    if !dry_run {
+        if report.complete() {
+            (actions.log)("    ✓ uninstall complete — zero residue");
+        } else if !report.residue.is_empty() {
+            (actions.log)(&format!(
+                "    ! residual items remain: {}",
+                report.residue.join(", ")
+            ));
+        }
+    }
+    report
 }
 
 /// Log a resolved component's source + dest in the pretty format.

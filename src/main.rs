@@ -88,6 +88,16 @@ struct Cli {
     #[arg(long = "uninstall-dig-node")]
     uninstall_dig_node: bool,
 
+    /// Uninstall the ENTIRE DIG install (#568): stop + deregister ALL services
+    /// (dig-node, dig-relay, dig-dns), remove ALL config (hosts entry, firewall
+    /// rule, URL-scheme handlers, auto-update scheduler), delete ALL binaries,
+    /// and unconfigure the browser-extension forcelist — idempotent, leaving
+    /// ZERO residue. Never removes a pre-existing org DNS/browser policy the
+    /// installer did not create. Runs standalone — ignores every other install
+    /// flag except --bin-dir/--dry-run/--json.
+    #[arg(long = "uninstall")]
+    uninstall: bool,
+
     /// Also download the DIG Browser native installer for this OS.
     #[arg(long)]
     with_browser: bool,
@@ -275,6 +285,11 @@ fn main() -> std::process::ExitCode {
 
     if cli.uninstall_ext_forcelist {
         return run_uninstall_ext_forcelist(cli.json);
+    }
+
+    if cli.uninstall {
+        let bin_dir = cli.bin_dir.clone().unwrap_or_else(paths::default_bin_dir);
+        return run_uninstall_all(&bin_dir, cli.dry_run, cli.json);
     }
 
     if cli.uninstall_dig_dns {
@@ -495,6 +510,38 @@ fn run_set_ext_forcelist_channel(channel: &str, json: bool) -> std::process::Exi
 fn run_uninstall_ext_forcelist(json: bool) -> std::process::ExitCode {
     let outcomes = dig_installer::unconfigure_extension_forcelist(&detected_browser_ids());
     report_forcelist("uninstall ext forcelist", &outcomes, json)
+}
+
+/// `--uninstall`: the first-class whole-stack uninstall (#568). Stops + removes
+/// every service, all config, all binaries, and the extension forcelist,
+/// idempotently and with zero residue. Prints the structured
+/// [`dig_installer::uninstall::UninstallReport`] under `--json`; exits non-zero
+/// only when a real run leaves the install incomplete (a step failed or residue
+/// remained), so a caller can re-run elevated.
+fn run_uninstall_all(
+    bin_dir: &std::path::Path,
+    dry_run: bool,
+    json: bool,
+) -> std::process::ExitCode {
+    let report = if json {
+        dig_installer::uninstall_all(bin_dir, &detected_browser_ids(), dry_run, &mut |line| {
+            eprintln!("{line}")
+        })
+    } else {
+        dig_installer::uninstall_all(bin_dir, &detected_browser_ids(), dry_run, &mut |line| {
+            println!("{line}")
+        })
+    };
+    if json {
+        let envelope = serde_json::json!({ "ok": report.complete(), "result": report });
+        println!("{}", serde_json::to_string(&envelope).unwrap());
+    }
+    // A dry-run always succeeds (nothing was removed); a real run must be clean.
+    if dry_run || report.complete() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }
 
 /// `--uninstall-dig-dns`: tear down the dig-dns OS service + OS wiring this

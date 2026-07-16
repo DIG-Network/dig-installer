@@ -37,6 +37,7 @@
 //!     substituted argument — so `dign` receives it as one `argv` element.
 //!   * On Linux the desktop-entry `%u` field code is expanded by the launcher
 //!     into one argument per the freedesktop spec; the URI is not word-split.
+//!
 //! The installer contributes only the static, non-interpolated argv shape
 //! (`open` + placeholder); the node's `dign open` is the sole parser.
 
@@ -391,7 +392,10 @@ mod tests {
         assert_eq!(cmd, r#""C:\Program Files\DIG\dign.exe" open "%1""#);
         assert!(cmd.starts_with('"'), "the bin path must be quoted: {cmd}");
         assert!(cmd.contains(" open "));
-        assert!(cmd.ends_with(r#""%1""#), "URI placeholder must be quoted: {cmd}");
+        assert!(
+            cmd.ends_with(r#""%1""#),
+            "URI placeholder must be quoted: {cmd}"
+        );
     }
 
     #[test]
@@ -406,13 +410,9 @@ mod tests {
 
     #[test]
     fn linux_desktop_declares_scheme_mimetypes_and_dign_open() {
-        let body = linux_desktop_contents(
-            &PathBuf::from("/opt/dig/dign"),
-            &["dig", "chia", "urn"],
-        );
-        assert!(body.contains(
-            "MimeType=x-scheme-handler/dig;x-scheme-handler/chia;x-scheme-handler/urn;"
-        ));
+        let body = linux_desktop_contents(&PathBuf::from("/opt/dig/dign"), &["dig", "chia", "urn"]);
+        assert!(body
+            .contains("MimeType=x-scheme-handler/dig;x-scheme-handler/chia;x-scheme-handler/urn;"));
         assert!(body.contains(r#"Exec="/opt/dig/dign" open %u"#));
         assert!(body.contains("Type=Application"));
     }
