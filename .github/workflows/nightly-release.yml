@@ -290,17 +290,17 @@ jobs:
           # (Windows requireAdministrator manifest; macOS/Linux fail loud with a
           # "re-run elevated" guard) — closing the #565 user->SYSTEM LPE.
           #
-          # build-binaries.yml uploads the GUI installer Windows-only (the collect
-          # + upload steps are gated `if: matrix.os == 'windows-latest'`); macOS/Linux
-          # GUI are withheld at the upload gate pending their elevation UX
-          # (dig_ecosystem#619) — the unfiltered flatten is safe only because those
-          # artifacts never reach the store. As defense-in-depth we do NOT rest on
-          # that gate: the setup-installer scope guard below positively includes only
-          # the Windows-x64 GUI setup, so a future non-Windows GUI upload cannot
-          # silently ship an unelevated installer.
-          # Copy everything EXCEPT a GUI setup that is not the Windows-x64 one.
+          # build-binaries.yml uploads the GUI installer for Windows (#610) + Linux
+          # (#638 — pkexec/polkit native elevation); macOS is withheld at the upload
+          # gate pending its elevation UX (dig_ecosystem#639). As defense-in-depth we
+          # do NOT rest on that gate: the scope guard below positively includes ONLY
+          # the Windows-x64 `.exe` and the Linux-x86_64 `.AppImage` GUI setups, so a
+          # future macOS GUI upload cannot silently ship an installer without an
+          # elevation path.
+          # Copy everything EXCEPT a GUI setup that is neither the Windows-x64 .exe
+          # nor the Linux-x86_64 .AppImage.
           find artifacts -type f \
-            ! \( -name 'DIG-Installer-Setup-*' ! -name 'DIG-Installer-Setup-*-windows-x64.exe' \) \
+            ! \( -name 'DIG-Installer-Setup-*' ! -name 'DIG-Installer-Setup-*-windows-x64.exe' ! -name 'DIG-Installer-Setup-*-linux-x86_64.AppImage' \) \
             -exec cp {} release/ \;
           ls -la release
 

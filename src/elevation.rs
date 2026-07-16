@@ -13,6 +13,9 @@
 //! runtime probe. The one-line elevation reason + per-OS remedy live in
 //! [`reason`]/[`remedy`] so both the CLI and the GUI surface identical copy.
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
 use crate::error::InstallError;
 use crate::proc::HideConsole;
 use crate::target::{Os, Target};
@@ -52,7 +55,18 @@ fn is_elevated_windows() -> bool {
 
 #[cfg(unix)]
 fn is_elevated_unix() -> bool {
-    std::process::Command::new("id")
+    // Resolve `id` to an ABSOLUTE path from a fixed set of trusted system
+    // directories — NEVER via `$PATH` (#638, MUST-HONOR from the #637 gate).
+    // `should_exec_verify` (the GUI's write→exec LPE gate) TRUSTS this bit: a
+    // `$PATH`-shadowed `id` printing a non-root uid under a root process would
+    // flip the gate and let the root process exec a user-writable binary. If the
+    // real `id` cannot be resolved we FAIL CLOSED (report NOT elevated), which at
+    // worst forces the elevation gate to demand elevation again — never the
+    // dangerous direction of falsely reporting elevated.
+    let Some(id) = resolve_system_tool("id") else {
+        return false;
+    };
+    std::process::Command::new(id)
         .arg("-u")
         .hide_console()
         .output()
@@ -60,6 +74,165 @@ fn is_elevated_unix() -> bool {
         .and_then(|o| parse_id_u(&o.stdout))
         .map(|uid| uid == 0)
         .unwrap_or(false)
+}
+
+/// The fixed set of trusted absolute directories a well-known system tool is
+/// resolved from. Deliberately NOT `$PATH`: resolving a bare command name via
+/// `$PATH` under (or on the way to) elevation is a root-`PATH`-hijack /
+/// pwnkit-class surface. Every tool the elevation path spawns — `id`, `pkexec`
+/// — is looked up here instead.
+#[cfg(unix)]
+const TRUSTED_SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"];
+
+/// Resolve a well-known system tool to an ABSOLUTE path from [`TRUSTED_SYSTEM_DIRS`],
+/// NEVER via `$PATH`. Returns `None` (fail-closed) when the tool is absent from
+/// every trusted directory.
+#[cfg(unix)]
+pub fn resolve_system_tool(name: &str) -> Option<PathBuf> {
+    TRUSTED_SYSTEM_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| path.is_file())
+}
+
+/// The fixed subcommand token the bundled installer recognises to run ONLY the
+/// privileged install headlessly (no GUI/WebView) when it is relaunched as root.
+///
+/// The Linux GUI is unelevated; when the selection needs privilege it relaunches
+/// its OWN executable as root via `pkexec` with this token, so the root child
+/// runs the scoped privileged install and exits — the GUI/WebView never runs as
+/// root (honoring the #637 constraint that elevation lifts only the child, and
+/// avoiding the #499-class "GUI as an over-privileged token" hazard).
+pub const ELEVATED_INSTALL_ARG: &str = "__dig-elevated-install";
+
+/// Build the FIXED argument vector handed to `pkexec` to relaunch `installer_exe`
+/// as root, running ONLY the headless privileged install.
+///
+/// Structurally immune to the pwnkit class (CVE-2021-4034):
+/// * `installer_exe` MUST be ABSOLUTE (pkexec requires a fully-qualified program
+///   path) — a relative path returns `None` (fail-closed).
+/// * The argv is fixed and fully controlled here: `[<abs installer>, <token>]`.
+///   There is no user-controlled `argv[0]`, no shell, and no interpolation of user
+///   text. The install selection is NOT an argument at all — it is streamed to the
+///   root child over its STDIN (see [`relaunch_elevated`]), so there is no plan
+///   file to race and nothing to splice into a command string.
+/// * The caller spawns via [`std::process::Command`], which ALWAYS sets a real
+///   `argv[0]` (`argc >= 1`), and `pkexec` itself resets the environment
+///   (sanitised `PATH`, `LD_*` stripped).
+///
+/// Pure and cross-platform (path logic only) so every property above is
+/// unit-tested on every OS the crate builds on.
+pub fn pkexec_argv(installer_exe: &Path) -> Option<Vec<OsString>> {
+    if !installer_exe.is_absolute() {
+        return None;
+    }
+    Some(vec![
+        installer_exe.as_os_str().to_os_string(),
+        OsString::from(ELEVATED_INSTALL_ARG),
+    ])
+}
+
+/// Resolve the executable `pkexec` should re-exec for the privileged child,
+/// given the process's `$APPIMAGE` env value (if any) and its `current_exe()`.
+///
+/// When the GUI runs as an **AppImage**, `current_exe()` points INSIDE the FUSE
+/// mount, which by default is NOT readable by root (`allow_other` is off) — so
+/// root's `pkexec` could not exec it and the privileged install would never start.
+/// The AppImage runtime exports `$APPIMAGE` = the absolute path of the `.AppImage`
+/// FILE itself (a normal on-disk file, root-readable); re-exec THAT so the
+/// AppImage bootstrap re-mounts as root and runs our binary with the elevation
+/// token. Falls back to `current_exe` when not running as an AppImage (a bare
+/// binary is already on a root-readable path). Pure, so the choice is unit-tested.
+pub fn relaunch_target(appimage_env: Option<&Path>, current_exe: &Path) -> PathBuf {
+    match appimage_env {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        _ => current_exe.to_path_buf(),
+    }
+}
+
+/// The fail-closed message shown when native elevation is unavailable on Linux
+/// (polkit/`pkexec` absent). No partial state is left; the user is pointed at the
+/// two supported recoveries (install polkit, or run the CLI under `sudo`).
+pub fn pkexec_unavailable_message() -> &'static str {
+    "native elevation is unavailable: pkexec (polkit) was not found. Install polkit \
+     (e.g. `sudo apt install policykit-1`) and re-launch the installer, or run \
+     `sudo dig-installer` in a terminal. Nothing was changed."
+}
+
+/// Relaunch this installer as root via `pkexec` to run the headless privileged
+/// install, streaming `plan_json` to the root child's STDIN, and block until it
+/// exits.
+///
+/// The selection is handed over the child's stdin rather than a filesystem path
+/// on purpose: there is NO shared-namespace plan file, so a co-located local user
+/// cannot pre-seed, symlink-swap, or race the plan (the plan-file TOCTOU class is
+/// eliminated, not merely hardened). The payload is small (a few hundred bytes),
+/// well under the pipe buffer, and stdin is closed before `wait()` so the child's
+/// read-to-EOF completes without deadlock.
+///
+/// Fail-closed: [`RelaunchError::PolkitMissing`] when `pkexec` is absent from the
+/// [trusted system dirs](TRUSTED_SYSTEM_DIRS) (NO setuid fallback), [`RelaunchError::BadPath`]
+/// when the installer path is not absolute, [`RelaunchError::Spawn`] when the spawn
+/// or stdin write fails. On a clean run it returns the child's
+/// [`std::process::ExitStatus`] (a non-zero status — e.g. the user dismissing the
+/// polkit auth dialog — is a normal, honest failure the caller surfaces).
+#[cfg(unix)]
+pub fn relaunch_elevated(
+    installer_exe: &Path,
+    plan_json: &[u8],
+) -> Result<std::process::ExitStatus, RelaunchError> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let pkexec = resolve_system_tool("pkexec").ok_or(RelaunchError::PolkitMissing)?;
+    let argv = pkexec_argv(installer_exe).ok_or(RelaunchError::BadPath)?;
+
+    let mut child = std::process::Command::new(pkexec)
+        .args(&argv)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| RelaunchError::Spawn(e.to_string()))?;
+
+    // Write the plan, then CLOSE stdin (drop the handle) so the child's
+    // read-to-EOF returns — before we wait(), to avoid a write/read deadlock.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| RelaunchError::Spawn("pkexec child stdin unavailable".to_string()))?;
+        stdin
+            .write_all(plan_json)
+            .map_err(|e| RelaunchError::Spawn(e.to_string()))?;
+    }
+
+    child
+        .wait()
+        .map_err(|e| RelaunchError::Spawn(e.to_string()))
+}
+
+/// Why a [`relaunch_elevated`] attempt could not even start the root child.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum RelaunchError {
+    /// `pkexec` (polkit) is not installed — fail closed, no setuid workaround.
+    PolkitMissing,
+    /// The installer path was not absolute (pkexec requires an abs program path).
+    BadPath,
+    /// The `pkexec` process could not be spawned, or its stdin could not be fed.
+    Spawn(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for RelaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelaunchError::PolkitMissing => f.write_str(pkexec_unavailable_message()),
+            RelaunchError::BadPath => {
+                f.write_str("internal error: the installer path was not absolute")
+            }
+            RelaunchError::Spawn(e) => write!(f, "could not start pkexec: {e}"),
+        }
+    }
 }
 
 /// Parse the numeric uid printed by `id -u` (e.g. `0\n` for root). Pure — split
@@ -335,5 +508,123 @@ mod tests {
     fn is_elevated_never_panics() {
         // The real probe must be safe to call on any host (CI runs un-elevated).
         let _ = is_elevated();
+    }
+
+    // ---- #638: Linux pkexec relaunch mechanism ----------------------------
+
+    use std::path::Path;
+
+    // Unix-only: `Path::is_absolute()` uses platform semantics, and a POSIX
+    // absolute path (`/opt/…`) is only recognised as absolute on unix — which is
+    // the only platform this argv is ever built on (pkexec is Linux).
+    #[cfg(unix)]
+    #[test]
+    fn pkexec_argv_has_the_fixed_pwnkit_safe_shape() {
+        // The argv is exactly [<abs installer>, <token>] — a real argv[0], a fixed
+        // token, no shell, no user-controlled argv[0], and (critically) NO plan
+        // argument: the selection goes over stdin, so there is nothing to splice
+        // and no plan file to race. Structural immunity to the pwnkit class.
+        let installer = Path::new("/opt/DIG Installer.AppImage");
+        let argv = pkexec_argv(installer).expect("an absolute path must build an argv");
+        assert_eq!(argv.len(), 2, "fixed 2-element argv (no plan arg)");
+        assert_eq!(
+            argv[0],
+            installer.as_os_str(),
+            "argv[0] is the ABSOLUTE program"
+        );
+        assert_eq!(argv[1], OsString::from(ELEVATED_INSTALL_ARG));
+    }
+
+    #[test]
+    fn pkexec_argv_fails_closed_on_a_relative_installer_path() {
+        // pkexec requires a fully-qualified program path; a relative one (which a
+        // hostile cwd could influence) is rejected rather than resolved.
+        assert!(pkexec_argv(Path::new("relative/installer")).is_none());
+    }
+
+    #[test]
+    fn relaunch_target_falls_back_to_current_exe_when_not_an_appimage() {
+        // No $APPIMAGE (a bare binary, already on a root-readable path) → current_exe.
+        let current = Path::new("/usr/lib/dig/dig-installer");
+        assert_eq!(
+            relaunch_target(None, current),
+            current.to_path_buf(),
+            "without $APPIMAGE the current executable is used"
+        );
+    }
+
+    // Unix-only: absolute-path semantics (see the argv test above).
+    #[cfg(unix)]
+    #[test]
+    fn relaunch_target_prefers_the_appimage_file_over_the_fuse_current_exe() {
+        // Running as an AppImage: `current_exe()` is inside the (root-unreadable)
+        // FUSE mount; $APPIMAGE is the .AppImage FILE (root-readable). Re-exec THAT.
+        let appimage = Path::new("/home/alice/Downloads/DIG-Installer.AppImage");
+        let fuse_exe = Path::new("/tmp/.mount_DIG-InXYZ/usr/bin/dig-installer");
+        assert_eq!(
+            relaunch_target(Some(appimage), fuse_exe),
+            appimage.to_path_buf(),
+            "the root-readable .AppImage file must be preferred over the FUSE path"
+        );
+        // A non-absolute $APPIMAGE (never expected) is ignored → current_exe.
+        assert_eq!(
+            relaunch_target(Some(Path::new("relative.AppImage")), fuse_exe),
+            fuse_exe.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn pkexec_argv_carries_no_shell_metacharacters_of_its_own() {
+        // The token we inject is a plain identifier — no shell will ever interpret
+        // it because we exec pkexec directly (no `sh -c`). Guards against a future
+        // edit that turns the token into something shell-sensitive.
+        assert!(!ELEVATED_INSTALL_ARG
+            .chars()
+            .any(|c| " \t\n;|&$`\"'\\<>(){}".contains(c)));
+    }
+
+    #[test]
+    fn pkexec_unavailable_message_is_fail_closed_and_actionable() {
+        let m = pkexec_unavailable_message();
+        assert!(m.contains("polkit"), "names the missing dependency: {m}");
+        assert!(
+            m.contains("sudo dig-installer"),
+            "offers the terminal recovery: {m}"
+        );
+        assert!(
+            m.contains("Nothing was changed"),
+            "promises no partial state: {m}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_system_tool_is_absolute_and_trusted_or_none() {
+        // A tool that exists nowhere resolves to None (fail-closed).
+        assert!(resolve_system_tool("definitely-not-a-real-tool-xyz-638").is_none());
+        // Any resolved tool is absolute AND under a trusted system dir — never $PATH.
+        if let Some(p) = resolve_system_tool("sh") {
+            assert!(p.is_absolute());
+            assert!(
+                TRUSTED_SYSTEM_DIRS.iter().any(|d| p.starts_with(d)),
+                "resolved tool must live under a trusted dir: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_elevated_unix_resolves_id_from_a_trusted_absolute_path() {
+        // The hardening (#638): `id` is resolved from a trusted absolute dir, so a
+        // real `id` MUST be present for the probe to even attempt the check. On any
+        // normal Linux/macOS host `id` exists under a trusted dir; assert the probe
+        // is wired to that resolution rather than a bare $PATH lookup.
+        assert!(
+            resolve_system_tool("id").is_some(),
+            "the elevation probe depends on a trusted absolute `id`"
+        );
+        // And the public probe stays panic-free + honest (CI is not root).
+        assert!(!is_elevated_unix(), "CI runs unprivileged");
     }
 }

@@ -54,7 +54,7 @@ const DIG_ICON_ICO: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "
 #[cfg(all(unix, not(target_os = "macos")))]
 const DIG_ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.png"));
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct InstallOpts {
     pub install_path: String,
     /// componentId -> enabled (cli is always true)
@@ -263,12 +263,51 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         Some(os) => extra_plan.requires_elevation(os) || places_digstore_in_protected_root(os),
         None => true,
     };
-    if needs_elevation && !dig_installer::elevation::is_elevated() {
+    let elevated = dig_installer::elevation::is_elevated();
+
+    // How the PRIVILEGED portion (LocalSystem/root services, protected-root
+    // binaries, hosts entry, the SYSTEM/root beacon) runs when this GUI process
+    // is NOT already root:
+    //   * Windows — the GUI elevated itself at launch (requireAdministrator
+    //     manifest, #610), so `elevated` is already true and this never triggers.
+    //   * Linux (#638) — the unelevated AppImage GUI relaunches its OWN executable
+    //     as root ONE-SHOT via `pkexec` for the privileged step only (Phase 7),
+    //     keeping the WebView unelevated. The `digstore --version` verify then
+    //     runs in THIS still-unelevated parent (Phase 6) — a genuinely
+    //     dropped-privilege context, never a root-exec of a user-writable binary
+    //     (the #637 MUST-HONOR).
+    //   * macOS (#639) — no GUI elevation UX yet → fail closed below.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let relaunch_privileged_via_pkexec = needs_elevation && !elevated;
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let relaunch_privileged_via_pkexec = false;
+
+    // Fail-closed gate (nothing partial). We only PROCEED unprivileged when the
+    // privileged step will be elevated by a Linux pkexec relaunch; otherwise an
+    // unprivileged run that needs elevation is the historical hard stop (#492).
+    if needs_elevation && !elevated && !relaunch_privileged_via_pkexec {
         let msg = format!(
             "elevation required: {}. Re-run the installer as Administrator (Windows) / with sudo \
              (macOS/Linux). Nothing was changed.",
             dig_installer::elevation::reason()
         );
+        let _ = app.emit(
+            "install://error",
+            InstallError {
+                message: msg.clone(),
+            },
+        );
+        return Err(msg);
+    }
+
+    // Linux elevation-gate FIRST: if the privileged step WILL need pkexec but
+    // polkit is absent, refuse NOW — before any unpack/write — so a machine
+    // without polkit never gets a half-install (design §2, fail-closed).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if relaunch_privileged_via_pkexec
+        && dig_installer::elevation::resolve_system_tool("pkexec").is_none()
+    {
+        let msg = dig_installer::elevation::pkexec_unavailable_message().to_string();
         let _ = app.emit(
             "install://error",
             InstallError {
@@ -545,37 +584,28 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
             app,
             "Installing the other selected DIG components:".to_string(),
         );
-        // Fail-loud (#493): a completed run that is NOT ready (a selected
-        // component didn't install or its service isn't RUNNING) is a FAILURE —
-        // never emit "DIG is ready". The report's aggregate `ready`/`failures`
-        // (real service-manager health, not a bare port probe) is the verdict.
-        match dig_installer::run_report(&extra_plan, &mut |line| emit_line(app, line)) {
-            Ok(report) if !report.ready => {
-                let msg = format!(
-                    "DIG is NOT ready — {} component(s) failed: {}. Re-run elevated \
-                     (Administrator/root) if elevation is the cause.",
-                    report.failures.len(),
-                    report.failures.join("; ")
-                );
-                let _ = app.emit(
-                    "install://error",
-                    InstallError {
-                        message: msg.clone(),
-                    },
-                );
-                return Err(msg);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let msg = format!("installing additional components failed: {e}");
-                let _ = app.emit(
-                    "install://error",
-                    InstallError {
-                        message: msg.clone(),
-                    },
-                );
-                return Err(msg);
-            }
+        // The privileged orchestration runs EITHER in-process (already root, or
+        // Windows) OR — on unelevated Linux (#638) — as a one-shot `pkexec` root
+        // relaunch of this executable. Both funnel through the SAME tested
+        // `dig_installer::run_report` machinery; the pkexec path just moves that
+        // call into a root child (headless, no WebView).
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let privileged_result = if relaunch_privileged_via_pkexec {
+            run_privileged_via_pkexec(app, &opts)
+        } else {
+            run_report_in_process(app, &extra_plan)
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let privileged_result = run_report_in_process(app, &extra_plan);
+
+        if let Err(msg) = privileged_result {
+            let _ = app.emit(
+                "install://error",
+                InstallError {
+                    message: msg.clone(),
+                },
+            );
+            return Err(msg);
         }
     }
 
@@ -675,6 +705,119 @@ fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::Insta
     }
 }
 
+/// Run the privileged component orchestration ([`dig_installer::run_report`])
+/// IN THIS PROCESS, streaming its log lines to the GUI. Used when the process is
+/// already elevated (Windows requireAdministrator, or a root/sudo run). Returns
+/// `Err(message)` when a component fails or the aggregate report is not ready —
+/// the caller owns emitting `install://error`.
+fn run_report_in_process(
+    app: &AppHandle,
+    extra_plan: &dig_installer::InstallPlan,
+) -> Result<(), String> {
+    // Fail-loud (#493): a completed-but-not-ready report (a selected component
+    // didn't install or its service isn't RUNNING) is a FAILURE — never "ready".
+    match dig_installer::run_report(extra_plan, &mut |line| emit_line(app, line)) {
+        Ok(report) if !report.ready => Err(format!(
+            "DIG is NOT ready — {} component(s) failed: {}. Re-run elevated \
+             (Administrator/root) if elevation is the cause.",
+            report.failures.len(),
+            report.failures.join("; ")
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("installing additional components failed: {e}")),
+    }
+}
+
+/// Run the privileged orchestration as ROOT via a one-shot `pkexec` relaunch of
+/// THIS installer (Linux, #638).
+///
+/// The unelevated GUI `pkexec`-relaunches the installer with the fixed
+/// [`ELEVATED_INSTALL_ARG`](dig_installer::elevation::ELEVATED_INSTALL_ARG) token
+/// and streams the install selection to the root child over its STDIN — there is
+/// NO plan file, so the plan-file TOCTOU class does not exist (a co-located user
+/// has nothing to pre-seed, symlink-swap, or race). The root child runs
+/// [`run_elevated_privileged_install_from_stdin`] (headless — it never starts the
+/// WebView) and exits; polkit renders the native admin-auth dialog.
+///
+/// The relaunch target is resolved via
+/// [`relaunch_target`](dig_installer::elevation::relaunch_target): when running as
+/// an AppImage it is `$APPIMAGE` (the root-readable `.AppImage` file), NOT the
+/// root-unreadable FUSE `current_exe()` — otherwise root's `pkexec` could not exec
+/// the installer at all.
+///
+/// Fail-closed: a missing `pkexec`, a declined prompt, or a non-zero child status
+/// is surfaced as an error with no "ready".
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_privileged_via_pkexec(app: &AppHandle, opts: &InstallOpts) -> Result<(), String> {
+    let current = std::env::current_exe()
+        .map_err(|e| format!("cannot resolve the installer executable path: {e}"))?;
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    let exe = dig_installer::elevation::relaunch_target(appimage.as_deref(), &current);
+
+    // The selection is streamed to the root child over stdin — never a shared file
+    // — so there is nothing to race. It is non-secret data (a component-id → bool
+    // map + the user-chosen install path) and, regardless, the privileged routing
+    // is INDEPENDENT of it: `plan_from_selection` sends every privileged binary to
+    // the protected root (`/opt/dig/bin`) via `bin_dir_for`, never the user path,
+    // so it can only toggle which official components install.
+    let plan_json = serde_json::to_vec(opts).map_err(|e| format!("serialize plan: {e}"))?;
+
+    emit_line(
+        app,
+        r#"<span class="dim">·</span> Requesting administrator authorization <span class="dim">(pkexec)</span>"#,
+    );
+
+    match dig_installer::elevation::relaunch_elevated(&exe, &plan_json) {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!(
+            "the privileged install did not complete (pkexec child exited with {}). \
+             If you dismissed the authorization prompt, re-run and approve it. Your \
+             per-user files (the digstore CLI in ~/.dig/bin and PATH entry) were \
+             installed; only the system-wide step (services + /opt/dig/bin) did not run.",
+            s.code().unwrap_or(-1)
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The headless privileged-install entrypoint the root `pkexec` child runs
+/// (Linux, #638). Reads the plan the unelevated GUI streamed over STDIN, asserts
+/// it is genuinely running as root, and executes ONLY the privileged component
+/// orchestration ([`dig_installer::run_report`]) — routing every privileged binary
+/// to the protected root (`/opt/dig/bin`). It NEVER starts the Tauri WebView (so no
+/// GUI ever runs as root) and NEVER execs a user-writable binary. Progress is
+/// written to stdout for the parent/logs.
+///
+/// Reading from stdin (rather than a path argument) is what eliminates the
+/// plan-file TOCTOU: there is no filesystem object for a local user to swap.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn run_elevated_privileged_install_from_stdin() -> Result<(), String> {
+    use std::io::Read;
+
+    // Defence in depth: the child MUST actually be root. `relaunch_elevated` only
+    // ever spawns this via pkexec, but assert it here so a mis-invocation can never
+    // run the "privileged" path unprivileged and silently no-op.
+    if !dig_installer::elevation::is_elevated() {
+        return Err("the elevated install child is not running as root — refusing".to_string());
+    }
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("read plan from stdin: {e}"))?;
+    let opts: InstallOpts =
+        serde_json::from_str(&raw).map_err(|e| format!("parse plan from stdin: {e}"))?;
+    let extra_plan = plan_from_selection(&opts.selected);
+    match dig_installer::run_report(&extra_plan, &mut |line| println!("{line}")) {
+        Ok(report) if !report.ready => Err(format!(
+            "DIG is NOT ready — {} component(s) failed: {}",
+            report.failures.len(),
+            report.failures.join("; ")
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("privileged install failed: {e}")),
+    }
+}
+
 /// Does the GUI's own `digstore` CLI placement land in the admin-only protected
 /// root on `os` (#610)?
 ///
@@ -724,24 +867,6 @@ fn digstore_write_exec_dir(plan: &dig_installer::InstallPlan, os: Option<Os>) ->
 /// child never execs `~/.dig/bin/digstore`.
 fn should_exec_verify(elevated: bool, bin_in_protected_root: bool) -> bool {
     !elevated || bin_in_protected_root
-}
-
-/// Resolve a well-known system tool to an ABSOLUTE path from a fixed set of
-/// trusted system directories — NEVER via `$PATH`.
-///
-/// Running a cache-refresh tool as a bare command name (`update-mime-database`)
-/// resolves it through `$PATH`, a root-`PATH`-hijack / pwnkit-class surface if
-/// the code path is ever reached under elevation. Resolving against a fixed
-/// allowlist of standard absolute locations removes that surface. Returns
-/// `None` (fail-soft) when the tool is absent, so the best-effort refresh
-/// simply skips rather than failing the install.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn resolve_system_tool(name: &str) -> Option<PathBuf> {
-    const TRUSTED_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
-    TRUSTED_DIRS
-        .iter()
-        .map(|dir| Path::new(dir).join(name))
-        .find(|path| path.is_file())
 }
 
 /// One component's live Install/Update/Skip status (issue #309), shaped for
@@ -963,10 +1088,10 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
         // never via `$PATH` — no root-`PATH`-hijack / pwnkit-class surface if
         // this path is ever reached under elevation (#635 item 3). Fail-soft:
         // a missing tool simply skips its refresh.
-        if let Some(tool) = resolve_system_tool("update-mime-database") {
+        if let Some(tool) = dig_installer::elevation::resolve_system_tool("update-mime-database") {
             let _ = Command::new(tool).arg(share.join("mime")).status();
         }
-        if let Some(tool) = resolve_system_tool("gtk-update-icon-cache") {
+        if let Some(tool) = dig_installer::elevation::resolve_system_tool("gtk-update-icon-cache") {
             let _ = Command::new(tool)
                 .arg("-f")
                 .arg(share.join("icons").join("hicolor"))
@@ -1070,6 +1195,27 @@ mod plan_from_selection_tests {
         )
         .expect("opts with selected_browsers should deserialize");
         assert_eq!(opts.selected_browsers, vec!["chrome", "brave"]);
+    }
+
+    // #638: the Linux pkexec relaunch streams the selection to the root child as
+    // JSON over stdin (never a file, never spliced into the command). That requires
+    // InstallOpts to round-trip losslessly through JSON — lock it so a field that
+    // stops serializing (dropping it from the elevated child's plan) fails a test.
+    #[test]
+    fn install_opts_round_trips_through_json_for_the_elevated_stdin_handoff() {
+        let mut selected = HashMap::new();
+        selected.insert("dig-node".to_string(), true);
+        selected.insert("auto-update".to_string(), false);
+        let opts = InstallOpts {
+            install_path: "/usr/local/digstore".to_string(),
+            selected,
+            selected_browsers: vec!["chrome".to_string(), "brave".to_string()],
+        };
+        let json = serde_json::to_string(&opts).expect("InstallOpts must serialize");
+        let back: InstallOpts = serde_json::from_str(&json).expect("and deserialize");
+        assert_eq!(back.install_path, opts.install_path);
+        assert_eq!(back.selected, opts.selected);
+        assert_eq!(back.selected_browsers, opts.selected_browsers);
     }
 
     #[test]
@@ -1310,25 +1456,10 @@ mod plan_from_selection_tests {
         );
     }
 
-    // #637 / #635 item 3: association cache-refresh tools resolve to ABSOLUTE
-    // paths from trusted system dirs, never `$PATH` — a missing tool fails soft.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn system_tools_resolve_to_absolute_trusted_paths_or_none() {
-        // A tool that cannot exist anywhere resolves to None (fail-soft skip).
-        assert!(super::resolve_system_tool("definitely-not-a-real-tool-xyz").is_none());
-        // Any resolved tool is an absolute path under a trusted system dir.
-        if let Some(path) = super::resolve_system_tool("sh") {
-            assert!(path.is_absolute(), "resolved tool must be an absolute path");
-            assert!(
-                ["/usr/bin", "/bin", "/usr/local/bin"]
-                    .iter()
-                    .any(|dir| path.starts_with(dir)),
-                "resolved tool must live under a trusted system dir, not $PATH: {}",
-                path.display()
-            );
-        }
-    }
+    // #637 / #635 item 3: the association cache-refresh tools now resolve via the
+    // library's `dig_installer::elevation::resolve_system_tool` (the single source
+    // of truth for trusted absolute-path resolution, tested in the library) — no
+    // duplicate resolver lives in the GUI crate.
 
     #[test]
     fn scheme_handler_defaults_on_in_sync_with_the_cli() {
