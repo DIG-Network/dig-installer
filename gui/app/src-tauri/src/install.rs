@@ -259,8 +259,17 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // GUI's own digstore placement lands in the admin-only protected root (#610):
     // writing into Program Files is itself a privileged operation, so a
     // digstore-only Windows GUI run must elevate too, exactly like the CLI.
+    // #648: an enterprise force-install writes each browser's admin-only managed
+    // policy (`HKLM`, `/etc/.../policies/managed`, `/Library/Managed Preferences`),
+    // so a run that force-installs the extension needs elevation too — even a
+    // browser-only selection with no downloadable component. Folded in here so the
+    // fail-closed gate and the Linux pkexec relaunch cover the forcelist write.
     let needs_elevation = match os {
-        Some(os) => extra_plan.requires_elevation(os) || places_digstore_in_protected_root(os),
+        Some(os) => {
+            extra_plan.requires_elevation(os)
+                || places_digstore_in_protected_root(os)
+                || wants_extension_forcelist(&opts)
+        }
         None => true,
     };
     let elevated = dig_installer::elevation::is_elevated();
@@ -578,6 +587,11 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         // component (dig-updater + its worker sibling) — must run even when
         // no OTHER extra component is selected (e.g. a digstore-only GUI run).
         || extra_plan.auto_update
+        // #648: the enterprise extension force-install is a privileged managed-
+        // policy write — it must run inside the SAME elevated step (in-process
+        // when already root, or the pkexec root child on Linux), so a
+        // browser-only selection still reaches the privileged path.
+        || wants_extension_forcelist(&opts)
     {
         emit_pct(app, 94.0, Some("additional components"));
         emit_line(
@@ -607,24 +621,44 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
             );
             return Err(msg);
         }
-    }
 
-    // Record the per-browser extension selection the user made on the Browsers
-    // step (#611). The enterprise force-install into each of these browsers is
-    // performed by #612's managed-policy writer; here the pipeline only carries
-    // the selection and surfaces it in the log so the choice is visible and
-    // auditable. Nothing is written to a browser policy in this step.
-    if opts.selected.get("extension").copied().unwrap_or(false)
-        && !opts.selected_browsers.is_empty()
-    {
-        emit_line(
-            app,
-            format!(
-                r#"<span class="ok">✓</span> DIG extension selected for {} browser(s): {}"#,
-                opts.selected_browsers.len(),
-                opts.selected_browsers.join(", ")
-            ),
-        );
+        // #648: enterprise force-install the DIG extension into the user-selected
+        // browsers via each browser's `ExtensionInstallForcelist` managed policy.
+        // This is a privileged write, so it runs in the SAME elevated context as
+        // the component install above:
+        //   * Linux pkexec relaunch — the root child already performed the write
+        //     (see `run_elevated_privileged_install_from_stdin`); this unelevated
+        //     parent MUST NOT attempt the privileged write (#565/#637), so it only
+        //     surfaces that the elevated step handled it.
+        //   * otherwise (Windows requireAdministrator, already-root unix, macOS) —
+        //     THIS process is the elevated context, so it does the write in-process.
+        if wants_extension_forcelist(&opts) {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let handled_in_child = relaunch_privileged_via_pkexec;
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            let handled_in_child = false;
+
+            if handled_in_child {
+                emit_line(
+                    app,
+                    format!(
+                        r#"<span class="ok">✓</span> DIG extension force-installed in the elevated step for {} browser(s): {}"#,
+                        opts.selected_browsers.len(),
+                        opts.selected_browsers.join(", ")
+                    ),
+                );
+            } else if let Err(msg) =
+                configure_extension_forcelist_step(&opts, &mut |line| emit_line(app, line))
+            {
+                let _ = app.emit(
+                    "install://error",
+                    InstallError {
+                        message: msg.clone(),
+                    },
+                );
+                return Err(msg);
+            }
+        }
     }
 
     // Every selected component installed AND its service is verified RUNNING.
@@ -703,6 +737,111 @@ fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::Insta
         force_reinstall: false,
         dry_run: false,
     }
+}
+
+/// Does this install want the enterprise extension force-install? True only when
+/// the `extension` component is selected AND the user kept at least one browser
+/// checked on the Browsers step (#611). PURE — the single predicate that gates
+/// both the elevation decision and the privileged forcelist write, so the two can
+/// never disagree.
+fn wants_extension_forcelist(opts: &InstallOpts) -> bool {
+    opts.selected.get("extension").copied().unwrap_or(false) && !opts.selected_browsers.is_empty()
+}
+
+/// Perform the privileged `ExtensionInstallForcelist` write for the user-selected
+/// browsers at the tracked channel, emitting one honest log line per browser
+/// outcome via `emit`.
+///
+/// Delegates the actual policy write to the tested library primitive
+/// ([`dig_installer::configure_extension_forcelist`], #612) — it does NOT
+/// re-implement the writer. The extension id + `update_url` are compiled-in
+/// constants inside that primitive; NO user-writable input becomes the policy
+/// value (#565/#648 injection invariant). The channel is fixed to
+/// [`Channel::Stable`] here — a channel SWITCH on an already-force-installed
+/// browser is #613's beacon-follow job, not a fresh install.
+///
+/// MUST run only in an elevated context (its callers guarantee this). Returns
+/// `Err` when ANY browser's write reported [`ForcelistAction::Failed`], so a
+/// partial failure fails the whole install rather than reporting "ready" over a
+/// silently-failed force-install.
+fn configure_extension_forcelist_step(
+    opts: &InstallOpts,
+    emit: &mut dyn FnMut(String),
+) -> Result<(), String> {
+    use dig_installer::forcelist::Channel;
+
+    if !wants_extension_forcelist(opts) {
+        return Ok(());
+    }
+
+    emit(format!(
+        r#"<span class="dim">·</span> Force-installing the DIG extension into {} browser(s) <span class="dim">(enterprise managed policy)</span>"#,
+        opts.selected_browsers.len()
+    ));
+
+    let outcomes =
+        dig_installer::configure_extension_forcelist(&opts.selected_browsers, Channel::Stable);
+    let (lines, result) = summarize_forcelist_outcomes(&outcomes);
+    for line in lines {
+        emit(line);
+    }
+    result
+}
+
+/// Fold the per-browser forcelist [`ForcelistOutcome`]s into (log lines, overall
+/// result). PURE — separated from the I/O-performing
+/// [`configure_extension_forcelist_step`] so the honesty invariant (a single
+/// `Failed` fails the whole step; nothing is ever silently swallowed) is directly
+/// unit-tested without touching a registry, plist, or `/etc`.
+///
+/// Every outcome produces a log line; a `Failed` outcome additionally accumulates
+/// into the returned `Err`, so the install surfaces exactly which browsers'
+/// force-install did not land.
+fn summarize_forcelist_outcomes(
+    outcomes: &[dig_installer::forcelist::ForcelistOutcome],
+) -> (Vec<String>, Result<(), String>) {
+    use dig_installer::forcelist::ForcelistAction;
+
+    let mut lines = Vec::with_capacity(outcomes.len());
+    let mut failures = Vec::new();
+
+    for o in outcomes {
+        let (mark, verb) = match o.action {
+            ForcelistAction::Wrote => ("ok", "force-installed"),
+            ForcelistAction::AlreadyPresent => ("ok", "already force-installed"),
+            ForcelistAction::Updated => ("ok", "updated"),
+            ForcelistAction::Skipped => ("dim", "skipped"),
+            ForcelistAction::Failed => ("err", "FAILED"),
+            // Removal actions never arise on the install path, but render them
+            // rather than panic if a future caller passes them through.
+            ForcelistAction::Removed => ("ok", "removed"),
+            ForcelistAction::NothingToRemove => ("dim", "nothing to remove"),
+        };
+        let note = if o.note.is_empty() {
+            String::new()
+        } else {
+            format!(r#" <span class="dim">({})</span>"#, o.note)
+        };
+        lines.push(format!(
+            r#"<span class="{mark}">{sym}</span> {verb}: {loc}{note}"#,
+            sym = if mark == "err" { "✗" } else { "✓" },
+            loc = o.location,
+        ));
+        if o.action == ForcelistAction::Failed {
+            failures.push(format!("{} ({})", o.location, o.note));
+        }
+    }
+
+    let result = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the extension force-install failed for {} browser(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    };
+    (lines, result)
 }
 
 /// Run the privileged component orchestration ([`dig_installer::run_report`])
@@ -813,7 +952,13 @@ pub fn run_elevated_privileged_install_from_stdin() -> Result<(), String> {
             report.failures.len(),
             report.failures.join("; ")
         )),
-        Ok(_) => Ok(()),
+        // #648: the enterprise extension force-install is a privileged managed-
+        // policy write into `/etc/.../policies/managed`, so it belongs to THIS
+        // root child — never the unelevated GUI parent. Runs after the components
+        // succeed; a Failed forcelist write fails the whole privileged step (a
+        // non-zero exit the parent surfaces), so the install never reports "ready"
+        // while a force-install silently failed.
+        Ok(_) => configure_extension_forcelist_step(&opts, &mut |line| println!("{line}")),
         Err(e) => Err(format!("privileged install failed: {e}")),
     }
 }
@@ -1167,10 +1312,98 @@ fn broadcast_environment_change() {
 
 #[cfg(test)]
 mod plan_from_selection_tests {
-    use super::{plan_from_selection, InstallOpts};
+    use super::{
+        configure_extension_forcelist_step, plan_from_selection, summarize_forcelist_outcomes,
+        wants_extension_forcelist, InstallOpts,
+    };
+    use dig_installer::forcelist::{ForcelistAction, ForcelistOutcome};
     use dig_installer::paths;
     use dig_installer::target::Os;
     use std::collections::HashMap;
+
+    fn opts_with(extension: bool, browsers: &[&str]) -> InstallOpts {
+        let mut selected = HashMap::new();
+        selected.insert("extension".to_string(), extension);
+        InstallOpts {
+            install_path: "/opt/dig".to_string(),
+            selected,
+            selected_browsers: browsers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn outcome(action: ForcelistAction, location: &str, note: &str) -> ForcelistOutcome {
+        ForcelistOutcome {
+            location: location.to_string(),
+            action,
+            note: note.to_string(),
+        }
+    }
+
+    // #648: the force-install fires only when the extension component is selected
+    // AND at least one browser is checked — the single gate the elevation
+    // decision and the privileged write share.
+    #[test]
+    fn wants_forcelist_only_when_extension_selected_and_a_browser_is_chosen() {
+        assert!(wants_extension_forcelist(&opts_with(true, &["chrome"])));
+        // extension component deselected → no write, even if browsers are listed.
+        assert!(!wants_extension_forcelist(&opts_with(false, &["chrome"])));
+        // extension selected but every browser unchecked → nothing to write.
+        assert!(!wants_extension_forcelist(&opts_with(true, &[])));
+    }
+
+    // #648 honesty invariant: a single Failed fails the whole step; a success mix
+    // still reports a line per browser and returns Ok.
+    #[test]
+    fn summarize_forcelist_reports_a_line_per_browser_and_is_ok_when_none_failed() {
+        let outcomes = vec![
+            outcome(ForcelistAction::Wrote, "HKLM\\...\\Chrome", ""),
+            outcome(
+                ForcelistAction::AlreadyPresent,
+                "HKLM\\...\\Brave",
+                "idempotent",
+            ),
+            outcome(
+                ForcelistAction::Skipped,
+                "HKLM\\...\\Edge",
+                "org policy present",
+            ),
+        ];
+        let (lines, result) = summarize_forcelist_outcomes(&outcomes);
+        assert_eq!(lines.len(), 3, "one honest log line per browser outcome");
+        assert!(result.is_ok(), "no Failed outcome → the step succeeds");
+    }
+
+    #[test]
+    fn summarize_forcelist_fails_the_step_when_any_browser_write_failed() {
+        let outcomes = vec![
+            outcome(ForcelistAction::Wrote, "HKLM\\...\\Chrome", ""),
+            outcome(ForcelistAction::Failed, "HKLM\\...\\Brave", "access denied"),
+        ];
+        let (lines, result) = summarize_forcelist_outcomes(&outcomes);
+        assert_eq!(lines.len(), 2);
+        let err = result.expect_err("a Failed browser must fail the whole step");
+        assert!(
+            err.contains("Brave") && err.contains("access denied"),
+            "the error names the failed browser + its cause, never swallows it: {err}"
+        );
+    }
+
+    // #648: when the extension component is NOT selected, the step performs NO
+    // policy write and emits nothing — a not-selected install never touches a
+    // browser policy. (Exercises the real primitive with an empty selection.)
+    #[test]
+    fn forcelist_step_is_a_silent_noop_when_extension_not_selected() {
+        let mut emitted = Vec::new();
+        let result =
+            configure_extension_forcelist_step(&opts_with(false, &["chrome"]), &mut |line| {
+                emitted.push(line)
+            });
+        assert!(result.is_ok());
+        assert!(
+            emitted.is_empty(),
+            "not-selected → no write, no log lines: {emitted:?}"
+        );
+    }
 
     // task #234: the selection→plan mapping is pure (no I/O), so every
     // selected/deselected/absent branch is asserted directly without mocking

@@ -442,6 +442,34 @@ require elevation, run standalone (ignore every other install flag), and support
 `ForcelistOutcome` = `{ location, action, note }` where `action` ∈ `wrote | already-present | updated
 | removed | nothing-to-remove | skipped | failed`.
 
+**Install-flow force-install (GUI/normal install, #648).** A normal install that selects the
+`extension` component (default-on) with at least one browser kept checked on the Browsers step
+(§1.8) force-installs the extension as part of the install itself — it is not a separate CLI action.
+The write is `forcelist::apply` for exactly `InstallOpts.selected_browsers` at the **stable** channel
+(the install-time default; a later channel SWITCH is the beacon-follow job #613, never the install
+path). The write is a privileged managed-policy write, so it runs in the SAME elevated context as the
+component install, and NEVER in an unelevated parent:
+
+- **Elevation.** Wanting the force-install (extension selected + ≥1 browser) makes the install
+  `require elevation` on its own — even a browser-only selection with no downloadable component — so
+  the fail-closed elevation gate and the Linux `pkexec` relaunch both cover it.
+- **Where the write runs.** On Windows (`requireAdministrator`), macOS, and an already-root unix run
+  the install process IS the elevated context and performs the write in-process. On an unelevated
+  Linux GUI the write is performed by the `pkexec` ROOT CHILD (streamed the selection over stdin,
+  #638), after the components install; the unelevated parent performs NO privileged policy write and
+  only surfaces that the elevated step handled it.
+- **Honest partial-failure.** Every browser's `ForcelistOutcome` is surfaced in the install log
+  (which browsers got the policy, which were skipped, which failed). A single `failed` outcome fails
+  the whole install step (the install never reports "ready" over a silently-failed force-install),
+  naming the failed browser(s) and cause — never swallowed.
+- **No injection surface.** The policy VALUE (extension id + `update_url`) is compiled-in (§1.9); the
+  only install-time input is WHICH selected browsers to write, which can never widen the value or the
+  target set beyond the §1.8 catalogue.
+
+**Uninstall coherence (#568).** A full uninstall calls `unconfigure_extension_forcelist` (the
+`--uninstall-ext-forcelist` CLI verb today; the aggregate GUI uninstall #568 wires the same call) so
+no `ExtensionInstallForcelist` residue survives a full removal.
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/
