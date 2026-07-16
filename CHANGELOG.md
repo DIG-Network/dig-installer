@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.27.0] - 2026-07-16
+
+### Features
+- Consume dig-dns v0.14.0 configure-os for live DNS activation (WU2) (#38)
+
 ## [0.26.0] - 2026-07-16
 
 ### Features
