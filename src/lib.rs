@@ -52,6 +52,7 @@ pub mod elevation;
 pub mod error;
 pub mod firewall;
 pub mod forcelist;
+pub mod hardening;
 pub mod health;
 pub mod hosts;
 pub mod manifest;
@@ -1264,6 +1265,15 @@ fn run_report_gated(
         }
     }
 
+    // Professional hardening (#573): register the Add/Remove Programs entry (its
+    // Uninstall button runs the #568 whole-stack `uninstall`) and configure
+    // service auto-recovery. Best-effort on a real Windows install — a failure is
+    // logged, never fatal (the install itself already succeeded).
+    #[cfg(windows)]
+    if !plan.dry_run {
+        apply_windows_hardening(plan, &target, log);
+    }
+
     // Aggregate readiness verdict (#493 + @mt-dev firm directive): "if
     // installation of ANY component failed, DIG is NOT ready." Never print a
     // green success line when a selected component didn't install or its
@@ -1272,6 +1282,52 @@ fn run_report_gated(
     report.ready = report.failures.is_empty();
     log_readiness_verdict(&report, log);
     Ok(report)
+}
+
+/// Apply Windows install hardening (#573): register the Add/Remove Programs
+/// entry (its Uninstall button runs the #568 whole-stack `uninstall`) and
+/// configure SCM auto-recovery for every service this plan installed. Persists
+/// the running installer to a stable path so the ARP Uninstall command keeps
+/// working after a transient `irm|iex` download is gone. Best-effort — every
+/// failure is logged, never fatal (the install already succeeded by this point).
+#[cfg(windows)]
+fn apply_windows_hardening(plan: &InstallPlan, target: &Target, log: &mut dyn FnMut(&str)) {
+    log("Registering the Add/Remove Programs entry + service auto-recovery (#573):");
+
+    // Persist the installer to a stable path for the ARP Uninstall command.
+    let installer_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
+    if let Ok(current) = std::env::current_exe() {
+        if current != installer_bin {
+            if let Some(parent) = installer_bin.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&current, &installer_bin);
+        }
+    }
+
+    let entry = hardening::arp_entry(env!("CARGO_PKG_VERSION"), &installer_bin, &plan.bin_dir);
+    match hardening::write_arp_entry(&entry) {
+        Ok(n) => log(&format!("    ✓ {n}")),
+        Err(e) => log(&format!("    ! {e}")),
+    }
+
+    // Auto-recovery for each installed Windows service.
+    let mut services = Vec::new();
+    if plan.with_dig_node {
+        services.push("net.dignetwork.dig-node");
+    }
+    if plan.with_dig_dns {
+        services.push("net.dignetwork.dig-dns");
+    }
+    if plan.with_relay {
+        services.push("net.dignetwork.dig-relay");
+    }
+    for svc in services {
+        match hardening::configure_service_recovery(svc) {
+            Ok(n) => log(&format!("    ✓ {n}")),
+            Err(e) => log(&format!("    · {svc}: {e}")),
+        }
+    }
 }
 
 /// Register the `dig://`/`chia://`/`urn:` OS URL-scheme handlers (#567/#563),
@@ -2231,10 +2287,21 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
             }
         }
+        // Remove the Add/Remove Programs entry alongside the binaries (Windows).
+        #[cfg(windows)]
+        let note_extra = match hardening::remove_arp_entry() {
+            Ok(n) => format!("; {n}"),
+            Err(e) => {
+                ok = false;
+                format!("; ARP: {e}")
+            }
+        };
+        #[cfg(not(windows))]
+        let note_extra = String::new();
         let note = if errs.is_empty() {
-            format!("deleted {removed} binary(ies)")
+            format!("deleted {removed} binary(ies){note_extra}")
         } else {
-            format!("deleted {removed}; failed: {}", errs.join(", "))
+            format!("deleted {removed}; failed: {}{note_extra}", errs.join(", "))
         };
         (ok, note)
     }
