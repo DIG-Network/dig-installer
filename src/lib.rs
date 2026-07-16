@@ -2363,48 +2363,108 @@ impl<'a> SystemActions<'a> {
     }
 }
 
-/// Is a service-teardown `Err` actually the idempotent "nothing was installed"
-/// case (a clean no-op), rather than a real failure? Absent is success. Pure.
+/// Does a service-teardown `Err` indicate the LAUNCHER BINARY could not be run
+/// (missing/unspawnable), rather than the service manager replying? A spawn
+/// failure surfaces through [`service::run_capturing`]'s stable `"could not run
+/// …"` marker (and the raw OS "no such file"/"cannot find the file"/`os error 2`
+/// text). When the launcher is gone we CANNOT confirm the service registration
+/// was removed, so this must never be treated as "already absent". Pure.
+fn is_launcher_spawn_failure(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("could not run")
+        || e.contains("no such file")
+        || e.contains("cannot find the file")
+        || e.contains("os error 2")
+}
+
+/// Is a service-teardown `Err` the idempotent "the service registration is
+/// already gone" case (a clean no-op), rather than a real failure? This is
+/// TRUE only for a genuine service-MANAGER reply that no such service exists —
+/// NOT for a launcher spawn failure ([`is_launcher_spawn_failure`], which leaves
+/// the registration state unknown and so is never "absent"). Pure.
 fn service_absent_is_ok(err: &str) -> bool {
+    if is_launcher_spawn_failure(err) {
+        return false;
+    }
     let e = err.to_ascii_lowercase();
     e.contains("does not exist")
         || e.contains("not exist")
         || e.contains("not installed")
-        || e.contains("not found")
-        || e.contains("no such")
-        || e.contains("absent")
+        || e.contains("not registered")
+        || e.contains("no such service")
+        || e.contains("service absent")
 }
 
 impl uninstall::UninstallActions for SystemActions<'_> {
-    fn stop_services(&mut self) -> (bool, String) {
+    fn stop_services(&mut self) -> uninstall::ServiceTeardown {
         let target = match Target::current() {
             Ok(t) => t,
-            Err(e) => return (false, format!("could not detect target: {e}")),
+            Err(e) => {
+                return uninstall::ServiceTeardown {
+                    ok: false,
+                    note: format!("could not detect target: {e}"),
+                    // Target unknown → we cannot safely delete ANY service
+                    // binary; mark them all as not-torn-down.
+                    failed_components: vec![
+                        "dig-node".into(),
+                        "dig-relay".into(),
+                        "dig-dns".into(),
+                        "digd".into(),
+                    ],
+                };
+            }
         };
         if self.dry_run {
-            return (
-                true,
-                "would stop + deregister the dig-node, dig-relay, and dig-dns services".into(),
-            );
+            return uninstall::ServiceTeardown {
+                ok: true,
+                note: "would stop + deregister the dig-node, dig-relay, and dig-dns services"
+                    .into(),
+                failed_components: Vec::new(),
+            };
         }
         let mut ok = true;
         let mut notes = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         for stem in ["dig-node", "dig-relay"] {
             let bin = self.component_bin(&target, stem);
+            // Structured launcher-gone signal: if the deregister binary is
+            // missing we cannot run it, so the service state is UNKNOWN — never
+            // "already absent". Its binary is gone anyway; mark it failed so the
+            // run is not falsely reported complete.
+            if !bin.exists() {
+                ok = false;
+                failed.push(stem.to_string());
+                notes.push(format!(
+                    "{stem}: launcher binary missing — cannot deregister its service (re-run after reinstall, or remove the service manually)"
+                ));
+                continue;
+            }
             match service::uninstall_service(&bin) {
                 Ok(n) => notes.push(format!("{stem}: {n}")),
                 Err(e) if service_absent_is_ok(&e) => notes.push(format!("{stem}: already absent")),
                 Err(e) => {
                     ok = false;
+                    failed.push(stem.to_string());
                     notes.push(format!("{stem}: {e}"));
                 }
             }
         }
-        // dig-dns has its own teardown (service + DNS wiring); it reports
-        // permission issues via a flag, never a hard error.
+        // dig-dns has its own teardown (service + DNS wiring); it reports a
+        // permission problem via `needs_elevation` (not a hard error). When it
+        // could NOT deregister, its binaries (dig-dns + the digd alias) must be
+        // left in place — deleting them would orphan a live dig-dns service.
         let dns = dns::uninstall(false);
         notes.push(format!("dig-dns: {}", dns.note));
-        (ok, notes.join("; "))
+        if dns.needs_elevation {
+            ok = false;
+            failed.push("dig-dns".to_string());
+            failed.push("digd".to_string());
+        }
+        uninstall::ServiceTeardown {
+            ok,
+            note: notes.join("; "),
+            failed_components: failed,
+        }
     }
 
     fn remove_beacon(&mut self) -> (bool, String) {
@@ -2444,7 +2504,7 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         (ok, notes.join("; "))
     }
 
-    fn delete_binaries(&mut self) -> (bool, String) {
+    fn delete_binaries(&mut self, skip: &[String]) -> (bool, String) {
         let target = match Target::current() {
             Ok(t) => t,
             Err(e) => return (false, format!("could not detect target: {e}")),
@@ -2458,6 +2518,12 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         let mut removed = 0usize;
         let mut errs = Vec::new();
         for stem in uninstall::COMPONENT_STEMS {
+            // Blocker #4: never delete a binary whose service could not be
+            // deregistered — that would orphan a still-registered service
+            // pointing at a missing ImagePath. Leave it for an elevated re-run.
+            if skip.iter().any(|s| s == stem) {
+                continue;
+            }
             for root in &roots {
                 let path = root.join(target.exe_name(stem));
                 if !path.exists() {
@@ -4150,6 +4216,38 @@ mod tests {
             "dig-node",
             download::WriteOutcome::Replaced
         ));
+    }
+
+    #[test]
+    fn service_absent_is_ok_distinguishes_launcher_gone_from_registration_gone() {
+        // Blocker #4: a missing-EXECUTABLE spawn error must NOT be swallowed as
+        // "service already absent" — the registration state is unknown.
+        for spawn_err in [
+            "dig-node uninstall failed: could not run C:\\x\\dig-node.exe: The system cannot find the file specified. (os error 2)",
+            "dig-node uninstall failed: could not run /opt/dig/bin/dig-node: No such file or directory (os error 2)",
+        ] {
+            assert!(
+                is_launcher_spawn_failure(spawn_err),
+                "spawn failure must be recognised: {spawn_err}"
+            );
+            assert!(
+                !service_absent_is_ok(spawn_err),
+                "a launcher spawn failure is NOT 'service absent': {spawn_err}"
+            );
+        }
+        // A genuine service-MANAGER reply that no such service exists IS the
+        // idempotent already-absent case.
+        for absent in [
+            "dig-node uninstall failed: sc delete exited with 1060: The specified service does not exist as an installed service.",
+            "the service is not registered",
+            "no such service",
+        ] {
+            assert!(
+                service_absent_is_ok(absent),
+                "a manager 'does not exist' reply is absent: {absent}"
+            );
+            assert!(!is_launcher_spawn_failure(absent));
+        }
     }
 
     fn running_service() -> ServiceResult {

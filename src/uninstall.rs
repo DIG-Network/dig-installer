@@ -109,19 +109,39 @@ impl UninstallReport {
 /// `true` with an "already absent" note, never an error.
 pub trait UninstallActions {
     /// Stop + deregister all DIG services (dig-node, dig-relay, dig-dns).
-    fn stop_services(&mut self) -> (bool, String);
+    fn stop_services(&mut self) -> ServiceTeardown;
     /// Remove the auto-update beacon's scheduler registration.
     fn remove_beacon(&mut self) -> (bool, String);
     /// Unregister the dig/chia/urn URL-scheme handlers (DIG-owned only).
     fn unregister_scheme(&mut self) -> (bool, String);
     /// Remove the dig.local hosts entry + the peer firewall rule.
     fn remove_network_config(&mut self) -> (bool, String);
-    /// Delete all installed DIG binaries from both bin roots.
-    fn delete_binaries(&mut self) -> (bool, String);
+    /// Delete all installed DIG binaries from both bin roots, EXCEPT the
+    /// binaries of the component stems in `skip` — those had a failed service
+    /// teardown, so deleting their binary would orphan a still-registered
+    /// service pointing at a missing ImagePath (which #573's SCM auto-recovery
+    /// would then thrash on). Leave them for an elevated re-run.
+    fn delete_binaries(&mut self, skip: &[String]) -> (bool, String);
     /// Ask the GUI backend to unconfigure the extension forcelist (#612/#648).
     fn unconfigure_forcelist(&mut self) -> (bool, String);
     /// Re-scan for anything still present; the returned strings are the residue.
     fn scan_residue(&mut self) -> Vec<String>;
+}
+
+/// The outcome of the service-teardown step. Carries the aggregate `ok` + note
+/// AND the component stems whose service could NOT be deregistered, so the
+/// orchestrator can refuse to delete THOSE binaries (avoiding an orphaned
+/// service → deleted-binary mismatch — blocker #4). A component absent from
+/// `failed_components` was torn down cleanly (or was already absent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct ServiceTeardown {
+    /// Every service reached its desired end-state (removed or already-absent).
+    pub ok: bool,
+    /// Human-readable detail across all services.
+    pub note: String,
+    /// Component stems whose service teardown FAILED — their binaries must be
+    /// left in place (never deleted) to avoid orphaning a live registration.
+    pub failed_components: Vec<String>,
 }
 
 /// Run the full uninstall orchestration against `actions`, in the fixed teardown
@@ -134,8 +154,8 @@ pub trait UninstallActions {
 pub fn orchestrate(actions: &mut dyn UninstallActions, dry_run: bool) -> UninstallReport {
     let mut report = UninstallReport::new(dry_run);
 
-    let (ok, note) = actions.stop_services();
-    report.record("services", ok, note);
+    let services = actions.stop_services();
+    report.record("services", services.ok, services.note);
 
     let (ok, note) = actions.remove_beacon();
     report.record("beacon", ok, note);
@@ -147,8 +167,20 @@ pub fn orchestrate(actions: &mut dyn UninstallActions, dry_run: bool) -> Uninsta
     report.record("network", ok, note);
 
     // Binaries are deleted only AFTER their services/schedulers are gone, so a
-    // live service never points at a deleted binary mid-teardown.
-    let (ok, note) = actions.delete_binaries();
+    // live service never points at a deleted binary mid-teardown. Crucially, a
+    // component whose service teardown FAILED (`failed_components`) keeps its
+    // binary — deleting it would leave a still-registered service pointing at a
+    // missing ImagePath (an orphan; blocker #4). Those are left for an elevated
+    // re-run, which the residue scan then reports as not-yet-complete.
+    let (ok, note) = actions.delete_binaries(&services.failed_components);
+    let note = if services.failed_components.is_empty() {
+        note
+    } else {
+        format!(
+            "{note}; left in place (service not fully torn down): {}",
+            services.failed_components.join(", ")
+        )
+    };
     report.record("binaries", ok, note);
 
     let (ok, note) = actions.unconfigure_forcelist();
@@ -168,6 +200,11 @@ mod tests {
         calls: Vec<String>,
         residue: Vec<String>,
         fail_step: Option<String>,
+        /// Component stems `stop_services` reports as failed-to-deregister.
+        service_failed: Vec<String>,
+        /// The `skip` set `delete_binaries` was actually invoked with (records
+        /// the orchestrator's gating decision for assertions).
+        delete_skip: Option<Vec<String>>,
     }
 
     impl FakeActions {
@@ -182,8 +219,13 @@ mod tests {
     }
 
     impl UninstallActions for FakeActions {
-        fn stop_services(&mut self) -> (bool, String) {
-            self.outcome("services")
+        fn stop_services(&mut self) -> ServiceTeardown {
+            self.calls.push("services".to_string());
+            ServiceTeardown {
+                ok: self.service_failed.is_empty() && self.fail_step.as_deref() != Some("services"),
+                note: "services".into(),
+                failed_components: self.service_failed.clone(),
+            }
         }
         fn remove_beacon(&mut self) -> (bool, String) {
             self.outcome("beacon")
@@ -194,8 +236,11 @@ mod tests {
         fn remove_network_config(&mut self) -> (bool, String) {
             self.outcome("network")
         }
-        fn delete_binaries(&mut self) -> (bool, String) {
-            self.outcome("binaries")
+        fn delete_binaries(&mut self, skip: &[String]) -> (bool, String) {
+            self.calls.push("binaries".to_string());
+            self.delete_skip = Some(skip.to_vec());
+            let ok = self.fail_step.as_deref() != Some("binaries");
+            (ok, format!("binaries: skip={skip:?}"))
         }
         fn unconfigure_forcelist(&mut self) -> (bool, String) {
             self.outcome("forcelist")
@@ -256,6 +301,44 @@ mod tests {
         assert!(!r.complete());
         let scheme = r.steps.iter().find(|s| s.id == "scheme").unwrap();
         assert!(!scheme.ok);
+    }
+
+    #[test]
+    fn a_failed_service_teardown_skips_that_components_binary_delete() {
+        // Blocker #4: an unelevated uninstall where dig-node's service could not
+        // be deregistered must NOT delete dig-node's binary — otherwise a
+        // still-registered service points at a missing ImagePath (orphan). The
+        // orchestrator gates delete_binaries on the failed set, and the leftover
+        // binary makes the run not-yet-complete (prompting an elevated re-run).
+        let mut a = FakeActions {
+            service_failed: vec!["dig-node".into()],
+            residue: vec!["/opt/dig/bin/dig-node".into()],
+            ..Default::default()
+        };
+        let r = orchestrate(&mut a, false);
+        assert_eq!(
+            a.delete_skip.as_deref(),
+            Some(&["dig-node".to_string()][..]),
+            "the failed component must be passed to delete_binaries as skip"
+        );
+        let services = r.steps.iter().find(|s| s.id == "services").unwrap();
+        assert!(!services.ok, "a failed service teardown is not ok");
+        assert!(
+            !r.complete(),
+            "an incomplete service teardown + left-in-place binary is not complete"
+        );
+    }
+
+    #[test]
+    fn a_clean_service_teardown_deletes_everything_no_skip() {
+        let mut a = FakeActions::default();
+        let r = orchestrate(&mut a, false);
+        assert_eq!(
+            a.delete_skip.as_deref(),
+            Some(&[][..]),
+            "a clean teardown skips nothing"
+        );
+        assert!(r.complete());
     }
 
     #[test]
