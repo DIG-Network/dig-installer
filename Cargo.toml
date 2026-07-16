@@ -30,7 +30,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.24.1"
+version = "0.25.0"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -72,6 +72,12 @@ service-manager = "0.7"
 # `rev` pin (bare `version + git`): the ecosystem convention (see dig-node-core's
 # own dig-constants dependency) so a shared consumer graph resolves to ONE copy.
 dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
+
+# macOS-only: `O_NOFOLLOW` for the root child's O_NOFOLLOW read of the private
+# elevation plan file (#639 osascript relaunch). Scoped to macOS so no other
+# platform gains a direct libc dependency.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # End-to-end CLI contract tests: drive the built `dig-installer` binary and

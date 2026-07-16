@@ -237,19 +237,20 @@ jobs:
       # (`/opt/dig/bin`) and failing CLOSED when polkit is absent. So Windows +
       # Linux are collected/uploaded as release assets.
       #
-      # macOS stays WITHHELD (still built below for CI compile/bundle coverage,
-      # but NOT collected/uploaded): the GUI has no native elevation UX there yet
-      # (Authorization Services, dig_ecosystem#639). It fails CLOSED — the
-      # plan-driven elevation gate refuses a privileged install when not root — but
-      # a double-clicked .dmg cannot complete the default full-stack install, so
-      # shipping one is a broken experience. Un-withhold it once #639 lands. The
-      # CLI (install.sh) is the supported macOS path meanwhile.
+      # macOS (#639) now has native elevation too: the unelevated `.app` GUI
+      # relaunches its own executable as root via `osascript … with administrator
+      # privileges` (Authorization Services — works UNSIGNED, so NOT gated on
+      # code-signing #536) for the privileged step only, routing every privileged
+      # binary to the admin-only protected root (`/opt/dig/bin`) and failing CLOSED
+      # when osascript is absent. So Windows + Linux + macOS are ALL collected and
+      # uploaded — NO GUI platform is withheld any longer.
       - name: Build the GUI installer
         working-directory: gui/app
         run: npx tauri build ${{ matrix.build_args }}
       - name: Collect single installer artifact
-        # Windows + Linux (see the note above): macOS GUI still lacks an elevation UX.
-        if: matrix.os == 'windows-latest' || matrix.os == 'ubuntu-22.04'
+        # Windows + Linux + macOS: every GUI platform now has native elevation
+        # (#610/#638/#639), so none is withheld (see the note above).
+        if: matrix.os == 'windows-latest' || matrix.os == 'ubuntu-22.04' || matrix.os == 'macos-latest'
         shell: bash
         working-directory: gui/app
         run: |
@@ -259,7 +260,7 @@ jobs:
           cp "$artifact" "../../dist-gui/DIG-Installer-Setup-${VERSION}-${{ matrix.out_name }}"
           ls -la ../../dist-gui
       - name: Upload GUI installer artifact
-        if: matrix.os == 'windows-latest' || matrix.os == 'ubuntu-22.04'
+        if: matrix.os == 'windows-latest' || matrix.os == 'ubuntu-22.04' || matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: digstore-gui-installer-${{ matrix.os }}

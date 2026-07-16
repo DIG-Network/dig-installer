@@ -23,12 +23,13 @@ the version from `Cargo.toml`, regenerates `CHANGELOG.md` with git-cliff, commit
   `macos-x64` → attached to the GitHub Release as `dig-installer-<ver>-<os_arch>[.exe]`. This is
   the artifact `install.sh`/`install.ps1` download.
 - **GUI installer** (Tauri, embeds the released `digstore` binary) → `DIG-Installer-Setup-<ver>-
-  windows-x64.exe` (raw exe) + `-linux-x86_64.AppImage`, attached to the same GitHub Release. The
-  Windows `.exe` (#610) and the Linux `.AppImage` (#638 — native `pkexec`/polkit elevation) ship;
-  the macOS `.dmg` is still BUILT for CI coverage but WITHHELD from releases until its elevation UX
-  lands (#639), gated at the build-binaries Collect/Upload step + the release/nightly flatten
-  allowlist. So a release attaches 6 assets today (4 CLI + Windows GUI + Linux GUI), reaching 7 when
-  the macOS GUI un-withholds.
+  windows-x64.exe` (raw exe) + `-linux-x86_64.AppImage` + `-macos.dmg`, attached to the same GitHub
+  Release. All three ship — each has a vetted native elevation path: Windows `.exe` (#610 —
+  `requireAdministrator`), Linux `.AppImage` (#638 — `pkexec`/polkit), macOS `.dmg` (#639 —
+  `osascript`/Authorization Services, works unsigned). The build-binaries Collect/Upload step +
+  release/nightly flatten allowlist positively include ONLY these three vetted GUI setups, so a
+  NEW/unvetted GUI target could never silently ship without an elevation path. A release therefore
+  attaches 7 assets (4 CLI + Windows GUI + Linux GUI + macOS GUI).
 
 There is no S3/CloudFront/npm target for this repo — GitHub Releases is the only distribution
 channel. `install.sh`/`install.ps1` (repo root) always resolve the LATEST release, so no
@@ -38,8 +39,8 @@ CDN/cache invalidation step is needed after a release goes live.
 
 1. `gh run list --repo DIG-Network/dig-installer --workflow release.yml --limit 1` then
    `gh run watch <id>` — confirm every per-OS build job is green.
-2. `gh release view vX.Y.Z --repo DIG-Network/dig-installer` — confirm the 6 expected assets are
-   attached (4 CLI + Windows `.exe` + Linux `.AppImage`); the macOS `.dmg` is withheld until #639.
+2. `gh release view vX.Y.Z --repo DIG-Network/dig-installer` — confirm the 7 expected assets are
+   attached (4 CLI + Windows `.exe` + Linux `.AppImage` + macOS `.dmg`).
 3. Smoke-test the one-liner: `curl -fsSL https://raw.githubusercontent.com/DIG-Network/dig-installer/main/install.sh | sh -s -- --dry-run` (or the PowerShell equivalent) resolves the new
    version without error.
 

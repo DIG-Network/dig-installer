@@ -5,7 +5,7 @@
 
 [package]
 name = "digstore-installer"
-version = "1.7.0"
+version = "1.8.0"
 description = "DIG Installer — the universal DIG Network desktop installer (digstore CLI + dig-node + dig-dns)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -51,6 +51,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS-only: `O_NOFOLLOW` for the root child's O_NOFOLLOW read of the private
+# elevation plan file (#639 osascript relaunch).
+libc = "0.2"
 
 [features]
 # This feature is used to enable the custom-protocol when bundling.
