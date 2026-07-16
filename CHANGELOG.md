@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.1] - 2026-07-16
+
+### Bug Fixes
+- **gui:** Unix write-then-exec hardening (#637) (#29)
+
 ## [0.19.0] - 2026-07-16
 
 ### Bug Fixes
