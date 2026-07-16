@@ -1,6 +1,6 @@
 import { Ic } from "../icons.jsx";
 
-export function Finish({ path, onCopy, copied, meta }) {
+export function Finish({ path, onCopy, copied, meta, restartRequired = false }) {
   return (
     <div className="fade-key finish">
       <div className="seal">
@@ -10,6 +10,12 @@ export function Finish({ path, onCopy, copied, meta }) {
       <h2>
         The DIG stack is <span className="gt">installed</span>
       </h2>
+      {restartRequired && (
+        <div className="notice restart-required" role="status">
+          <b>Restart required.</b> A component that was running has its update staged — restart your computer to
+          finish applying it.
+        </div>
+      )}
       <p className="lead">
         The <b>DigStore</b> CLI, your <b>dig-node</b>, and <b>dig-dns</b> are ready. Initialize your first store, then
         commit a <b>capsule</b> (<code>storeId:rootHash</code> — one immutable generation) and push it to <b>DIGHUb</b>.
