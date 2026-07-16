@@ -74,6 +74,7 @@ use std::path::PathBuf;
 
 use asset::AssetKind;
 use error::InstallError;
+use hardening::{InstallAction, RollbackGuard, RollbackReport};
 use release::Repo;
 use service::ServiceConfig;
 use target::Target;
@@ -757,155 +758,446 @@ fn run_report_gated(
         restart_required: false,
     };
 
-    // #565: MIGRATE any existing user-writable install off the legacy root, then
-    //    ensure the admin-only protected root exists + is hardened (unix `chmod
-    //    0755`; Windows inherits Program Files' admin-only DACL) — BEFORE placing
-    //    any privileged binary in it. The migration stops + re-points services by
-    //    canonical id via the OS service manager; it NEVER executes a binary from
-    //    the (possibly attacker-replaced) legacy user-writable dir. Gated on
-    //    `installs_a_privileged_binary` — DECOUPLED from
-    //    `installs_a_protected_component` so it runs on a `--bin-dir`/GUI
-    //    privileged install too (the migration only acts on legacy roots, never
-    //    the custom dir): otherwise a legacy-bound registration would survive.
-    if !plan.dry_run && plan.installs_a_privileged_binary(target.os) {
-        let migration = migrate::migrate_from_legacy_roots(&target, log);
-        if migration.migrated {
-            report.migration = Some(migration);
-        }
-        let protected = paths::protected_bin_dir();
-        if let Err(e) = secure::ensure_protected_dir(target.os, &protected) {
-            log(&format!(
+    // A partial-failure install must never leave a half-written stack (the #544
+    // half-write lesson, #573): every privileged step below records itself into
+    // this guard the instant it succeeds. If ANY step fails before the install
+    // completes, `rollback_partial_install` reverses the recorded steps in LIFO
+    // order; only a fully-successful run `commit`s the guard so the steps stand.
+    let mut guard = RollbackGuard::new();
+    let run_steps = |report: &mut InstallReport,
+                     guard: &mut RollbackGuard,
+                     log: &mut dyn FnMut(&str)|
+     -> Result<(), InstallError> {
+        // #565: MIGRATE any existing user-writable install off the legacy root, then
+        //    ensure the admin-only protected root exists + is hardened (unix `chmod
+        //    0755`; Windows inherits Program Files' admin-only DACL) — BEFORE placing
+        //    any privileged binary in it. The migration stops + re-points services by
+        //    canonical id via the OS service manager; it NEVER executes a binary from
+        //    the (possibly attacker-replaced) legacy user-writable dir. Gated on
+        //    `installs_a_privileged_binary` — DECOUPLED from
+        //    `installs_a_protected_component` so it runs on a `--bin-dir`/GUI
+        //    privileged install too (the migration only acts on legacy roots, never
+        //    the custom dir): otherwise a legacy-bound registration would survive.
+        if !plan.dry_run && plan.installs_a_privileged_binary(target.os) {
+            let migration = migrate::migrate_from_legacy_roots(&target, log);
+            if migration.migrated {
+                report.migration = Some(migration);
+            }
+            let protected = paths::protected_bin_dir();
+            if let Err(e) = secure::ensure_protected_dir(target.os, &protected) {
+                log(&format!(
                 "    ! could not pre-create the protected install root {} ({e}); the per-binary \
                  write will create it",
                 protected.display()
             ));
+            }
         }
-    }
 
-    // 0. Machine-wide daemon state directories (#501/#499). Created BEFORE any
-    //    daemon starts so dig-node/dig-dns write their control-token into a
-    //    stable, identity-independent, tightly-ACL'd dir the operator CLI can
-    //    read WITHOUT being SYSTEM (enables `dig-node pair approve …` from a
-    //    normal shell). Only when a daemon is being installed.
-    if plan.with_dig_node || plan.with_dig_dns {
-        log("Preparing the machine-wide daemon state directories:");
-        report.daemon_dirs = daemon_dir::ensure(target.os, plan.dry_run, log);
-    }
-
-    // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
-    //    published in the SAME digstore release under its own asset stem
-    //    (`digs-<ver>-<os_arch>[.exe]`) and behaves identically to `digstore`;
-    //    it is resolved/downloaded exactly like digstore — same version pin,
-    //    same bin dir (so no separate PATH entry is needed) — and follows the
-    //    same `with_digstore`/`digstore_version` flags (it has none of its own).
-    if plan.with_digstore {
-        log("Installing the digstore CLI:");
-        let mut c = resolve_component(
-            resolve,
-            &Repo::digstore(),
-            &plan.digstore_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("digstore", target.os),
-        )?;
-        log_component(log, &c);
-        // #309 version-aware updater: detect what's already at this
-        // destination — a read-only check, safe under `--dry-run` — and
-        // decide Install/Update/Skip against the version just resolved above.
-        let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-        if decision.action != update::UpdateAction::Skip {
-            let outcome = download_component(&c, plan.dry_run)?;
-            report.restart_required |= log_write_outcome(log, "digstore", outcome);
-        } else {
-            log("    · already up to date — skipping the download");
+        // 0. Machine-wide daemon state directories (#501/#499). Created BEFORE any
+        //    daemon starts so dig-node/dig-dns write their control-token into a
+        //    stable, identity-independent, tightly-ACL'd dir the operator CLI can
+        //    read WITHOUT being SYSTEM (enables `dig-node pair approve …` from a
+        //    normal shell). Only when a daemon is being installed.
+        if plan.with_dig_node || plan.with_dig_dns {
+            log("Preparing the machine-wide daemon state directories:");
+            report.daemon_dirs = daemon_dir::ensure(target.os, plan.dry_run, log);
         }
-        if !plan.dry_run {
-            report.installed.push(c.dest.clone());
-        }
-        report.components.push(c);
 
-        log("Installing the digs alias (same digstore CLI, published as a separate binary):");
-        let digs = resolve_component(
-            resolve,
-            &Repo::digs(),
-            &plan.digstore_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("digs", target.os),
-        )?;
-        log_component(log, &digs);
-        let outcome = download_component(&digs, plan.dry_run)?;
-        report.restart_required |= log_write_outcome(log, "digs", outcome);
-        if !plan.dry_run {
-            report.installed.push(digs.dest.clone());
-        }
-        report.components.push(digs);
-    }
+        // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
+        //    published in the SAME digstore release under its own asset stem
+        //    (`digs-<ver>-<os_arch>[.exe]`) and behaves identically to `digstore`;
+        //    it is resolved/downloaded exactly like digstore — same version pin,
+        //    same bin dir (so no separate PATH entry is needed) — and follows the
+        //    same `with_digstore`/`digstore_version` flags (it has none of its own).
+        if plan.with_digstore {
+            log("Installing the digstore CLI:");
+            let mut c = resolve_component(
+                resolve,
+                &Repo::digstore(),
+                &plan.digstore_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("digstore", target.os),
+            )?;
+            log_component(log, &c);
+            // #309 version-aware updater: detect what's already at this
+            // destination — a read-only check, safe under `--dry-run` — and
+            // decide Install/Update/Skip against the version just resolved above.
+            let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+            if decision.action != update::UpdateAction::Skip {
+                let outcome = download_component(&c, plan.dry_run)?;
+                report.restart_required |= log_write_outcome(log, "digstore", outcome);
+            } else {
+                log("    · already up to date — skipping the download");
+            }
+            if !plan.dry_run {
+                note_binary_written(report, guard, &c.dest);
+            }
+            report.components.push(c);
 
-    // 2. PATH (only meaningful if we placed a PATH binary).
-    if plan.modify_path && (plan.with_digstore || plan.with_dig_node || plan.with_dig_dns) {
-        log(&format!("Adding {} to PATH:", plan.bin_dir.display()));
-        let dir = plan.bin_dir.to_string_lossy().into_owned();
-        if plan.dry_run {
-            log("    (would add to PATH)");
-            report.path = Some(PathResult {
-                modified: false,
-                dir,
-                note: "would add to PATH".to_string(),
-            });
-        } else {
-            match paths::add_to_path(&plan.bin_dir) {
-                Ok(note) => {
-                    log(&format!("    ✓ {note}"));
-                    report.path = Some(PathResult {
-                        modified: true,
-                        dir,
-                        note,
-                    });
-                }
-                Err(e) => {
-                    // Non-fatal: the binary is placed; only PATH wiring failed.
-                    let note = format!("could not update PATH automatically ({e})");
-                    log(&format!("    ! {note}"));
-                    report.path = Some(PathResult {
-                        modified: false,
-                        dir,
-                        note,
-                    });
+            log("Installing the digs alias (same digstore CLI, published as a separate binary):");
+            let digs = resolve_component(
+                resolve,
+                &Repo::digs(),
+                &plan.digstore_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("digs", target.os),
+            )?;
+            log_component(log, &digs);
+            let outcome = download_component(&digs, plan.dry_run)?;
+            report.restart_required |= log_write_outcome(log, "digs", outcome);
+            if !plan.dry_run {
+                note_binary_written(report, guard, &digs.dest);
+            }
+            report.components.push(digs);
+        }
+
+        // 2. PATH (only meaningful if we placed a PATH binary).
+        if plan.modify_path && (plan.with_digstore || plan.with_dig_node || plan.with_dig_dns) {
+            log(&format!("Adding {} to PATH:", plan.bin_dir.display()));
+            let dir = plan.bin_dir.to_string_lossy().into_owned();
+            if plan.dry_run {
+                log("    (would add to PATH)");
+                report.path = Some(PathResult {
+                    modified: false,
+                    dir,
+                    note: "would add to PATH".to_string(),
+                });
+            } else {
+                match paths::add_to_path(&plan.bin_dir) {
+                    Ok(note) => {
+                        log(&format!("    ✓ {note}"));
+                        report.path = Some(PathResult {
+                            modified: true,
+                            dir,
+                            note,
+                        });
+                    }
+                    Err(e) => {
+                        // Non-fatal: the binary is placed; only PATH wiring failed.
+                        let note = format!("could not update PATH automatically ({e})");
+                        log(&format!("    ! {note}"));
+                        report.path = Some(PathResult {
+                            modified: false,
+                            dir,
+                            note,
+                        });
+                    }
                 }
             }
         }
-    }
 
-    // 3. dig-node service (optional) + its `dign` alias binary (issue #548) +
-    //    dig.local hosts entry.
-    if plan.with_dig_node {
-        log("Installing the dig-node local node:");
-        let mut c = resolve_dig_node(
-            resolve,
-            &plan.dig_node_version,
-            &target,
-            &plan.bin_dir_for("dig-node", target.os),
-            log,
-        )?;
-        log_component(log, &c);
-        // #309 version-aware updater: decide Install/Update/Skip BEFORE
-        // touching anything. Only Install/Update proceed to the #232
-        // stop-before-write lifecycle below; Skip leaves the running service
-        // and its binary untouched (`register_dig_node` re-verifies it below
-        // rather than reinstalling it).
-        let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-        if decision.action != update::UpdateAction::Skip {
-            // Task #232: stop a currently-running dig-node BEFORE overwriting
-            // its binary (Windows locks a running exe's file — overwriting it
-            // in place would fail with a sharing violation, or worse, corrupt
-            // a partial write). Skip-when-absent/not-serving is not an error;
-            // a stop FAILURE aborts this artifact's write entirely rather
-            // than risk a half-written binary underneath a still-running
-            // service.
+        // 3. dig-node service (optional) + its `dign` alias binary (issue #548) +
+        //    dig.local hosts entry.
+        if plan.with_dig_node {
+            log("Installing the dig-node local node:");
+            let mut c = resolve_dig_node(
+                resolve,
+                &plan.dig_node_version,
+                &target,
+                &plan.bin_dir_for("dig-node", target.os),
+                log,
+            )?;
+            log_component(log, &c);
+            // #309 version-aware updater: decide Install/Update/Skip BEFORE
+            // touching anything. Only Install/Update proceed to the #232
+            // stop-before-write lifecycle below; Skip leaves the running service
+            // and its binary untouched (`register_dig_node` re-verifies it below
+            // rather than reinstalling it).
+            let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+            if decision.action != update::UpdateAction::Skip {
+                // Task #232: stop a currently-running dig-node BEFORE overwriting
+                // its binary (Windows locks a running exe's file — overwriting it
+                // in place would fail with a sharing violation, or worse, corrupt
+                // a partial write). Skip-when-absent/not-serving is not an error;
+                // a stop FAILURE aborts this artifact's write entirely rather
+                // than risk a half-written binary underneath a still-running
+                // service.
+                if !plan.dry_run {
+                    let dest = std::path::Path::new(&c.dest);
+                    let stop = service::stop_running_dig_node(dest)
+                        .map_err(InstallError::service_stop_failed)?;
+                    log(&format!(
+                        "    {} {}",
+                        if stop.attempted { "✓" } else { "·" },
+                        stop.note
+                    ));
+                }
+                let outcome = download_component(&c, plan.dry_run)?;
+                report.restart_required |= log_write_outcome(log, "dig-node", outcome);
+            }
+            if !plan.dry_run {
+                note_binary_written(report, guard, &c.dest);
+            }
+            let dig_node_path = PathBuf::from(c.dest.clone());
+            report.components.push(c);
+
+            // dign (issue #548): a first-class alias of dig-node, published in the
+            // SAME dig-node release under its own asset stem, installed alongside
+            // it — same version pin, same bin dir, no separate PATH entry needed —
+            // mirroring the digs-alongside-digstore pattern above (§1 in this
+            // file's header). Not update-tracked (mirrors digs, #309 §7.3): it
+            // always re-downloads fresh when present, sharing dig-node's version
+            // pin. Resolution failure is gated gracefully (logged, not fatal): the
+            // pre-rename `dig-companion` fallback above resolves dig-node from a
+            // DIFFERENT repo than `Repo::dign()` targets, so a dig-node install
+            // that fell back to the legacy repo has no dign asset to find —
+            // exercised by `dig_node_falls_back_to_legacy_dig_companion_release`
+            // below — and that must never sink the otherwise-successful install.
+            log(
+            "Installing the dign alias (same dig-node local node, published as a separate binary):",
+        );
+            match resolve_component(
+                resolve,
+                &Repo::dign(),
+                &plan.dig_node_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("dign", target.os),
+            ) {
+                Ok(dign) => {
+                    log_component(log, &dign);
+                    let outcome = download_component(&dign, plan.dry_run)?;
+                    report.restart_required |= log_write_outcome(log, "dign", outcome);
+                    if !plan.dry_run {
+                        note_binary_written(report, guard, &dign.dest);
+                    }
+                    report.components.push(dign);
+                }
+                Err(e) if e.code() == "ASSET_NOT_FOUND" => {
+                    log(&format!(
+                    "    · dign alias not available for this release ({e}) — skipping; dig-node itself is unaffected"
+                ));
+                }
+                Err(e) => return Err(e),
+            }
+
+            report.service = Some(register_dig_node(&dig_node_path, plan, &decision, log));
+            // Record ONLY a genuinely fresh registration (`Install`) for rollback —
+            // never an `Update`/`Skip` of a service the user already had, so a
+            // rollback restores the pre-install state without removing what predated
+            // this run.
+            if decision.action == update::UpdateAction::Install
+                && report.service.as_ref().is_some_and(|s| s.installed)
+            {
+                guard.record(InstallAction::ServiceRegistered(
+                    svc::DIG_NODE_SERVICE_ID.to_string(),
+                ));
+            }
+
+            // 3b. App-scoped firewall rule for dig-node's peer-RPC listener
+            //     (#424) — default-on, toggleable, best-effort (never aborts the
+            //     install; a decline/failure just means peers reach this node
+            //     via the relay fallback instead of directly).
+            if plan.open_firewall {
+                log("Opening the firewall for dig-node's peer-RPC port:");
+                let f = firewall::open(&dig_node_path, plan.dry_run);
+                log(&format!(
+                    "    {} {}",
+                    if f.applied { "✓" } else { "·" },
+                    f.note
+                ));
+                report.firewall = Some(f);
+            }
+        }
+
+        // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service, along
+        //    with its `digd` alias binary (issue #548). Unlike dig-node/dig-relay, dig-dns has no
+        //    `install`/`start` subcommands of its own, so this installer owns the full per-OS
+        //    service + split-DNS/NRPT + browser-policy wiring (see the `dns` module) and
+        //    self-verifies with `dig-dns doctor` once started.
+        if plan.with_dig_dns {
+            log("Installing dig-dns (local *.dig name resolution):");
+            match resolve_component(
+                resolve,
+                &Repo::dig_dns(),
+                &plan.dig_dns_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("dig-dns", target.os),
+            ) {
+                Ok(mut c) => {
+                    log_component(log, &c);
+                    // #309 version-aware updater — same decide-before-touch
+                    // convention as digstore/dig-node above. `register_dig_dns`
+                    // reuses `dns::verify_existing` (a read-only re-check) rather
+                    // than the full clean-reinstall path when Skip.
+                    let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+                    if decision.action != update::UpdateAction::Skip {
+                        // #544: stop a running dig-dns service BEFORE overwriting its
+                        // binary — parity with dig-node/dig-relay's #232 stop-before-
+                        // write. dig-dns has no `stop` verb of its own, so the
+                        // installer stops the OS service it registered. A stop
+                        // failure is non-fatal: the resilient write below falls back
+                        // to a reboot-time replace if the binary is still locked.
+                        if !plan.dry_run {
+                            let dest = std::path::Path::new(&c.dest);
+                            let stop = dns::stop_before_replace(dest);
+                            log(&format!(
+                                "    {} {}",
+                                if stop.attempted { "✓" } else { "·" },
+                                stop.note
+                            ));
+                        }
+                        let outcome = download_component(&c, plan.dry_run)?;
+                        report.restart_required |= log_write_outcome(log, "dig-dns", outcome);
+                    }
+                    if !plan.dry_run {
+                        note_binary_written(report, guard, &c.dest);
+                    }
+                    let dig_dns_path = PathBuf::from(c.dest.clone());
+                    report.components.push(c);
+
+                    // digd (issue #548): a first-class alias of dig-dns, published
+                    // in the SAME dig-dns release under its own asset stem,
+                    // installed alongside it — same version pin, same bin dir, no
+                    // separate PATH entry needed — exactly mirroring
+                    // digs-alongside-digstore above. Unlike dign (which has a
+                    // pre-rename legacy-repo fallback dig-node itself can take),
+                    // digd resolves against the IDENTICAL repo + version pin as
+                    // dig-dns itself with no such divergence, so it always
+                    // succeeds whenever dig-dns just did — no separate gate is
+                    // needed here (only reached inside this `Ok(mut c)` arm, i.e.
+                    // once dig-dns itself resolved; the ASSET_NOT_FOUND gate below
+                    // handles dig-dns being entirely unpublished). Not
+                    // update-tracked (mirrors digs, #309 §7.3): it always
+                    // re-downloads fresh, sharing dig-dns's version pin.
+                    log("Installing the digd alias (same dig-dns resolver, published as a separate binary):");
+                    let digd = resolve_component(
+                        resolve,
+                        &Repo::digd(),
+                        &plan.dig_dns_version,
+                        &target,
+                        AssetKind::RawBinary,
+                        &plan.bin_dir_for("digd", target.os),
+                    )?;
+                    log_component(log, &digd);
+                    let outcome = download_component(&digd, plan.dry_run)?;
+                    report.restart_required |= log_write_outcome(log, "digd", outcome);
+                    if !plan.dry_run {
+                        note_binary_written(report, guard, &digd.dest);
+                    }
+                    report.components.push(digd);
+
+                    report.dns = Some(register_dig_dns(&dig_dns_path, plan, &decision, log));
+                    // Fresh (`Install`) registrations only — see the dig-node note.
+                    if decision.action == update::UpdateAction::Install
+                        && report.dns.as_ref().is_some_and(|d| d.installed)
+                    {
+                        guard.record(InstallAction::ServiceRegistered(
+                            svc::DIG_DNS_SERVICE_ID.to_string(),
+                        ));
+                    }
+                }
+                // dig-dns is EPIC #174 and may ship no published release yet. Gate
+                // this ONE component gracefully instead of failing the whole plan
+                // (task #234): record a clear "not yet available" state and let
+                // every other selected component (dig-relay, browser, …) still
+                // install. A genuine transport failure (not "nothing published")
+                // still propagates like every other component.
+                Err(e) if e.code() == "ASSET_NOT_FOUND" => {
+                    let note = format!(
+                        "dig-dns is not yet available ({e}) — it is EPIC #174 and has no matching \
+                     release yet; skipped, the rest of the install continues. Re-run once a \
+                     release is published."
+                    );
+                    log(&format!("    ! {note}"));
+                    report.dns = Some(dns::DnsInstallResult {
+                        installed: false,
+                        started: false,
+                        service_running: false,
+                        needs_elevation: false,
+                        note,
+                        doctor: None,
+                        paths_live: Vec::new(),
+                        bound_port: None,
+                        pac_url: None,
+                        fallback_instruction: None,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // 5. The DIG auto-update beacon (dig-updater + its dig-updater-worker sibling, #514) —
+        //    default-on, toggleable. Resolves + downloads BOTH binaries (the broker spawns the
+        //    worker as a sibling process, so they must be co-located), then asks the freshly-
+        //    installed `dig-updater` to register its own daily scheduler against itself
+        //    (`beacon::register`) — the same "delegate to the component's own subcommands" pattern
+        //    dig-node/dig-relay's service registration already uses.
+        if plan.auto_update {
+            log("Installing the DIG auto-update beacon:");
+            let mut c = resolve_component(
+                resolve,
+                &Repo::dig_updater(),
+                &plan.dig_updater_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("dig-updater", target.os),
+            )?;
+            log_component(log, &c);
+            // #309 version-aware updater, extended to the beacon (#514): same
+            // decide-before-touch convention as digstore/dig-node/dig-dns above.
+            let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+            if decision.action != update::UpdateAction::Skip {
+                let outcome = download_component(&c, plan.dry_run)?;
+                report.restart_required |= log_write_outcome(log, "dig-updater", outcome);
+            } else {
+                log("    · already up to date — skipping the download");
+            }
+            if !plan.dry_run {
+                note_binary_written(report, guard, &c.dest);
+            }
+            let dig_updater_path = PathBuf::from(c.dest.clone());
+            report.components.push(c);
+
+            log("Installing the dig-updater-worker sibling (same release, published as a separate binary):");
+            let worker = resolve_component(
+                resolve,
+                &Repo::dig_updater_worker(),
+                &plan.dig_updater_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("dig-updater-worker", target.os),
+            )?;
+            log_component(log, &worker);
+            let outcome = download_component(&worker, plan.dry_run)?;
+            report.restart_required |= log_write_outcome(log, "dig-updater-worker", outcome);
+            if !plan.dry_run {
+                note_binary_written(report, guard, &worker.dest);
+            }
+            report.components.push(worker);
+
+            log("Registering the beacon's daily update-check scheduler:");
+            let b = beacon::register(&dig_updater_path, plan.dry_run);
+            log(&format!(
+                "    {} {}",
+                if b.applied { "✓" } else { "!" },
+                b.note
+            ));
+            report.beacon = Some(b);
+        }
+
+        // 6. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
+        //    points at relay.dig.net, so this is only for users who want to operate a relay.
+        if plan.with_relay {
+            log("Installing the dig-relay (run-your-own-relay):");
+            let c = resolve_component(
+                resolve,
+                &Repo::dig_relay(),
+                &plan.relay_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("dig-relay", target.os),
+            )?;
+            log_component(log, &c);
+            // Task #232: stop a currently-running dig-relay before overwriting
+            // its binary — same skip-when-absent/not-serving, abort-on-stop-
+            // failure contract as dig-node above.
             if !plan.dry_run {
                 let dest = std::path::Path::new(&c.dest);
-                let stop = service::stop_running_dig_node(dest)
+                let stop = service::stop_running_dig_relay(dest)
                     .map_err(InstallError::service_stop_failed)?;
                 log(&format!(
                     "    {} {}",
@@ -914,388 +1206,150 @@ fn run_report_gated(
                 ));
             }
             let outcome = download_component(&c, plan.dry_run)?;
-            report.restart_required |= log_write_outcome(log, "dig-node", outcome);
-        }
-        if !plan.dry_run {
-            report.installed.push(c.dest.clone());
-        }
-        let dig_node_path = PathBuf::from(c.dest.clone());
-        report.components.push(c);
-
-        // dign (issue #548): a first-class alias of dig-node, published in the
-        // SAME dig-node release under its own asset stem, installed alongside
-        // it — same version pin, same bin dir, no separate PATH entry needed —
-        // mirroring the digs-alongside-digstore pattern above (§1 in this
-        // file's header). Not update-tracked (mirrors digs, #309 §7.3): it
-        // always re-downloads fresh when present, sharing dig-node's version
-        // pin. Resolution failure is gated gracefully (logged, not fatal): the
-        // pre-rename `dig-companion` fallback above resolves dig-node from a
-        // DIFFERENT repo than `Repo::dign()` targets, so a dig-node install
-        // that fell back to the legacy repo has no dign asset to find —
-        // exercised by `dig_node_falls_back_to_legacy_dig_companion_release`
-        // below — and that must never sink the otherwise-successful install.
-        log(
-            "Installing the dign alias (same dig-node local node, published as a separate binary):",
-        );
-        match resolve_component(
-            resolve,
-            &Repo::dign(),
-            &plan.dig_node_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("dign", target.os),
-        ) {
-            Ok(dign) => {
-                log_component(log, &dign);
-                let outcome = download_component(&dign, plan.dry_run)?;
-                report.restart_required |= log_write_outcome(log, "dign", outcome);
-                if !plan.dry_run {
-                    report.installed.push(dign.dest.clone());
-                }
-                report.components.push(dign);
+            report.restart_required |= log_write_outcome(log, "dig-relay", outcome);
+            if !plan.dry_run {
+                note_binary_written(report, guard, &c.dest);
             }
-            Err(e) if e.code() == "ASSET_NOT_FOUND" => {
-                log(&format!(
-                    "    · dign alias not available for this release ({e}) — skipping; dig-node itself is unaffected"
+            let relay_path = PathBuf::from(c.dest.clone());
+            report.components.push(c);
+
+            report.relay = Some(register_relay(&relay_path, plan, log));
+            // The relay is opt-in + not update-tracked here, so any successful
+            // registration this run is fresh and rollback-reversible.
+            if report.relay.as_ref().is_some_and(|r| r.installed) {
+                guard.record(InstallAction::ServiceRegistered(
+                    svc::DIG_RELAY_SERVICE_ID.to_string(),
                 ));
             }
-            Err(e) => return Err(e),
         }
 
-        report.service = Some(register_dig_node(&dig_node_path, plan, &decision, log));
-
-        // 3b. App-scoped firewall rule for dig-node's peer-RPC listener
-        //     (#424) — default-on, toggleable, best-effort (never aborts the
-        //     install; a decline/failure just means peers reach this node
-        //     via the relay fallback instead of directly).
-        if plan.open_firewall {
-            log("Opening the firewall for dig-node's peer-RPC port:");
-            let f = firewall::open(&dig_node_path, plan.dry_run);
-            log(&format!(
-                "    {} {}",
-                if f.applied { "✓" } else { "·" },
-                f.note
-            ));
-            report.firewall = Some(f);
-        }
-    }
-
-    // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service, along
-    //    with its `digd` alias binary (issue #548). Unlike dig-node/dig-relay, dig-dns has no
-    //    `install`/`start` subcommands of its own, so this installer owns the full per-OS
-    //    service + split-DNS/NRPT + browser-policy wiring (see the `dns` module) and
-    //    self-verifies with `dig-dns doctor` once started.
-    if plan.with_dig_dns {
-        log("Installing dig-dns (local *.dig name resolution):");
-        match resolve_component(
-            resolve,
-            &Repo::dig_dns(),
-            &plan.dig_dns_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("dig-dns", target.os),
-        ) {
-            Ok(mut c) => {
-                log_component(log, &c);
-                // #309 version-aware updater — same decide-before-touch
-                // convention as digstore/dig-node above. `register_dig_dns`
-                // reuses `dns::verify_existing` (a read-only re-check) rather
-                // than the full clean-reinstall path when Skip.
-                let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-                if decision.action != update::UpdateAction::Skip {
-                    // #544: stop a running dig-dns service BEFORE overwriting its
-                    // binary — parity with dig-node/dig-relay's #232 stop-before-
-                    // write. dig-dns has no `stop` verb of its own, so the
-                    // installer stops the OS service it registered. A stop
-                    // failure is non-fatal: the resilient write below falls back
-                    // to a reboot-time replace if the binary is still locked.
-                    if !plan.dry_run {
-                        let dest = std::path::Path::new(&c.dest);
-                        let stop = dns::stop_before_replace(dest);
-                        log(&format!(
-                            "    {} {}",
-                            if stop.attempted { "✓" } else { "·" },
-                            stop.note
-                        ));
-                    }
-                    let outcome = download_component(&c, plan.dry_run)?;
-                    report.restart_required |= log_write_outcome(log, "dig-dns", outcome);
-                }
-                if !plan.dry_run {
-                    report.installed.push(c.dest.clone());
-                }
-                let dig_dns_path = PathBuf::from(c.dest.clone());
-                report.components.push(c);
-
-                // digd (issue #548): a first-class alias of dig-dns, published
-                // in the SAME dig-dns release under its own asset stem,
-                // installed alongside it — same version pin, same bin dir, no
-                // separate PATH entry needed — exactly mirroring
-                // digs-alongside-digstore above. Unlike dign (which has a
-                // pre-rename legacy-repo fallback dig-node itself can take),
-                // digd resolves against the IDENTICAL repo + version pin as
-                // dig-dns itself with no such divergence, so it always
-                // succeeds whenever dig-dns just did — no separate gate is
-                // needed here (only reached inside this `Ok(mut c)` arm, i.e.
-                // once dig-dns itself resolved; the ASSET_NOT_FOUND gate below
-                // handles dig-dns being entirely unpublished). Not
-                // update-tracked (mirrors digs, #309 §7.3): it always
-                // re-downloads fresh, sharing dig-dns's version pin.
-                log("Installing the digd alias (same dig-dns resolver, published as a separate binary):");
-                let digd = resolve_component(
-                    resolve,
-                    &Repo::digd(),
-                    &plan.dig_dns_version,
-                    &target,
-                    AssetKind::RawBinary,
-                    &plan.bin_dir_for("digd", target.os),
-                )?;
-                log_component(log, &digd);
-                let outcome = download_component(&digd, plan.dry_run)?;
-                report.restart_required |= log_write_outcome(log, "digd", outcome);
-                if !plan.dry_run {
-                    report.installed.push(digd.dest.clone());
-                }
-                report.components.push(digd);
-
-                report.dns = Some(register_dig_dns(&dig_dns_path, plan, &decision, log));
+        // 7. DIG Browser native installer (optional).
+        if plan.with_browser {
+            log("Downloading the DIG Browser installer:");
+            let c = resolve_component(
+                resolve,
+                &Repo::dig_browser(),
+                &plan.browser_version,
+                &target,
+                AssetKind::Installer,
+                &plan.bin_dir_for("browser", target.os),
+            )?;
+            log_component(log, &c);
+            download_component(&c, plan.dry_run)?;
+            if !plan.dry_run {
+                log(&format!("    run the installer to finish: {}", c.dest));
+                note_binary_written(report, guard, &c.dest);
             }
-            // dig-dns is EPIC #174 and may ship no published release yet. Gate
-            // this ONE component gracefully instead of failing the whole plan
-            // (task #234): record a clear "not yet available" state and let
-            // every other selected component (dig-relay, browser, …) still
-            // install. A genuine transport failure (not "nothing published")
-            // still propagates like every other component.
-            Err(e) if e.code() == "ASSET_NOT_FOUND" => {
-                let note = format!(
-                    "dig-dns is not yet available ({e}) — it is EPIC #174 and has no matching \
-                     release yet; skipped, the rest of the install continues. Re-run once a \
-                     release is published."
-                );
-                log(&format!("    ! {note}"));
-                report.dns = Some(dns::DnsInstallResult {
-                    installed: false,
-                    started: false,
-                    service_running: false,
-                    needs_elevation: false,
-                    note,
-                    doctor: None,
-                    paths_live: Vec::new(),
-                    bound_port: None,
-                    pac_url: None,
-                    fallback_instruction: None,
-                });
+            report.components.push(c);
+        }
+
+        // 8. chia:// (+ urn:) OS URL-scheme handler (#389) — default-on, toggleable.
+        //    Registers THIS installer's persisted binary as the handler; a clicked
+        //    chia:// link resolves through the local dig-node (§5.3) into the
+        //    browser. Per-user (no elevation). Best-effort: a registration failure
+        //    is recorded, never aborts the install (the rest already succeeded).
+        if plan.register_scheme {
+            log("Registering the chia:// URL-scheme handler (opens links via the local dig-node):");
+            report.scheme = Some(register_scheme_handler(plan, &target, log));
+            if report.scheme.as_ref().is_some_and(|s| s.registered) {
+                guard.record(InstallAction::SchemeRegistered);
             }
-            Err(e) => return Err(e),
         }
-    }
 
-    // 5. The DIG auto-update beacon (dig-updater + its dig-updater-worker sibling, #514) —
-    //    default-on, toggleable. Resolves + downloads BOTH binaries (the broker spawns the
-    //    worker as a sibling process, so they must be co-located), then asks the freshly-
-    //    installed `dig-updater` to register its own daily scheduler against itself
-    //    (`beacon::register`) — the same "delegate to the component's own subcommands" pattern
-    //    dig-node/dig-relay's service registration already uses.
-    if plan.auto_update {
-        log("Installing the DIG auto-update beacon:");
-        let mut c = resolve_component(
-            resolve,
-            &Repo::dig_updater(),
-            &plan.dig_updater_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("dig-updater", target.os),
-        )?;
-        log_component(log, &c);
-        // #309 version-aware updater, extended to the beacon (#514): same
-        // decide-before-touch convention as digstore/dig-node/dig-dns above.
-        let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-        if decision.action != update::UpdateAction::Skip {
-            let outcome = download_component(&c, plan.dry_run)?;
-            report.restart_required |= log_write_outcome(log, "dig-updater", outcome);
-        } else {
-            log("    · already up to date — skipping the download");
-        }
+        // PATH verification (#496): confirm each required DIG CLI resolves by bare
+        // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
+        // immediately. Non-dry-run only (dry-run installs nothing to resolve).
         if !plan.dry_run {
-            report.installed.push(c.dest.clone());
+            verify_clis_on_path(&target, report, log);
         }
-        let dig_updater_path = PathBuf::from(c.dest.clone());
-        report.components.push(c);
 
-        log("Installing the dig-updater-worker sibling (same release, published as a separate binary):");
-        let worker = resolve_component(
-            resolve,
-            &Repo::dig_updater_worker(),
-            &plan.dig_updater_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("dig-updater-worker", target.os),
-        )?;
-        log_component(log, &worker);
-        let outcome = download_component(&worker, plan.dry_run)?;
-        report.restart_required |= log_write_outcome(log, "dig-updater-worker", outcome);
+        // #565: VERIFY the dir every privileged/service-executed binary landed in
+        //    denies unprivileged write, now that all are in place. This is the
+        //    machine-checkable "no service binary sits where a non-admin could
+        //    replace it" gate; a DEFINITIVE breach (an unprivileged Allow-write ACE /
+        //    group-writable mode) makes the install NOT ready. The dir is the
+        //    admin-only protected root by default OR the `--bin-dir` / GUI-chosen dir
+        //    when an override redirected the stack (#565 H3): the verify follows the
+        //    binaries so a privileged install into a user-writable custom dir can
+        //    NEVER silently succeed.
         if !plan.dry_run {
-            report.installed.push(worker.dest.clone());
-        }
-        report.components.push(worker);
-
-        log("Registering the beacon's daily update-check scheduler:");
-        let b = beacon::register(&dig_updater_path, plan.dry_run);
-        log(&format!(
-            "    {} {}",
-            if b.applied { "✓" } else { "!" },
-            b.note
-        ));
-        report.beacon = Some(b);
-    }
-
-    // 6. dig-relay service (optional, advanced — run-your-own-relay). The DEFAULT node already
-    //    points at relay.dig.net, so this is only for users who want to operate a relay.
-    if plan.with_relay {
-        log("Installing the dig-relay (run-your-own-relay):");
-        let c = resolve_component(
-            resolve,
-            &Repo::dig_relay(),
-            &plan.relay_version,
-            &target,
-            AssetKind::RawBinary,
-            &plan.bin_dir_for("dig-relay", target.os),
-        )?;
-        log_component(log, &c);
-        // Task #232: stop a currently-running dig-relay before overwriting
-        // its binary — same skip-when-absent/not-serving, abort-on-stop-
-        // failure contract as dig-node above.
-        if !plan.dry_run {
-            let dest = std::path::Path::new(&c.dest);
-            let stop =
-                service::stop_running_dig_relay(dest).map_err(InstallError::service_stop_failed)?;
-            log(&format!(
-                "    {} {}",
-                if stop.attempted { "✓" } else { "·" },
-                stop.note
-            ));
-        }
-        let outcome = download_component(&c, plan.dry_run)?;
-        report.restart_required |= log_write_outcome(log, "dig-relay", outcome);
-        if !plan.dry_run {
-            report.installed.push(c.dest.clone());
-        }
-        let relay_path = PathBuf::from(c.dest.clone());
-        report.components.push(c);
-
-        report.relay = Some(register_relay(&relay_path, plan, log));
-    }
-
-    // 7. DIG Browser native installer (optional).
-    if plan.with_browser {
-        log("Downloading the DIG Browser installer:");
-        let c = resolve_component(
-            resolve,
-            &Repo::dig_browser(),
-            &plan.browser_version,
-            &target,
-            AssetKind::Installer,
-            &plan.bin_dir_for("browser", target.os),
-        )?;
-        log_component(log, &c);
-        download_component(&c, plan.dry_run)?;
-        if !plan.dry_run {
-            log(&format!("    run the installer to finish: {}", c.dest));
-            report.installed.push(c.dest.clone());
-        }
-        report.components.push(c);
-    }
-
-    // 8. chia:// (+ urn:) OS URL-scheme handler (#389) — default-on, toggleable.
-    //    Registers THIS installer's persisted binary as the handler; a clicked
-    //    chia:// link resolves through the local dig-node (§5.3) into the
-    //    browser. Per-user (no elevation). Best-effort: a registration failure
-    //    is recorded, never aborts the install (the rest already succeeded).
-    if plan.register_scheme {
-        log("Registering the chia:// URL-scheme handler (opens links via the local dig-node):");
-        report.scheme = Some(register_scheme_handler(plan, &target, log));
-    }
-
-    // PATH verification (#496): confirm each required DIG CLI resolves by bare
-    // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
-    // immediately. Non-dry-run only (dry-run installs nothing to resolve).
-    if !plan.dry_run {
-        verify_clis_on_path(&target, &mut report, log);
-    }
-
-    // #565: VERIFY the dir every privileged/service-executed binary landed in
-    //    denies unprivileged write, now that all are in place. This is the
-    //    machine-checkable "no service binary sits where a non-admin could
-    //    replace it" gate; a DEFINITIVE breach (an unprivileged Allow-write ACE /
-    //    group-writable mode) makes the install NOT ready. The dir is the
-    //    admin-only protected root by default OR the `--bin-dir` / GUI-chosen dir
-    //    when an override redirected the stack (#565 H3): the verify follows the
-    //    binaries so a privileged install into a user-writable custom dir can
-    //    NEVER silently succeed.
-    if !plan.dry_run {
-        if let Some(root) = plan.privileged_install_root(target.os) {
-            log("Verifying the install root denies unprivileged write:");
-            let verdict = secure::verify_install_root(target.os, &root);
-            log(&format!(
-                "    {} {}",
-                if verdict.checked && !verdict.secure {
-                    "!"
-                } else {
-                    "✓"
-                },
-                verdict.note
-            ));
-            report.install_root_security = Some(verdict);
-
-            // #581: record the authoritative install root in install.json so the
-            // auto-update beacon has a single source of truth for where DIG lives
-            // (coherent with the beacon's own current_exe-derived root). Only for
-            // the DEFAULT protected root — a custom override is the user's own dir.
-            if root == paths::protected_bin_dir() {
-                let m = manifest::write_install_manifest(
-                    target.os,
-                    &paths::protected_bin_dir(),
-                    env!("CARGO_PKG_VERSION"),
-                    plan.dry_run,
-                );
+            if let Some(root) = plan.privileged_install_root(target.os) {
+                log("Verifying the install root denies unprivileged write:");
+                let verdict = secure::verify_install_root(target.os, &root);
                 log(&format!(
                     "    {} {}",
-                    if m.written { "✓" } else { "·" },
-                    m.note
+                    if verdict.checked && !verdict.secure {
+                        "!"
+                    } else {
+                        "✓"
+                    },
+                    verdict.note
                 ));
-                report.install_manifest = Some(m);
+                report.install_root_security = Some(verdict);
+
+                // #581: record the authoritative install root in install.json so the
+                // auto-update beacon has a single source of truth for where DIG lives
+                // (coherent with the beacon's own current_exe-derived root). Only for
+                // the DEFAULT protected root — a custom override is the user's own dir.
+                if root == paths::protected_bin_dir() {
+                    let m = manifest::write_install_manifest(
+                        target.os,
+                        &paths::protected_bin_dir(),
+                        env!("CARGO_PKG_VERSION"),
+                        plan.dry_run,
+                    );
+                    log(&format!(
+                        "    {} {}",
+                        if m.written { "✓" } else { "·" },
+                        m.note
+                    ));
+                    report.install_manifest = Some(m);
+                }
+            }
+
+            // #565 (review — H1 backstop + H2b): AUDIT every privileged registration's
+            //    ACTUAL configured binPath, read back from the OS (never by executing
+            //    the binary). A registration still resolving under a legacy/
+            //    user-writable root — a service the tolerated re-install left there, or
+            //    an orphaned SYSTEM beacon task a component opt-out stranded — makes the
+            //    install NOT ready ([`evaluate_readiness`]). Gated on
+            //    `installs_a_privileged_binary` (the SAME gate as the migration above),
+            //    so it fires whenever a privileged binary is placed — including on a
+            //    `--bin-dir`/GUI install, not only the default protected root.
+            if plan.installs_a_privileged_binary(target.os) {
+                log("Auditing that every privileged registration runs from the protected root:");
+                report.registration_audit = regaudit::audit(target.os);
+                for a in &report.registration_audit {
+                    log(&format!(
+                        "    {} {}",
+                        if a.under_legacy_root { "!" } else { "✓" },
+                        a.note
+                    ));
+                }
             }
         }
 
-        // #565 (review — H1 backstop + H2b): AUDIT every privileged registration's
-        //    ACTUAL configured binPath, read back from the OS (never by executing
-        //    the binary). A registration still resolving under a legacy/
-        //    user-writable root — a service the tolerated re-install left there, or
-        //    an orphaned SYSTEM beacon task a component opt-out stranded — makes the
-        //    install NOT ready ([`evaluate_readiness`]). Gated on
-        //    `installs_a_privileged_binary` (the SAME gate as the migration above),
-        //    so it fires whenever a privileged binary is placed — including on a
-        //    `--bin-dir`/GUI install, not only the default protected root.
-        if plan.installs_a_privileged_binary(target.os) {
-            log("Auditing that every privileged registration runs from the protected root:");
-            report.registration_audit = regaudit::audit(target.os);
-            for a in &report.registration_audit {
-                log(&format!(
-                    "    {} {}",
-                    if a.under_legacy_root { "!" } else { "✓" },
-                    a.note
-                ));
-            }
+        // Professional hardening (#573): register the Add/Remove Programs entry (its
+        // Uninstall button runs the #568 whole-stack `uninstall`) and configure
+        // service auto-recovery. Best-effort on a real Windows install — a failure is
+        // logged, never fatal (the install itself already succeeded).
+        #[cfg(windows)]
+        if !plan.dry_run {
+            apply_windows_hardening(plan, &target, guard, log);
         }
-    }
 
-    // Professional hardening (#573): register the Add/Remove Programs entry (its
-    // Uninstall button runs the #568 whole-stack `uninstall`) and configure
-    // service auto-recovery. Best-effort on a real Windows install — a failure is
-    // logged, never fatal (the install itself already succeeded).
-    #[cfg(windows)]
-    if !plan.dry_run {
-        apply_windows_hardening(plan, &target, log);
+        Ok(())
+    };
+
+    // Run every install step; a mid-install failure rolls the completed
+    // privileged steps back (LIFO, best-effort) BEFORE the error propagates, so
+    // the guarantee SPEC §3.11 makes — "never a half-written install" — holds.
+    match run_steps(&mut report, &mut guard, log) {
+        Ok(()) => guard.commit(),
+        Err(e) => {
+            rollback_partial_install(&guard, &target, log);
+            return Err(e);
+        }
     }
 
     // Aggregate readiness verdict (#493 + @mt-dev firm directive): "if
@@ -1308,31 +1362,136 @@ fn run_report_gated(
     Ok(report)
 }
 
+/// Note a freshly written binary: append it to the install report AND record it
+/// for rollback, so a later mid-install failure deletes it rather than leaving a
+/// half-written stack (#573/#544). Called only on a real (non-dry-run) write.
+fn note_binary_written(report: &mut InstallReport, guard: &mut RollbackGuard, dest: &str) {
+    report.installed.push(dest.to_string());
+    guard.record(InstallAction::FileCreated(dest.to_string()));
+}
+
+/// Reverse ONE recorded privileged install action (#573/#544). Best-effort and
+/// idempotent: an already-absent target is a clean success, and a genuine
+/// reversal failure is returned as `Err(msg)` so the LIFO rollback records it
+/// and carries on rather than stranding the earlier steps. Never panics.
+///
+/// Each variant maps to the exact inverse of the step that recorded it:
+///   * [`InstallAction::FileCreated`] → delete the written binary,
+///   * [`InstallAction::ServiceRegistered`] → deregister the service by its
+///     canonical id via the OS service manager,
+///   * [`InstallAction::SchemeRegistered`] → unregister the `dig://`/`chia://`/
+///     `urn:` handlers we created,
+///   * [`InstallAction::ArpEntryWritten`] → remove the Add/Remove Programs entry.
+fn undo_install_action(action: &InstallAction) -> Result<(), String> {
+    match action {
+        InstallAction::FileCreated(path) => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove {path}: {e}")),
+        },
+        InstallAction::ServiceRegistered(id) => svc::deregister_service(id),
+        InstallAction::SchemeRegistered => {
+            // `unregister` is itself idempotent + best-effort (only ever removes
+            // handlers that point at our `dign open`), so a reversal always
+            // leaves the scheme registry no worse than pristine.
+            scheme::unregister(false);
+            Ok(())
+        }
+        InstallAction::ArpEntryWritten => {
+            #[cfg(windows)]
+            {
+                hardening::remove_arp_entry().map(|_| ())
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Reverse the privileged steps a partial-failure install recorded — LIFO,
+/// best-effort (#573/#544) — so a mid-install failure never leaves a half-written
+/// stack (SPEC §3.11). Every reversal (and any reversal that itself failed) is
+/// logged; a stuck undo is surfaced, never fatal. A no-op when nothing privileged
+/// was recorded yet (e.g. a failure during resolution, before the first write).
+fn rollback_partial_install(
+    guard: &RollbackGuard,
+    _target: &Target,
+    log: &mut dyn FnMut(&str),
+) -> RollbackReport {
+    if guard.actions().is_empty() {
+        return RollbackReport {
+            reversed: Vec::new(),
+            failures: Vec::new(),
+        };
+    }
+    log("Install failed partway — rolling back the completed steps (#573):");
+    let report = guard.rollback(&mut |a| undo_install_action(a));
+    for a in &report.reversed {
+        log(&format!("    ↩ reversed {a:?}"));
+    }
+    for f in &report.failures {
+        log(&format!("    ! rollback could not fully reverse {f}"));
+    }
+    report
+}
+
 /// Apply Windows install hardening (#573): register the Add/Remove Programs
 /// entry (its Uninstall button runs the #568 whole-stack `uninstall`) and
 /// configure SCM auto-recovery for every service this plan installed. Persists
 /// the running installer to a stable path so the ARP Uninstall command keeps
 /// working after a transient `irm|iex` download is gone. Best-effort — every
 /// failure is logged, never fatal (the install already succeeded by this point).
+///
+/// The persisted installer + the machine-wide ARP `UninstallString` are pinned to
+/// the admin-only [`paths::protected_bin_dir`] and only written when the verified
+/// install root is owner-secure (#565): an elevated-exec pointer must NEVER be
+/// planted in a user-writable custom `--bin-dir`.
 #[cfg(windows)]
-fn apply_windows_hardening(plan: &InstallPlan, target: &Target, log: &mut dyn FnMut(&str)) {
+fn apply_windows_hardening(
+    plan: &InstallPlan,
+    target: &Target,
+    guard: &mut RollbackGuard,
+    log: &mut dyn FnMut(&str),
+) {
     log("Registering the Add/Remove Programs entry + service auto-recovery (#573):");
 
-    // Persist the installer to a stable path for the ARP Uninstall command.
-    let installer_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
-    if let Ok(current) = std::env::current_exe() {
-        if current != installer_bin {
-            if let Some(parent) = installer_bin.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    // #565: the persisted installer + the machine-wide ARP `UninstallString` are
+    // an ELEVATED-EXEC pointer, so they are pinned to the admin-only protected
+    // root — NEVER a user-chosen `--bin-dir`, which could be user-writable and let
+    // an unprivileged user later repoint the pointer at an attacker binary. And we
+    // write it ONLY when that protected root is genuinely owner-secure; otherwise
+    // the machine-wide entry is skipped entirely (service auto-recovery, which
+    // plants no such pointer, still proceeds below).
+    let protected = paths::protected_bin_dir();
+    let verdict = secure::verify_install_root(target.os, &protected);
+    if verdict.checked && !verdict.secure {
+        log(&format!(
+            "    ! skipping the Add/Remove Programs entry — the protected install root is not \
+             owner-secure ({})",
+            verdict.note
+        ));
+    } else {
+        // Persist the installer to the protected root for the ARP Uninstall command.
+        let installer_bin = protected.join(target.exe_name("dig-installer"));
+        if let Ok(current) = std::env::current_exe() {
+            if current != installer_bin {
+                if let Some(parent) = installer_bin.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::copy(&current, &installer_bin);
             }
-            let _ = std::fs::copy(&current, &installer_bin);
         }
-    }
 
-    let entry = hardening::arp_entry(env!("CARGO_PKG_VERSION"), &installer_bin, &plan.bin_dir);
-    match hardening::write_arp_entry(&entry) {
-        Ok(n) => log(&format!("    ✓ {n}")),
-        Err(e) => log(&format!("    ! {e}")),
+        let entry = hardening::arp_entry(env!("CARGO_PKG_VERSION"), &installer_bin, &protected);
+        match hardening::write_arp_entry(&entry) {
+            Ok(n) => {
+                log(&format!("    ✓ {n}"));
+                guard.record(InstallAction::ArpEntryWritten);
+            }
+            Err(e) => log(&format!("    ! {e}")),
+        }
     }
 
     // Auto-recovery for each installed Windows service.
@@ -2794,6 +2953,73 @@ mod tests {
     ) -> Result<InstallReport, InstallError> {
         let resolve = resolver_from(releases);
         run_report_with(plan, &resolve, &mut |_| {})
+    }
+
+    /// Regression for #573/#544 (partial-failure rollback): a mid-install failure
+    /// must never leave a half-written stack. `rollback_partial_install` runs the
+    /// PRODUCTION undo (`undo_install_action`) for every privileged action a
+    /// partial install recorded; here two real binaries are recorded (as
+    /// `note_binary_written` does on each successful write) and a failure is then
+    /// forced. The rollback must DELETE both written binaries (no residual file)
+    /// and report a clean LIFO reversal — the concrete guarantee SPEC §3.11 makes.
+    #[test]
+    fn rollback_after_midinstall_failure_removes_written_binaries_573_544() {
+        let dir = std::env::temp_dir().join(format!("dig-rollback-573-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let first = dir.join("digstore.bin");
+        let second = dir.join("dig-node.bin");
+        std::fs::write(&first, b"first written binary").expect("write first");
+        std::fs::write(&second, b"second written binary").expect("write second");
+
+        // Two privileged writes succeeded, recorded newest-last, exactly as the
+        // install flow records them; then a later step "fails" (we call rollback).
+        let mut guard = RollbackGuard::new();
+        guard.record(InstallAction::FileCreated(
+            first.to_string_lossy().into_owned(),
+        ));
+        guard.record(InstallAction::FileCreated(
+            second.to_string_lossy().into_owned(),
+        ));
+        assert!(
+            first.exists() && second.exists(),
+            "precondition: both written"
+        );
+
+        let target = Target::current().expect("host target");
+        let report = rollback_partial_install(&guard, &target, &mut |_| {});
+
+        assert!(
+            !second.exists(),
+            "rollback must delete the newest write first"
+        );
+        assert!(!first.exists(), "rollback must delete every written binary");
+        assert!(report.clean(), "the file reversals must succeed cleanly");
+        assert_eq!(report.reversed.len(), 2, "both writes reversed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A committed (fully-successful) install reverses nothing, and an already-
+    /// absent file is a clean, idempotent no-op reversal — the rollback is
+    /// best-effort and never fails an install that had nothing to undo (#573).
+    #[test]
+    fn rollback_is_a_clean_noop_when_nothing_privileged_recorded() {
+        let target = Target::current().expect("host target");
+        let empty = RollbackGuard::new();
+        let report = rollback_partial_install(&empty, &target, &mut |_| {});
+        assert!(report.reversed.is_empty() && report.clean());
+
+        // An already-absent binary reverses cleanly (idempotent undo).
+        let mut guard = RollbackGuard::new();
+        guard.record(InstallAction::FileCreated(
+            std::env::temp_dir()
+                .join("dig-573-absent.bin")
+                .to_string_lossy()
+                .into_owned(),
+        ));
+        let report = rollback_partial_install(&guard, &target, &mut |_| {});
+        assert!(report.clean(), "an absent target is a clean reversal");
+        assert_eq!(report.reversed.len(), 1);
     }
 
     /// #301 (universal installer): a bare install with no opt-out flags installs

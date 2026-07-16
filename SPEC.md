@@ -851,27 +851,35 @@ pure core over an injected `UninstallActions`; `SystemActions` wires the real te
 emits `{ ok: report.complete(), result: <UninstallReport> }`; a real (non-dry-run) incomplete run
 exits non-zero so a caller can re-run elevated.
 
-## 3.11 Install hardening — ARP, auto-recovery, rollback, health verify (#573)
+## 3.11 Install hardening — ARP, auto-recovery, rollback (#573)
 
 The install behaves like a well-behaved native package:
 
 - **Add/Remove Programs (Windows).** An `HKLM\…\Uninstall\DIG_Network` entry (`DisplayName` = "DIG
   Network", `DisplayVersion`, `Publisher`, `InstallLocation`, `NoModify=1`, `NoRepair=1`) whose
   `UninstallString` = `"<installer>" --uninstall` — the ARP Uninstall button runs the §3.10
-  whole-stack uninstall. The entry is removed as part of `--uninstall`.
+  whole-stack uninstall. The entry is removed as part of `--uninstall`. The persisted installer and
+  the `UninstallString` are an elevated-exec pointer, so both are pinned to the admin-only protected
+  install root (never a user-chosen `--bin-dir`), and the machine-wide entry is written ONLY when
+  that root is verified owner-secure — never planting an elevated pointer where an unprivileged user
+  could repoint it.
 - **Service auto-recovery (Windows).** Each installed service is configured via `sc failure` to
   auto-restart on crash: `reset=86400` (daily) + `actions=restart/5000/restart/5000//5000`.
-- **Install rollback.** A `RollbackGuard` records each reversible install action (file created,
-  service registered, ARP written, scheme registered) and, on partial failure, reverses them in
-  **LIFO** order — never a half-written install. A single failed undo does not strand the earlier
-  reversals: rollback continues and surfaces the failure in `RollbackReport { reversed, failures }`
-  (`clean()` iff no undo failed).
-- **Post-install health verify.** `verify_components` aggregates per-component health;
-  `all_healthy()` is false — and `unhealthy()` names the offenders — if any component is down, so a
-  down component fails LOUDLY rather than passing silently.
+- **Install rollback (WIRED into the install flow).** `run_report` threads a `RollbackGuard` through
+  the install: each privileged step records itself the instant it succeeds — a written binary
+  (`FileCreated`), a *freshly* registered service (`ServiceRegistered`, `Install` only — never an
+  update/skip of a pre-existing service), the registered URL-scheme handlers (`SchemeRegistered`),
+  and the ARP entry (`ArpEntryWritten`). If ANY step returns an error before the install completes,
+  the guard reverses the recorded steps in **LIFO** order (delete the binary, deregister the service
+  by canonical id, unregister the scheme handlers, remove the ARP entry) BEFORE the error propagates
+  — never a half-written install (the #544 half-write lesson). A fully-successful run `commit`s the
+  guard so the steps stand. Rollback is best-effort + idempotent: an already-absent target is a clean
+  success, and a single failed undo does not strand the earlier reversals — rollback continues and
+  surfaces the failure in `RollbackReport { reversed, failures }` (`clean()` iff no undo failed).
 
-All value/argument builders + the guard core are pure + unit-tested; the registry/SCM writes are the
-thin, best-effort I/O layer (a hardening failure logs but never fails an otherwise-successful install).
+Post-install health is the readiness verdict's job (§4.2), not this module's. All value/argument
+builders + the guard core are pure + unit-tested; the registry/SCM writes are the thin, best-effort
+I/O layer (a hardening failure logs but never fails an otherwise-successful install).
 
 ## 4.2 Readiness verdict — fail loud (#493)
 

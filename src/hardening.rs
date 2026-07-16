@@ -1,14 +1,17 @@
 //! Professional install hardening (#573): a Windows Add/Remove Programs (ARP)
-//! entry, service auto-recovery configuration, install rollback on partial
-//! failure, and a post-install health verification across components.
+//! entry, service auto-recovery configuration, and install rollback on partial
+//! failure.
 //!
 //! These make the install behave like a well-behaved native package:
 //!   * it shows up in **Add/Remove Programs** with a working Uninstall button
 //!     (whose command is the #568 whole-stack `uninstall`),
 //!   * its services **auto-recover** if they crash (SCM failure actions),
 //!   * a **partial-failure install rolls back** cleanly — never a half-written
-//!     install (the #544 half-write lesson),
-//!   * a **post-install health verify** fails LOUDLY if any component is down.
+//!     install (the #544 half-write lesson).
+//!
+//! (Post-install health is the readiness verdict's job, not this module's:
+//! `crate::run_report` folds every component's `svc::is_service_running` +
+//! health-probe result into `InstallReport::ready` via `evaluate_readiness`.)
 //!
 //! Every value/argument builder here is pure and unit-tested; the registry/SCM
 //! writes are the thin I/O layer.
@@ -190,48 +193,6 @@ impl RollbackGuard {
 }
 
 // ---------------------------------------------------------------------------
-// Post-install health verification
-// ---------------------------------------------------------------------------
-
-/// One component's post-install health outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ComponentHealth {
-    pub component: String,
-    pub healthy: bool,
-    pub note: String,
-}
-
-/// The aggregate post-install health verification result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct HealthVerifyReport {
-    pub components: Vec<ComponentHealth>,
-}
-
-impl HealthVerifyReport {
-    /// True iff EVERY verified component is healthy. A single down component
-    /// fails the verify LOUDLY (the caller surfaces it, never a silent pass).
-    pub fn all_healthy(&self) -> bool {
-        self.components.iter().all(|c| c.healthy)
-    }
-
-    /// The names of any unhealthy components (for a clear failure message).
-    pub fn unhealthy(&self) -> Vec<&str> {
-        self.components
-            .iter()
-            .filter(|c| !c.healthy)
-            .map(|c| c.component.as_str())
-            .collect()
-    }
-}
-
-/// Aggregate per-component health outcomes into a verify report. Pure — the
-/// caller performs the actual probes (e.g. [`crate::health::wait_for_node_health`])
-/// and feeds the results here.
-pub fn verify_components(components: Vec<ComponentHealth>) -> HealthVerifyReport {
-    HealthVerifyReport { components }
-}
-
-// ---------------------------------------------------------------------------
 // I/O layer (Windows registry + SCM). Thin wrappers over the pure builders
 // above; best-effort — a failure is returned, never panics.
 // ---------------------------------------------------------------------------
@@ -388,35 +349,6 @@ mod tests {
         assert_eq!(report.failures.len(), 1);
         // The two file deletes still happened despite the middle failure.
         assert_eq!(report.reversed.len(), 2);
-    }
-
-    #[test]
-    fn health_verify_fails_loudly_when_any_component_is_down() {
-        let report = verify_components(vec![
-            ComponentHealth {
-                component: "dig-node".into(),
-                healthy: true,
-                note: "ok".into(),
-            },
-            ComponentHealth {
-                component: "dig-dns".into(),
-                healthy: false,
-                note: "no response on :53".into(),
-            },
-        ]);
-        assert!(!report.all_healthy());
-        assert_eq!(report.unhealthy(), vec!["dig-dns"]);
-    }
-
-    #[test]
-    fn health_verify_passes_when_all_components_up() {
-        let report = verify_components(vec![ComponentHealth {
-            component: "dig-node".into(),
-            healthy: true,
-            note: "ok".into(),
-        }]);
-        assert!(report.all_healthy());
-        assert!(report.unhealthy().is_empty());
     }
 
     #[test]
