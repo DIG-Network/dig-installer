@@ -32,6 +32,7 @@ use tauri::{AppHandle, Emitter};
 use tauri::Manager;
 
 use dig_installer::proc::HideConsole;
+use dig_installer::target::Os;
 
 // ---- Embedded payload (single-file install) ----------------------------------
 // When the release build staged a `digstore` binary, build.rs embedded it (and
@@ -183,7 +184,6 @@ fn digstore_payload(app: &AppHandle) -> Result<(Vec<u8>, Option<String>), String
 /// emits `install://error` and returns Err (the caller has already streamed it).
 pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     let install_dir = PathBuf::from(&opts.install_path);
-    let bin_dir = install_dir.join("bin");
     let lib_dir = install_dir.join("lib");
 
     // ---- Phase 0: enforce elevation (#492) ----
@@ -215,10 +215,49 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         return Err(msg);
     }
 
-    let selects_service = ["dig-node", "dig-dns", "dig-relay"]
-        .iter()
-        .any(|id| *opts.selected.get(*id).unwrap_or(&false));
-    if selects_service && !dig_installer::elevation::is_elevated() {
+    // Build the plan for the privileged/service components up front so the
+    // elevation decision uses the AUTHORITATIVE `InstallPlan::requires_elevation`
+    // rather than a hand-maintained id list. This closes two gaps the old
+    // `["dig-node","dig-dns","dig-relay"]` check had (#610): (1) it missed the
+    // default-on SYSTEM auto-update beacon (`auto_update`), and (2) it missed a
+    // protected-root binary write on Windows. An unknown target fails CLOSED
+    // (require elevation) so a privileged install can never proceed unprivileged.
+    let extra_plan = plan_from_selection(&opts.selected);
+
+    // Resolve the OS once so the digstore placement (#610) and the elevation
+    // decision share a single, authoritative answer. An unresolved target fails
+    // CLOSED: unknown OS ⇒ require elevation (below) and fall back to the
+    // library default bin dir (which is the protected root on Windows).
+    let os = dig_installer::target::Target::current().ok().map(|t| t.os);
+
+    // #610 (NEW LPE the requireAdministrator switch opened): the now-elevated
+    // (high-integrity) GUI process MUST NOT write-then-execute a binary from a
+    // user-writable directory — medium-IL malware could swap the exe in the
+    // write→exec window and gain the user's freshly-granted Administrator. The
+    // bundled `digstore` CLI is unpacked AND executed (`digstore --version`,
+    // Phase 6) by this process, so it is routed through the SAME protected-root
+    // placement the CLI installer uses (`InstallPlan::bin_dir_for`): the
+    // admin-only `%ProgramFiles%\DIG\bin` on Windows (the #565 "whole Windows
+    // stack in Program Files" invariant), the elevation-free per-user
+    // `~/.dig/bin` on unix (where digstore runs AS the user — not an escalation).
+    // The user's chosen `install_dir` still receives the NON-executable install
+    // artifacts (completions, example store, the .dig icon) — data this process
+    // never executes, so no escalation window exists there. The user runs
+    // digstore via PATH regardless of where the binary physically lives.
+    let bin_dir = os
+        .map(|os| extra_plan.bin_dir_for("digstore", os))
+        .unwrap_or_else(dig_installer::paths::default_bin_dir);
+
+    // Elevation is required when the extra components need it (services / beacon
+    // / hosts entry — the library's authoritative `requires_elevation`) OR the
+    // GUI's own digstore placement lands in the admin-only protected root (#610):
+    // writing into Program Files is itself a privileged operation, so a
+    // digstore-only Windows GUI run must elevate too, exactly like the CLI.
+    let needs_elevation = match os {
+        Some(os) => extra_plan.requires_elevation(os) || places_digstore_in_protected_root(os),
+        None => true,
+    };
+    if needs_elevation && !dig_installer::elevation::is_elevated() {
         let msg = format!(
             "elevation required: {}. Re-run the installer as Administrator (Windows) / with sudo \
              (macOS/Linux). Nothing was changed.",
@@ -464,7 +503,6 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // (`dig_installer::run_report`) — this reuses its release resolution,
     // download, and (task #232) stop-before-write/start-after-write service
     // lifecycle rather than re-implementing any of it in the GUI.
-    let extra_plan = plan_from_selection(&opts.selected, &bin_dir);
     if extra_plan.with_dig_node
         || extra_plan.with_dig_dns
         || extra_plan.with_relay
@@ -529,15 +567,31 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
 /// #234). digstore itself is deliberately excluded (`with_digstore: false`)
 /// — the GUI installs it via its own embedded/staged pipeline above, not
 /// through this plan. Pure mapping (no I/O), so the selection→plan contract
-/// — which components install, which are skipped when deselected/absent — is
+/// — which components install, which are skipped when deselected/absent, and
+/// that privileged components route to the protected root (#610) — is
 /// unit-tested directly without mocking the network or a service manager.
-fn plan_from_selection(
-    selected: &HashMap<String, bool>,
-    bin_dir: &Path,
-) -> dig_installer::InstallPlan {
+fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::InstallPlan {
     let selected_on = |id: &str| *selected.get(id).unwrap_or(&false);
     dig_installer::InstallPlan {
-        bin_dir: bin_dir.to_path_buf(),
+        // #610 (re-opened #565 LPE): the privileged, service-executed components
+        // this plan installs — the LocalSystem dig-node/dig-dns/dig-relay
+        // services and the SYSTEM auto-update beacon — MUST land in the
+        // admin-only protected root (`%ProgramFiles%\DIG\bin` / `/opt/dig/bin`),
+        // never a user-writable dir a non-admin could plant a binary in. Using
+        // the library's built-in `default_bin_dir()` (rather than the GUI's
+        // user-chosen install path) keeps `has_custom_bin_dir()` FALSE, so
+        // `InstallPlan::bin_dir_for` routes every privileged component through
+        // `paths::protected_bin_dir()` — the exact same path the CLI uses — and
+        // re-arms the #565 legacy-root migration + fail-loud ACL verify + binPath
+        // audit on the GUI path. The GUI-owned `digstore` CLI is NOT installed via
+        // this plan (`with_digstore: false`) but by the pipeline above — which,
+        // per #610, ALSO routes it through `bin_dir_for("digstore", os)` (the
+        // protected root on Windows) rather than the user's chosen dir, because
+        // the elevated GUI both writes AND executes it: a user-writable location
+        // would be a write→exec privilege-escalation vector under the elevated
+        // process. The user's chosen install dir receives only NON-executable
+        // artifacts (completions, example store, the .dig icon).
+        bin_dir: dig_installer::paths::default_bin_dir(),
         with_digstore: false,
         digstore_version: None,
         with_dig_node: selected_on("dig-node"),
@@ -576,6 +630,20 @@ fn plan_from_selection(
         force_reinstall: false,
         dry_run: false,
     }
+}
+
+/// Does the GUI's own `digstore` CLI placement land in the admin-only protected
+/// root on `os` (#610)?
+///
+/// The elevated GUI process unpacks AND executes digstore, so on any OS where it
+/// lands in the protected root that write is a privileged operation and the run
+/// MUST elevate first (a digstore-only Windows GUI run elevates too, matching the
+/// CLI installer's #565 behaviour). True on Windows (the whole stack lives in
+/// `%ProgramFiles%\DIG\bin`), false on unix (digstore is a user-run CLI in
+/// `~/.dig/bin`, executed as the user — not an escalation). Pure, so every OS
+/// branch is asserted directly.
+fn places_digstore_in_protected_root(os: Os) -> bool {
+    dig_installer::paths::is_privileged_component(os, "digstore")
 }
 
 /// One component's live Install/Update/Skip status (issue #309), shaped for
@@ -871,8 +939,9 @@ fn broadcast_environment_change() {
 #[cfg(test)]
 mod plan_from_selection_tests {
     use super::plan_from_selection;
+    use dig_installer::paths;
+    use dig_installer::target::Os;
     use std::collections::HashMap;
-    use std::path::Path;
 
     // task #234: the selection→plan mapping is pure (no I/O), so every
     // selected/deselected/absent branch is asserted directly without mocking
@@ -880,7 +949,7 @@ mod plan_from_selection_tests {
 
     #[test]
     fn nothing_selected_installs_nothing_extra() {
-        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        let plan = plan_from_selection(&HashMap::new());
         assert!(
             !plan.with_digstore,
             "digstore is owned by the GUI's own pipeline, never this plan"
@@ -898,7 +967,7 @@ mod plan_from_selection_tests {
         sel.insert("dig-dns".to_string(), true);
         sel.insert("dig-relay".to_string(), true);
         sel.insert("browser".to_string(), true);
-        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        let plan = plan_from_selection(&sel);
         assert!(!plan.with_digstore);
         assert!(plan.with_dig_node);
         assert!(plan.with_dig_dns);
@@ -913,24 +982,163 @@ mod plan_from_selection_tests {
         sel.insert("dig-dns".to_string(), false); // explicitly unchecked
         sel.insert("dig-relay".to_string(), true);
         sel.insert("browser".to_string(), true);
-        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        let plan = plan_from_selection(&sel);
         assert!(plan.with_dig_node);
         assert!(!plan.with_dig_dns, "deselected component must be skipped");
         assert!(plan.with_relay);
         assert!(plan.with_browser);
     }
 
+    // #610 regression (a): the GUI plan uses the built-in DEFAULT bin dir, NOT a
+    // user-chosen custom dir — that is precisely what keeps `has_custom_bin_dir()`
+    // false so the library's per-component protected-root routing engages. The
+    // pre-fix GUI passed `%LOCALAPPDATA%\Programs\DigStore\bin` here (a custom
+    // dir), which routed the WHOLE stack — including LocalSystem services — into
+    // a user-writable dir (the #565 user→SYSTEM LPE).
     #[test]
-    fn bin_dir_is_threaded_through() {
-        let plan = plan_from_selection(&HashMap::new(), Path::new("/opt/dig/bin"));
-        assert_eq!(plan.bin_dir, Path::new("/opt/dig/bin"));
+    fn gui_plan_never_uses_a_custom_bin_dir() {
+        let plan = plan_from_selection(&HashMap::new());
+        assert_eq!(
+            plan.bin_dir,
+            paths::default_bin_dir(),
+            "the GUI plan MUST use the built-in default bin dir, never a user-chosen one"
+        );
+        assert!(
+            !plan.has_custom_bin_dir(),
+            "a custom bin dir would defeat protected-root routing (#610/#565)"
+        );
+    }
+
+    // #610 regression (b): a privileged/service-executed component (LocalSystem
+    // dig-node/dig-dns services, the SYSTEM auto-update beacon) NEVER lands in a
+    // user-writable dir — it resolves to the admin-only protected root, on every
+    // OS, via the SAME `bin_dir_for`/`privileged_install_root` path the CLI uses.
+    #[test]
+    fn gui_plan_routes_privileged_components_to_the_protected_root() {
+        let mut sel = HashMap::new();
+        sel.insert("dig-node".to_string(), true);
+        sel.insert("dig-dns".to_string(), true);
+        let plan = plan_from_selection(&sel);
+
+        // Windows: the whole stack is privileged → the protected Program Files root.
+        for c in ["dig-node", "dig-dns", "dig-relay", "dig-updater"] {
+            assert_eq!(
+                plan.bin_dir_for(c, Os::Windows),
+                paths::protected_bin_dir(),
+                "{c} must route to the protected root on Windows"
+            );
+        }
+        // unix: the machine-wide privileged binaries → /opt/dig/bin.
+        for c in ["dig-dns", "dig-updater"] {
+            assert_eq!(
+                plan.bin_dir_for(c, Os::Linux),
+                paths::protected_bin_dir(),
+                "{c} must route to the protected root on unix"
+            );
+        }
+        // And the #565 gates (migration + fail-loud ACL verify + audit) are armed
+        // on the GUI path: the privileged install root is the protected root.
+        assert_eq!(
+            plan.privileged_install_root(Os::Windows),
+            Some(paths::protected_bin_dir())
+        );
+        assert!(plan.installs_a_privileged_binary(Os::Windows));
+    }
+
+    // #610: the default GUI plan (services + beacon on) requires elevation on
+    // every OS — no silent unprivileged install of privileged components.
+    #[test]
+    fn default_gui_plan_requires_elevation_on_every_os() {
+        let plan = plan_from_selection(&HashMap::new());
+        for os in [Os::Windows, Os::Linux, Os::MacOs] {
+            assert!(
+                plan.requires_elevation(os),
+                "the default GUI plan installs services + the beacon → needs elevation on {os:?}"
+            );
+        }
+    }
+
+    // #610 regression (HIGH — the NEW LPE the requireAdministrator switch opened):
+    // the elevated GUI unpacks AND executes the bundled digstore CLI, so it MUST
+    // place + run it from the admin-only protected root on Windows — never a
+    // user-writable dir a medium-IL process could swap in the write→exec window.
+    // Pre-fix the GUI wrote digstore into user-writable `%LOCALAPPDATA%\...\bin`
+    // and executed it inside the high-integrity process (admin-runs-user-writable
+    // = LPE). Routed via the SAME `bin_dir_for` the CLI installer uses.
+    #[test]
+    fn gui_places_and_executes_digstore_from_the_protected_root_on_windows() {
+        let plan = plan_from_selection(&HashMap::new());
+        let dir = plan.bin_dir_for("digstore", Os::Windows);
+        assert_eq!(
+            dir,
+            paths::protected_bin_dir(),
+            "the elevated GUI must unpack + execute digstore from the admin-only \
+             protected root on Windows, never a user-writable dir"
+        );
+        // NEVER a user-writable legacy AppData root (the pre-fix LPE location).
+        for legacy in paths::legacy_privileged_roots(Os::Windows) {
+            assert_ne!(dir, legacy, "digstore must not land in a user-writable dir");
+        }
+    }
+
+    // #610: every binary the elevated process runs is routed to the protected
+    // root on Windows — the digstore CLI (GUI-owned) AND the privileged
+    // service/beacon binaries (library-owned via `run_report`).
+    #[test]
+    fn every_windows_executed_binary_lands_in_the_protected_root() {
+        let mut sel = HashMap::new();
+        sel.insert("dig-node".to_string(), true);
+        sel.insert("dig-dns".to_string(), true);
+        let plan = plan_from_selection(&sel);
+        for c in [
+            "digstore",
+            "dig-node",
+            "dig-dns",
+            "dig-relay",
+            "dig-updater",
+        ] {
+            assert_eq!(
+                plan.bin_dir_for(c, Os::Windows),
+                paths::protected_bin_dir(),
+                "{c} is executed by the elevated GUI/services → must be protected-root"
+            );
+        }
+    }
+
+    // #610: digstore's protected-root placement drives elevation. On Windows it
+    // lands in Program Files (privileged write) → a digstore-only GUI run must
+    // elevate too; on unix it is a user-run CLI in ~/.dig/bin → no elevation from
+    // digstore alone. `super::places_digstore_in_protected_root` is the pure
+    // predicate `run()` ORs into its elevation decision.
+    #[test]
+    fn digstore_placement_requires_elevation_only_on_windows() {
+        assert!(
+            super::places_digstore_in_protected_root(Os::Windows),
+            "digstore lands in Program Files on Windows → elevated write"
+        );
+        assert!(!super::places_digstore_in_protected_root(Os::Linux));
+        assert!(!super::places_digstore_in_protected_root(Os::MacOs));
+    }
+
+    // #610: on unix the GUI digstore CLI stays in the elevation-free per-user
+    // root (executed AS the user, so not an escalation) — matching the CLI.
+    #[test]
+    fn gui_places_digstore_in_the_user_root_on_unix() {
+        let plan = plan_from_selection(&HashMap::new());
+        for os in [Os::Linux, Os::MacOs] {
+            assert_eq!(
+                plan.bin_dir_for("digstore", os),
+                paths::default_bin_dir(),
+                "unix digstore is a user-run CLI in ~/.dig/bin, not the protected root"
+            );
+        }
     }
 
     #[test]
     fn scheme_handler_defaults_on_in_sync_with_the_cli() {
         // #389: absent from the selection map -> ON by default, matching the
         // CLI's default-on `register_scheme` (GUI + CLI defaults in sync).
-        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        let plan = plan_from_selection(&HashMap::new());
         assert!(
             plan.register_scheme,
             "the chia:// scheme handler defaults ON in the GUI, mirroring the CLI"
@@ -943,7 +1151,7 @@ mod plan_from_selection_tests {
         // CLI's `--no-register-scheme` produces.
         let mut sel = HashMap::new();
         sel.insert("register-scheme".to_string(), false);
-        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        let plan = plan_from_selection(&sel);
         assert!(
             !plan.register_scheme,
             "an explicit opt-out disables the handler"
@@ -954,7 +1162,7 @@ mod plan_from_selection_tests {
     fn firewall_rule_defaults_on_in_sync_with_the_cli() {
         // #424: absent from the selection map -> ON by default, matching the
         // CLI's default-on `open_firewall` (GUI + CLI defaults in sync).
-        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        let plan = plan_from_selection(&HashMap::new());
         assert!(
             plan.open_firewall,
             "the dig-node firewall rule defaults ON in the GUI, mirroring the CLI"
@@ -967,7 +1175,7 @@ mod plan_from_selection_tests {
         // CLI's `--no-open-firewall` produces.
         let mut sel = HashMap::new();
         sel.insert("open-firewall".to_string(), false);
-        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        let plan = plan_from_selection(&sel);
         assert!(
             !plan.open_firewall,
             "an explicit opt-out disables the firewall rule"
@@ -978,7 +1186,7 @@ mod plan_from_selection_tests {
     fn auto_update_beacon_defaults_on_in_sync_with_the_cli() {
         // #514: absent from the selection map -> ON by default, matching the
         // CLI's default-on `auto_update` (GUI + CLI defaults in sync).
-        let plan = plan_from_selection(&HashMap::new(), Path::new("/bin"));
+        let plan = plan_from_selection(&HashMap::new());
         assert!(
             plan.auto_update,
             "the auto-update beacon defaults ON in the GUI, mirroring the CLI"
@@ -991,7 +1199,7 @@ mod plan_from_selection_tests {
         // CLI's `--no-auto-update` produces.
         let mut sel = HashMap::new();
         sel.insert("auto-update".to_string(), false);
-        let plan = plan_from_selection(&sel, Path::new("/bin"));
+        let plan = plan_from_selection(&sel);
         assert!(
             !plan.auto_update,
             "an explicit opt-out disables the auto-update beacon"
