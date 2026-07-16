@@ -329,7 +329,7 @@ pub fn parse_acl_verify(output: &str, user_sid: &str) -> Result<(), String> {
 /// caller FAILS CLOSED (never grants a spoofable/broad principal).
 #[cfg(windows)]
 fn current_user_sid() -> Result<String, String> {
-    let out = std::process::Command::new("whoami")
+    let out = std::process::Command::new(crate::proc::system_tool("whoami"))
         .args(["/user", "/fo", "csv", "/nh"])
         .hide_console()
         .output()
@@ -354,7 +354,7 @@ fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
     let ps = format!(
         "(Get-Acl -LiteralPath '{dir}').GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
     );
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .hide_console()
         .output()
@@ -373,7 +373,7 @@ fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
 /// Run `icacls` with `args`; `Ok(())` iff it exits 0.
 #[cfg(windows)]
 fn run_icacls(args: &[String]) -> Result<(), String> {
-    let out = std::process::Command::new("icacls")
+    let out = std::process::Command::new(crate::proc::system_tool("icacls"))
         .args(args)
         .hide_console()
         .output()
@@ -396,7 +396,7 @@ fn run_icacls(args: &[String]) -> Result<(), String> {
 #[cfg(windows)]
 fn read_and_verify_acl(path: &std::path::Path, user_sid: &str) -> Result<(), String> {
     let ps = acl_verify_ps_command(&path.to_string_lossy());
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .hide_console()
         .output()

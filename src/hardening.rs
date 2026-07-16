@@ -252,7 +252,7 @@ pub fn configure_service_recovery(service_name: &str) -> Result<String, String> 
     // that prose raw on THIS process's stdout, corrupting `--json` mode's
     // "exactly one JSON line on stdout" contract (same class as service.rs
     // #502/#524 — caught by the 3-OS installer e2e `jq` gate on install.json).
-    let out = Command::new("sc")
+    let out = Command::new(crate::proc::system_tool("sc"))
         .args(&args)
         .hide_console()
         .output()

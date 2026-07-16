@@ -55,15 +55,75 @@ fn apply_in(dir: &Path, channel: Channel) -> ForcelistOutcome {
             &format!("create dir: {e}"),
         );
     }
-    // A single atomic-ish write: on failure nothing partial is force-installed
-    // (the file either has the full policy or does not exist).
-    match std::fs::write(&path, &desired) {
+    // Symlink-safe atomic write (#650): as root into a compiled-in `/etc/**`
+    // path, write a fresh O_NOFOLLOW temp file and atomically rename it over the
+    // target. `rename` replaces the final path component itself (never following
+    // a symlink AT it), so a redirecting symlink cannot divert the write, and the
+    // policy file is only ever seen fully-written or absent — never partial.
+    match write_atomic_nofollow(&path, desired.as_bytes()) {
         Ok(()) => outcome(
             location,
             ForcelistAction::Wrote,
             "wrote dig-owned managed-policy file (merged by the Chromium policy union)",
         ),
         Err(e) => outcome(location, ForcelistAction::Failed, &format!("write: {e}")),
+    }
+}
+
+/// Write `contents` to `path` symlink-safely and atomically (#650): stage a
+/// fresh temp file in the SAME directory, opened `O_NOFOLLOW | O_EXCL` so a
+/// pre-seeded symlink at the temp name is refused rather than followed, then
+/// `rename` it over `path`. The rename is atomic and operates on `path`'s final
+/// component directly — replacing a redirecting symlink there with our regular
+/// file instead of writing through it. The hardened pattern for a root writer
+/// into a directory an attacker might race.
+fn write_atomic_nofollow(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy path has no parent",
+        )
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "policy path has no file name",
+        )
+    })?;
+    // A unique, hidden temp name in the same dir so the final rename is atomic
+    // (same filesystem). The PID + a nanosecond stamp avoid colliding with a
+    // concurrent run or a pre-planted name; O_EXCL is the real guarantee.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".{file_name}.dig-tmp-{}-{stamp}",
+        std::process::id()
+    ));
+
+    let write_tmp = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_EXCL: refuse any pre-existing object (symlink included)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -186,6 +246,50 @@ mod tests {
             remove_in(dir.path()).action,
             ForcelistAction::NothingToRemove
         );
+    }
+
+    /// #650 regression: a symlink pre-planted AT the policy path must NOT be
+    /// followed — the atomic rename replaces the symlink itself with our regular
+    /// file, leaving the symlink's target untouched (no write-through).
+    #[test]
+    fn apply_does_not_follow_a_symlink_at_the_policy_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        // The file a hostile symlink would try to redirect our root write into.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "original-victim-content").unwrap();
+        // Plant a symlink where our policy file goes, pointing at the victim.
+        symlink(&victim, policy_path(dir.path())).unwrap();
+
+        let out = apply_in(dir.path(), Channel::Stable);
+        assert_eq!(out.action, ForcelistAction::Wrote);
+
+        // The victim was NOT overwritten through the symlink …
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original-victim-content",
+            "the write must never follow the symlink into the victim file"
+        );
+        // … and the policy path is now a real file with our policy (symlink gone).
+        let meta = std::fs::symlink_metadata(policy_path(dir.path())).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the policy path must be a regular file after the atomic replace"
+        );
+        assert!(is_our_entry(&read_forcelist(dir.path())[0]));
+    }
+
+    /// The atomic write leaves no stray temp files behind on success.
+    #[test]
+    fn apply_leaves_no_temp_file_behind() {
+        let dir = tempdir().unwrap();
+        apply_in(dir.path(), Channel::Stable);
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("dig-tmp"))
+            .collect();
+        assert!(strays.is_empty(), "no .dig-tmp-* file must remain");
     }
 
     #[test]

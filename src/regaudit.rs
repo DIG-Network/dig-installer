@@ -147,33 +147,62 @@ pub struct RegistrationAudit {
     pub note: String,
 }
 
-/// Audit every privileged DIG registration on `os`: for each that is present,
-/// read its configured binary path back from the OS and flag any that resolves
-/// under a legacy / user-writable root (#565 — the H1 refuse-ready backstop +
-/// the H2 post-registration binPath assertion). Only returns an entry for a
-/// registration that is actually present (nothing to say about an absent one).
-/// I/O — the classification it applies is the pure [`bin_path_under_any`].
-pub fn audit(os: Os) -> Vec<RegistrationAudit> {
+/// Audit every privileged DIG registration on `os` against the ALLOWLIST
+/// invariant (#565 H1/H2 backstop, strengthened per #619): for each present
+/// registration, read its configured binary path back from the OS and flag it
+/// unless the binary resolves UNDER `expected_root` — the admin-only install
+/// root this run placed the privileged binaries in (`protected_bin_dir` by
+/// default, or the `--bin-dir`/GUI dir the whole stack was redirected to).
+///
+/// Why an allowlist, not a blocklist: [`bin_path_under_any`] only knows the
+/// KNOWN legacy roots ([`paths::legacy_privileged_roots`]). A privileged
+/// registration a prior `--bin-dir` install left in a user-writable directory
+/// that is neither a known legacy root nor the current install dir would escape
+/// a blocklist entirely (the ACL verify only covers the current dir). Requiring
+/// the binPath to resolve under the trusted `expected_root` refuses that residual
+/// — including junction / 8.3-short-name / any other non-protected path (#619).
+///
+/// Only returns an entry for a registration that is actually present (nothing to
+/// say about an absent one). I/O — the classification it applies is the pure
+/// [`bin_path_under`].
+pub fn audit(os: Os, expected_root: &Path) -> Vec<RegistrationAudit> {
     let legacy = paths::legacy_privileged_roots(os);
     let mut out = Vec::new();
     for reg in privileged_regs(os) {
         let Some(bin) = reg.registered_bin_path() else {
             continue;
         };
-        let under = bin_path_under_any(&bin, &legacy, os);
+        // ALLOWLIST: a privileged binary MUST resolve under the trusted install
+        // root; anything else is the escalation surface. The read-back path is
+        // CANONICALIZED first ([`bin_resolves_under`], #619) so a junction /
+        // symlink / 8.3-short-name / `..` traversal at the trusted root cannot
+        // spoof the prefix — and a binary that cannot be canonicalized fails
+        // CLOSED (treated as outside the protected root).
+        let outside_protected = !bin_resolves_under(&bin, expected_root, os);
+        let under_legacy = bin_path_under_any(&bin, &legacy, os);
         let label = reg.label();
-        let note = if under {
+        let note = if under_legacy {
             format!(
                 "{label} runs a binary under a user-writable legacy root ({bin}) — a non-admin \
                  could replace it and gain its privileges"
             )
+        } else if outside_protected {
+            format!(
+                "{label} runs a binary OUTSIDE the protected install root {} ({bin}) — a \
+                 privileged binary must live under the admin-only root; this location may be \
+                 user-writable, letting a non-admin replace it",
+                expected_root.display()
+            )
         } else {
-            format!("{label} runs from a protected location ({bin})")
+            format!("{label} runs from the protected install root ({bin})")
         };
         out.push(RegistrationAudit {
             registration: label.to_string(),
             bin_path: Some(bin),
-            under_legacy_root: under,
+            // The field name predates #619; it now means "in a location that is
+            // NOT the trusted protected root" (a legacy root, or any other
+            // non-allowlisted path). A definitive `true` still fails readiness.
+            under_legacy_root: outside_protected,
             note,
         });
     }
@@ -220,14 +249,21 @@ pub fn regs_pointing_under_legacy(os: Os) -> Vec<PrivilegedReg> {
 /// on Windows (matching [`paths::path_append`]), so `<root>\x.exe run` is caught
 /// regardless of trailing args. Pure.
 ///
-// #565 follow-up (Fable N1): this is a BLOCKLIST of known legacy roots. A stronger
-// posture is an ALLOWLIST — "a privileged binPath MUST resolve under
-// `protected_bin_dir`" — which also refuses a binPath under an unknown
-// user-writable path (a junction / 8.3 short-name / non-DIG dir). Deferred to keep
-// this fix scoped; tracked as a follow-up hardening ticket.
+/// This is the BLOCKLIST predicate the migration uses to find KNOWN legacy roots
+/// to deregister ([`regs_pointing_under_legacy`]). The readiness [`audit`] layers
+/// the stronger ALLOWLIST ([`bin_path_under`] against the trusted install root)
+/// on top of it (#619).
 pub fn bin_path_under_any(bin_path: &str, roots: &[PathBuf], os: Os) -> bool {
     let field = strip_leading_quote(bin_path);
     roots.iter().any(|root| path_has_prefix(field, root, os))
+}
+
+/// Does `bin_path` resolve UNDER the single directory `root`? The allowlist
+/// primitive [`audit`] uses to require a privileged binary live under the trusted
+/// install root (#619). Same quote/prefix normalisation as [`bin_path_under_any`].
+/// Pure.
+pub fn bin_path_under(bin_path: &str, root: &Path, os: Os) -> bool {
+    path_has_prefix(strip_leading_quote(bin_path), root, os)
 }
 
 /// Strip a leading `"` (and surrounding whitespace) from a raw image field, so a
@@ -235,6 +271,44 @@ pub fn bin_path_under_any(bin_path: &str, roots: &[PathBuf], os: Os) -> bool {
 fn strip_leading_quote(raw: &str) -> &str {
     let t = raw.trim();
     t.strip_prefix('"').unwrap_or(t)
+}
+
+/// Does the read-back binary `bin` (image path + possible trailing args) resolve
+/// UNDER the trusted `root` once BOTH are canonicalized to their real filesystem
+/// paths (#619 defence-in-depth)? Canonicalization collapses `..` traversal and
+/// dereferences junctions / symlinks / 8.3 short names on the untrusted binPath —
+/// so a registration that string-prefix-matches the root but physically resolves
+/// elsewhere is caught. Fails CLOSED: a binary or root that cannot be
+/// canonicalized (missing / unreadable) is reported as NOT under the root, so an
+/// unverifiable privileged registration can never green-light readiness. I/O.
+fn bin_resolves_under(bin: &str, root: &Path, os: Os) -> bool {
+    let (Some(real_bin), Ok(real_root)) =
+        (canonical_executable(bin, os), std::fs::canonicalize(root))
+    else {
+        return false;
+    };
+    // Both sides are now real, absolute paths (Windows: `\\?\`-verbatim), so the
+    // pure prefix test compares like with like.
+    bin_path_under(&real_bin.to_string_lossy(), &real_root, os)
+}
+
+/// Isolate the executable from a raw registration image field (`"C:\dir\x.exe"
+/// args` / `/opt/dig/bin/x`) and canonicalize it to its real filesystem path.
+/// On Windows the argv follows the `.exe`, so the field is cut at the first
+/// `.exe` boundary (the path itself may contain spaces, e.g. `Program Files`);
+/// on unix the per-tool parser already isolated the path. `None` when the
+/// executable cannot be canonicalized (missing / unreadable). I/O.
+fn canonical_executable(raw: &str, os: Os) -> Option<PathBuf> {
+    let field = strip_leading_quote(raw).trim();
+    let exe = if os == Os::Windows {
+        match field.to_ascii_lowercase().find(".exe") {
+            Some(i) => &field[..i + ".exe".len()],
+            None => field,
+        }
+    } else {
+        field
+    };
+    std::fs::canonicalize(exe).ok()
 }
 
 /// Is `field` equal to, or a descendant of, `root`? Normalises separators + case
@@ -249,6 +323,17 @@ fn path_has_prefix(field: &str, root: &Path, os: Os) -> bool {
         }
     };
     let field = norm(field);
+    // #619: a `..` path component walks OUT of whatever prefix precedes it, so a
+    // value like `<root>\..\..\..\Users\attacker\evil.exe` STRING-prefix-matches
+    // the trusted root yet resolves elsewhere entirely — a plain prefix test
+    // would wrongly admit it to the allowlist. A legitimate registered binPath is
+    // always an already-resolved path with no traversal, so reject any `..`
+    // component outright (fail CLOSED for the allowlist; [`audit`] additionally
+    // canonicalizes the read-back path as defence-in-depth against junctions /
+    // symlinks / 8.3 short names).
+    if field.split(sep).any(|component| component == "..") {
+        return false;
+    }
     let root = norm(&root.to_string_lossy());
     let root = root.trim_end_matches(sep);
     if root.is_empty() {
@@ -557,7 +642,10 @@ fn deregister_beacon() -> Result<(), String> {
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn spawn(tool: &str, args: &[String]) -> Option<String> {
     use crate::proc::HideConsole;
-    let out = std::process::Command::new(tool)
+    // #657: on Windows resolve `sc`/`schtasks` to their absolute System32 path so
+    // a current-directory search-order hijack can't substitute the tool (identity
+    // for the unix `systemctl`/`launchctl` names — out of this Windows-only scope).
+    let out = std::process::Command::new(crate::proc::system_tool(tool))
         .args(args)
         .hide_console()
         .output()
@@ -573,7 +661,9 @@ fn spawn(tool: &str, args: &[String]) -> Option<String> {
 #[cfg(any(windows, target_os = "macos"))]
 fn spawn_status(tool: &str, args: &[String]) -> Option<bool> {
     use crate::proc::HideConsole;
-    std::process::Command::new(tool)
+    // #657: absolute System32 resolution for the Windows `schtasks`/`launchctl`
+    // present-check spawn (identity on the unix tool names).
+    std::process::Command::new(crate::proc::system_tool(tool))
         .args(args)
         .hide_console()
         .output()
@@ -696,6 +786,122 @@ mod tests {
             &[PathBuf::from("")],
             Os::Linux
         ));
+    }
+
+    // -- #619: the allowlist (a privileged binPath MUST be under the trusted root)
+
+    #[test]
+    fn bin_path_under_accepts_only_paths_within_the_protected_root() {
+        let protected = Path::new(r"C:\Program Files\DIG\bin");
+        // A binary in the protected root (with args, quotes, mixed case) is under it.
+        assert!(bin_path_under(
+            r"C:\Program Files\DIG\bin\dig-dns.exe run",
+            protected,
+            Os::Windows
+        ));
+        assert!(bin_path_under(
+            r#""c:/program files/dig/bin/dig-node.exe" run"#,
+            protected,
+            Os::Windows
+        ));
+        // Anything else is NOT under it — the allowlist rejects it.
+        assert!(!bin_path_under(
+            r"C:\Users\me\AppData\Local\Programs\DIG\bin\dig-dns.exe",
+            protected,
+            Os::Windows
+        ));
+    }
+
+    #[test]
+    fn allowlist_flags_an_unknown_user_writable_root_a_blocklist_would_miss() {
+        // The exact #619 residual: a privileged binPath in a user-writable dir
+        // that is NEITHER a known legacy root NOR the protected root. A blocklist
+        // (`bin_path_under_any` over the legacy roots) MISSES it; the allowlist
+        // (`bin_path_under` the protected root) CATCHES it.
+        let protected = Path::new("/opt/dig/bin");
+        let legacy = paths::legacy_privileged_roots(Os::Linux); // ~/.dig/bin
+        let rogue = "/home/me/tools/dig-dns serve";
+        assert!(
+            !bin_path_under_any(rogue, &legacy, Os::Linux),
+            "the blocklist does not know this arbitrary dir"
+        );
+        assert!(
+            !bin_path_under(rogue, protected, Os::Linux),
+            "the allowlist flags it (not under the protected root)"
+        );
+    }
+
+    #[test]
+    fn allowlist_rejects_a_parent_traversal_binpath_under_the_trusted_root() {
+        // #619: a registered binPath that STRING-prefix-matches the trusted root
+        // but walks OUT of it via `..` resolves to an attacker-controlled location
+        // — it must NOT pass the allowlist. Both the allowlist (`bin_path_under`)
+        // and the blocklist (`bin_path_under_any`) reject a `..`-traversal outright.
+        let protected = Path::new(r"C:\Program Files\DIG\bin");
+        let traversal = r"C:\Program Files\DIG\bin\..\..\..\Users\attacker\evil.exe";
+        assert!(
+            !bin_path_under(traversal, protected, Os::Windows),
+            "a `..`-traversal binPath must be flagged, not admitted to the allowlist"
+        );
+        // A quoted form with trailing args is equally rejected.
+        assert!(!bin_path_under(
+            r#""C:\Program Files\DIG\bin\..\..\Windows\System32\cmd.exe" /c evil"#,
+            protected,
+            Os::Windows
+        ));
+        // unix mirror (case-sensitive, slash-based).
+        let uprotected = Path::new("/opt/dig/bin");
+        assert!(!bin_path_under(
+            "/opt/dig/bin/../../home/attacker/evil",
+            uprotected,
+            Os::Linux
+        ));
+        // The migration blocklist must not treat a traversal as a known legacy root.
+        let legacy = vec![PathBuf::from(r"C:\Program Files\DIG\bin")];
+        assert!(!bin_path_under_any(traversal, &legacy, Os::Windows));
+    }
+
+    #[test]
+    fn bin_resolves_under_canonicalizes_and_fails_closed() {
+        // Defence-in-depth (#619): the read-back binary is canonicalized before
+        // the prefix test, and an unverifiable path fails CLOSED.
+        let os = crate::target::Target::current().expect("supported host").os;
+        let base = std::env::temp_dir().join(format!("dig-regaudit-{}", std::process::id()));
+        let inside_dir = base.join("bin");
+        std::fs::create_dir_all(&inside_dir).expect("create the trusted root");
+        let exe = inside_dir.join(if os == Os::Windows { "dig.exe" } else { "dig" });
+        std::fs::write(&exe, b"stub").expect("write the stub binary");
+
+        // A real binary physically under the (canonicalized) trusted root passes.
+        assert!(
+            bin_resolves_under(&exe.to_string_lossy(), &inside_dir, os),
+            "a binary genuinely under the canonicalized root must be accepted"
+        );
+
+        // A binary that does NOT exist cannot be canonicalized → fails CLOSED.
+        let missing = inside_dir.join(if os == Os::Windows {
+            "definitely-absent.exe"
+        } else {
+            "definitely-absent"
+        });
+        assert!(
+            !bin_resolves_under(&missing.to_string_lossy(), &inside_dir, os),
+            "an uncanonicalizable (missing) binary must fail closed (flagged)"
+        );
+
+        // A real binary OUTSIDE the trusted root is flagged.
+        let outside_exe = base.join(if os == Os::Windows {
+            "loose.exe"
+        } else {
+            "loose"
+        });
+        std::fs::write(&outside_exe, b"stub").expect("write the outside binary");
+        assert!(
+            !bin_resolves_under(&outside_exe.to_string_lossy(), &inside_dir, os),
+            "a binary outside the trusted root must be flagged"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // -- the per-tool binPath parsers ------------------------------------------
@@ -834,7 +1040,7 @@ mod tests {
         // asserts only host-agnostic invariants: it never panics, and every entry
         // is self-consistent. `regs_pointing_under_legacy` must be equally safe.
         let os = crate::target::Target::current().expect("supported host").os;
-        let audits = audit(os);
+        let audits = audit(os, &paths::protected_bin_dir());
         for a in &audits {
             assert!(
                 a.bin_path.is_some(),

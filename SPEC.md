@@ -275,13 +275,26 @@ installer can never be tricked into running an attacker-replaced binary.
 back the ACTUAL configured binary of every privileged registration — the three LocalSystem services
 via `sc qc` / `systemctl show -p ExecStart` / `launchctl print`, and the SYSTEM auto-update beacon
 scheduled task via `schtasks /Query /XML` / systemd / launchd (`regaudit::audit`, always by canonical
-id / task path — never by executing the binary) — and REFUSES ready if any still resolves UNDER a
-legacy/user-writable root. This catches a service a tolerated "already exists" re-install left
-pointing at the writable legacy path, and an orphaned registration a component opt-out stranded.
-Like the ACL verify, this audit runs whenever the plan installs a privileged binary ANYWHERE
-(`InstallPlan::installs_a_privileged_binary`, DECOUPLED from `installs_a_protected_component`), so it
-fires on a `--bin-dir`/GUI privileged install too — not only the default protected root. Recorded in
-`InstallReport.registration_audit`.
+id / task path — never by executing the binary) — and REFUSES ready if any does NOT resolve UNDER the
+trusted install root this run used. The check is an ALLOWLIST (#619): a privileged binPath MUST live
+under the expected protected root (`protected_bin_dir`, or the `--bin-dir`/GUI dir the whole stack was
+redirected to); anything else is flagged, not merely the KNOWN legacy roots a blocklist would enumerate
+— so a registration a prior `--bin-dir` install left in an arbitrary user-writable directory is caught
+too. The read-back binPath is CANONICALIZED to its real filesystem path (`std::fs::canonicalize` on
+both the binary and the trusted root) before the prefix test, and any path containing a `..` component
+is rejected outright, so a value that merely STRING-prefix-matches the root but physically resolves
+elsewhere — a `..` traversal (`<root>\..\..\evil.exe`), a junction/symlink at the root, or an 8.3
+short name — cannot spoof a match; a binPath that cannot be canonicalized (missing/unreadable) fails
+CLOSED (treated as outside the protected root). This catches a service a tolerated
+"already exists" re-install left pointing at a writable path, and an orphaned registration a component
+opt-out stranded. Like the ACL verify, this audit runs whenever the plan installs a privileged binary
+ANYWHERE (`InstallPlan::installs_a_privileged_binary`, DECOUPLED from `installs_a_protected_component`),
+so it fires on a `--bin-dir`/GUI privileged install too — not only the default protected root. Recorded
+in `InstallReport.registration_audit`.
+
+The ACL read-back that backs the readiness verdict (`secure::verify_install_root`) additionally asserts
+it OBSERVED at least one access rule before reporting `secure`: a `Get-Acl` read that emits ZERO ACEs is
+treated as indeterminate (`checked:false`), never a vacuous `secure:true` (#619).
 
 **Migration (existing installs).** Gated on the SAME `installs_a_privileged_binary` predicate as the
 audit (so it runs on a `--bin-dir`/GUI privileged install too, not only the default protected root;
@@ -310,6 +323,24 @@ truth for the install root the auto-update beacon consumes; it is coherent with 
 `current_exe().parent()`-derived root by construction now that the beacon binary lives in the
 protected root. A consumer MUST verify the file is admin-only-writable before trusting it. Recorded
 in `InstallReport.install_manifest`.
+
+**System-tool resolution (Windows, #657).** Every Windows system tool the installer spawns
+(`sc`, `netsh`, `powershell`, `icacls`, `schtasks`, `net`, `whoami`) is addressed by its ABSOLUTE
+`%SystemRoot%\System32\<tool>.exe` path, resolved from the OS via `GetSystemDirectoryW` (NOT the
+spoofable `%SystemRoot%` env) through the single `proc::system_tool` resolver — never a bare name.
+Windows' bare-name search order places the current directory before System32, so an elevated run with
+an attacker-controlled CWD could otherwise execute a planted `sc.exe`/`netsh.exe`; absolute resolution
+closes that search-order hijack. `powershell.exe` resolves to its real `System32\WindowsPowerShell\v1.0`
+location. The machine hosts-file path (`hosts::hosts_path`) uses the same `GetSystemDirectoryW`-resolved
+System32 dir rather than the `%SystemRoot%` env.
+
+**Symlink-safe atomic file writes (#650).** A root writer into a compiled-in `/etc/**` policy path (the
+Linux `ExtensionInstallForcelist` writer) stages an `O_NOFOLLOW | O_EXCL` temp file in the same
+directory and atomically `rename`s it over the target. The rename replaces the final path component
+itself — never following a symlink AT it — so a redirecting symlink cannot divert the write, and the
+policy file is only ever observed fully-written or absent (never partial). (The Linux DNS/DoH OS-config
+write moved to `dig-dns configure-os` in #627-WU2; the same symlink-safe pattern belongs there and is
+tracked for that repo.)
 
 ### 1.7 Chromium-family browser detection (#609)
 

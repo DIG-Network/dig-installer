@@ -43,7 +43,7 @@ pub fn is_elevated() -> bool {
 
 #[cfg(windows)]
 fn is_elevated_windows() -> bool {
-    std::process::Command::new("net")
+    std::process::Command::new(crate::proc::system_tool("net"))
         .arg("session")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -491,7 +491,7 @@ pub fn guard(elevated: bool, is_system: bool, target: &Target) -> Result<(), Ins
 pub fn is_system() -> bool {
     #[cfg(windows)]
     {
-        match std::process::Command::new("whoami")
+        match std::process::Command::new(crate::proc::system_tool("whoami"))
             .arg("/user")
             .hide_console()
             .output()
