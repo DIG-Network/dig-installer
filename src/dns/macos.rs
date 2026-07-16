@@ -15,7 +15,7 @@
 //! brief's "don't clobber an existing org policy — print instructions
 //! instead").
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -27,15 +27,6 @@ use service_manager::{
 use super::plan;
 use super::{doctor, DnsInstallConfig, DnsInstallResult, DnsUninstallResult};
 use crate::proc::HideConsole;
-
-const RESOLVER_PATH: &str = "/etc/resolver/dig";
-/// Where an org's MDM-provisioned Chrome managed preferences normally live —
-/// scanned (never written to) to detect an existing policy.
-const MANAGED_PREFS_DIR: &str = "/Library/Managed Preferences";
-/// The best-effort fallback plist this installer writes when no existing
-/// managed policy is found (a per-machine, not per-user, filename so it does
-/// not require knowing which user account will run Chrome).
-const CHROME_FALLBACK_PLIST: &str = "/Library/Managed Preferences/com.google.Chrome.plist";
 
 fn lo0_label() -> ServiceLabel {
     plan::LO0_ALIAS_LABEL
@@ -132,6 +123,8 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
         bound_port: None,
         pac_url: None,
         fallback_instruction: None,
+        reboot_required: false,
+        reboot_reason: None,
     }
 }
 
@@ -160,108 +153,17 @@ fn ensure_lo0_alias_now(ip: &str) -> Result<bool, String> {
     }
 }
 
-/// Remove the live `lo0` alias immediately (uninstall). A missing alias is a
-/// no-op, not an error.
-fn remove_lo0_alias_now(ip: &str) -> Result<bool, String> {
-    let out = Command::new("ifconfig")
-        .arg("lo0")
-        .hide_console()
-        .output()
-        .map_err(|e| format!("ifconfig lo0: {e}"))?;
-    if !String::from_utf8_lossy(&out.stdout).contains(ip) {
-        return Ok(false);
-    }
-    let status = Command::new("ifconfig")
-        .args(["lo0", "-alias", ip])
-        .hide_console()
-        .status()
-        .map_err(|e| format!("ifconfig lo0 -alias {ip}: {e}"))?;
-    Ok(status.success())
-}
-
-/// Write `content` to `path` only if it differs from what's already there
-/// (idempotent). Returns `Ok(true)` if a write happened.
-fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
-            return Ok(false);
-        }
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(true)
-}
-
-/// Remove `path` only if it carries [`plan::MARKER`] (never delete a file
-/// this installer did not create). A missing file is a no-op.
-fn remove_if_ours(path: &Path) -> Result<bool, String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) if content.contains(plan::MARKER) => {
-            std::fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
-}
-
-/// Does an existing (non-ours) Chrome managed-preferences policy already
-/// exist under [`MANAGED_PREFS_DIR`]? Scans plist filenames for
-/// `com.google.Chrome`, since real MDM-provisioned policies are per-console-
-/// user (`<username>/com.google.Chrome.plist`) and this installer must never
-/// clobber one.
-fn existing_chrome_managed_policy() -> bool {
-    let Ok(entries) = std::fs::read_dir(MANAGED_PREFS_DIR) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.contains("com.google.Chrome") && !is_ours_plist(&entry.path()) {
-            return true;
-        }
-        // A per-user subdirectory (`<user>/com.google.Chrome.plist`).
-        if entry.path().is_dir() {
-            let nested = entry.path().join("com.google.Chrome.plist");
-            if nested.exists() && !is_ours_plist(&nested) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn is_ours_plist(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|c| c.contains(plan::MARKER))
-        .unwrap_or(false)
-}
-
-/// Apply the best-effort Chrome managed DoH policy, UNLESS an existing
-/// (non-ours) managed policy is already present. Returns `Ok(true)` if
-/// written.
-fn apply_chrome_managed_policy() -> Result<bool, String> {
-    if existing_chrome_managed_policy() {
-        return Ok(false);
-    }
-    write_if_changed(
-        Path::new(CHROME_FALLBACK_PLIST),
-        &plan::chrome_managed_plist(),
-    )
-}
-
-/// Install dig-dns as a macOS LaunchDaemon: apply + persist the `lo0` alias,
-/// write `/etc/resolver/dig`, register + start the dig-dns LaunchDaemon,
-/// best-effort apply the Chrome managed policy, then self-verify with
+/// Install dig-dns as a macOS LaunchDaemon: apply the live `lo0` alias (the
+/// binding prerequisite), register + start the dig-dns LaunchDaemon, delegate
+/// the resolver/browser wiring to `dig-dns configure-os`, then self-verify with
 /// `dig-dns doctor` + `dig-dns pac`.
 pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> DnsInstallResult {
     if dry_run {
         return DnsInstallResult {
             note: format!(
-                "would alias {} on lo0 (boot-persistent), write {RESOLVER_PATH}, ensure a clean \
-                 reinstall (bootout + remove any pre-existing LaunchDaemon), register the \
-                 dig-dns LaunchDaemon for {}, and set the Chrome managed DoH policy",
+                "would alias {} on lo0 (the binding prerequisite), ensure a clean reinstall \
+                 (bootout + remove any pre-existing LaunchDaemon), register the dig-dns \
+                 LaunchDaemon for {}, then run dig-dns configure-os to wire + verify the resolver",
                 plan::LOOPBACK_IP,
                 dig_dns_bin.display()
             ),
@@ -287,34 +189,15 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         );
     }
 
+    // The `lo0` alias is a FUNCTIONAL PREREQUISITE for the dig-dns service to
+    // bind 127.0.0.5:53 (macOS answers only 127.0.0.1 on lo0 by default), so
+    // apply it LIVE before starting the service. Boot-persisting the alias and
+    // the rest of the resolver wiring is owned by `dig-dns configure-os`, run
+    // after the service is up (#627 WU2).
     match ensure_lo0_alias_now(plan::LOOPBACK_IP) {
         Ok(true) => notes.push(format!("aliased {} on lo0", plan::LOOPBACK_IP)),
         Ok(false) => notes.push(format!("{} already aliased on lo0", plan::LOOPBACK_IP)),
         Err(e) => notes.push(format!("lo0 alias failed: {e}")),
-    }
-
-    let lo0_mgr = service_manager::LaunchdServiceManager::system();
-    match lo0_mgr.install(ServiceInstallCtx {
-        label: lo0_label(),
-        program: PathBuf::from("/sbin/ifconfig"),
-        args: vec![],
-        contents: Some(plan::launchd_lo0_alias_plist(plan::LOOPBACK_IP)),
-        username: None,
-        working_directory: None,
-        environment: None,
-        autostart: true,
-    }) {
-        Ok(()) => notes.push("registered the boot-persistent lo0-alias LaunchDaemon".to_string()),
-        Err(e) => notes.push(format!("lo0-alias LaunchDaemon not registered: {e}")),
-    }
-
-    match write_if_changed(
-        Path::new(RESOLVER_PATH),
-        &plan::resolver_dig_content(plan::LOOPBACK_IP),
-    ) {
-        Ok(true) => notes.push(format!("wrote {RESOLVER_PATH}")),
-        Ok(false) => notes.push(format!("{RESOLVER_PATH} already up to date")),
-        Err(e) => notes.push(format!("{RESOLVER_PATH} not written: {e}")),
     }
 
     let svc_mgr = service_manager::LaunchdServiceManager::system();
@@ -355,19 +238,11 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         Err(e) => notes.push(format!("dig-dns LaunchDaemon not registered: {e}")),
     }
 
-    match apply_chrome_managed_policy() {
-        Ok(true) => notes.push("Chrome managed DoH policy applied (best-effort fallback)".to_string()),
-        Ok(false) => notes.push(
-            "Chrome policy left untouched (an existing managed policy was found, or is MDM-provisioned)"
-                .to_string(),
-        ),
-        Err(e) => notes.push(format!("Chrome policy not applied: {e}")),
-    }
-    notes.push(
-        "Chrome enterprise policy on macOS is normally provisioned via MDM; if the DoH-off \
-         policy does not take effect, set it manually (see the runbook)"
-            .to_string(),
-    );
+    // Resolver activation (#627 WU2): `/etc/resolver/dig`, the boot-persistent
+    // lo0-alias LaunchDaemon, the DNS-cache flush, the Chrome managed DoH
+    // policy, and the end-to-end resolve VERIFY are owned by `dig-dns
+    // configure-os`, invoked by the ABSOLUTE path to the installed binary.
+    let (reboot_required, reboot_reason) = apply_os_config(dig_dns_bin, &mut notes);
 
     let doctor_summary = if started {
         doctor::wait_for_doctor(dig_dns_bin, 10, Duration::from_millis(500)).ok()
@@ -406,22 +281,43 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         bound_port,
         pac_url,
         fallback_instruction,
+        reboot_required,
+        reboot_reason,
     }
 }
 
-/// Reverse [`install`]: stop + remove both LaunchDaemons, remove
-/// `/etc/resolver/dig` (if ours), remove the live `lo0` alias, and remove the
-/// Chrome managed plist ONLY if this installer wrote it.
-pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
+/// Run `dig-dns configure-os` (via [`super::os_config`]), fold its notes into
+/// the install log, and return the `(reboot_required, reboot_reason)` the caller
+/// ORs into the #562 restart verdict. A spawn/parse failure is recorded but
+/// non-fatal and never synthesizes a reboot prompt.
+fn apply_os_config(dig_dns_bin: &Path, notes: &mut Vec<String>) -> (bool, Option<String>) {
+    match super::os_config::configure_os(dig_dns_bin) {
+        Ok(summary) => {
+            notes.extend(summary.notes.iter().cloned());
+            match summary.restart_reason() {
+                Some(reason) => (true, Some(reason)),
+                None => (false, None),
+            }
+        }
+        Err(e) => {
+            notes.push(format!("dig-dns configure-os failed: {e}"));
+            (false, None)
+        }
+    }
+}
+
+/// Reverse [`install`]: stop + remove the dig-dns LaunchDaemon, then delegate
+/// the resolver/lo0-alias/browser-policy teardown to `dig-dns unconfigure-os`
+/// ([`super::os_config`]).
+pub fn uninstall(dig_dns_bin: Option<&Path>, dry_run: bool) -> DnsUninstallResult {
     if dry_run {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,
             service_removed: false,
-            note: format!(
-                "would stop + remove the dig-dns and lo0-alias LaunchDaemons, {RESOLVER_PATH}, \
-                 the lo0 alias, and the Chrome managed plist if this installer wrote it"
-            ),
+            note: "would stop + remove the dig-dns LaunchDaemon, then delegate the \
+                   resolver/lo0-alias/browser-policy teardown to dig-dns unconfigure-os"
+                .to_string(),
             residue_removed: Vec::new(),
         };
     }
@@ -449,24 +345,24 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         removed.push(format!("dig-dns LaunchDaemon \"{}\"", plan::SERVICE_LABEL));
     }
 
+    // Legacy: a machine wired by the PRE-WU2 installer has the installer's OWN
+    // lo0-alias LaunchDaemon (a distinct label from dig-dns's). Tear it down
+    // here so an upgrade-then-uninstall never orphans it; the current
+    // dig-dns-owned lo0 daemon/alias/resolver file/browser policy are removed by
+    // `unconfigure-os` below.
     let lo0_mgr = service_manager::LaunchdServiceManager::system();
     let _ = lo0_mgr.stop(ServiceStopCtx { label: lo0_label() });
     if lo0_mgr
         .uninstall(ServiceUninstallCtx { label: lo0_label() })
         .is_ok()
     {
-        removed.push("lo0-alias LaunchDaemon".to_string());
+        removed.push("legacy lo0-alias LaunchDaemon".to_string());
     }
 
-    if let Ok(true) = remove_if_ours(Path::new(RESOLVER_PATH)) {
-        removed.push(RESOLVER_PATH.to_string());
-    }
-    if let Ok(true) = remove_lo0_alias_now(plan::LOOPBACK_IP) {
-        removed.push(format!("live lo0 alias {}", plan::LOOPBACK_IP));
-    }
-    if let Ok(true) = remove_if_ours(Path::new(CHROME_FALLBACK_PLIST)) {
-        removed.push("Chrome managed DoH policy".to_string());
-    }
+    // Resolver/lo0-alias/browser-policy teardown (#627 WU2) is owned by
+    // `dig-dns unconfigure-os` — it removes both dig-dns's own artifacts and the
+    // legacy installer's (marker-scoped, incl. the bare `/etc/resolver/dig`).
+    removed.extend(super::os_config::unconfigure_removed(dig_dns_bin));
 
     DnsUninstallResult {
         uninstalled: !removed.is_empty(),
@@ -484,59 +380,6 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "dig-installer-dns-macos-{tag}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn write_if_changed_writes_when_absent_and_skips_when_identical() {
-        let dir = tmp_subdir("write-changed");
-        let p = dir.join("resolver-dig");
-        assert!(write_if_changed(&p, "nameserver 127.0.0.5\n").unwrap());
-        assert!(
-            !write_if_changed(&p, "nameserver 127.0.0.5\n").unwrap(),
-            "identical content is a no-op"
-        );
-        assert!(
-            write_if_changed(&p, "nameserver 127.0.0.9\n").unwrap(),
-            "changed content re-writes"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
-            "nameserver 127.0.0.9\n"
-        );
-    }
-
-    #[test]
-    fn remove_if_ours_only_deletes_marked_files() {
-        let dir = tmp_subdir("remove-ours");
-        let ours = dir.join("ours.txt");
-        std::fs::write(&ours, format!("# {}\ncontent\n", plan::MARKER)).unwrap();
-        let not_ours = dir.join("not-ours.txt");
-        std::fs::write(&not_ours, "someone else's content\n").unwrap();
-
-        assert!(remove_if_ours(&ours).unwrap());
-        assert!(!ours.exists());
-
-        assert!(
-            !remove_if_ours(&not_ours).unwrap(),
-            "must not delete an unmarked file"
-        );
-        assert!(not_ours.exists());
-    }
-
-    #[test]
-    fn remove_if_ours_is_a_noop_when_missing() {
-        let dir = tmp_subdir("remove-missing");
-        let missing = dir.join("does-not-exist.txt");
-        assert!(!remove_if_ours(&missing).unwrap());
-    }
 
     #[test]
     fn is_root_never_panics() {

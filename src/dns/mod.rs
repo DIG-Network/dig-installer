@@ -31,6 +31,7 @@
 pub mod doctor;
 pub mod linux;
 pub mod macos;
+pub mod os_config;
 pub mod plan;
 pub mod windows;
 
@@ -91,6 +92,19 @@ pub struct DnsInstallResult {
     pub pac_url: Option<String>,
     /// The one-line browser-fallback instruction printed after install.
     pub fallback_instruction: Option<String>,
+    /// `true` iff `dig-dns configure-os` wired the OS resolver but the OS did
+    /// NOT go live before a restart (#627 WU2 — `applied && !activated`). This
+    /// is ORed into the installer's #562 [`crate::InstallReport::restart_required`]
+    /// verdict. Expected to stay `false`: on all three OSes `configure-os`
+    /// flushes the resolver cache and verifies resolution is live, so a restart
+    /// is prompted only in the rare case the OS resolver has not picked up the
+    /// split-DNS.
+    #[serde(default)]
+    pub reboot_required: bool,
+    /// Why a restart is being prompted, when [`Self::reboot_required`] — carried
+    /// through from `dig-dns configure-os`'s report. `None` otherwise.
+    #[serde(default)]
+    pub reboot_reason: Option<String>,
 }
 
 /// The structured result of uninstalling the dig-dns OS service.
@@ -151,6 +165,8 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
             bound_port: None,
             pac_url: None,
             fallback_instruction: None,
+            reboot_required: false,
+            reboot_reason: None,
         }
     }
 }
@@ -201,29 +217,37 @@ pub fn verify_existing(dig_dns_bin: &Path) -> DnsInstallResult {
         bound_port,
         pac_url,
         fallback_instruction,
+        // A read-only re-verify of an existing registration never re-runs
+        // `configure-os`, so it neither activates nor prompts a restart.
+        reboot_required: false,
+        reboot_reason: None,
     }
 }
 
-/// Reverse [`install`]: stop + remove the service registration, the OS
-/// split-DNS/NRPT wiring, and any Chrome/Edge policy this installer created —
-/// leaving zero residue. Never touches a pre-existing rule/policy it did not
-/// create (matched by [`plan::MARKER`]).
-pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
+/// Reverse [`install`]: stop + remove the service registration, then delegate
+/// the OS resolver/browser-policy teardown to `dig-dns unconfigure-os` (#627
+/// WU2) — the single owner of the OS-DNS wiring, which removes both dig-dns's
+/// OWN artifacts and the legacy installer's (marker-scoped, never touching a
+/// pre-existing rule/policy). `dig_dns_bin` is the absolute path to the
+/// installed binary; when it is `None`/absent (already deleted, or a machine
+/// never wired), the resolver teardown is skipped best-effort — the service
+/// registration teardown (the #568 binary-delete gate) still runs.
+pub fn uninstall(dig_dns_bin: Option<&Path>, dry_run: bool) -> DnsUninstallResult {
     #[cfg(windows)]
     {
-        windows::uninstall(dry_run)
+        windows::uninstall(dig_dns_bin, dry_run)
     }
     #[cfg(target_os = "macos")]
     {
-        macos::uninstall(dry_run)
+        macos::uninstall(dig_dns_bin, dry_run)
     }
     #[cfg(target_os = "linux")]
     {
-        linux::uninstall(dry_run)
+        linux::uninstall(dig_dns_bin, dry_run)
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
-        let _ = dry_run;
+        let _ = (dig_dns_bin, dry_run);
         DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,

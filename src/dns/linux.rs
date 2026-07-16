@@ -19,11 +19,6 @@ use super::plan;
 use super::{doctor, DnsInstallConfig, DnsInstallResult, DnsUninstallResult};
 use crate::proc::HideConsole;
 
-const RESOLVED_DROPIN: &str = "/etc/systemd/resolved.conf.d/dig.conf";
-const NM_DNSMASQ_CONF: &str = "/etc/NetworkManager/dnsmasq.d/dig.conf";
-const CHROME_POLICY_PATH: &str = "/etc/opt/chrome/policies/managed/dig-dns.json";
-const CHROMIUM_POLICY_PATH: &str = "/etc/chromium/policies/managed/dig-dns.json";
-
 fn service_label() -> ServiceLabel {
     plan::SERVICE_LABEL
         .parse()
@@ -118,6 +113,8 @@ fn failed(note: impl Into<String>) -> DnsInstallResult {
         bound_port: None,
         pac_url: None,
         fallback_instruction: None,
+        reboot_required: false,
+        reboot_reason: None,
     }
 }
 
@@ -147,17 +144,6 @@ pub fn detect_resolv_owner(
         return ResolvOwner::NetworkManagerDnsmasq;
     }
     ResolvOwner::Unknown
-}
-
-/// Live version of [`detect_resolv_owner`]: reads `/etc/resolv.conf`'s
-/// symlink target (a plain regular file has none) and checks for
-/// `/etc/NetworkManager/dnsmasq.d`.
-fn detect_resolv_owner_live() -> ResolvOwner {
-    let link_target = std::fs::read_link("/etc/resolv.conf")
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    let nm_dir = Path::new("/etc/NetworkManager/dnsmasq.d").is_dir();
-    detect_resolv_owner(link_target.as_deref(), nm_dir)
 }
 
 /// Does the dedicated service user already exist? (`id -u <user>`.)
@@ -196,130 +182,9 @@ fn ensure_service_user(user: &str) -> Result<bool, String> {
     }
 }
 
-fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
-            return Ok(false);
-        }
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(true)
-}
-
-fn remove_if_ours(path: &Path) -> Result<bool, String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) if content.contains(plan::MARKER) => {
-            std::fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
-}
-
-/// Wire split-DNS to whichever resolver owns the system, per
-/// [`detect_resolv_owner_live`]. Never rewrites a plain `/etc/resolv.conf` —
-/// on `Unknown`, this only returns a warning note.
-fn configure_split_dns(ip: &str) -> (Vec<String>, Vec<String>) {
-    let mut notes = Vec::new();
-    let mut applied = Vec::new();
-    match detect_resolv_owner_live() {
-        ResolvOwner::SystemdResolved => {
-            match write_if_changed(
-                Path::new(RESOLVED_DROPIN),
-                &plan::systemd_resolved_dropin(ip),
-            ) {
-                Ok(true) | Ok(false) => {
-                    let _ = Command::new("systemctl")
-                        .args(["reload-or-restart", "systemd-resolved"])
-                        .hide_console()
-                        .status();
-                    notes.push(format!(
-                        "configured systemd-resolved split-DNS ({RESOLVED_DROPIN})"
-                    ));
-                    applied.push(RESOLVED_DROPIN.to_string());
-                }
-                Err(e) => notes.push(format!("systemd-resolved drop-in not written: {e}")),
-            }
-        }
-        ResolvOwner::NetworkManagerDnsmasq => {
-            match write_if_changed(
-                Path::new(NM_DNSMASQ_CONF),
-                &plan::networkmanager_dnsmasq_conf(ip),
-            ) {
-                Ok(true) | Ok(false) => {
-                    let _ = Command::new("systemctl")
-                        .args(["reload", "NetworkManager"])
-                        .hide_console()
-                        .status();
-                    notes.push(format!(
-                        "configured NetworkManager-dnsmasq split-DNS ({NM_DNSMASQ_CONF})"
-                    ));
-                    applied.push(NM_DNSMASQ_CONF.to_string());
-                }
-                Err(e) => notes.push(format!("NetworkManager-dnsmasq config not written: {e}")),
-            }
-        }
-        ResolvOwner::Unknown => {
-            notes.push(
-                "no systemd-resolved/NetworkManager-dnsmasq resolver detected; \
-                 /etc/resolv.conf is left untouched — relying on Path B (the PAC proxy)"
-                    .to_string(),
-            );
-        }
-    }
-    (notes, applied)
-}
-
-fn remove_split_dns() -> Vec<String> {
-    let mut removed = Vec::new();
-    if let Ok(true) = remove_if_ours(Path::new(RESOLVED_DROPIN)) {
-        let _ = Command::new("systemctl")
-            .args(["reload-or-restart", "systemd-resolved"])
-            .hide_console()
-            .status();
-        removed.push(RESOLVED_DROPIN.to_string());
-    }
-    if let Ok(true) = remove_if_ours(Path::new(NM_DNSMASQ_CONF)) {
-        let _ = Command::new("systemctl")
-            .args(["reload", "NetworkManager"])
-            .hide_console()
-            .status();
-        removed.push(NM_DNSMASQ_CONF.to_string());
-    }
-    removed
-}
-
-/// Write the Chrome + Chromium managed-policy JSON. Each is a UNIQUELY NAMED
-/// file (`dig-dns.json`) inside a directory Chrome merges — so it can never
-/// clobber another admin's policy file (only add a new one alongside it).
-fn apply_chrome_policies() -> Vec<String> {
-    let mut applied = Vec::new();
-    for path in [CHROME_POLICY_PATH, CHROMIUM_POLICY_PATH] {
-        if write_if_changed(Path::new(path), &plan::chrome_policy_json()).is_ok() {
-            applied.push(path.to_string());
-        }
-    }
-    applied
-}
-
-fn remove_chrome_policies() -> Vec<String> {
-    let mut removed = Vec::new();
-    for path in [CHROME_POLICY_PATH, CHROMIUM_POLICY_PATH] {
-        // These are files this installer solely owns (a uniquely-named file we created), so a
-        // plain existence + removal is safe without a marker check.
-        if Path::new(path).exists() && std::fs::remove_file(path).is_ok() {
-            removed.push(path.to_string());
-        }
-    }
-    removed
-}
-
-/// Install dig-dns as a systemd service: create the dedicated user, write +
-/// enable the unit, wire split-DNS, write the Chrome/Chromium policy, then
-/// self-verify with `dig-dns doctor` + `dig-dns pac`.
+/// Install dig-dns as a systemd service: create the dedicated user, register +
+/// enable the unit, delegate the split-DNS + Chrome/Chromium policy wiring to
+/// `dig-dns configure-os`, then self-verify with `dig-dns doctor` + `dig-dns pac`.
 pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> DnsInstallResult {
     if dry_run {
         return DnsInstallResult {
@@ -398,18 +263,11 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         Err(e) => notes.push(format!("systemd unit not registered: {e}")),
     }
 
-    let (dns_notes, _applied) = configure_split_dns(plan::LOOPBACK_IP);
-    notes.extend(dns_notes);
-
-    let policies = apply_chrome_policies();
-    if policies.is_empty() {
-        notes.push("Chrome/Chromium policy not written".to_string());
-    } else {
-        notes.push(format!(
-            "wrote Chrome/Chromium policy: {}",
-            policies.join(", ")
-        ));
-    }
+    // Resolver activation (#627 WU2): the split-DNS drop-in (systemd-resolved /
+    // NetworkManager-dnsmasq), the resolver-cache flush, the Chrome/Chromium
+    // managed policy, and the end-to-end resolve VERIFY are owned by `dig-dns
+    // configure-os`, invoked by the ABSOLUTE path to the installed binary.
+    let (reboot_required, reboot_reason) = apply_os_config(dig_dns_bin, &mut notes);
 
     let doctor_summary = if started {
         doctor::wait_for_doctor(dig_dns_bin, 10, Duration::from_millis(500)).ok()
@@ -448,21 +306,43 @@ pub fn install(dig_dns_bin: &Path, cfg: &DnsInstallConfig, dry_run: bool) -> Dns
         bound_port,
         pac_url,
         fallback_instruction,
+        reboot_required,
+        reboot_reason,
     }
 }
 
-/// Reverse [`install`]: stop + remove the systemd unit, remove ONLY the
-/// split-DNS drop-in this installer wrote, remove the Chrome/Chromium policy
-/// files, and remove the dedicated service user.
-pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
+/// Run `dig-dns configure-os` (via [`super::os_config`]), fold its notes into
+/// the install log, and return the `(reboot_required, reboot_reason)` the caller
+/// ORs into the #562 restart verdict. A spawn/parse failure is recorded but
+/// non-fatal and never synthesizes a reboot prompt.
+fn apply_os_config(dig_dns_bin: &Path, notes: &mut Vec<String>) -> (bool, Option<String>) {
+    match super::os_config::configure_os(dig_dns_bin) {
+        Ok(summary) => {
+            notes.extend(summary.notes.iter().cloned());
+            match summary.restart_reason() {
+                Some(reason) => (true, Some(reason)),
+                None => (false, None),
+            }
+        }
+        Err(e) => {
+            notes.push(format!("dig-dns configure-os failed: {e}"));
+            (false, None)
+        }
+    }
+}
+
+/// Reverse [`install`]: stop + remove the systemd unit, delegate the
+/// split-DNS + Chrome/Chromium policy teardown to `dig-dns unconfigure-os`
+/// ([`super::os_config`]), and remove the dedicated service user.
+pub fn uninstall(dig_dns_bin: Option<&Path>, dry_run: bool) -> DnsUninstallResult {
     if dry_run {
         return DnsUninstallResult {
             uninstalled: false,
             needs_elevation: false,
             service_removed: false,
             note: format!(
-                "would stop + remove the dig-dns systemd unit, its split-DNS drop-in, the \
-                 Chrome/Chromium policy files, and the {} user",
+                "would stop + remove the dig-dns systemd unit, delegate the split-DNS + \
+                 Chrome/Chromium policy teardown to dig-dns unconfigure-os, and remove the {} user",
                 plan::LINUX_SERVICE_USER
             ),
             residue_removed: Vec::new(),
@@ -493,8 +373,10 @@ pub fn uninstall(dry_run: bool) -> DnsUninstallResult {
         removed.push(format!("systemd unit \"{}\"", plan::service_script_name()));
     }
 
-    removed.extend(remove_split_dns());
-    removed.extend(remove_chrome_policies());
+    // Split-DNS + browser-policy teardown (#627 WU2) is owned by `dig-dns
+    // unconfigure-os` — it removes both dig-dns's own artifacts and the legacy
+    // installer's (marker-scoped).
+    removed.extend(super::os_config::unconfigure_removed(dig_dns_bin));
 
     if user_exists(plan::LINUX_SERVICE_USER)
         && Command::new("userdel")
@@ -562,29 +444,6 @@ mod tests {
     #[test]
     fn detects_unknown_for_a_plain_resolv_conf() {
         assert_eq!(detect_resolv_owner(None, false), ResolvOwner::Unknown);
-    }
-
-    #[test]
-    fn write_if_changed_is_idempotent() {
-        let dir = tmp_subdir("write-changed");
-        let p = dir.join("dig.conf");
-        assert!(write_if_changed(&p, "a\n").unwrap());
-        assert!(!write_if_changed(&p, "a\n").unwrap());
-        assert!(write_if_changed(&p, "b\n").unwrap());
-    }
-
-    #[test]
-    fn remove_if_ours_only_deletes_marked_files() {
-        let dir = tmp_subdir("remove-ours");
-        let ours = dir.join("ours.conf");
-        std::fs::write(&ours, format!("# {}\nDNS=127.0.0.5\n", plan::MARKER)).unwrap();
-        let not_ours = dir.join("not-ours.conf");
-        std::fs::write(&not_ours, "DNS=1.1.1.1\n").unwrap();
-
-        assert!(remove_if_ours(&ours).unwrap());
-        assert!(!ours.exists());
-        assert!(!remove_if_ours(&not_ours).unwrap());
-        assert!(not_ours.exists());
     }
 
     #[test]
