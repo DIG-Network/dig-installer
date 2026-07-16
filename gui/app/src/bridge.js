@@ -99,6 +99,26 @@ export async function componentUpdateStatus(installPath) {
   }
 }
 
+/* detectBrowsers — the installed Chromium-family browsers (#609 detection),
+ * for the conditional Browsers step (#611). Each entry is a `DetectedBrowser`
+ * ({ id, display_name, kind, install_path, detected, policy_target }). In a
+ * plain browser (no backend) it returns a representative demo list — the same
+ * "still demonstrable outside Tauri" convention as `simulateInstall` — so the
+ * checklist is visible in a `vite dev`/`preview` run, not just a packaged
+ * build. A detection failure in a packaged build rejects so the step can show
+ * its error/Retry state. */
+const SIM_DETECTED_BROWSERS = [
+  { id: "chrome", display_name: "Google Chrome", kind: "chromium-family", install_path: "/opt/google/chrome/chrome", detected: true },
+  { id: "edge", display_name: "Microsoft Edge", kind: "chromium-family", install_path: "/opt/microsoft/msedge/msedge", detected: true },
+  { id: "brave", display_name: "Brave", kind: "chromium-family", install_path: "/usr/bin/brave-browser", detected: true },
+];
+
+export async function detectBrowsers() {
+  const a = await api();
+  if (!a) return SIM_DETECTED_BROWSERS;
+  return a.invoke("detect_browsers");
+}
+
 export async function pickFolder(current) {
   if (!_tauri) {
     const v = window.prompt("Install location", current);
@@ -224,6 +244,10 @@ export async function runInstall(opts, { onProgress, onError, onDone }) {
           opts: {
             install_path: opts.installPath,
             selected: opts.selected,
+            // The per-browser extension selection #612 consumes (the ids of the
+            // detected browsers the user kept checked). Empty when the extension
+            // component is deselected.
+            selected_browsers: opts.selectedBrowsers || [],
           },
         });
         // Do NOT clean up here — wait for done/error above.

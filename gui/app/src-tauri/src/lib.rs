@@ -85,6 +85,17 @@ fn default_install_path() -> String {
     install::default_install_path()
 }
 
+/// The installed Chromium-family browsers on this machine (#609 detection), for
+/// the conditional Browsers checklist step (#611). Read-only: it enumerates
+/// browsers and where each one's managed-extension policy would be written; it
+/// writes NOTHING (the #612 force-install writer does that). Returns an empty
+/// list when no supported browser is found, which the GUI renders as its
+/// (non-dead-end) empty state.
+#[tauri::command]
+fn detect_browsers() -> Vec<dig_installer::browsers::DetectedBrowser> {
+    dig_installer::browsers::detect_installed()
+}
+
 /// Component-selection screen preview (issue #309): per-component Install/
 /// Update/Skip status for dig-node/dig-dns, checked against `install_path`
 /// BEFORE the user clicks Install.
@@ -194,6 +205,7 @@ pub fn run() {
             installer_meta,
             bundled_digstore_version,
             default_install_path,
+            detect_browsers,
             component_update_status,
             run_install,
             cancel_install,

@@ -31,6 +31,7 @@ opt-in.
 | `digd`     | `DIG-Network/dig-dns` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-dns`) | NO separate flag — follows `dig-dns`'s `--no-dig-dns`/`--with-dig-dns`/`--dig-dns-version` | follows `dig-dns` |
 | `dig-updater` | `DIG-Network/dig-updater`  | raw binary + a daily OS-scheduled task/timer/LaunchDaemon (issue #514, §1.5) | on by default; `--no-auto-update` opts out; `--auto-update` (redundant) | yes, as the "Keep DIG up to date automatically" option |
 | `dig-updater-worker` | `DIG-Network/dig-updater` (alias, issue #514) | raw binary, added to PATH (same bin dir as `dig-updater`) | NO separate flag — follows `dig-updater`'s `--no-auto-update`/`--auto-update`/`--dig-updater-version` | follows `dig-updater` |
+| `extension`| `DIG-Network/dig-chrome-extension` | managed browser extension, force-installed via each browser's `ExtensionInstallForcelist` policy (#602/#612) | (GUI) on by default; selecting it reveals the Browsers step (§1.8) | yes (#611) |
 | `dig-relay`| `DIG-Network/dig-relay`       | raw binary + OS service (advanced, opt-in) | `--with-relay` | no — unchecked, user-checkable (#491) |
 | `browser`  | `DIG-Network/DIG_Browser`     | native installer, downloaded only (not run) | `--with-browser` | no — hidden, not offered (#491) |
 
@@ -349,6 +350,34 @@ known `.app` bundles and reads each bundle's `CFBundleIdentifier` from `Contents
 **Linux** resolves the known launcher binaries against the `PATH` directories. The raw findings feed
 a pure matcher against the browser catalogue, so the mapping is fixture-tested without a real
 registry, filesystem, or `Info.plist`.
+
+### 1.8 GUI browser-checklist step + the extension selection contract (#611)
+
+The GUI wizard offers the DIG browser extension as a Components entry (id `extension`,
+`gui/app/src/data.jsx` → `COMPONENTS`), **checked by default**. When it is selected the wizard shows
+one additional step, **Browsers**, slotted between Components and Installing:
+
+```
+Welcome → License → Components → [Browsers] → Installing → Finish
+```
+
+The step is CONDITIONAL — present exactly when `extension` is selected, absent otherwise. The visible
+step list is derived from the selection (`gui/app/src/steps.js` → `computeSteps`), and the rail, the
+footer dots, and next/back navigation all key off that one computed list rather than fixed indices.
+
+The Browsers step (`gui/app/src/steps/Browsers.jsx`) calls the `detect_browsers` Tauri command
+(which returns the §1.7 `DetectedBrowser` list) and renders the four async states: **loading** while
+detection runs, **error** with a Retry when detection fails, **empty** (a clear "no supported browser
+detected — install manually later" message, never a dead-end) when none is found, and **success** —
+a **scrollable** checklist of the detected browsers. **Every detected browser is checked by default**;
+the user may uncheck any browser to skip installing the extension into it. Back and Continue remain
+available in every state (the step never traps).
+
+The selection is carried to the install pipeline as `InstallOpts.selected_browsers` — a list of the
+detected-browser `id`s the user kept checked (empty when the extension is deselected). This is the
+contract the enterprise force-install writer (#612) consumes to decide which browsers'
+`ExtensionInstallForcelist` policy to write. In this step the pipeline only CARRIES the selection
+(and surfaces it in the install log); it writes no browser policy.
 
 ## 2. Install lifecycle — stop before write, start after write
 

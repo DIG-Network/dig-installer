@@ -1,13 +1,16 @@
 {
   "name": "digstore-installer",
   "private": true,
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "DIG Installer — the universal cross-platform DIG Network desktop installer (digstore CLI + dig-node + dig-dns).",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -20,7 +23,13 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.0"
+    "@vitest/coverage-v8": "^2.1.9",
+    "jsdom": "^25.0.1",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.9"
   }
 }

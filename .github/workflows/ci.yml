@@ -169,6 +169,28 @@ jobs:
       # No Tauri system deps needed: fmt only parses source, never compiles.
       - run: cargo fmt --manifest-path gui/app/src-tauri/Cargo.toml --all -- --check
 
+  # The GUI frontend's component/unit suite (issue #611): Vitest + React Testing
+  # Library exercise the React step logic (the conditional step model, the
+  # Browsers checklist's four async states, the Components catalogue) in jsdom.
+  # Coverage is scoped to the tested UI files and gated at the ecosystem >=80%
+  # floor (CLAUDE.md §2.3) via `vitest.config.js` thresholds — no browser or
+  # Tauri backend needed, so this is a fast, isolated JS-only gate.
+  gui-js-test:
+    name: gui js test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install + test the frontend
+        working-directory: gui/app
+        run: |
+          npm ci || npm install
+          npm run test:coverage
+
   gui-clippy:
     name: gui clippy
     runs-on: ubuntu-latest
