@@ -275,13 +275,21 @@ fn unregister_windows(schemes: &[String]) -> SchemeResult {
     }
 }
 
-/// Does a registered handler command belong to us — i.e. does it delegate to
-/// `dign open`? Used so unregister only removes DIG-owned handlers. Recognises
-/// BOTH the current `dign open` form and the legacy installer `handle-url` form
-/// (so an upgrade cleans up the old self-hosted handler too). Pure.
+/// Does a registered handler command belong to us — i.e. is it the EXACT shape
+/// this installer writes? Used so unregister only removes DIG-owned handlers and
+/// never a third-party registration. Matches the real trailing token shape —
+/// `dign` + a trailing `open "%1"` (Windows) or `open %u` (Linux) — plus the
+/// legacy self-hosted installer form (`handle-url` with the same trailing URI
+/// placeholder), so an upgrade cleans up the old handler too. A loose substring
+/// check (e.g. a foreign command that merely mentions "open") is NOT ours. Pure.
 pub fn is_our_handler_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    (lower.contains("dign") && lower.contains(DIGN_OPEN_SUBCOMMAND)) || lower.contains("handle-url")
+    let trimmed = command.trim_end();
+    let dign_open = trimmed.contains("dign")
+        && (trimmed.ends_with(&format!("{DIGN_OPEN_SUBCOMMAND} \"%1\""))
+            || trimmed.ends_with(&format!("{DIGN_OPEN_SUBCOMMAND} %u")));
+    let legacy = trimmed.contains("handle-url")
+        && (trimmed.ends_with("handle-url \"%1\"") || trimmed.ends_with("handle-url %u"));
+    dign_open || legacy
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -437,6 +445,14 @@ mod tests {
         // A foreign handler is NOT ours.
         assert!(!is_our_handler_command(
             r#""C:\Other\browser.exe" --open "%1""#
+        ));
+        // A foreign command that merely MENTIONS dign + open but isn't the exact
+        // shape we write must NOT be classified as ours (tightened matcher).
+        assert!(!is_our_handler_command(
+            r#""C:\evil\dign-thief.exe" open-sesame "%1""#
+        ));
+        assert!(!is_our_handler_command(
+            r#""C:\evil\dign.exe" resolve "%1" --then-open"#
         ));
     }
 
