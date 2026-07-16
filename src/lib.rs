@@ -1273,36 +1273,26 @@ fn run_report_gated(
     Ok(report)
 }
 
-/// Register the `chia://`/`urn:` OS URL-scheme handler (#389). Persists this
-/// installer's own binary to `bin_dir` (a stable handler target that survives a
-/// transient `irm|iex` download) and points the OS handler at it. Never
-/// aborts — a failure is recorded in the result. Reports intent on dry-run.
+/// Register the `dig://`/`chia://`/`urn:` OS URL-scheme handlers (#567/#563),
+/// each pointing at the installed `dign` binary run as `dign open "%1"`
+/// (dig-node = the single URI-resolve-and-open authority). Never aborts — a
+/// failure is recorded in the result. Reports intent on dry-run.
 fn register_scheme_handler(
     plan: &InstallPlan,
     target: &Target,
     log: &mut dyn FnMut(&str),
 ) -> scheme::SchemeResult {
+    // The `dign` alias (issue #548) is the local dig-node CLI the handlers
+    // delegate to; it is installed alongside dig-node in the same run.
+    let dign_bin = plan
+        .bin_dir_for("dign", target.os)
+        .join(target.exe_name("dign"));
     if plan.dry_run {
-        let r = scheme::register(
-            &plan.bin_dir.join(target.exe_name("dig-installer")),
-            true,
-            true,
-        );
+        let r = scheme::register(&dign_bin, true, true);
         log(&format!("    ({})", r.note));
         return r;
     }
-    // Persist the running installer to a stable path so the registered handler
-    // keeps working after a transient download copy is gone.
-    let handler_bin = plan.bin_dir.join(target.exe_name("dig-installer"));
-    if let Ok(current) = std::env::current_exe() {
-        if current != handler_bin {
-            if let Some(parent) = handler_bin.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::copy(&current, &handler_bin);
-        }
-    }
-    let r = scheme::register(&handler_bin, true, false);
+    let r = scheme::register(&dign_bin, true, false);
     if r.registered {
         log(&format!("    ✓ {}", r.note));
     } else {
@@ -2292,11 +2282,11 @@ pub fn help_json() -> String {
             "force_flag": "--force-reinstall"
         },
         "url_scheme_handler": {
-            "schemes": ["chia", "urn"],
+            "schemes": ["dig", "chia", "urn"],
             "default": true,
             "opt_out": "--no-register-scheme",
             "per_user": true,
-            "description": "By default the installer registers itself as the OS handler for chia:// (and best-effort urn:) links: a clicked link is resolved through the local dig-node (the dig.local → localhost → rpc.dig.net ladder) and opened in the browser. Per-user, no elevation. The OS invokes `dig-installer handle-url <uri>` (a hidden subcommand, not part of the public flag surface)."
+            "description": "By default the installer registers the OS handlers for dig://, chia:// (and best-effort urn:) links, all delegating to `dign open <uri>` — the local dig-node resolves and opens the clicked link (the dig.local → localhost → rpc.dig.net ladder lives in dig-node, not the installer). Per-user, no elevation."
         },
         "firewall": {
             "port": firewall::DEFAULT_PEER_PORT,

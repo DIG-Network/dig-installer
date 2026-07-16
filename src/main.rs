@@ -251,26 +251,10 @@ fn main() -> std::process::ExitCode {
     // start-timeout, causing `1053`). So there is nothing to intercept before
     // clap on that account.
 
-    // The OS URL-scheme handler (#389) launches THIS binary as
-    // `dig-installer handle-url <uri>` when a chia:// link is clicked. It carries
-    // no public `--help` surface, so it is matched BEFORE clap (which would
-    // reject the bare subcommand). It resolves the URI through the local
-    // dig-node (§5.3) and opens the browser.
-    {
-        let argv: Vec<String> = std::env::args().collect();
-        if let Some(uri) = dig_installer::scheme::matches_handle_url_invocation(&argv) {
-            return match dig_installer::scheme::handle_url(&uri) {
-                Ok(url) => {
-                    eprintln!("opening {url}");
-                    std::process::ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("dig-installer handle-url error: {e}");
-                    std::process::ExitCode::FAILURE
-                }
-            };
-        }
-    }
+    // The OS URL-scheme handlers (#567) now delegate directly to `dign open`
+    // (dig-node = the single URI-resolve-and-open authority) — the installer no
+    // longer hosts a `handle-url` subcommand or its own resolve ladder, so there
+    // is nothing to intercept before clap.
 
     let cli = Cli::parse();
 
