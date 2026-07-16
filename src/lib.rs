@@ -1080,7 +1080,21 @@ fn run_report_gated(
                     }
                     report.components.push(digd);
 
-                    report.dns = Some(register_dig_dns(&dig_dns_path, plan, &decision, log));
+                    let dns_result = register_dig_dns(&dig_dns_path, plan, &decision, log);
+                    // #627 WU2: `dig-dns configure-os` wires + flushes + VERIFIES
+                    // the OS resolver. In the rare case it wired the split-DNS
+                    // but the OS did not go live before a restart, OR that into
+                    // the #562 restart verdict (reusing the existing surface — no
+                    // new field). The expected case is activated ⇒ no prompt.
+                    if dns_result.reboot_required {
+                        report.restart_required = true;
+                        if let Some(reason) = &dns_result.reboot_reason {
+                            log(&format!(
+                                "    ! restart required to activate .dig resolution: {reason}"
+                            ));
+                        }
+                    }
+                    report.dns = Some(dns_result);
                     // Fresh (`Install`) registrations only — see the dig-node note.
                     if decision.action == update::UpdateAction::Install
                         && report.dns.as_ref().is_some_and(|d| d.installed)
@@ -1114,6 +1128,8 @@ fn run_report_gated(
                         bound_port: None,
                         pac_url: None,
                         fallback_instruction: None,
+                        reboot_required: false,
+                        reboot_reason: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -2363,6 +2379,21 @@ impl<'a> SystemActions<'a> {
     }
 }
 
+/// Resolve the absolute path of the INSTALLED `dig-dns` binary under `bin_dir`
+/// (or the protected bin dir), returning `Some` only when it actually exists.
+/// The standalone `--uninstall-dig-dns` action (#627 WU2) passes this to
+/// [`dns::uninstall`] so its resolver teardown shells out to `dig-dns
+/// unconfigure-os` by ABSOLUTE path — never a bare `dig-dns` resolved through
+/// `PATH` on an elevated process (#565/#657). `None` when no binary is present
+/// (nothing to un-wire).
+pub fn installed_dig_dns_bin(bin_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let target = Target::current().ok()?;
+    let name = target.exe_name("dig-dns");
+    [paths::protected_bin_dir().join(&name), bin_dir.join(&name)]
+        .into_iter()
+        .find(|p| p.exists())
+}
+
 /// Did the dig-dns service teardown FAIL to remove the service registration —
 /// so its binaries (dig-dns + the digd alias) must be left in place (never
 /// deleted) to avoid orphaning a still-registered service (blocker #4)? Gates on
@@ -2468,7 +2499,13 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         // binaries (dig-dns + the digd alias) must be left in place — deleting
         // them would orphan a still-registered service pointing at a missing
         // ImagePath (the blocker-#4 orphan).
-        let dns = dns::uninstall(false);
+        // #627 WU2: the resolver/browser-policy teardown is delegated to
+        // `dig-dns unconfigure-os`, so pass the installed binary's absolute path
+        // (this teardown runs BEFORE `delete_binaries`, so the binary is still
+        // present). An absent binary ⇒ `None` ⇒ the resolver teardown is skipped
+        // best-effort; the service-registration teardown still runs.
+        let dig_dns_bin = self.component_bin(&target, "dig-dns");
+        let dns = dns::uninstall(dig_dns_bin.exists().then_some(dig_dns_bin.as_path()), false);
         notes.push(format!("dig-dns: {}", dns.note));
         if dns_service_teardown_failed(&dns) {
             ok = false;
@@ -4670,6 +4707,8 @@ mod tests {
             bound_port: None,
             pac_url: None,
             fallback_instruction: None,
+            reboot_required: false,
+            reboot_reason: None,
         });
         report.registration_audit = vec![regaudit::RegistrationAudit {
             registration: "dig-dns".to_string(),
@@ -4824,6 +4863,8 @@ mod tests {
             bound_port: None,
             pac_url: None,
             fallback_instruction: None,
+            reboot_required: false,
+            reboot_reason: None,
         });
         let failures = evaluate_readiness(&plan, &report);
         assert_eq!(failures.len(), 1, "got: {failures:?}");
@@ -4851,6 +4892,8 @@ mod tests {
             bound_port: None,
             pac_url: None,
             fallback_instruction: None,
+            reboot_required: false,
+            reboot_reason: None,
         });
         let failures = evaluate_readiness(&plan, &report);
         assert_eq!(failures.len(), 1, "got: {failures:?}");

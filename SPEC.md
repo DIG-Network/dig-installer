@@ -616,6 +616,41 @@ An absent registration is a no-op at the detect step (nothing to remove); the re
 best-effort (errors are noted but never abort the install — the subsequent create attempt is the
 authoritative outcome).
 
+### 2.2a OS-DNS resolver activation is delegated to `dig-dns configure-os` (#627 WU2)
+
+The installer does NOT wire the OS resolver itself. After it registers + starts the dig-dns OS
+service, it shells out to the INSTALLED dig-dns binary — `dig-dns configure-os --browser-policy
+--json` — and consumes the machine-readable `OsConfigReport`. dig-dns (v0.14.0+) is the SINGLE owner
+of the OS-DNS wiring: per OS it applies the split-DNS rule (NRPT on Windows, `/etc/resolver/<tld>` +
+a boot-persistent `lo0` alias on macOS, a systemd-resolved / NetworkManager-dnsmasq drop-in on
+Linux) + the Chrome/Edge managed DoH policy, FLUSHES the resolver cache, then runs an end-to-end
+resolve VERIFY and reports whether `*.dig` resolution went LIVE. This removed the installer's OWN
+duplicated per-OS resolver-activation (the pre-#627 `dns::{windows,macos,linux}` copies), whose
+missing cache-flush was the root cause of the spurious "needs a reboot" symptom.
+
+- **Absolute-path invocation (security, #565/#657).** dig-dns is invoked by the absolute path the
+  installer wrote it to (resolved from the install root / protected bin dir via
+  `installed_dig_dns_bin`), NEVER a bare `dig-dns` name resolved through `PATH` — an elevated install
+  must not be hijackable by a `PATH`-shadowing binary. dig-dns itself spawns the OS resolver tools
+  (`powershell`, `resolvectl`, `dscacheutil`, `killall`, `systemctl`) by absolute path.
+- **macOS ordering.** The live `lo0` alias is a functional PREREQUISITE for the service to bind
+  `127.0.0.5:53`, so the installer applies it live BEFORE starting the service; `configure-os` (run
+  after the service is up, so its VERIFY is meaningful) idempotently re-applies + boot-persists it.
+- **Report → restart_required mapping (#562 reuse).** The installer derives the DNS restart signal
+  from the report as `reboot_required = applied && !activated` — resolver wiring WAS applied but the
+  OS did not go live — and ORs it into the existing `InstallReport.restart_required` verdict (§ the
+  Restart-required note), carrying the report's `reboot_reason` through into the install log. It
+  trusts dig-dns's authoritative `reboot_required` field AND defensively re-derives the same
+  condition, so a report can never wrongly SUPPRESS a needed prompt; it never prompts when NOTHING
+  was applied (e.g. the Linux PAC-only path). The EXPECTED outcome on all three OSes is `activated:
+  true` ⇒ NO restart prompt.
+- **Uninstall symmetry.** The teardown delegates the resolver/browser-policy removal to `dig-dns
+  unconfigure-os --json` (marker-scoped — removes both dig-dns's own artifacts and the legacy
+  installer's), passing the installed binary's absolute path; an absent binary skips the resolver
+  teardown best-effort without blocking the service-registration teardown (the #568 binary-delete
+  gate). A machine wired by the pre-#627 installer also has its legacy `lo0`-alias LaunchDaemon torn
+  down on macOS.
+
 ### 2.3 dig-dns stop-before-replace + the locked-binary fallback (#544)
 
 dig-dns is brought to parity with dig-node/dig-relay's §2 stop-before-write. Because dig-dns ships
@@ -894,7 +929,11 @@ trivially `ready`.
 **Restart-required (#562).** `InstallReport` also carries `restart_required: bool`, set true when
 ANY component's write was reboot-deferred (its running binary was locked, so the new version is
 staged for the next reboot). It is set from EVERY component site (digstore, digs, dign, dig-node,
-dig-dns, digd, dig-relay, dig-updater[-worker]), not just one path. When set on an otherwise-ready
+dig-dns, digd, dig-relay, dig-updater[-worker]), not just one path. It is ALSO set for dig-dns's
+DNS-activation case (#627 WU2): when `dig-dns configure-os` wired the OS resolver but the end-to-end
+verify shows it did not go live before a restart (`applied && !activated`), the same flag is ORed in
+with the report's reason (§2.2a) — expected to stay false, since `configure-os` flushes + verifies so
+resolution is normally live at install. When set on an otherwise-ready
 install the CLI verdict reads **RESTART REQUIRED** instead of "DIG is ready" (a reboot-deferred step
 must not read as fully done), the flag rides the `--json` record, and the GUI Finish step shows an
 accessible restart-required notice (detected from the streamed verdict line).

@@ -293,7 +293,8 @@ fn main() -> std::process::ExitCode {
     }
 
     if cli.uninstall_dig_dns {
-        return run_uninstall_dig_dns(cli.dry_run, cli.json);
+        let bin_dir = cli.bin_dir.clone().unwrap_or_else(paths::default_bin_dir);
+        return run_uninstall_dig_dns(&bin_dir, cli.dry_run, cli.json);
     }
 
     if cli.uninstall_dig_node {
@@ -549,8 +550,15 @@ fn run_uninstall_all(
 /// [`dig_installer::dns::uninstall`] never fails (a permission issue is
 /// reported via `needs_elevation`, not an `Err`), so this always exits
 /// success; the caller re-runs elevated if prompted.
-fn run_uninstall_dig_dns(dry_run: bool, json: bool) -> std::process::ExitCode {
-    let result = dig_installer::dns::uninstall(dry_run);
+fn run_uninstall_dig_dns(
+    bin_dir: &std::path::Path,
+    dry_run: bool,
+    json: bool,
+) -> std::process::ExitCode {
+    // #627 WU2: hand the resolver teardown the ABSOLUTE path of the installed
+    // dig-dns binary (never a bare name) so it can shell `dig-dns unconfigure-os`.
+    let dig_dns_bin = dig_installer::installed_dig_dns_bin(bin_dir);
+    let result = dig_installer::dns::uninstall(dig_dns_bin.as_deref(), dry_run);
     if json {
         println!("{}", dig_installer::dns_uninstall_json(&result));
     } else {
