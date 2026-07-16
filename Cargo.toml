@@ -30,7 +30,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.27.0"
+version = "0.28.0"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -73,10 +73,12 @@ service-manager = "0.7"
 # own dig-constants dependency) so a shared consumer graph resolves to ONE copy.
 dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
 
-# macOS-only: `O_NOFOLLOW` for the root child's O_NOFOLLOW read of the private
-# elevation plan file (#639 osascript relaunch). Scoped to macOS so no other
-# platform gains a direct libc dependency.
-[target.'cfg(target_os = "macos")'.dependencies]
+# unix-only: `O_NOFOLLOW` for the root child's O_NOFOLLOW read of the private
+# macOS elevation plan file (#639 osascript relaunch) AND the Linux forcelist
+# writer's symlink-safe atomic write (#650, forcelist::linux::write_atomic_nofollow).
+# The flag's numeric value differs per platform, so libc is used rather than a
+# hardcoded constant. Scoped to unix so Windows gains no direct libc dependency.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
@@ -100,6 +102,11 @@ windows-sys = { version = "0.59", features = [
     # (#544): stage + schedule a reboot-time replace when a running service still
     # holds its exe open (download.rs::schedule_replace_on_reboot).
     "Win32_Storage_FileSystem",
+    # GetSystemDirectoryW — resolve the absolute %SystemRoot%\System32 dir (not the
+    # spoofable %SystemRoot% env) so every Windows system-tool spawn (sc/netsh/
+    # powershell/icacls/schtasks/net/whoami) is addressed by an absolute path,
+    # immune to the current-directory search-order hijack (#657, proc::system_tool).
+    "Win32_System_SystemInformation",
 ] }
 # NOTE: the `windows-service` crate (the SCM service-protocol dispatcher) was
 # removed with the host-shim (#499): the dig-dns Windows service now runs

@@ -1334,7 +1334,14 @@ fn run_report_gated(
             //    `--bin-dir`/GUI install, not only the default protected root.
             if plan.installs_a_privileged_binary(target.os) {
                 log("Auditing that every privileged registration runs from the protected root:");
-                report.registration_audit = regaudit::audit(target.os);
+                // #619: audit against the ACTUAL install root this run used (the
+                // allowlist) — the default protected root, or the `--bin-dir`/GUI
+                // dir the whole stack was redirected to. A registration whose
+                // binary resolves anywhere else fails readiness.
+                let expected_root = plan
+                    .privileged_install_root(target.os)
+                    .unwrap_or_else(paths::protected_bin_dir);
+                report.registration_audit = regaudit::audit(target.os, &expected_root);
                 for a in &report.registration_audit {
                     log(&format!(
                         "    {} {}",

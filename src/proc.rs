@@ -61,6 +61,81 @@ impl HideConsole for std::process::Command {
     }
 }
 
+/// Resolve a Windows system tool (`sc`, `netsh`, `powershell`, `icacls`,
+/// `schtasks`, `net`, `whoami`, `reg`, …) to its ABSOLUTE
+/// `%SystemRoot%\System32\<name>.exe` path — never a bare name (#657).
+///
+/// Windows resolves a bare program name via a search order that places the
+/// **current directory before System32**, so an elevated process launched with
+/// an attacker-controlled CWD could execute a planted `sc.exe`/`netsh.exe`
+/// instead of the real tool (a search-order hijack). Routing every system-tool
+/// spawn through this resolver makes the invocation immune: the System32
+/// directory is read from the OS via `GetSystemDirectoryW` (NOT the spoofable
+/// `%SystemRoot%` env), and the tool is addressed by its fully-qualified path.
+///
+/// On non-Windows targets this is the identity (the bare name), so a shared
+/// call site compiles and behaves identically everywhere; the hardening applies
+/// only where the hijack exists.
+pub fn system_tool(name: &str) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        let resolved = system32_join(&system_directory(), name);
+        // Defensive: use the absolute path only when it actually exists (it does
+        // for every tool we invoke). If a system deviates from the expected
+        // layout, fall back to the bare name rather than a guaranteed spawn
+        // failure — functionality never regresses; the hardening applies on the
+        // overwhelmingly-common correct layout.
+        if std::path::Path::new(&resolved).exists() {
+            std::ffi::OsString::from(resolved)
+        } else {
+            std::ffi::OsString::from(name)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::ffi::OsString::from(name)
+    }
+}
+
+/// Join a resolved System32 directory and a tool `name` into an absolute
+/// executable path. Appends `.exe` when absent, normalises the trailing
+/// separator, and maps the tools that do NOT live directly in System32 to their
+/// real System32-relative location. Pure — so the path construction is
+/// unit-tested on every OS.
+///
+/// `powershell` is the notable special case: `powershell.exe` is NOT in
+/// System32 itself but in `System32\WindowsPowerShell\v1.0\` (which is on the
+/// default PATH — the reason a bare `powershell` normally resolves). Addressing
+/// it absolutely still closes the search-order hijack (#657).
+pub fn system32_join(system_dir: &str, name: &str) -> String {
+    let base = system_dir.trim_end_matches(['\\', '/']);
+    let lower = name.to_ascii_lowercase();
+    let relative = if lower == "powershell" || lower == "powershell.exe" {
+        r"WindowsPowerShell\v1.0\powershell.exe".to_string()
+    } else if lower.ends_with(".exe") {
+        name.to_string()
+    } else {
+        format!("{name}.exe")
+    };
+    format!("{base}\\{relative}")
+}
+
+/// The absolute Windows System32 directory, read from the OS via
+/// `GetSystemDirectoryW` (immune to `%SystemRoot%`/`%SystemDrive%` env
+/// redirection). Falls back to the literal `C:\Windows\System32` only if the API
+/// itself fails. The one hardened resolver both [`system_tool`] and the
+/// machine hosts-file path ([`crate::hosts::hosts_path`]) share (#657).
+#[cfg(windows)]
+pub fn system_directory() -> String {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len == 0 || len > buf.len() {
+        return r"C:\Windows\System32".to_string();
+    }
+    String::from_utf16_lossy(&buf[..len])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +182,69 @@ mod tests {
     #[test]
     fn create_no_window_is_the_win32_flag() {
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+    }
+
+    #[test]
+    fn system32_join_builds_an_absolute_exe_path() {
+        // The #657 invariant: a bare tool name becomes a fully-qualified
+        // System32 path (with `.exe`), so no current-directory search-order
+        // hijack can substitute a planted binary.
+        assert_eq!(
+            system32_join(r"C:\Windows\System32", "sc"),
+            r"C:\Windows\System32\sc.exe"
+        );
+        assert_eq!(
+            system32_join(r"C:\Windows\System32", "netsh"),
+            r"C:\Windows\System32\netsh.exe"
+        );
+        // An explicit `.exe` (any case) is not doubled.
+        assert_eq!(
+            system32_join(r"C:\Windows\System32", "ICACLS.EXE"),
+            r"C:\Windows\System32\ICACLS.EXE"
+        );
+    }
+
+    #[test]
+    fn system32_join_maps_powershell_to_its_real_subdir() {
+        // powershell.exe is NOT directly in System32 — it lives under
+        // WindowsPowerShell\v1.0 (on the default PATH). The absolute resolution
+        // must point THERE, not System32\powershell.exe (which does not exist).
+        let expected = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        assert_eq!(
+            system32_join(r"C:\Windows\System32", "powershell"),
+            expected
+        );
+        assert_eq!(
+            system32_join(r"C:\Windows\System32", "powershell.exe"),
+            expected
+        );
+    }
+
+    #[test]
+    fn system32_join_normalises_a_trailing_separator() {
+        // A resolved dir that carries a trailing separator must not double it.
+        assert_eq!(
+            system32_join(r"C:\Windows\System32\", "reg"),
+            r"C:\Windows\System32\reg.exe"
+        );
+    }
+
+    #[test]
+    fn system_tool_is_absolute_on_windows_and_the_bare_name_elsewhere() {
+        let sc = system_tool("sc");
+        #[cfg(windows)]
+        {
+            let s = sc.to_string_lossy().to_lowercase();
+            assert!(
+                s.ends_with(r"system32\sc.exe"),
+                "windows must resolve to an absolute System32 path: {s}"
+            );
+            assert!(std::path::Path::new(&sc).is_absolute());
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(sc, std::ffi::OsString::from("sc"));
+        }
     }
 
     /// Build a command that prints `token` to stdout and exits zero, using each

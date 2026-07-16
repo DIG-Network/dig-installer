@@ -83,6 +83,26 @@ pub fn acl_write_probe_ps_command(dir: &str) -> String {
     )
 }
 
+/// Count the well-formed `ACE;<sid>;<rights>;<kind>` lines in
+/// [`acl_write_probe_ps_command`] output — the number of access rules the probe
+/// actually OBSERVED. Pure.
+///
+/// A read that classifies as `Ok` over ZERO ACEs is VACUOUS, not secure: an
+/// empty stdout with a zero exit would otherwise be reported `checked:true,
+/// secure:true` without a single rule having been evaluated (#619). A real DACL
+/// on any directory always carries at least the owner/SYSTEM/Administrators
+/// ACEs, so an observed count of 0 means the read did not genuinely see the ACL
+/// and MUST resolve to `checked:false` (indeterminate) rather than a false
+/// "secure".
+pub fn count_aces(output: &str) -> usize {
+    output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ACE;"))
+        // A well-formed ACE carries at least a sid and a rights field.
+        .filter(|rest| rest.split(';').nth(1).is_some_and(|r| !r.trim().is_empty()))
+        .count()
+}
+
 /// Classify [`acl_write_probe_ps_command`] output: `Err` iff any **Allow** ACE
 /// grants a write-capable right ([`grants_write`]) to a well-known unprivileged
 /// principal ([`is_unprivileged_write_principal`]) — the #565 escalation. `Deny`
@@ -167,13 +187,29 @@ pub fn verify_install_root(os: Os, root: &std::path::Path) -> InstallRootSecurit
 fn verify_windows(root_str: &str, root: &std::path::Path) -> InstallRootSecurity {
     use crate::proc::HideConsole;
     let ps = acl_write_probe_ps_command(&root.to_string_lossy());
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .hide_console()
         .output();
     match out {
         Ok(o) if o.status.success() => {
-            match parse_acl_write_grants(&String::from_utf8_lossy(&o.stdout)) {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // #619: a successful exit that emitted ZERO ACEs is a VACUOUS read
+            // (empty/garbled Get-Acl output), not proof of an admin-only root.
+            // Refuse to report `secure` without having observed at least one
+            // access rule — resolve to `checked:false` (indeterminate) instead.
+            if count_aces(&stdout) == 0 {
+                return InstallRootSecurity {
+                    root: root_str.to_string(),
+                    checked: false,
+                    secure: false,
+                    note: "the install-root ACL read returned no access rules (Get-Acl produced \
+                           no ACE lines) — indeterminate; the admin-only Program Files location \
+                           remains the primary guarantee"
+                        .to_string(),
+                };
+            }
+            match parse_acl_write_grants(&stdout) {
                 Ok(()) => InstallRootSecurity {
                     root: root_str.to_string(),
                     checked: true,
@@ -369,6 +405,31 @@ mod tests {
     fn ignores_malformed_and_non_ace_lines() {
         let mixed = "garbage\nACE;S-1-5-18;2032127;Allow\nACE;incomplete\n\n";
         assert!(parse_acl_write_grants(mixed).is_ok());
+    }
+
+    // -- #619: the vacuous-Ok guard (assert ≥1 ACE before trusting a read) ------
+
+    #[test]
+    fn count_aces_counts_only_well_formed_ace_lines() {
+        // A real DACL: four proper ACEs.
+        assert_eq!(count_aces(program_files_style_acl()), 4);
+        // Non-ACE noise + an incomplete `ACE;` (no rights field) count as zero.
+        assert_eq!(count_aces("garbage\nACE;incomplete\n\n"), 0);
+        assert_eq!(count_aces(""), 0);
+        assert_eq!(count_aces("[SC] some unrelated tool output\r\n"), 0);
+        // One valid ACE among noise is counted.
+        assert_eq!(count_aces("noise\nACE;S-1-5-18;2032127;Allow\n"), 1);
+    }
+
+    #[test]
+    fn a_read_with_no_aces_is_vacuous_not_secure() {
+        // The #619 hole: `parse_acl_write_grants` returns Ok over zero ACEs, so a
+        // caller must NOT treat "Ok + no observed ACE" as secure. `count_aces`
+        // is the guard: empty/garbled output has no ACEs, so `verify_windows`
+        // resolves it to `checked:false` (indeterminate) rather than a false
+        // `secure:true`. (The parse itself is still vacuously Ok — hence the guard.)
+        assert!(parse_acl_write_grants("").is_ok());
+        assert_eq!(count_aces(""), 0, "an empty read observed no access rule");
     }
 
     #[test]

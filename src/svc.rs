@@ -309,7 +309,7 @@ pub fn classify_display_name(actual: Option<&str>, expected: &str, id: &str) -> 
 pub fn service_display_name(id: &str) -> Option<String> {
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("sc")
+        let out = std::process::Command::new(crate::proc::system_tool("sc"))
             .arg("qc")
             .arg(id)
             .hide_console()
@@ -365,7 +365,7 @@ fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
     use std::process::Command;
     match os {
         Os::Windows => {
-            let out = Command::new("sc")
+            let out = Command::new(crate::proc::system_tool("sc"))
                 .arg("query")
                 .arg(id)
                 .hide_console()

@@ -37,7 +37,7 @@ fn label() -> ServiceLabel {
 /// `is_elevated` (probing by attempting `net session`, which only an elevated
 /// token can run).
 pub fn is_elevated() -> bool {
-    std::process::Command::new("net")
+    std::process::Command::new(crate::proc::system_tool("net"))
         .arg("session")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -53,7 +53,7 @@ pub fn is_elevated() -> bool {
 /// requires elevation (querying, unlike creating/deleting/configuring, is
 /// available to any user).
 fn service_exists(service_name: &str) -> bool {
-    let output = std::process::Command::new("sc")
+    let output = std::process::Command::new(crate::proc::system_tool("sc"))
         .args(["query", service_name])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -117,7 +117,7 @@ fn wait_until_not_running(max_wait: Duration) {
 /// `ServiceInstallCtx` field overrides it), so this is a follow-up call.
 fn set_display_name(service_name: &str, display_name: &str) -> Result<(), String> {
     let args = plan::sc_set_display_name_args(service_name, display_name);
-    let status = std::process::Command::new("sc")
+    let status = std::process::Command::new(crate::proc::system_tool("sc"))
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

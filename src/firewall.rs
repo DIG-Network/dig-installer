@@ -294,7 +294,7 @@ pub fn close(program: &Path, dry_run: bool) -> FirewallResult {
 #[cfg(windows)]
 fn run_netsh(args: &[String]) -> Result<String, String> {
     use crate::proc::HideConsole;
-    let out = std::process::Command::new("netsh")
+    let out = std::process::Command::new(crate::proc::system_tool("netsh"))
         .args(args)
         .hide_console()
         .output()

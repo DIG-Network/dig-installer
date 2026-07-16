@@ -42,14 +42,17 @@ pub fn dig_local_line() -> String {
     format!("{DIG_LOCAL_IP}\t{DIG_LOCAL_HOST}\t{MARKER}")
 }
 
-/// Platform hosts-file path: `%SystemRoot%\System32\drivers\etc\hosts` on
-/// Windows (honouring `%SystemRoot%`), `/etc/hosts` elsewhere.
+/// Platform hosts-file path: `<System32>\drivers\etc\hosts` on Windows,
+/// `/etc/hosts` elsewhere.
+///
+/// The System32 directory is resolved from the OS via `GetSystemDirectoryW`
+/// (`crate::proc::system_tool` shares the same resolver), NOT the spoofable
+/// `%SystemRoot%` env — an elevated write to the machine hosts file must never
+/// be steered by an environment variable a launching process controls (#657).
 pub fn hosts_path() -> PathBuf {
     #[cfg(windows)]
     {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-        PathBuf::from(root)
-            .join("System32")
+        PathBuf::from(crate::proc::system_directory())
             .join("drivers")
             .join("etc")
             .join("hosts")

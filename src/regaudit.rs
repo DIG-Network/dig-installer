@@ -147,33 +147,58 @@ pub struct RegistrationAudit {
     pub note: String,
 }
 
-/// Audit every privileged DIG registration on `os`: for each that is present,
-/// read its configured binary path back from the OS and flag any that resolves
-/// under a legacy / user-writable root (#565 — the H1 refuse-ready backstop +
-/// the H2 post-registration binPath assertion). Only returns an entry for a
-/// registration that is actually present (nothing to say about an absent one).
-/// I/O — the classification it applies is the pure [`bin_path_under_any`].
-pub fn audit(os: Os) -> Vec<RegistrationAudit> {
+/// Audit every privileged DIG registration on `os` against the ALLOWLIST
+/// invariant (#565 H1/H2 backstop, strengthened per #619): for each present
+/// registration, read its configured binary path back from the OS and flag it
+/// unless the binary resolves UNDER `expected_root` — the admin-only install
+/// root this run placed the privileged binaries in (`protected_bin_dir` by
+/// default, or the `--bin-dir`/GUI dir the whole stack was redirected to).
+///
+/// Why an allowlist, not a blocklist: [`bin_path_under_any`] only knows the
+/// KNOWN legacy roots ([`paths::legacy_privileged_roots`]). A privileged
+/// registration a prior `--bin-dir` install left in a user-writable directory
+/// that is neither a known legacy root nor the current install dir would escape
+/// a blocklist entirely (the ACL verify only covers the current dir). Requiring
+/// the binPath to resolve under the trusted `expected_root` refuses that residual
+/// — including junction / 8.3-short-name / any other non-protected path (#619).
+///
+/// Only returns an entry for a registration that is actually present (nothing to
+/// say about an absent one). I/O — the classification it applies is the pure
+/// [`bin_path_under`].
+pub fn audit(os: Os, expected_root: &Path) -> Vec<RegistrationAudit> {
     let legacy = paths::legacy_privileged_roots(os);
     let mut out = Vec::new();
     for reg in privileged_regs(os) {
         let Some(bin) = reg.registered_bin_path() else {
             continue;
         };
-        let under = bin_path_under_any(&bin, &legacy, os);
+        // ALLOWLIST: a privileged binary MUST resolve under the trusted install
+        // root; anything else is the escalation surface.
+        let outside_protected = !bin_path_under(&bin, expected_root, os);
+        let under_legacy = bin_path_under_any(&bin, &legacy, os);
         let label = reg.label();
-        let note = if under {
+        let note = if under_legacy {
             format!(
                 "{label} runs a binary under a user-writable legacy root ({bin}) — a non-admin \
                  could replace it and gain its privileges"
             )
+        } else if outside_protected {
+            format!(
+                "{label} runs a binary OUTSIDE the protected install root {} ({bin}) — a \
+                 privileged binary must live under the admin-only root; this location may be \
+                 user-writable, letting a non-admin replace it",
+                expected_root.display()
+            )
         } else {
-            format!("{label} runs from a protected location ({bin})")
+            format!("{label} runs from the protected install root ({bin})")
         };
         out.push(RegistrationAudit {
             registration: label.to_string(),
             bin_path: Some(bin),
-            under_legacy_root: under,
+            // The field name predates #619; it now means "in a location that is
+            // NOT the trusted protected root" (a legacy root, or any other
+            // non-allowlisted path). A definitive `true` still fails readiness.
+            under_legacy_root: outside_protected,
             note,
         });
     }
@@ -220,14 +245,21 @@ pub fn regs_pointing_under_legacy(os: Os) -> Vec<PrivilegedReg> {
 /// on Windows (matching [`paths::path_append`]), so `<root>\x.exe run` is caught
 /// regardless of trailing args. Pure.
 ///
-// #565 follow-up (Fable N1): this is a BLOCKLIST of known legacy roots. A stronger
-// posture is an ALLOWLIST — "a privileged binPath MUST resolve under
-// `protected_bin_dir`" — which also refuses a binPath under an unknown
-// user-writable path (a junction / 8.3 short-name / non-DIG dir). Deferred to keep
-// this fix scoped; tracked as a follow-up hardening ticket.
+/// This is the BLOCKLIST predicate the migration uses to find KNOWN legacy roots
+/// to deregister ([`regs_pointing_under_legacy`]). The readiness [`audit`] layers
+/// the stronger ALLOWLIST ([`bin_path_under`] against the trusted install root)
+/// on top of it (#619).
 pub fn bin_path_under_any(bin_path: &str, roots: &[PathBuf], os: Os) -> bool {
     let field = strip_leading_quote(bin_path);
     roots.iter().any(|root| path_has_prefix(field, root, os))
+}
+
+/// Does `bin_path` resolve UNDER the single directory `root`? The allowlist
+/// primitive [`audit`] uses to require a privileged binary live under the trusted
+/// install root (#619). Same quote/prefix normalisation as [`bin_path_under_any`].
+/// Pure.
+pub fn bin_path_under(bin_path: &str, root: &Path, os: Os) -> bool {
+    path_has_prefix(strip_leading_quote(bin_path), root, os)
 }
 
 /// Strip a leading `"` (and surrounding whitespace) from a raw image field, so a
@@ -557,7 +589,10 @@ fn deregister_beacon() -> Result<(), String> {
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn spawn(tool: &str, args: &[String]) -> Option<String> {
     use crate::proc::HideConsole;
-    let out = std::process::Command::new(tool)
+    // #657: on Windows resolve `sc`/`schtasks` to their absolute System32 path so
+    // a current-directory search-order hijack can't substitute the tool (identity
+    // for the unix `systemctl`/`launchctl` names — out of this Windows-only scope).
+    let out = std::process::Command::new(crate::proc::system_tool(tool))
         .args(args)
         .hide_console()
         .output()
@@ -573,7 +608,9 @@ fn spawn(tool: &str, args: &[String]) -> Option<String> {
 #[cfg(any(windows, target_os = "macos"))]
 fn spawn_status(tool: &str, args: &[String]) -> Option<bool> {
     use crate::proc::HideConsole;
-    std::process::Command::new(tool)
+    // #657: absolute System32 resolution for the Windows `schtasks`/`launchctl`
+    // present-check spawn (identity on the unix tool names).
+    std::process::Command::new(crate::proc::system_tool(tool))
         .args(args)
         .hide_console()
         .output()
@@ -696,6 +733,49 @@ mod tests {
             &[PathBuf::from("")],
             Os::Linux
         ));
+    }
+
+    // -- #619: the allowlist (a privileged binPath MUST be under the trusted root)
+
+    #[test]
+    fn bin_path_under_accepts_only_paths_within_the_protected_root() {
+        let protected = Path::new(r"C:\Program Files\DIG\bin");
+        // A binary in the protected root (with args, quotes, mixed case) is under it.
+        assert!(bin_path_under(
+            r"C:\Program Files\DIG\bin\dig-dns.exe run",
+            protected,
+            Os::Windows
+        ));
+        assert!(bin_path_under(
+            r#""c:/program files/dig/bin/dig-node.exe" run"#,
+            protected,
+            Os::Windows
+        ));
+        // Anything else is NOT under it — the allowlist rejects it.
+        assert!(!bin_path_under(
+            r"C:\Users\me\AppData\Local\Programs\DIG\bin\dig-dns.exe",
+            protected,
+            Os::Windows
+        ));
+    }
+
+    #[test]
+    fn allowlist_flags_an_unknown_user_writable_root_a_blocklist_would_miss() {
+        // The exact #619 residual: a privileged binPath in a user-writable dir
+        // that is NEITHER a known legacy root NOR the protected root. A blocklist
+        // (`bin_path_under_any` over the legacy roots) MISSES it; the allowlist
+        // (`bin_path_under` the protected root) CATCHES it.
+        let protected = Path::new("/opt/dig/bin");
+        let legacy = paths::legacy_privileged_roots(Os::Linux); // ~/.dig/bin
+        let rogue = "/home/me/tools/dig-dns serve";
+        assert!(
+            !bin_path_under_any(rogue, &legacy, Os::Linux),
+            "the blocklist does not know this arbitrary dir"
+        );
+        assert!(
+            !bin_path_under(rogue, protected, Os::Linux),
+            "the allowlist flags it (not under the protected root)"
+        );
     }
 
     // -- the per-tool binPath parsers ------------------------------------------
@@ -834,7 +914,7 @@ mod tests {
         // asserts only host-agnostic invariants: it never panics, and every entry
         // is self-consistent. `regs_pointing_under_legacy` must be equally safe.
         let os = crate::target::Target::current().expect("supported host").os;
-        let audits = audit(os);
+        let audits = audit(os, &paths::protected_bin_dir());
         for a in &audits {
             assert!(
                 a.bin_path.is_some(),
