@@ -1,0 +1,223 @@
+# Cross-browser extension force-install + auto-update acceptance (dig_ecosystem#645).
+#
+# Tier 1 (the per-browser × per-OS policy-target + entry matrix) is a pure
+# `cargo test` suite (`tests/cross_browser_forcelist.rs`) that already rides the
+# normal `ci.yml` test gate on every runner — it is NOT duplicated here.
+#
+# This workflow adds the two acceptance tiers that need the network / a real
+# browser, which the pure suite cannot cover:
+#
+#   * Tier 2 — the LIVE auto-update source. The whole cross-browser claim rests
+#     on every Chromium brand polling the SAME self-hosted `update_url`; this
+#     proves that URL actually serves a valid Omaha manifest for the DIG
+#     extension id and a fetchable CRX (#607/#608), so the arming is real.
+#   * Tier 3 — a real Linux Chrome smoke through the SHIPPED binary: install
+#     google-chrome-stable, run `dig-installer --set-ext-forcelist-channel`, and
+#     read back the ACTUAL managed-policy file Chrome will honor. Linux is the
+#     one CI-drivable brand (a plain JSON file in a world-readable policy dir);
+#     the other brands' end-to-end install is documented manual acceptance in
+#     `runbooks/cross-browser-ext-acceptance.md`.
+#
+# Tier 2 hits a live external endpoint, so it is deliberately NOT wired as a
+# required merge gate (a transient updates.dig.net blip must not block every PR);
+# it runs on PR + push + a daily cron as an always-on liveness signal. Tier 1
+# (pure) is the required part of the acceptance.
+name: Cross-browser ext acceptance (Tier 2 live source + Tier 3 Linux smoke)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/browsers.rs"
+      - "src/forcelist/**"
+      - "src/main.rs"
+      - "tests/cross_browser_forcelist.rs"
+      - ".github/workflows/cross-browser-ext-acceptance.yml"
+      - "runbooks/cross-browser-ext-acceptance.md"
+  push:
+    branches: [main]
+  schedule:
+    # Daily liveness check of the self-hosted auto-update source.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The canonical DIG extension id (§canonical, must match
+  # `forcelist::EXTENSION_ID`). Duplicated here so the shell asserts pin the
+  # SAME value the Rust matrix pins — a drift on either side fails loudly.
+  EXTENSION_ID: mlibddmbhlgogepnjdienclhnkfpkfah
+
+jobs:
+  # -- Tier 2 -----------------------------------------------------------------
+  # The live auto-update source every browser polls, per channel.
+  updates-endpoint-live:
+    name: Tier 2 — live update source serves a valid Omaha manifest (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable currently ships a published build; nightly is served + armed
+        # but may legitimately carry NO app entry until the first nightly CRX is
+        # cut — asserted per-channel below (honest: we do not fake a nightly build).
+        channel: [stable, nightly]
+    steps:
+      - name: Install xmllint
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libxml2-utils
+
+      - name: Fetch + validate the ${{ matrix.channel }} updates.xml
+        run: |
+          set -euo pipefail
+          URL="https://updates.dig.net/ext/${{ matrix.channel }}/updates.xml"
+          echo "Fetching $URL"
+
+          # Retry a few times so a transient edge blip is not a false failure.
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --max-time 20 "$URL" -o updates.xml; then
+              break
+            fi
+            echo "attempt $attempt failed; retrying…"
+            sleep $((attempt * 3))
+          done
+
+          echo "----- updates.xml -----"
+          cat updates.xml
+          echo "-----------------------"
+
+          # Well-formed XML.
+          xmllint --noout updates.xml
+
+          # A Google Omaha update2 response manifest.
+          grep -q 'gupdate' updates.xml
+          grep -q 'protocol="2.0"' updates.xml
+
+      - name: Assert the stable manifest pins our id + serves a fetchable CRX
+        if: matrix.channel == 'stable'
+        run: |
+          set -euo pipefail
+          # The manifest advertises OUR extension id.
+          grep -q "appid=\"${EXTENSION_ID}\"" updates.xml
+
+          # Extract the codebase CRX url and prove it is really downloadable.
+          CRX_URL="$(grep -oE 'codebase="[^"]+"' updates.xml | head -n1 | sed -E 's/codebase="([^"]+)"/\1/')"
+          echo "CRX codebase: $CRX_URL"
+          test -n "$CRX_URL"
+          case "$CRX_URL" in
+            https://updates.dig.net/ext/stable/*.crx) ;;
+            *) echo "unexpected codebase url: $CRX_URL"; exit 1 ;;
+          esac
+
+          HEADERS="$(curl -fsSI --max-time 40 "$CRX_URL")"
+          echo "$HEADERS"
+          echo "$HEADERS" | grep -qE '^HTTP/.* 200'
+          echo "$HEADERS" | grep -qi 'content-type: application/x-chrome-extension'
+
+      - name: Assert the nightly channel is served + armed (build optional)
+        if: matrix.channel == 'nightly'
+        run: |
+          set -euo pipefail
+          # The nightly channel MUST be served as a valid Omaha manifest (proven
+          # above). It MAY or MAY NOT yet carry a published app entry. If it does,
+          # it must be OUR id with a fetchable CRX — never a foreign id.
+          if grep -q 'appid=' updates.xml; then
+            echo "nightly has a published build — verifying it is ours + fetchable"
+            grep -q "appid=\"${EXTENSION_ID}\"" updates.xml
+            CRX_URL="$(grep -oE 'codebase="[^"]+"' updates.xml | head -n1 | sed -E 's/codebase="([^"]+)"/\1/')"
+            curl -fsSI --max-time 40 "$CRX_URL" | grep -qE '^HTTP/.* 200'
+          else
+            echo "nightly served + armed with no published build yet (expected; not a failure)"
+          fi
+
+  # -- Tier 3 -----------------------------------------------------------------
+  # The shipped binary writes a REAL browser's REAL managed-policy file.
+  linux-forcelist-smoke:
+    name: Tier 3 — shipped binary force-installs into real Chrome (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: Linux-xbrowser-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: Linux-xbrowser-smoke-
+
+      # A real Chromium-family browser so the installer's live detection
+      # (`browsers::detect_installed`, PATH-based on Linux) actually finds a
+      # browser to force-install into. Chrome is the one brand hosted runners
+      # can install cleanly; it is representative of the shared mechanism.
+      - name: Install Google Chrome (stable)
+        run: |
+          set -euo pipefail
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          command -v google-chrome || command -v google-chrome-stable
+
+      - name: Build dig-installer (release)
+        run: cargo build --release --locked --bin dig-installer
+
+      - name: Force-install the extension via the shipped binary
+        run: |
+          set -euo pipefail
+          sudo -E "$(pwd)/target/release/dig-installer" \
+            --set-ext-forcelist-channel stable --json | tee forcelist.json
+
+      - name: Assert the JSON contract + Chrome was written
+        run: |
+          set -euo pipefail
+          jq -e '.ok == true' forcelist.json
+          # At least one browser (Chrome) had our entry written/ensured, and no
+          # write failed.
+          jq -e '[.result[] | select(.action == "wrote" or .action == "updated" or .action == "already-present")] | length >= 1' forcelist.json
+          jq -e '[.result[] | select(.action == "failed")] | length == 0' forcelist.json
+
+      - name: Assert the REAL Chrome managed-policy file holds exactly our entry
+        run: |
+          set -euo pipefail
+          POLICY=/etc/opt/chrome/policies/managed/dig-extension-forcelist.json
+          echo "----- $POLICY -----"
+          sudo cat "$POLICY"
+          echo "-------------------"
+          # The sole entry is the canonical id pinned to the stable update_url.
+          EXPECTED="${EXTENSION_ID};https://updates.dig.net/ext/stable/updates.xml"
+          sudo jq -e --arg e "$EXPECTED" \
+            '.ExtensionInstallForcelist | length == 1 and .[0] == $e' "$POLICY"
+
+      - name: Uninstall the forcelist entry + assert zero residue
+        run: |
+          set -euo pipefail
+          sudo -E "$(pwd)/target/release/dig-installer" \
+            --uninstall-ext-forcelist --json | tee unforcelist.json
+          jq -e '.ok == true' unforcelist.json
+          test ! -f /etc/opt/chrome/policies/managed/dig-extension-forcelist.json
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-browser-ext-acceptance-linux
+          path: |
+            forcelist.json
+            unforcelist.json
+          if-no-files-found: ignore
