@@ -98,11 +98,16 @@ published" as opposed to a network/transport failure), the installer:
 A genuine transport/network failure resolving dig-dns (not "no release exists") is NOT gated —
 it propagates like any other component's resolution failure (`NETWORK`, exit code 4).
 
-### 1.3 `chia://` URL-scheme handler (#389)
+### 1.3 DIG URL-scheme handlers → `dign open` (#567/#563, was #389)
 
-By default the installer registers itself as the OS handler for `chia://` links (and, best-effort,
-`urn:` where the OS permits a generic handler). This is a **first-class, toggleable install
-option**, default ON, controlled identically from the CLI and the GUI:
+By default the installer registers the OS handlers for the DIG scheme set — **`dig://`** (primary),
+**`chia://`** (legacy/compat), and best-effort **`urn:`** where the OS permits a generic handler —
+each delegating to **`dign open <uri>`**. dig-node's shipped `dign open` (v0.27.0; the `dign` alias
+v0.31.0) is the SINGLE URI-resolve-and-open authority: the installer no longer carries its own URI
+parser or §5.3 resolve ladder (the removed `handle-url` subcommand), so there is exactly one thing
+that knows how to resolve a DIG URI. The registered scheme set `{dig, chia, urn} → dign open` is a
+cross-repo canon (see the superproject `SYSTEM.md` + the `canonical` skill). This is a **first-class,
+toggleable install option**, default ON, controlled identically from the CLI and the GUI:
 
 - **CLI:** registered by default. `--no-register-scheme` opts OUT; `--register-scheme` is the
   redundant explicit opt-in (symmetry with the `--no-<component>`/`--with-<component>` flags). Both
@@ -114,21 +119,22 @@ option**, default ON, controlled identically from the CLI and the GUI:
 
 Registration is **per-user, no elevation** (unlike the OS services). Per-OS mechanism:
 
-| OS | Registration | `urn:` |
-|----|--------------|--------|
-| Windows | `HKCU\Software\Classes\chia` with an empty `URL Protocol` value + `shell\open\command` = `"<bin>" handle-url "%1"` | yes (`HKCU\Software\Classes\urn`) |
-| Linux | a `~/.local/share/applications/dig-network-url-handler.desktop` with `MimeType=x-scheme-handler/chia;` + `xdg-mime default` | yes (`x-scheme-handler/urn`) |
-| macOS | LaunchServices binds a scheme to a `.app` bundle, not a bare CLI — a CLI-only install cannot own the scheme, so registration is a documented best-effort no-op (reported honestly in `SchemeResult.note`, never a silent fake success); the DIG Browser `.app` registers it when installed | n/a |
+| OS | Registration (per scheme `<s>` ∈ {dig, chia[, urn]}) |
+|----|--------------|
+| Windows | `HKCU\Software\Classes\<s>` with an empty `URL Protocol` value + `shell\open\command` = `"<dign>" open "%1"` |
+| Linux | a `~/.local/share/applications/dig-network-url-handler.desktop` with `MimeType=x-scheme-handler/dig;x-scheme-handler/chia;[x-scheme-handler/urn;]` + `xdg-mime default`, `Exec="<dign>" open %u` |
+| macOS | LaunchServices binds a scheme to a `.app` bundle, not a bare CLI — a CLI-only install cannot own the scheme, so registration is a documented best-effort no-op (reported honestly in `SchemeResult.note`, never a silent fake success); the DIG Browser `.app` registers it when installed |
 
-The registered handler is **this installer's own binary**, persisted to the bin dir so it survives
-a transient `irm|iex` download copy, invoked by the OS as the hidden subcommand `dig-installer
-handle-url <uri>`. `handle-url` parses the URI (`chia://<store>/<path>` or
-`urn:dig:chia:<store>[/<path>]`), picks the first reachable §5.3 base
-(`http://dig.local` → `http://localhost:9778` → `https://rpc.dig.net`, falling back to the public
-gateway so a click always opens something), builds the node serve URL `<base>/s/<store>/<path>`,
-and opens it in the default browser. Registration is **best-effort within the install**: a failure
-is recorded in `InstallReport.scheme` (a `SchemeResult { registered, schemes, note }`) but never
-aborts the install (every other component already succeeded).
+The registered handler is the installed **`dign` binary** run as `dign open "%1"` (Windows) /
+`dign open %u` (Linux); dig-node resolves the URI (its own §5.3 ladder) and opens the content.
+**Argument-injection safety (security-critical):** NO shell is ever invoked — the OS launches the
+handler via `ShellExecute`/`CreateProcess` (Windows) or the desktop-entry `Exec` (Linux), never
+through `cmd /C` or `/bin/sh -c`, and the URI arrives as a SINGLE substituted argument (`%1` / the
+`%u` field code), so an attacker-controlled `dig://…` URI cannot break out into extra tokens or a
+shell. Registration is **best-effort within the install**: a failure is recorded in
+`InstallReport.scheme` (a `SchemeResult { registered, schemes, note }`) but never aborts the install.
+Unregister removes ONLY DIG-owned handlers — those whose command delegates to `dign open` (and,
+for upgrade cleanup, the legacy `handle-url` form) — never a foreign registration.
 
 ### 1.4 App-scoped firewall rule for dig-node's peer-RPC port (#424)
 
@@ -822,6 +828,51 @@ ONLY, keeping the WebView unelevated:
 - **#536 (Developer ID code-signing) is NOT a blocker.** Elevation works unsigned; Gatekeeper's
   first-open warning is a distribution-polish issue (bypass via right-click → Open) deferred to #536.
 
+## 3.10 Whole-stack `uninstall` (#568)
+
+`--uninstall` is a first-class, standalone command that removes the ENTIRE DIG install and leaves
+**zero residue** — one orchestration over the previously-piecemeal teardown flags. It runs the fixed
+ordered sequence (services/schedulers first so a live service never points at a deleted binary):
+
+1. **services** — stop + deregister dig-node, dig-relay, dig-dns;
+2. **beacon** — remove the auto-update scheduler registration;
+3. **scheme** — unregister the dig/chia/urn handlers (DIG-owned only);
+4. **network** — remove the `dig.local` hosts entry + the peer firewall rule;
+5. **binaries** — delete ALL installed binaries across both bin roots (the running installer image is
+   exempt — self-delete is impossible while running; OS cleanup handles it) + the Windows ARP entry;
+6. **forcelist** — unconfigure the browser-extension forcelist (DIG entry only).
+
+It then re-scans and reports any residue. The result is a structured `UninstallReport { steps:
+[{id, ok, note}], residue: [..], dry_run }`; `complete()` is true iff every step reached its
+end-state AND the post-run inventory found nothing left. **Invariants:** idempotent (a second run is
+a clean no-op — "already absent" is success, never an error); never deletes pre-existing org policy
+the installer did not create (each step stays DIG-scoped). The ordering + residue accounting is a
+pure core over an injected `UninstallActions`; `SystemActions` wires the real teardown. `--json`
+emits `{ ok: report.complete(), result: <UninstallReport> }`; a real (non-dry-run) incomplete run
+exits non-zero so a caller can re-run elevated.
+
+## 3.11 Install hardening — ARP, auto-recovery, rollback, health verify (#573)
+
+The install behaves like a well-behaved native package:
+
+- **Add/Remove Programs (Windows).** An `HKLM\…\Uninstall\DIG_Network` entry (`DisplayName` = "DIG
+  Network", `DisplayVersion`, `Publisher`, `InstallLocation`, `NoModify=1`, `NoRepair=1`) whose
+  `UninstallString` = `"<installer>" --uninstall` — the ARP Uninstall button runs the §3.10
+  whole-stack uninstall. The entry is removed as part of `--uninstall`.
+- **Service auto-recovery (Windows).** Each installed service is configured via `sc failure` to
+  auto-restart on crash: `reset=86400` (daily) + `actions=restart/5000/restart/5000//5000`.
+- **Install rollback.** A `RollbackGuard` records each reversible install action (file created,
+  service registered, ARP written, scheme registered) and, on partial failure, reverses them in
+  **LIFO** order — never a half-written install. A single failed undo does not strand the earlier
+  reversals: rollback continues and surfaces the failure in `RollbackReport { reversed, failures }`
+  (`clean()` iff no undo failed).
+- **Post-install health verify.** `verify_components` aggregates per-component health;
+  `all_healthy()` is false — and `unhealthy()` names the offenders — if any component is down, so a
+  down component fails LOUDLY rather than passing silently.
+
+All value/argument builders + the guard core are pure + unit-tested; the registry/SCM writes are the
+thin, best-effort I/O layer (a hardening failure logs but never fails an otherwise-successful install).
+
 ## 4.2 Readiness verdict — fail loud (#493)
 
 A run does not report success merely because downloads succeeded. `InstallReport` carries an
@@ -831,6 +882,14 @@ component installed AND its service is verified RUNNING**. The CLI prints `✓ D
 `INSTALL_INCOMPLETE` (exit 12). `--json` still emits the full report with `ok:false`. The GUI emits
 `install://error` (never `install://done`) when not ready. A `--dry-run` installs nothing, so it is
 trivially `ready`.
+
+**Restart-required (#562).** `InstallReport` also carries `restart_required: bool`, set true when
+ANY component's write was reboot-deferred (its running binary was locked, so the new version is
+staged for the next reboot). It is set from EVERY component site (digstore, digs, dign, dig-node,
+dig-dns, digd, dig-relay, dig-updater[-worker]), not just one path. When set on an otherwise-ready
+install the CLI verdict reads **RESTART REQUIRED** instead of "DIG is ready" (a reboot-deferred step
+must not read as fully done), the flag rides the `--json` record, and the GUI Finish step shows an
+accessible restart-required notice (detected from the streamed verdict line).
 
 ### Real service health — by service id, not a port probe
 
@@ -932,6 +991,20 @@ the same window op the title-bar close control uses) beside the primary **Launch
 user always has a one-click exit on the final step (never trapped). The window opens at 1080×720 and
 enforces a minimum of **980×600** — 980 wide so the three-action Done footer (Open Documentation ·
 Close · Launch Terminal) always fits without clipping the primary action.
+
+### 6.0 Internationalization (#642)
+
+The GUI is internationalized with **react-intl** (`src/i18n/`). An `I18nProvider` wraps the app and
+supplies the active locale via context + an `IntlProvider`; the canonical **14-locale** set
+(`en, zh-CN, zh-TW, ko, ja, ru, es, pt-BR, fr, de, tr, vi, id, hi` — a cross-repo canon, CLAUDE.md
+§6.6 / the `canonical` skill) is registered in `locales.js` with each locale's endonym display name.
+The initial locale is a persisted choice (`localStorage`) → the first `navigator.languages` tag that
+maps to a supported locale (exact → base-language → regional-variant matching) → English. A
+`LanguageSelector` in the app shell footer switches + persists the locale. Copy uses react-intl's
+inline `defaultMessage` pattern (the English source IS the extractable catalog); non-English catalogs
+fall back to the English source until supplied, and missing-translation errors are swallowed so all
+14 locales are selectable today. Brand/scheme literals ($DIG, XCH, DIGHUb, `chia://`/`dig://`,
+store/capsule) are preserved verbatim by the message formatter.
 
 ### 6.1 No flashing console windows (Windows)
 
