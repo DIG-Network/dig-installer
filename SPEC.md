@@ -279,8 +279,13 @@ id / task path — never by executing the binary) — and REFUSES ready if any d
 trusted install root this run used. The check is an ALLOWLIST (#619): a privileged binPath MUST live
 under the expected protected root (`protected_bin_dir`, or the `--bin-dir`/GUI dir the whole stack was
 redirected to); anything else is flagged, not merely the KNOWN legacy roots a blocklist would enumerate
-— so a registration a prior `--bin-dir` install left in an arbitrary user-writable directory (a
-junction / 8.3-short-name / any non-protected path) is caught too. This catches a service a tolerated
+— so a registration a prior `--bin-dir` install left in an arbitrary user-writable directory is caught
+too. The read-back binPath is CANONICALIZED to its real filesystem path (`std::fs::canonicalize` on
+both the binary and the trusted root) before the prefix test, and any path containing a `..` component
+is rejected outright, so a value that merely STRING-prefix-matches the root but physically resolves
+elsewhere — a `..` traversal (`<root>\..\..\evil.exe`), a junction/symlink at the root, or an 8.3
+short name — cannot spoof a match; a binPath that cannot be canonicalized (missing/unreadable) fails
+CLOSED (treated as outside the protected root). This catches a service a tolerated
 "already exists" re-install left pointing at a writable path, and an orphaned registration a component
 opt-out stranded. Like the ACL verify, this audit runs whenever the plan installs a privileged binary
 ANYWHERE (`InstallPlan::installs_a_privileged_binary`, DECOUPLED from `installs_a_protected_component`),

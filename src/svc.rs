@@ -242,13 +242,29 @@ fn deregister_service_command(id: &str) {
     }
 }
 
+/// Build the [`std::process::Command`] for an OS service-control tool, resolving
+/// a Windows system tool (`sc`) to its absolute `System32\sc.exe` path via the
+/// single hardened [`crate::proc::system_tool`] resolver (#657) — the identity on
+/// the unix `systemctl`/`launchctl` names, so cross-platform behaviour is
+/// unchanged. Split out so the resolved program can be asserted directly (via
+/// [`std::process::Command::get_program`]) without spawning.
+///
+/// Without this, an elevated `sc stop`/`sc delete` teardown launched with an
+/// attacker-controlled CWD could execute a planted `sc.exe` from the current
+/// directory (Windows' bare-name search order places the CWD before System32) —
+/// the exact search-order hijack #657 closes, mirroring [`crate::regaudit::spawn`].
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn svc_tool_command(tool: &str) -> std::process::Command {
+    std::process::Command::new(crate::proc::system_tool(tool))
+}
+
 /// Spawn an OS service-control tool, discarding its output (the authoritative
 /// signal is always the subsequent [`service_run_state`] poll, not the tool's
 /// exit code — a stop of an already-stopped service exits non-zero). `Ok(())`
 /// iff the tool exited 0.
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn run_svc_tool(tool: &str, args: &[String]) -> Result<(), String> {
-    std::process::Command::new(tool)
+    svc_tool_command(tool)
         .args(args)
         .hide_console()
         .output()
@@ -808,6 +824,43 @@ mod tests {
         assert!(!is_service_running(
             "net.dignetwork.definitely-not-a-real-dig-service-xyz"
         ));
+    }
+
+    // -- #657: the service-control tool resolves to an ABSOLUTE System32 path ---
+
+    #[test]
+    fn service_teardown_sc_resolves_through_the_system32_hardened_resolver() {
+        // #657 completeness: the `sc stop`/`sc delete` teardown spawn is an
+        // elevated path reachable via `stop_service`/`deregister_service`, so the
+        // ACTUAL program of the command it builds MUST be the absolute
+        // `System32\sc.exe` — never a bare `sc` a current-directory search-order
+        // hijack could substitute. Observing `get_program()` makes this RED if the
+        // helper reverts to a bare `Command::new(tool)` (the missed #657 site).
+        let program = svc_tool_command("sc").get_program().to_owned();
+        #[cfg(windows)]
+        {
+            let s = program.to_string_lossy().to_lowercase();
+            assert!(
+                s.ends_with(r"system32\sc.exe"),
+                "the service-teardown `sc` command must resolve to an absolute \
+                 System32 path, not a bare name: {s}"
+            );
+            assert!(std::path::Path::new(&program).is_absolute());
+        }
+        #[cfg(not(windows))]
+        {
+            // Identity on the unix service-control names — cross-platform behaviour
+            // is unchanged (mirrors `regaudit::spawn`).
+            assert_eq!(program, std::ffi::OsString::from("sc"));
+            assert_eq!(
+                svc_tool_command("systemctl").get_program().to_owned(),
+                std::ffi::OsString::from("systemctl")
+            );
+            assert_eq!(
+                svc_tool_command("launchctl").get_program().to_owned(),
+                std::ffi::OsString::from("launchctl")
+            );
+        }
     }
 
     // -- #565: stop/deregister BY ID (never by executing the service binary) ---
