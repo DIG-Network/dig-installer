@@ -286,7 +286,7 @@ const SIM_LOG = [
 ];
 const SIM_FILES = ["bin/digstore", "lib/dig_host.wasm", "lib/compiler.wasm", "share/completions/_digstore", "trusted/host-keys.toml", "examples/hello.wasm"];
 
-function simulateInstall(opts, { onProgress, onError, onDone }) {
+function simulateInstall(opts, { onProgress, onDone }) {
   return new Promise((resolve) => {
     const path = opts.installPath || "/usr/local/digstore";
     const timers = SIM_LOG.map((ev) =>
@@ -294,17 +294,16 @@ function simulateInstall(opts, { onProgress, onError, onDone }) {
     );
     const start = performance.now();
     const dur = 4150;
-    let raf;
     const tick = (now) => {
       const p = Math.min(100, ((now - start) / dur) * 100);
       onProgress({ pct: p, nowFile: SIM_FILES[Math.min(SIM_FILES.length - 1, Math.floor((p / 100) * SIM_FILES.length))] });
-      if (p < 100) raf = requestAnimationFrame(tick);
+      if (p < 100) requestAnimationFrame(tick);
       else {
         timers.forEach(clearTimeout);
         onDone();
         resolve();
       }
     };
-    raf = requestAnimationFrame(tick);
+    requestAnimationFrame(tick);
   });
 }
