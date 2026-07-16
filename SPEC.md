@@ -596,16 +596,26 @@ reimplements release resolution, download, service, or scheduler control.
 The GUI plan MUST NOT set a user-chosen custom `bin_dir`: it sets `bin_dir = paths::default_bin_dir()`
 so `has_custom_bin_dir()` is false and every privileged/service-executed component routes through the
 admin-only `protected_bin_dir()` (§1.6), re-arming the §5 migration + fail-loud ACL verify + binPath
-audit on the GUI path exactly as on the CLI. A user-chosen install path affects only the GUI-owned
-`digstore` CLI (unpacked into `<install_dir>/bin`), never a service binary — a service binary in a
-user-writable dir under a LocalSystem service / SYSTEM beacon task is the user→SYSTEM local privilege
-escalation (#565/#610). On Windows the GUI's embedded manifest requests `requireAdministrator` (not
+audit on the GUI path exactly as on the CLI. The GUI-owned `digstore` CLI is routed the SAME way: the
+pipeline places AND executes it via `bin_dir_for("digstore", os)` — the admin-only
+`protected_bin_dir()` (`%ProgramFiles%\DIG\bin`) on Windows, the elevation-free per-user `~/.dig/bin`
+on unix. Because the elevated GUI both WRITES and EXECUTES digstore (`digstore --version`, Phase 6),
+a user-writable location would be a write→exec local privilege escalation under the high-integrity
+process (medium-IL malware swaps the exe in the window and inherits the user's freshly-granted
+Administrator) — so digstore is NOT a "never a privilege-escalation vector" once the process is
+elevated. digstore's protected-root placement on Windows is itself an elevated write, so a
+digstore-only Windows GUI run also requires elevation (matching the CLI). A user-chosen install path
+receives only the NON-executable install artifacts (shell completions, example store, the `.dig`
+icon) — data this process never executes. A service/executed binary in a user-writable dir under a
+LocalSystem service / SYSTEM beacon task is the user→SYSTEM local privilege escalation (#565/#610).
+On Windows the GUI's embedded manifest requests `requireAdministrator` (not
 `asInvoker`) so the elevation needed to write the protected root + register services is obtained up
 front via a UAC elevation of the same interactive user (the `elevation::guard` SYSTEM check still
 rejects a service/`psexec -s` relaunch); on macOS/Linux the pre-install `elevation::guard` fails loud
 with a "re-run elevated" remedy rather than performing a silent unprivileged install of a privileged
-component. The pre-install elevation decision uses `InstallPlan::requires_elevation` (which also
-covers the default-on SYSTEM auto-update beacon), not a hand-maintained component-id list.
+component. The pre-install elevation decision is `InstallPlan::requires_elevation` (which also covers
+the default-on SYSTEM auto-update beacon) OR-ed with the GUI's own digstore protected-root placement
+(so a digstore-only Windows run still elevates), not a hand-maintained component-id list.
 
 The Done screen exposes a **Close** action (`bridge.js` `closeWindow` → Tauri `getCurrentWindow().close()`,
 the same window op the title-bar close control uses) beside the primary **Launch Terminal**, so the
