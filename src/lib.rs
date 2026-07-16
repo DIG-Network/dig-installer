@@ -44,6 +44,7 @@
 
 pub mod asset;
 pub mod beacon;
+pub mod browsers;
 pub mod daemon_dir;
 pub mod dns;
 pub mod download;
@@ -2219,6 +2220,7 @@ pub fn help_json() -> String {
             { "flag": "--no-register-scheme", "description": "opt out of registering the chia:// (+ best-effort urn:) OS URL-scheme handler (registered by default; #389)" },
             { "flag": "--register-scheme", "description": "explicit (redundant) opt-in — the chia:// URL-scheme handler is registered by default" },
             { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" },
+            { "flag": "--detect-browsers", "description": "list the installed Chromium-family browsers + their per-OS managed-extension-policy locations (read-only, #609); runs standalone, ignores every other flag; pair with --json for a machine result" },
             { "flag": "--no-open-firewall", "description": "opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; #424)" },
             { "flag": "--open-firewall", "description": "explicit (redundant) opt-in — the firewall rule is opened by default" },
             { "flag": "--no-auto-update", "description": "opt out of installing + registering the DIG auto-update beacon (installed by default; #514)" },

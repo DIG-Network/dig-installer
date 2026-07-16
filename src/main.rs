@@ -216,6 +216,13 @@ struct Cli {
     /// flags, the exit-code table) as JSON, then exit.
     #[arg(long = "help-json")]
     help_json: bool,
+
+    /// List the Chromium-family browsers installed on this machine (read-only)
+    /// and their per-OS managed-extension-policy locations, then exit. Feeds
+    /// the DIG-extension force-install step (#602). Use `--json` for a machine
+    /// result. Runs standalone — ignores every other install flag.
+    #[arg(long = "detect-browsers")]
+    detect_browsers: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -254,6 +261,10 @@ fn main() -> std::process::ExitCode {
     }
     // (`help_json`/`error_json` live in the library so they are unit-tested
     // directly; main.rs only wires them to stdout/exit codes.)
+
+    if cli.detect_browsers {
+        return run_detect_browsers(cli.json);
+    }
 
     if cli.uninstall_dig_dns {
         return run_uninstall_dig_dns(cli.dry_run, cli.json);
@@ -395,6 +406,25 @@ fn run_json(plan: &InstallPlan) -> std::process::ExitCode {
             std::process::ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// `--detect-browsers`: enumerate the installed Chromium-family browsers +
+/// their managed-extension-policy locations (read-only, #609). `--json` emits
+/// the typed list a caller scripts against; pretty mode lists them for a human.
+fn run_detect_browsers(json: bool) -> std::process::ExitCode {
+    let browsers = dig_installer::browsers::detect_installed();
+    if json {
+        let envelope = serde_json::json!({ "ok": true, "browsers": browsers });
+        println!("{}", serde_json::to_string(&envelope).unwrap());
+    } else if browsers.is_empty() {
+        println!("no Chromium-family browsers detected");
+    } else {
+        println!("detected {} Chromium-family browser(s):", browsers.len());
+        for b in &browsers {
+            println!("  - {} ({})", b.display_name, b.id);
+        }
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// `--uninstall-dig-dns`: tear down the dig-dns OS service + OS wiring this

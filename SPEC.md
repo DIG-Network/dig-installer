@@ -304,6 +304,52 @@ truth for the install root the auto-update beacon consumes; it is coherent with 
 protected root. A consumer MUST verify the file is admin-only-writable before trusting it. Recorded
 in `InstallReport.install_manifest`.
 
+### 1.7 Chromium-family browser detection (#609)
+
+The installer force-installs the DIG extension across the Chromium-family browsers on the machine
+via each browser's `ExtensionInstallForcelist` managed policy (epic #602). To target that write it
+first DETECTS which browsers are installed and WHERE each one's managed-policy location is. This is a
+**read-only** capability — detection writes no policy and touches no browser; the forcelist writer
+(#612) consumes the detected list.
+
+**CLI:** `dig-installer --detect-browsers` lists the detected browsers; `--detect-browsers --json`
+emits the machine result `{ "ok": true, "browsers": [ DetectedBrowser, … ] }`. The action is
+standalone (ignores every other flag), network-free, and always exits `0`.
+
+Each `DetectedBrowser` is:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `id` | string | stable slug — one of `chrome`, `edge`, `brave`, `chromium`, `vivaldi`, `opera` |
+| `display_name` | string | human name for the GUI checklist (e.g. `Google Chrome`) |
+| `kind` | string | `chromium-family` (the only family that honors the forcelist policy) |
+| `install_path` | string \| null | the path that evidenced detection, when one matched (null when only a Windows uninstall-registry entry evidenced it) |
+| `detected` | bool | always `true` for a returned entry (explicit in the contract) |
+| `policy_target` | object | where #612 writes this browser's managed extension policy, for the host OS |
+
+`policy_target` is OS-tagged: `{ "os": "windows", "policy_key": "SOFTWARE\\Policies\\Google\\Chrome" }`,
+`{ "os": "macos", "preferences_domain": "com.google.Chrome" }`, or
+`{ "os": "linux", "managed_policy_dir": "/etc/opt/chrome/policies/managed" }`. The per-browser policy
+coordinates are the epic #602 D6 table (the single source of truth #612 also writes against):
+
+| Browser | Windows policy key (`HKLM`-relative) | macOS preferences domain | Linux managed-policy dir |
+|---------|--------------------------------------|--------------------------|--------------------------|
+| Chrome | `SOFTWARE\Policies\Google\Chrome` | `com.google.Chrome` | `/etc/opt/chrome/policies/managed` |
+| Edge | `SOFTWARE\Policies\Microsoft\Edge` | `com.microsoft.Edge` | `/etc/opt/edge/policies/managed` |
+| Brave | `SOFTWARE\Policies\BraveSoftware\Brave` | `com.brave.Browser` | `/etc/brave/policies/managed` |
+| Chromium | `SOFTWARE\Policies\Chromium` | `org.chromium.Chromium` | `/etc/chromium/policies/managed` |
+| Vivaldi | `SOFTWARE\Policies\Vivaldi` | `com.vivaldi.Vivaldi` | `/etc/opt/vivaldi/policies/managed` |
+| Opera | `SOFTWARE\Policies\Opera Software\Opera` | `com.operasoftware.Opera` | `/etc/opt/opera/policies/managed` |
+
+**Per-OS detection mechanism** (best-effort — a failed probe contributes fewer signals, never an
+error): **Windows** reads `DisplayName` values from the uninstall registry keys (`HKLM` +
+`WOW6432Node` + `HKCU`) and probes the well-known executable paths under `%ProgramFiles%` /
+`%ProgramFiles(x86)%` / `%LOCALAPPDATA%`; **macOS** scans `/Applications` + `~/Applications` for the
+known `.app` bundles and reads each bundle's `CFBundleIdentifier` from `Contents/Info.plist`;
+**Linux** resolves the known launcher binaries against the `PATH` directories. The raw findings feed
+a pure matcher against the browser catalogue, so the mapping is fixture-tested without a real
+registry, filesystem, or `Info.plist`.
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/

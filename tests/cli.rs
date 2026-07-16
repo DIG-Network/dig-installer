@@ -615,3 +615,38 @@ fn gui_defaults_dig_relay_unchecked_and_browser_hidden() {
         "Components.jsx must not render a hidden component (#491)"
     );
 }
+
+#[test]
+fn detect_browsers_json_emits_a_typed_browser_list() {
+    // `--detect-browsers --json` is a standalone, read-only, network-free
+    // action (#609): it always succeeds and emits `{ok:true, browsers:[…]}`,
+    // whatever browsers happen to be installed on the runner.
+    let out = bin()
+        .args(["--detect-browsers", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).expect("--detect-browsers --json must be JSON");
+    assert_eq!(v["ok"], true);
+    assert!(v["browsers"].is_array(), "browsers must be an array");
+    // Every entry (if any) carries the machine contract #611/#612 consume.
+    for b in v["browsers"].as_array().unwrap() {
+        assert!(b["id"].is_string());
+        assert_eq!(b["kind"], "chromium-family");
+        assert_eq!(b["detected"], true);
+        assert!(b["policy_target"]["os"].is_string());
+    }
+}
+
+#[test]
+fn help_json_advertises_detect_browsers() {
+    let out = bin().arg("--help-json").assert().success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    let has = v["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["flag"] == "--detect-browsers");
+    assert!(has, "--help-json must advertise --detect-browsers");
+}
