@@ -237,6 +237,9 @@ pub fn verify_components(components: Vec<ComponentHealth>) -> HealthVerifyReport
 // ---------------------------------------------------------------------------
 
 /// The full `HKLM` path to the DIG ARP subkey (relative to `HKEY_LOCAL_MACHINE`).
+/// Windows-only — the registry I/O that uses it is `#[cfg(windows)]`, so gate the
+/// const too or it is dead code (a `-D warnings` clippy error on the Linux job).
+#[cfg(windows)]
 const ARP_SUBKEY_PATH: &str =
     "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DIG_Network";
 
@@ -283,17 +286,22 @@ pub fn configure_service_recovery(service_name: &str) -> Result<String, String> 
     use crate::proc::HideConsole;
     use std::process::Command;
     let args = windows_service_recovery_args(service_name);
-    let status = Command::new("sc")
+    // CAPTURE `sc`'s stdio — never `.status()` (which inherits it). `sc failure`
+    // prints `[SC] ChangeServiceConfig2 SUCCESS` to stdout; inheriting it lands
+    // that prose raw on THIS process's stdout, corrupting `--json` mode's
+    // "exactly one JSON line on stdout" contract (same class as service.rs
+    // #502/#524 — caught by the 3-OS installer e2e `jq` gate on install.json).
+    let out = Command::new("sc")
         .args(&args)
         .hide_console()
-        .status()
+        .output()
         .map_err(|e| format!("run sc failure: {e}"))?;
-    if status.success() {
+    if out.status.success() {
         Ok(format!("{service_name}: auto-recovery configured"))
     } else {
         Err(format!(
             "sc failure {service_name} exited with {:?}",
-            status.code()
+            out.status.code()
         ))
     }
 }
