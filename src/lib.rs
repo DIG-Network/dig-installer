@@ -489,6 +489,12 @@ pub struct InstallReport {
     /// ready). Each entry names the component + why it is not ready + the
     /// remedy — never silent (#493).
     pub failures: Vec<String>,
+    /// `true` when ANY component's update was staged for a reboot-time replace
+    /// (its running binary was locked, #544/#562) — the install is otherwise
+    /// complete but the user MUST restart to finish applying it. Every surface
+    /// (the CLI verdict, the `--json` record, the GUI Finish step) reads this so
+    /// a reboot-deferred step never reads as fully done.
+    pub restart_required: bool,
 }
 
 /// The dig-relay service result (run-your-own-relay).
@@ -644,16 +650,27 @@ fn download_component(
     })
 }
 
-/// LOUDLY flag the locked-destination reboot-replace fallback (#544): when a
-/// running binary was still held open at write time, its update was staged and
-/// will apply on the next reboot — the user must restart to finish it. A plain
-/// in-place [`download::WriteOutcome::Replaced`] logs nothing extra.
-fn log_write_outcome(log: &mut dyn FnMut(&str), component: &str, outcome: download::WriteOutcome) {
+/// LOUDLY flag the locked-destination reboot-replace fallback (#544/#562): when
+/// a running binary was still held open at write time, its update was staged and
+/// will apply on the next reboot — the user must restart to finish it. Returns
+/// `true` when the write was reboot-deferred, so the caller records it on
+/// [`InstallReport::restart_required`] (surfaced at EVERY component site — the
+/// CLI verdict, the `--json` record, the GUI Finish step). A plain in-place
+/// [`download::WriteOutcome::Replaced`] logs nothing and returns `false`.
+#[must_use]
+fn log_write_outcome(
+    log: &mut dyn FnMut(&str),
+    component: &str,
+    outcome: download::WriteOutcome,
+) -> bool {
     if outcome == download::WriteOutcome::ScheduledForReboot {
         log(&format!(
             "    ! {component} was still running and locked its binary, so the update was staged \
              and will apply on the next REBOOT — restart your computer to finish updating {component}."
         ));
+        true
+    } else {
+        false
     }
 }
 
@@ -737,6 +754,7 @@ fn run_report_gated(
         install_manifest: None,
         ready: true,
         failures: Vec::new(),
+        restart_required: false,
     };
 
     // #565: MIGRATE any existing user-writable install off the legacy root, then
@@ -796,7 +814,8 @@ fn run_report_gated(
         // decide Install/Update/Skip against the version just resolved above.
         let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
         if decision.action != update::UpdateAction::Skip {
-            download_component(&c, plan.dry_run)?;
+            let outcome = download_component(&c, plan.dry_run)?;
+            report.restart_required |= log_write_outcome(log, "digstore", outcome);
         } else {
             log("    · already up to date — skipping the download");
         }
@@ -815,7 +834,8 @@ fn run_report_gated(
             &plan.bin_dir_for("digs", target.os),
         )?;
         log_component(log, &digs);
-        download_component(&digs, plan.dry_run)?;
+        let outcome = download_component(&digs, plan.dry_run)?;
+        report.restart_required |= log_write_outcome(log, "digs", outcome);
         if !plan.dry_run {
             report.installed.push(digs.dest.clone());
         }
@@ -894,7 +914,7 @@ fn run_report_gated(
                 ));
             }
             let outcome = download_component(&c, plan.dry_run)?;
-            log_write_outcome(log, "dig-node", outcome);
+            report.restart_required |= log_write_outcome(log, "dig-node", outcome);
         }
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
@@ -927,7 +947,8 @@ fn run_report_gated(
         ) {
             Ok(dign) => {
                 log_component(log, &dign);
-                download_component(&dign, plan.dry_run)?;
+                let outcome = download_component(&dign, plan.dry_run)?;
+                report.restart_required |= log_write_outcome(log, "dign", outcome);
                 if !plan.dry_run {
                     report.installed.push(dign.dest.clone());
                 }
@@ -998,7 +1019,7 @@ fn run_report_gated(
                         ));
                     }
                     let outcome = download_component(&c, plan.dry_run)?;
-                    log_write_outcome(log, "dig-dns", outcome);
+                    report.restart_required |= log_write_outcome(log, "dig-dns", outcome);
                 }
                 if !plan.dry_run {
                     report.installed.push(c.dest.clone());
@@ -1030,7 +1051,8 @@ fn run_report_gated(
                     &plan.bin_dir_for("digd", target.os),
                 )?;
                 log_component(log, &digd);
-                download_component(&digd, plan.dry_run)?;
+                let outcome = download_component(&digd, plan.dry_run)?;
+                report.restart_required |= log_write_outcome(log, "digd", outcome);
                 if !plan.dry_run {
                     report.installed.push(digd.dest.clone());
                 }
@@ -1089,7 +1111,8 @@ fn run_report_gated(
         // decide-before-touch convention as digstore/dig-node/dig-dns above.
         let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
         if decision.action != update::UpdateAction::Skip {
-            download_component(&c, plan.dry_run)?;
+            let outcome = download_component(&c, plan.dry_run)?;
+            report.restart_required |= log_write_outcome(log, "dig-updater", outcome);
         } else {
             log("    · already up to date — skipping the download");
         }
@@ -1109,7 +1132,8 @@ fn run_report_gated(
             &plan.bin_dir_for("dig-updater-worker", target.os),
         )?;
         log_component(log, &worker);
-        download_component(&worker, plan.dry_run)?;
+        let outcome = download_component(&worker, plan.dry_run)?;
+        report.restart_required |= log_write_outcome(log, "dig-updater-worker", outcome);
         if !plan.dry_run {
             report.installed.push(worker.dest.clone());
         }
@@ -1152,7 +1176,7 @@ fn run_report_gated(
             ));
         }
         let outcome = download_component(&c, plan.dry_run)?;
-        log_write_outcome(log, "dig-relay", outcome);
+        report.restart_required |= log_write_outcome(log, "dig-relay", outcome);
         if !plan.dry_run {
             report.installed.push(c.dest.clone());
         }
@@ -1583,7 +1607,14 @@ fn log_readiness_verdict(report: &InstallReport, log: &mut dyn FnMut(&str)) {
         return;
     }
     if report.ready {
-        log("✓ DIG is ready.");
+        if report.restart_required {
+            // A reboot-deferred replace must NOT read as fully done (#562): the
+            // install succeeded but a locked binary's update applies only after
+            // a restart. Say so unmistakably at the final verdict.
+            log("✓ DIG is installed — RESTART REQUIRED to finish applying an update to a component that was running (its new version is staged for the next reboot).");
+        } else {
+            log("✓ DIG is ready.");
+        }
     } else {
         log("✗ DIG is NOT ready — the following component(s) failed:");
         for f in &report.failures {
@@ -3852,7 +3883,47 @@ mod tests {
             install_manifest: None,
             ready: true,
             failures: Vec::new(),
+            restart_required: false,
         }
+    }
+
+    #[test]
+    fn verdict_flags_restart_required_when_a_component_was_reboot_deferred() {
+        // #562: a ready install with a reboot-deferred replace must NOT read as
+        // fully done — the final verdict says RESTART REQUIRED, not "ready".
+        let mut report = report_shell();
+        report.ready = true;
+        report.restart_required = true;
+        let mut lines = Vec::new();
+        log_readiness_verdict(&report, &mut |l| lines.push(l.to_string()));
+        let out = lines.join("\n");
+        assert!(out.contains("RESTART REQUIRED"), "got: {out}");
+        assert!(!out.contains("DIG is ready."));
+    }
+
+    #[test]
+    fn verdict_says_ready_when_no_restart_needed() {
+        let mut report = report_shell();
+        report.ready = true;
+        report.restart_required = false;
+        let mut lines = Vec::new();
+        log_readiness_verdict(&report, &mut |l| lines.push(l.to_string()));
+        assert!(lines.join("\n").contains("✓ DIG is ready."));
+    }
+
+    #[test]
+    fn log_write_outcome_returns_true_only_for_reboot_deferred() {
+        let mut sink = |_: &str| {};
+        assert!(log_write_outcome(
+            &mut sink,
+            "dig-node",
+            download::WriteOutcome::ScheduledForReboot
+        ));
+        assert!(!log_write_outcome(
+            &mut sink,
+            "dig-node",
+            download::WriteOutcome::Replaced
+        ));
     }
 
     fn running_service() -> ServiceResult {
