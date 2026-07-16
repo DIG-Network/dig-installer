@@ -51,6 +51,7 @@ pub mod download;
 pub mod elevation;
 pub mod error;
 pub mod firewall;
+pub mod forcelist;
 pub mod health;
 pub mod hosts;
 pub mod manifest;
@@ -2158,6 +2159,59 @@ pub fn beacon_uninstall_json(result: &beacon::BeaconResult) -> String {
     serde_json::to_string(&envelope).expect("beacon uninstall envelope serializes")
 }
 
+/// Force-install the DIG extension into the given `selected` browsers (by slug
+/// id) for the tracked `channel` — the standalone entry point the GUI install
+/// pipeline and the `--set-ext-forcelist-channel` CLI verb call, and the write
+/// half of #612.
+///
+/// Resolves each selected browser to its per-OS managed-policy location for THIS
+/// host ([`browsers::policy_targets_for`]), then MERGES our single
+/// `ExtensionInstallForcelist` entry beside any pre-existing org forcelist
+/// ([`forcelist::apply`]). Marker-owned + idempotent. This writes to admin-only
+/// policy locations, so callers MUST run it only in the already-elevated
+/// context (#565) — it neither elevates nor reads any user-writable input.
+pub fn configure_extension_forcelist(
+    selected: &[String],
+    channel: forcelist::Channel,
+) -> Vec<forcelist::ForcelistOutcome> {
+    let os = Target::current().map(|t| t.os).unwrap_or(target::Os::Linux);
+    forcelist::apply(&browsers::policy_targets_for(os, selected), channel)
+}
+
+/// Remove ONLY the DIG extension's `ExtensionInstallForcelist` entry from the
+/// given `selected` browsers — the `--uninstall-ext-forcelist` verb + the
+/// force-install part of the full uninstall (#568). Leaves any pre-existing org
+/// forcelist untouched; idempotent + zero-residue.
+pub fn unconfigure_extension_forcelist(selected: &[String]) -> Vec<forcelist::ForcelistOutcome> {
+    let os = Target::current().map(|t| t.os).unwrap_or(target::Os::Linux);
+    forcelist::remove(&browsers::policy_targets_for(os, selected))
+}
+
+/// Switch the given `selected` browsers to `channel` as a clean per-browser
+/// reinstall ([`forcelist::reinstall`]) — remove then re-add, because a
+/// nightly build numerically outranks the matching stable and Chromium will not
+/// auto-downgrade across the channel boundary. The transition primitive the
+/// beacon-follow job (#613) drives; same elevated-context requirement as
+/// [`configure_extension_forcelist`].
+pub fn switch_extension_forcelist_channel(
+    selected: &[String],
+    channel: forcelist::Channel,
+) -> Vec<forcelist::ForcelistOutcome> {
+    let os = Target::current().map(|t| t.os).unwrap_or(target::Os::Linux);
+    forcelist::reinstall(&browsers::policy_targets_for(os, selected), channel)
+}
+
+/// The `--json` envelope for the forcelist verbs (`--set-ext-forcelist-channel`
+/// / `--uninstall-ext-forcelist`): `{"ok":true,"result":[<ForcelistOutcome>…]}`.
+/// `ok:false` only when a per-browser write reported [`forcelist::ForcelistAction::Failed`].
+pub fn forcelist_json(outcomes: &[forcelist::ForcelistOutcome]) -> String {
+    let ok = !outcomes
+        .iter()
+        .any(|o| o.action == forcelist::ForcelistAction::Failed);
+    let envelope = serde_json::json!({ "ok": ok, "result": outcomes });
+    serde_json::to_string(&envelope).expect("forcelist envelope serializes")
+}
+
 /// The full machine-readable invocation contract for `--help-json`: the
 /// component catalogue, supported targets, global/per-command flags, and the
 /// exit-code table. An agent introspects this instead of scraping `--help`.
@@ -2221,6 +2275,8 @@ pub fn help_json() -> String {
             { "flag": "--register-scheme", "description": "explicit (redundant) opt-in — the chia:// URL-scheme handler is registered by default" },
             { "flag": "--unregister-scheme", "description": "unregister the chia:// / urn: URL-scheme handler this installer created (idempotent); runs standalone, ignores every other flag" },
             { "flag": "--detect-browsers", "description": "list the installed Chromium-family browsers + their per-OS managed-extension-policy locations (read-only, #609); runs standalone, ignores every other flag; pair with --json for a machine result" },
+            { "flag": "--set-ext-forcelist-channel", "description": "force-install the DIG extension into every detected Chromium browser via its ExtensionInstallForcelist managed policy for CHANNEL (stable|nightly, default stable); a channel change is a clean per-browser reinstall (#613 downgrade rule); merges beside any org forcelist; requires elevation; runs standalone; pair with --json (#612)" },
+            { "flag": "--uninstall-ext-forcelist", "description": "remove ONLY the DIG extension's ExtensionInstallForcelist entry from every detected Chromium browser (idempotent, zero residue; never touches a pre-existing org forcelist); requires elevation; runs standalone (#612)" },
             { "flag": "--no-open-firewall", "description": "opt out of opening the app-scoped inbound firewall rule for dig-node's peer-RPC port (opened by default when dig-node is installed; #424)" },
             { "flag": "--open-firewall", "description": "explicit (redundant) opt-in — the firewall rule is opened by default" },
             { "flag": "--no-auto-update", "description": "opt out of installing + registering the DIG auto-update beacon (installed by default; #514)" },
@@ -3421,6 +3477,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forcelist_json_is_ok_when_no_write_failed() {
+        let outcomes = vec![forcelist::ForcelistOutcome {
+            location: r"SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist".to_string(),
+            action: forcelist::ForcelistAction::Wrote,
+            note: "added".to_string(),
+        }];
+        let v: serde_json::Value = serde_json::from_str(&forcelist_json(&outcomes)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"][0]["action"], "wrote");
+    }
+
+    #[test]
+    fn forcelist_json_is_not_ok_when_any_write_failed() {
+        let outcomes = vec![
+            forcelist::ForcelistOutcome {
+                location: "a".to_string(),
+                action: forcelist::ForcelistAction::Wrote,
+                note: String::new(),
+            },
+            forcelist::ForcelistOutcome {
+                location: "b".to_string(),
+                action: forcelist::ForcelistAction::Failed,
+                note: "denied".to_string(),
+            },
+        ];
+        let v: serde_json::Value = serde_json::from_str(&forcelist_json(&outcomes)).unwrap();
+        assert_eq!(v["ok"], false);
+    }
+
     // -- #492 elevation gate + #493 fail-loud readiness ----------------------
 
     /// A non-dry-run plan whose ONLY selected component is the dig-node service.
@@ -4352,4 +4438,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bin_dir);
     }
 }
-pub mod forcelist;

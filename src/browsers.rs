@@ -280,6 +280,26 @@ pub fn detect(os: Os, evidence: &Evidence) -> Vec<DetectedBrowser> {
         .collect()
 }
 
+/// Resolve the per-OS [`PolicyTarget`]s for a set of selected browser slug ids
+/// (the `selected_browsers` the GUI checklist (#611) rides), for the given `os`.
+///
+/// The forcelist writer (#612) consumes exactly this: it force-installs ONLY
+/// into browsers the user selected. PURE — a lookup over [`CATALOGUE`], so it
+/// needs no live probe. Unknown ids are silently ignored (a stale/foreign id can
+/// never widen the set of browsers written to), and the result preserves the
+/// caller's `selected` order.
+pub fn policy_targets_for(os: Os, selected: &[String]) -> Vec<PolicyTarget> {
+    selected
+        .iter()
+        .filter_map(|id| {
+            CATALOGUE
+                .iter()
+                .find(|spec| spec.id == id)
+                .map(|spec| spec.policy_target(os))
+        })
+        .collect()
+}
+
 /// The first confirmed-present path that identifies `spec` on `os`, if any.
 /// Pure helper feeding both the presence test and the reported `install_path`.
 fn matched_install_path(os: Os, spec: &BrowserSpec, evidence: &Evidence) -> Option<String> {
@@ -574,6 +594,33 @@ mod tests {
                 policy_key: r"SOFTWARE\Policies\Opera Software\Opera".to_string()
             }
         );
+    }
+
+    #[test]
+    fn policy_targets_for_resolves_only_selected_in_order_and_drops_unknown() {
+        let selected = vec![
+            "brave".to_string(),
+            "unknown-browser".to_string(),
+            "chrome".to_string(),
+        ];
+        let targets = policy_targets_for(Os::Linux, &selected);
+        // Unknown id dropped; selection order preserved (brave then chrome).
+        assert_eq!(
+            targets,
+            vec![
+                PolicyTarget::Linux {
+                    managed_policy_dir: "/etc/brave/policies/managed".to_string()
+                },
+                PolicyTarget::Linux {
+                    managed_policy_dir: "/etc/opt/chrome/policies/managed".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_targets_for_empty_selection_writes_nothing() {
+        assert!(policy_targets_for(Os::Windows, &[]).is_empty());
     }
 
     #[test]

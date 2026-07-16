@@ -379,6 +379,66 @@ contract the enterprise force-install writer (#612) consumes to decide which bro
 `ExtensionInstallForcelist` policy to write. In this step the pipeline only CARRIES the selection
 (and surfaces it in the install log); it writes no browser policy.
 
+### 1.9 `ExtensionInstallForcelist` force-install writer (#612)
+
+The installer force-installs the DIG Chromium extension into each selected browser by writing an
+`ExtensionInstallForcelist` entry into that browser's per-OS enterprise managed-policy surface, and
+removes ONLY that entry on uninstall. The written value is the canonical force-install pair
+`"<extension-id>;<update_url>"`:
+
+- **Extension id** = `mlibddmbhlgogepnjdienclhnkfpkfah` (compiled-in constant, pinned in the
+  `canonical` skill; derived from the extension signing key SPKI — MUST NOT drift). The id is the
+  SAME for both channels.
+- **`update_url`** = `https://updates.dig.net/ext/<channel>/updates.xml`, `<channel>` ∈
+  `stable` | `nightly` (compiled-in HTTPS constant, #608). No user or environment input flows into the
+  value — there is no injection surface.
+- **Channel** follows the tracked release channel; the **default is `stable`**.
+
+**Per-browser × OS policy locations** (the §1.7 `policy_target`):
+
+| OS | Location written |
+|----|------------------|
+| Windows | `HKLM\<policy_key>\ExtensionInstallForcelist` — numbered `REG_SZ` values (`"1"`, `"2"`, …), one per entry |
+| macOS | the per-bundle managed plist `/Library/Managed Preferences/<preferences_domain>.plist` |
+| Linux | a dedicated dig-owned file `<managed_policy_dir>/dig-extension-forcelist.json` (the OS policy union merges it) |
+
+Only browsers the user selected (`InstallOpts.selected_browsers`, §1.8) are written; absent browsers
+are skipped. A `policy_target` for a non-host OS is reported `skipped`, never written.
+
+**Security invariants (normative):**
+
+- **Never clobber a pre-existing org forcelist.** `ExtensionInstallForcelist` is a list. On Windows we
+  MERGE — our entry is added at the first free numbered slot beside any enterprise entries, and removal
+  deletes ONLY the value(s) whose data is ours; the subkey itself is never deleted. On Linux we drop a
+  uniquely-named dig-owned file the policy union merges, so nothing is clobbered. On macOS we write our
+  managed plist only when none exists for the domain or the existing one is ours; a non-DIG (MDM/org)
+  managed plist is left untouched and the outcome recommends MDM for a managed fleet (best-effort,
+  honest about MDM).
+- **Marker-owned.** On Windows/macOS the entry value itself is the marker — it begins with the
+  canonical extension id, which no other tool emits; on Linux the marker is the dedicated filename.
+  `remove` deletes only what carries the marker.
+- **Idempotent + no half-write.** Re-running with the same channel is a no-op (no duplicate entry); a
+  partial failure leaves no half-registered policy; removal is complete (zero residue).
+- **Channel-switch semantics = clean reinstall (not a rewrite).** The extension id is identical across
+  channels, and a nightly build (`X.Y.Z.N`) numerically OUTRANKS the matching stable `X.Y.Z`, so
+  repointing a nightly-installed browser at the stable `update_url` is a downgrade Chromium refuses to
+  auto-apply. A channel change is therefore performed as a per-browser REMOVE (the browser uninstalls
+  the extension) followed by a re-ADD at the new channel (a fresh install of that channel), not a value
+  rewrite. The `forcelist::reinstall` primitive supports this transition; the beacon-follow job (#613)
+  owns staging the remove and the re-add across policy-refresh cycles and the active-channel→update_url
+  mapping.
+- **Privileged-only.** Every target location (`HKLM`, `/etc`, `/Library/Managed Preferences`) is
+  admin-owned; the writes run only inside the already-gated elevated context (#565). The module neither
+  elevates on its own nor reads any user-writable input.
+
+**CLI (standalone actions):** `dig-installer --set-ext-forcelist-channel <stable|nightly>`
+force-installs into every DETECTED browser on the given channel (a channel change is a clean
+reinstall); `--uninstall-ext-forcelist` removes only the DIG entry from every detected browser. Both
+require elevation, run standalone (ignore every other install flag), and support `--json`, emitting
+`{ "ok": <bool>, "result": [ ForcelistOutcome, … ] }` (`ok:false` iff any per-browser write failed).
+`ForcelistOutcome` = `{ location, action, note }` where `action` ∈ `wrote | already-present | updated
+| removed | nothing-to-remove | skipped | failed`.
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/

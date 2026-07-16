@@ -223,6 +223,23 @@ struct Cli {
     /// result. Runs standalone — ignores every other install flag.
     #[arg(long = "detect-browsers")]
     detect_browsers: bool,
+
+    /// Force-install the DIG extension into every DETECTED Chromium browser by
+    /// writing its `ExtensionInstallForcelist` managed policy for the given
+    /// channel (`stable` — the default — or `nightly`), then exit (#612). A
+    /// channel change is performed as a clean per-browser reinstall (a nightly
+    /// build outranks stable, so a naive rewrite would not downgrade). Merges
+    /// beside any org forcelist; requires elevation. Use `--json` for a machine
+    /// result. Runs standalone — ignores every other install flag.
+    #[arg(long = "set-ext-forcelist-channel", value_name = "CHANNEL")]
+    set_ext_forcelist_channel: Option<String>,
+
+    /// Remove ONLY the DIG extension's `ExtensionInstallForcelist` entry from
+    /// every detected Chromium browser (idempotent, zero residue; never touches
+    /// a pre-existing org forcelist), then exit (#612). Requires elevation.
+    /// Runs standalone.
+    #[arg(long = "uninstall-ext-forcelist")]
+    uninstall_ext_forcelist: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -264,6 +281,14 @@ fn main() -> std::process::ExitCode {
 
     if cli.detect_browsers {
         return run_detect_browsers(cli.json);
+    }
+
+    if let Some(channel) = cli.set_ext_forcelist_channel.as_deref() {
+        return run_set_ext_forcelist_channel(channel, cli.json);
+    }
+
+    if cli.uninstall_ext_forcelist {
+        return run_uninstall_ext_forcelist(cli.json);
     }
 
     if cli.uninstall_dig_dns {
@@ -425,6 +450,65 @@ fn run_detect_browsers(json: bool) -> std::process::ExitCode {
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// Detected-browser slug ids for the standalone forcelist verbs — the CLI has
+/// no GUI selection, so it targets every Chromium browser found on the host.
+fn detected_browser_ids() -> Vec<String> {
+    dig_installer::browsers::detect_installed()
+        .into_iter()
+        .map(|b| b.id)
+        .collect()
+}
+
+/// Emit the shared JSON/pretty result of a forcelist verb + map its exit code
+/// (non-success iff any per-browser write failed).
+fn report_forcelist(
+    verb: &str,
+    outcomes: &[dig_installer::forcelist::ForcelistOutcome],
+    json: bool,
+) -> std::process::ExitCode {
+    let any_failed = outcomes
+        .iter()
+        .any(|o| o.action == dig_installer::forcelist::ForcelistAction::Failed);
+    if json {
+        println!("{}", dig_installer::forcelist_json(outcomes));
+    } else if outcomes.is_empty() {
+        println!("{verb}: no Chromium-family browsers detected");
+    } else {
+        println!("{verb}:");
+        for o in outcomes {
+            println!("  - {:?} · {} · {}", o.action, o.location, o.note);
+        }
+        if any_failed {
+            eprintln!("hint: re-run in an elevated (Administrator/root) console");
+        }
+    }
+    if any_failed {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+/// `--set-ext-forcelist-channel <nightly|stable>`: force-install the DIG
+/// extension into every detected Chromium browser on the given channel (#612).
+/// A channel change is a clean per-browser reinstall (#613 downgrade rule).
+fn run_set_ext_forcelist_channel(channel: &str, json: bool) -> std::process::ExitCode {
+    let Some(channel) = dig_installer::forcelist::Channel::parse(channel) else {
+        eprintln!("invalid channel {channel:?} — expected 'stable' or 'nightly'");
+        return std::process::ExitCode::FAILURE;
+    };
+    let outcomes =
+        dig_installer::switch_extension_forcelist_channel(&detected_browser_ids(), channel);
+    report_forcelist("set ext forcelist channel", &outcomes, json)
+}
+
+/// `--uninstall-ext-forcelist`: remove ONLY the DIG forcelist entry from every
+/// detected Chromium browser (#612), leaving any org forcelist untouched.
+fn run_uninstall_ext_forcelist(json: bool) -> std::process::ExitCode {
+    let outcomes = dig_installer::unconfigure_extension_forcelist(&detected_browser_ids());
+    report_forcelist("uninstall ext forcelist", &outcomes, json)
 }
 
 /// `--uninstall-dig-dns`: tear down the dig-dns OS service + OS wiring this
