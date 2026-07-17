@@ -27,9 +27,24 @@ impl Repo {
         }
     }
 
-    /// The canonical digstore CLI release source.
-    pub fn digstore() -> Repo {
-        Repo::new("DIG-Network", "digstore", "digstore")
+    /// The canonical dig-store CLI release source.
+    ///
+    /// The repo was renamed `digstore` → `dig-store` (epic #703) and its release
+    /// assets now carry the `dig-store-*` stem. The GitHub repo redirect keeps the
+    /// old `DIG-Network/digstore` URL working, but the ASSET STEM changed, so a
+    /// release that only has the pre-rename `digstore-*` assets is resolved via
+    /// [`Repo::dig_store_legacy`] instead — mirroring [`Repo::dig_node`] /
+    /// [`Repo::dig_node_legacy`].
+    pub fn dig_store() -> Repo {
+        Repo::new("DIG-Network", "dig-store", "dig-store")
+    }
+
+    /// Pre-rename dig-store source: the new repo name (its redirect also covers
+    /// the old `digstore` URL) but the OLD asset stem `digstore`. Used as a
+    /// fallback so the installer keeps resolving a release that was cut before the
+    /// asset rename landed.
+    pub fn dig_store_legacy() -> Repo {
+        Repo::new("DIG-Network", "dig-store", "digstore")
     }
 
     /// The canonical dig-node release source.
@@ -102,15 +117,16 @@ impl Repo {
     }
 
     /// The `digs` alias binary's release source (issue #434): `digs <args>`
-    /// behaves IDENTICALLY to `digstore <args>` (same entrypoint, digstore's
+    /// behaves IDENTICALLY to `dig-store <args>` (same entrypoint, dig-store's
     /// `SPEC.md` § "CLI binaries") and is published in the **SAME**
-    /// `DIG-Network/digstore` release as the `digstore` CLI, under its own
+    /// `DIG-Network/dig-store` release as the `dig-store` CLI, under its own
     /// asset stem (`digs-<ver>-<os_arch>[.exe]` — byte-for-byte the same shape
-    /// as `digstore-<ver>-<os_arch>[.exe]`). Same owner/repo as
-    /// [`Repo::digstore`], only the stem differs, so it resolves via the SAME
-    /// [`crate::asset::select_asset`] matcher with zero new matcher logic.
+    /// as `dig-store-<ver>-<os_arch>[.exe]`). Same owner/repo as
+    /// [`Repo::dig_store`], only the stem differs, so it resolves via the SAME
+    /// [`crate::asset::select_asset`] matcher with zero new matcher logic. The
+    /// `digs` stem is unchanged by the #703 rename, so it needs no legacy fallback.
     pub fn digs() -> Repo {
-        Repo::new("DIG-Network", "digstore", "digs")
+        Repo::new("DIG-Network", "dig-store", "digs")
     }
 
     /// The `dign` alias binary's release source (issue #548): `dign <args>`
@@ -223,8 +239,12 @@ mod tests {
     #[test]
     fn canonical_repos() {
         assert_eq!(
-            Repo::digstore(),
-            Repo::new("DIG-Network", "digstore", "digstore")
+            Repo::dig_store(),
+            Repo::new("DIG-Network", "dig-store", "dig-store")
+        );
+        assert_eq!(
+            Repo::dig_store_legacy(),
+            Repo::new("DIG-Network", "dig-store", "digstore")
         );
         assert_eq!(
             Repo::dig_node(),
@@ -246,7 +266,7 @@ mod tests {
             Repo::dig_dns(),
             Repo::new("DIG-Network", "dig-dns", "dig-dns")
         );
-        assert_eq!(Repo::digs(), Repo::new("DIG-Network", "digstore", "digs"));
+        assert_eq!(Repo::digs(), Repo::new("DIG-Network", "dig-store", "digs"));
         assert_eq!(Repo::dign(), Repo::new("DIG-Network", "dig-node", "dign"));
         assert_eq!(Repo::digd(), Repo::new("DIG-Network", "dig-dns", "digd"));
         assert_eq!(
@@ -287,28 +307,48 @@ mod tests {
     }
 
     #[test]
-    fn digs_shares_the_digstore_repo_with_its_own_stem() {
-        // digs (issue #434) is published in the SAME digstore release, just under
-        // a different asset stem — same owner/name as Repo::digstore().
+    fn digs_shares_the_dig_store_repo_with_its_own_stem() {
+        // digs (issue #434) is published in the SAME dig-store release, just under
+        // a different asset stem — same owner/name as Repo::dig_store().
         let digs = Repo::digs();
-        let digstore = Repo::digstore();
-        assert_eq!(digs.owner, digstore.owner);
-        assert_eq!(digs.name, digstore.name);
+        let dig_store = Repo::dig_store();
+        assert_eq!(digs.owner, dig_store.owner);
+        assert_eq!(digs.name, dig_store.name);
         assert_eq!(digs.stem, "digs");
     }
 
     #[test]
     fn digs_binary_url_matches_published_asset_naming() {
-        // digstore's release.yml publishes digs-<ver>-<os_arch>[.exe] alongside
-        // digstore-<ver>-<os_arch>[.exe] in the SAME release — the installer must
-        // build the same URL shape, against the digstore repo, to resolve it.
+        // dig-store's release.yml publishes digs-<ver>-<os_arch>[.exe] alongside
+        // dig-store-<ver>-<os_arch>[.exe] in the SAME release — the installer must
+        // build the same URL shape, against the dig-store repo, to resolve it.
         assert_eq!(
             Repo::digs().binary_url("v0.6.0", "0.6.0", &lin()),
-            "https://github.com/DIG-Network/digstore/releases/download/v0.6.0/digs-0.6.0-linux-x64"
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.6.0/digs-0.6.0-linux-x64"
         );
         assert_eq!(
             Repo::digs().binary_url("v0.6.0", "0.6.0", &win()),
-            "https://github.com/DIG-Network/digstore/releases/download/v0.6.0/digs-0.6.0-windows-x64.exe"
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.6.0/digs-0.6.0-windows-x64.exe"
+        );
+    }
+
+    #[test]
+    fn dig_store_resolves_the_renamed_asset_stem() {
+        // Post-#703 the CLI asset is dig-store-<ver>-<os_arch>[.exe].
+        assert_eq!(
+            Repo::dig_store().binary_url("v0.14.0", "0.14.0", &lin()),
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.14.0/dig-store-0.14.0-linux-x64"
+        );
+    }
+
+    #[test]
+    fn dig_store_legacy_resolves_the_pre_rename_asset_stem() {
+        // The transitional fallback keeps the old digstore-<ver> asset resolvable
+        // via the (redirecting) repo, so a release cut before the asset rename
+        // still installs.
+        assert_eq!(
+            Repo::dig_store_legacy().binary_url("v0.13.0", "0.13.0", &win()),
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.13.0/digstore-0.13.0-windows-x64.exe"
         );
     }
 
@@ -401,8 +441,8 @@ mod tests {
     #[test]
     fn latest_release_api_url() {
         assert_eq!(
-            Repo::digstore().latest_release_api(),
-            "https://api.github.com/repos/DIG-Network/digstore/releases/latest"
+            Repo::dig_store().latest_release_api(),
+            "https://api.github.com/repos/DIG-Network/dig-store/releases/latest"
         );
     }
 
@@ -417,28 +457,28 @@ mod tests {
     #[test]
     fn release_by_tag_api_url() {
         assert_eq!(
-            Repo::digstore().release_by_tag_api("v0.6.0"),
-            "https://api.github.com/repos/DIG-Network/digstore/releases/tags/v0.6.0"
+            Repo::dig_store().release_by_tag_api("v0.6.0"),
+            "https://api.github.com/repos/DIG-Network/dig-store/releases/tags/v0.6.0"
         );
     }
 
     #[test]
     fn asset_download_url_uses_tag_verbatim() {
         assert_eq!(
-            Repo::digstore().asset_download_url("v0.6.0", "digstore-0.6.0-linux-x64"),
-            "https://github.com/DIG-Network/digstore/releases/download/v0.6.0/digstore-0.6.0-linux-x64"
+            Repo::dig_store().asset_download_url("v0.6.0", "dig-store-0.6.0-linux-x64"),
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.6.0/dig-store-0.6.0-linux-x64"
         );
     }
 
     #[test]
     fn binary_url_composes_tag_and_target_asset() {
         assert_eq!(
-            Repo::digstore().binary_url("v0.6.0", "0.6.0", &lin()),
-            "https://github.com/DIG-Network/digstore/releases/download/v0.6.0/digstore-0.6.0-linux-x64"
+            Repo::dig_store().binary_url("v0.6.0", "0.6.0", &lin()),
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.6.0/dig-store-0.6.0-linux-x64"
         );
         assert_eq!(
-            Repo::digstore().binary_url("v0.6.0", "0.6.0", &win()),
-            "https://github.com/DIG-Network/digstore/releases/download/v0.6.0/digstore-0.6.0-windows-x64.exe"
+            Repo::dig_store().binary_url("v0.6.0", "0.6.0", &win()),
+            "https://github.com/DIG-Network/dig-store/releases/download/v0.6.0/dig-store-0.6.0-windows-x64.exe"
         );
     }
 

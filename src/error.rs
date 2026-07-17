@@ -388,10 +388,10 @@ mod tests {
     #[test]
     fn error_carries_code_message_and_hint() {
         let e = InstallError::asset_not_found("no asset for linux-x64")
-            .with_hint("pin a version with --digstore-version");
+            .with_hint("pin a version with --dig-store-version");
         assert_eq!(e.code(), "ASSET_NOT_FOUND");
         assert_eq!(e.exit_code(), 3);
         assert_eq!(e.message(), "no asset for linux-x64");
-        assert_eq!(e.hint(), Some("pin a version with --digstore-version"));
+        assert_eq!(e.hint(), Some("pin a version with --dig-store-version"));
     }
 }

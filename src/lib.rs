@@ -3,7 +3,7 @@
 //! It bundles nothing. At install time it resolves, per host OS/arch, the LATEST
 //! GitHub release asset for each selected component and downloads it:
 //!
-//! * the **digstore CLI** (`DIG-Network/digstore`) → placed on PATH, along with
+//! * the **dig-store CLI** (`DIG-Network/dig-store`) → placed on PATH, along with
 //!   its **`digs` alias binary** (issue #434) — published in the SAME digstore
 //!   release under a separate asset stem, installed alongside digstore in the
 //!   same bin dir (no separate flag or PATH entry),
@@ -26,7 +26,7 @@
 //!   browser-policy wiring directly (see [`dns`]), self-verifying with
 //!   `dig-dns doctor` when done.
 //!
-//! Each component is selectable (`--with-digstore`/`--with-dig-node`/
+//! Each component is selectable (`--with-dig-store`/`--with-dig-node`/
 //! `--with-browser`/`--with-dig-dns`/`--service`) with a pinnable per-artifact version override,
 //! and every download is integrity-checked. The asset for a release is resolved
 //! from the release's *actual* asset list ([`asset::select_asset`]) rather than a
@@ -84,7 +84,7 @@ use target::Target;
 pub struct InstallPlan {
     /// Directory to place the downloaded binaries in.
     pub bin_dir: PathBuf,
-    /// Install the digstore CLI (default true — part of the universal 3-component
+    /// Install the dig-store CLI (default true — part of the universal 3-component
     /// stack, #301). Also gates the `digs` alias binary (issue #434), which has
     /// no flag of its own and installs/uninstalls alongside digstore.
     pub with_digstore: bool,
@@ -190,7 +190,7 @@ impl InstallPlan {
         let places_a_binary = self.with_digstore || self.with_browser;
         places_a_binary
             && !self.has_custom_bin_dir()
-            && self.bin_dir_for("digstore", os) == paths::protected_bin_dir()
+            && self.bin_dir_for("dig-store", os) == paths::protected_bin_dir()
     }
 
     /// The directory a given `component` is installed into on `os` (#565).
@@ -282,7 +282,7 @@ impl InstallPlan {
     fn selected_components(&self) -> Vec<&'static str> {
         let mut c = Vec::new();
         if self.with_digstore {
-            c.extend(["digstore", "digs"]);
+            c.extend(["dig-store", "digs"]);
         }
         if self.with_dig_node {
             c.extend(["dig-node", "dign"]);
@@ -598,7 +598,7 @@ fn resolve_component(
         asset,
         url,
         dest: dest.to_string_lossy().into_owned(),
-        // The tracked call sites (digstore/dig-node/dig-dns in `run_report_gated`)
+        // The tracked call sites (dig-store/dig-node/dig-dns in `run_report_gated`)
         // overwrite these with a real `update::decide` verdict; every other
         // caller (digs, dig-relay, the DIG Browser) keeps this default, which
         // matches their existing always-fresh-download behavior.
@@ -610,7 +610,7 @@ fn resolve_component(
 /// Detect what's already at a resolved component's destination, decide
 /// Install/Update/Skip against the version just resolved (issue #309), log
 /// the decision, and record it onto the [`ComponentResult`] (`update_action`/
-/// `previous_version`) so the caller — the digstore/dig-node/dig-dns sections
+/// `previous_version`) so the caller — the dig-store/dig-node/dig-dns sections
 /// of [`run_report_gated`] — can gate the rest of its lifecycle (the
 /// download, the #232 stop/replace/restart) on one source of truth. Detection
 /// is read-only (`update::detect_installed_version`), so this is safe to call
@@ -727,7 +727,7 @@ fn run_report_gated(
     // with NO partial state. Rejects running as LocalSystem/SYSTEM (#499 — a
     // SYSTEM token breaks the GUI + lands state in the wrong profile) AND an
     // un-elevated run (#492). Only enforced when the plan actually needs
-    // elevation (registers a service / writes hosts); a dry-run or digstore-only
+    // elevation (registers a service / writes hosts); a dry-run or dig-store-only
     // run does not trip it.
     if plan.requires_elevation(target.os) {
         elevation::guard(is_elevated(), elevation::is_system(), &target)?;
@@ -803,21 +803,20 @@ fn run_report_gated(
             report.daemon_dirs = daemon_dir::ensure(target.os, plan.dry_run, log);
         }
 
-        // 1. digstore CLI + its `digs` alias binary (issue #434). `digs` is
-        //    published in the SAME digstore release under its own asset stem
-        //    (`digs-<ver>-<os_arch>[.exe]`) and behaves identically to `digstore`;
-        //    it is resolved/downloaded exactly like digstore — same version pin,
+        // 1. dig-store CLI + its `digs` alias binary (issue #434). `digs` is
+        //    published in the SAME dig-store release under its own asset stem
+        //    (`digs-<ver>-<os_arch>[.exe]`) and behaves identically to `dig-store`;
+        //    it is resolved/downloaded exactly like dig-store — same version pin,
         //    same bin dir (so no separate PATH entry is needed) — and follows the
         //    same `with_digstore`/`digstore_version` flags (it has none of its own).
         if plan.with_digstore {
-            log("Installing the digstore CLI:");
-            let mut c = resolve_component(
+            log("Installing the dig-store CLI:");
+            let mut c = resolve_dig_store(
                 resolve,
-                &Repo::digstore(),
                 &plan.digstore_version,
                 &target,
-                AssetKind::RawBinary,
-                &plan.bin_dir_for("digstore", target.os),
+                &plan.bin_dir_for("dig-store", target.os),
+                log,
             )?;
             log_component(log, &c);
             // #309 version-aware updater: detect what's already at this
@@ -826,7 +825,7 @@ fn run_report_gated(
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
             if decision.action != update::UpdateAction::Skip {
                 let outcome = download_component(&c, plan.dry_run)?;
-                report.restart_required |= log_write_outcome(log, "digstore", outcome);
+                report.restart_required |= log_write_outcome(log, "dig-store", outcome);
             } else {
                 log("    · already up to date — skipping the download");
             }
@@ -835,7 +834,7 @@ fn run_report_gated(
             }
             report.components.push(c);
 
-            log("Installing the digs alias (same digstore CLI, published as a separate binary):");
+            log("Installing the digs alias (same dig-store CLI, published as a separate binary):");
             let digs = resolve_component(
                 resolve,
                 &Repo::digs(),
@@ -1020,7 +1019,7 @@ fn run_report_gated(
                 Ok(mut c) => {
                     log_component(log, &c);
                     // #309 version-aware updater — same decide-before-touch
-                    // convention as digstore/dig-node above. `register_dig_dns`
+                    // convention as dig-store/dig-node above. `register_dig_dns`
                     // reuses `dns::verify_existing` (a read-only re-check) rather
                     // than the full clean-reinstall path when Skip.
                     let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
@@ -1154,7 +1153,7 @@ fn run_report_gated(
             )?;
             log_component(log, &c);
             // #309 version-aware updater, extended to the beacon (#514): same
-            // decide-before-touch convention as digstore/dig-node/dig-dns above.
+            // decide-before-touch convention as dig-store/dig-node/dig-dns above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
             if decision.action != update::UpdateAction::Skip {
                 let outcome = download_component(&c, plan.dry_run)?;
@@ -1565,10 +1564,10 @@ fn register_scheme_handler(
 }
 
 /// The user-facing DIG CLIs that MUST be runnable by bare name after install
-/// (#496): the digstore CLI + the two node/dns CLIs a user drives directly
+/// (#496): the dig-store CLI + the two node/dns CLIs a user drives directly
 /// (e.g. `dig-node pair approve <id>`). dig-relay is a background service (no
 /// user CLI surface required); the DIG Browser is a GUI installer.
-const REQUIRED_CLIS: &[&str] = &["digstore", "dig-node", "dig-dns"];
+const REQUIRED_CLIS: &[&str] = &["dig-store", "dig-node", "dig-dns"];
 
 /// Verify each installed required CLI resolves by bare name on the post-install
 /// PATH (#496) and record the result into `report.cli_path_checks`. Only checks
@@ -1984,6 +1983,67 @@ fn register_dig_dns(
     result
 }
 
+/// Resolve the dig-store CLI, falling back to the pre-rename `dig-store-*` asset
+/// stem if the release only carries the old-named assets (epic #703). The repo
+/// redirect covers the URL, but the asset STEM changed (`dig-store-*` →
+/// `dig-store-*`), so this tries the new stem first and the legacy stem second —
+/// mirroring [`resolve_dig_node`]. Either way the on-PATH binary is normalized to
+/// `dig-store` so the component id + install path stay consistent.
+fn resolve_dig_store(
+    resolve: &ReleaseResolver<'_>,
+    requested: &Option<String>,
+    target: &Target,
+    bin_dir: &std::path::Path,
+    log: &mut dyn FnMut(&str),
+) -> Result<ComponentResult, InstallError> {
+    // The asset matcher only *prefers* the queried stem — it does not require it
+    // — so against a pre-rename release (which carries `digstore-*`/`digs-*` but
+    // no `dig-store-*`) a query for stem `dig-store` would soft-match the wrong
+    // binary. Accept the primary result only when it truly resolved a
+    // `dig-store-*` asset; otherwise fall through to the legacy stem.
+    let primary = resolve_component(
+        resolve,
+        &Repo::dig_store(),
+        requested,
+        target,
+        AssetKind::RawBinary,
+        bin_dir,
+    );
+    match primary {
+        Ok(c) if c.asset.starts_with("dig-store") => Ok(c),
+        primary => {
+            log("    (no dig-store-* asset; trying the pre-rename digstore asset stem…)");
+            // The legacy stem is `digstore`; normalize the on-PATH name back to
+            // dig-store so the component id + later use stay consistent.
+            match resolve_component(
+                resolve,
+                &Repo::dig_store_legacy(),
+                requested,
+                target,
+                AssetKind::RawBinary,
+                bin_dir,
+            ) {
+                Ok(mut c) => {
+                    c.component = "dig-store".to_string();
+                    c.dest = bin_dir
+                        .join(target.exe_name("dig-store"))
+                        .to_string_lossy()
+                        .into_owned();
+                    Ok(c)
+                }
+                // The legacy stem also failed. Prefer the primary dig-store error
+                // (the current name) when there was one; a soft-matched-but-wrong
+                // primary means the release has neither CLI asset, so surface the
+                // legacy miss.
+                Err(legacy) => match primary {
+                    Ok(_) => Err(legacy),
+                    Err(primary_err) => Err(primary_err),
+                },
+            }
+        }
+    }
+}
+
 /// Resolve dig-node, falling back to the pre-rename `dig-companion` release if
 /// the renamed repo has no matching release yet.
 fn resolve_dig_node(
@@ -2229,7 +2289,7 @@ const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// the same [`Target::exe_name`] convention `register_dig_node` uses) and runs
 /// its own `uninstall` subcommand, then removes the hosts entry, then removes
 /// the firewall rule (idempotent — a declined/absent rule is a clean no-op).
-/// Never touches the digstore/browser/relay/dig-dns installs. Never
+/// Never touches the dig-store/browser/relay/dig-dns installs. Never
 /// panics/aborts — a failure (missing binary, needs elevation) is recorded in
 /// the result, always with a clear `note` (never silent).
 pub fn uninstall_dig_node(
@@ -2325,7 +2385,7 @@ pub fn uninstall_dig_node(
 /// locates the `dig-updater` binary a prior `--auto-update` run placed at
 /// `bin_dir` (the same [`Target::exe_name`] convention every tracked component
 /// uses) and delegates to its own `schedule uninstall` verb. Never touches the
-/// digstore/dig-node/dig-dns/relay/browser installs, and never deletes the
+/// dig-store/dig-node/dig-dns/relay/browser installs, and never deletes the
 /// downloaded binaries themselves — only the scheduler registration. Never
 /// returns an error — a missing binary or elevation issue is recorded in the
 /// result's `note`, mirroring every other uninstall action in this crate.
@@ -2844,12 +2904,12 @@ pub fn help_json() -> String {
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": SCHEMA_VERSION,
         "description": "Universal DIG installer: by default installs the full DIG stack (the \
-    digstore CLI + the dig-node boot-start service + the dig-dns boot-start service) in one run, \
+    dig-store CLI + the dig-node boot-start service + the dig-dns boot-start service) in one run, \
     resolving + downloading the latest per-OS/arch release asset for each. dig-relay and the DIG \
     Browser are opt-in.",
         "components": [
-            { "id": "digstore", "repo": "DIG-Network/digstore", "default": true, "flag": "--no-digstore disables", "kind": "raw_binary" },
-            { "id": "digs", "repo": "DIG-Network/digstore", "default": true, "flag": "alias of digstore — no separate flag; follows --no-digstore/--with-digstore/--digstore-version", "kind": "raw_binary_alias" },
+            { "id": "dig-store", "repo": "DIG-Network/dig-store", "default": true, "flag": "--no-dig-store disables", "kind": "raw_binary" },
+            { "id": "digs", "repo": "DIG-Network/dig-store", "default": true, "flag": "alias of dig-store — no separate flag; follows --no-dig-store/--with-dig-store/--dig-store-version", "kind": "raw_binary_alias" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dign", "repo": "DIG-Network/dig-node", "default": true, "flag": "alias of dig-node — no separate flag; follows --no-dig-node/--with-dig-node/--dig-node-version", "kind": "raw_binary_alias" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
@@ -2868,15 +2928,15 @@ pub fn help_json() -> String {
         ],
         "flags": [
             { "flag": "--bin-dir", "value": "DIR", "description": "where to place binaries" },
-            { "flag": "--no-digstore", "description": "opt out of the digstore CLI (installed by default)" },
-            { "flag": "--with-digstore", "description": "explicit (redundant) opt-in — digstore installs by default" },
-            { "flag": "--digstore-version", "value": "VERSION", "description": "pin digstore version (default: latest)" },
+            { "flag": "--no-dig-store", "description": "opt out of the dig-store CLI (installed by default)" },
+            { "flag": "--with-dig-store", "description": "explicit (redundant) opt-in — dig-store installs by default" },
+            { "flag": "--dig-store-version", "value": "VERSION", "description": "pin dig-store version (default: latest)" },
             { "flag": "--no-dig-node", "description": "opt out of the dig-node local node + service (installed by default)" },
             { "flag": "--with-dig-node", "alias": "--service", "description": "explicit (redundant) opt-in — dig-node installs + starts as a boot-start service by default" },
             { "flag": "--dig-node-version", "value": "VERSION", "description": "pin dig-node version (default: latest)" },
             { "flag": "--dig-node-port", "value": "PORT", "default": dig_constants::DIG_NODE_PORT, "description": "loopback port for the dig-node service" },
             { "flag": "--no-service-start", "description": "install the service(s) but do not start them (still registered boot-start)" },
-            { "flag": "--uninstall-dig-node", "description": "uninstall the dig-node OS service + remove the dig.local hosts entry + remove the firewall rule this installer created (idempotent; does not touch the digstore/browser/relay/dig-dns installs)" },
+            { "flag": "--uninstall-dig-node", "description": "uninstall the dig-node OS service + remove the dig.local hosts entry + remove the firewall rule this installer created (idempotent; does not touch the dig-store/browser/relay/dig-dns installs)" },
             { "flag": "--with-browser", "description": "download the DIG Browser native installer (opt-in)" },
             { "flag": "--browser-version", "value": "VERSION", "description": "pin DIG Browser version (default: latest)" },
             { "flag": "--with-relay", "description": "install + start dig-relay as a service (run-your-own-relay; advanced, opt-in — the default node uses relay.dig.net)" },
@@ -2899,12 +2959,12 @@ pub fn help_json() -> String {
             { "flag": "--no-auto-update", "description": "opt out of installing + registering the DIG auto-update beacon (installed by default; #514)" },
             { "flag": "--auto-update", "description": "explicit (redundant) opt-in — the auto-update beacon is installed by default" },
             { "flag": "--dig-updater-version", "value": "VERSION", "description": "pin the auto-update beacon's version (default: latest)" },
-            { "flag": "--uninstall-dig-updater", "description": "remove the auto-update beacon's daily scheduler registration this installer created (idempotent; does not remove the downloaded binaries or touch the digstore/browser/relay/dig-node/dig-dns installs)" },
-            { "flag": "--force-reinstall", "description": "reinstall digstore/dig-node/dig-dns/dig-updater even if `update_policy` would otherwise skip them as already up to date (#309)" }
+            { "flag": "--uninstall-dig-updater", "description": "remove the auto-update beacon's daily scheduler registration this installer created (idempotent; does not remove the downloaded binaries or touch the dig-store/browser/relay/dig-node/dig-dns installs)" },
+            { "flag": "--force-reinstall", "description": "reinstall dig-store/dig-node/dig-dns/dig-updater even if `update_policy` would otherwise skip them as already up to date (#309)" }
         ],
         "update_policy": {
-            "description": "Every run detects what's already installed for digstore/dig-node/dig-dns/dig-updater (`<bin> --version`), compares it to the release just resolved, and decides per component: absent -> install, an older or unreadable installed version -> update (replace it, reusing the §2 stop/replace/restart lifecycle for the service components), already current (or newer than the latest release) -> skip. A bare re-run is therefore idempotent: it updates only what's outdated and leaves the rest untouched. `--force-reinstall` overrides a skip decision back to update.",
-            "components": ["digstore", "dig-node", "dig-dns", "dig-updater"],
+            "description": "Every run detects what's already installed for dig-store/dig-node/dig-dns/dig-updater (`<bin> --version`), compares it to the release just resolved, and decides per component: absent -> install, an older or unreadable installed version -> update (replace it, reusing the §2 stop/replace/restart lifecycle for the service components), already current (or newer than the latest release) -> skip. A bare re-run is therefore idempotent: it updates only what's outdated and leaves the rest untouched. `--force-reinstall` overrides a skip decision back to update.",
+            "components": ["dig-store", "dig-node", "dig-dns", "dig-updater"],
             "actions": ["install", "update", "skip"],
             "force_flag": "--force-reinstall"
         },
@@ -2975,10 +3035,10 @@ mod tests {
         // Names cover all four OS/arch slugs + the browser installers, so the
         // asset matcher finds a match whatever host the test runs on.
         let digstore: Vec<&'static str> = vec![
-            "digstore-0.6.0-windows-x64.exe",
-            "digstore-0.6.0-linux-x64",
-            "digstore-0.6.0-macos-arm64",
-            "digstore-0.6.0-macos-x64",
+            "dig-store-0.6.0-windows-x64.exe",
+            "dig-store-0.6.0-linux-x64",
+            "dig-store-0.6.0-macos-arm64",
+            "dig-store-0.6.0-macos-x64",
             // `digs` (issue #434) is published in the SAME digstore release,
             // under its own stem — see digstore's release.yml.
             "digs-0.6.0-windows-x64.exe",
@@ -3022,7 +3082,7 @@ mod tests {
             "digd-0.6.0-macos-x64",
         ];
         // The beacon (#514) and its dig-updater-worker sibling publish from the
-        // SAME repo (`dig-updater`), so — exactly like digstore/digs above —
+        // SAME repo (`dig-updater`), so — exactly like dig-store/digs above —
         // both asset stems live under ONE map entry keyed by the repo name.
         let updater: Vec<&'static str> = vec![
             "dig-updater-0.6.0-windows-x64.exe",
@@ -3035,7 +3095,7 @@ mod tests {
             "dig-updater-worker-0.6.0-macos-x64",
         ];
         let mut m = HashMap::new();
-        m.insert("digstore", ("v0.6.0", digstore));
+        m.insert("dig-store", ("v0.6.0", digstore));
         m.insert("dig-node", ("v0.2.0", node));
         m.insert("dig-relay", ("v0.1.0", relay));
         m.insert("DIG_Browser", ("v1.0.0", browser));
@@ -3148,7 +3208,7 @@ mod tests {
     }
 
     /// #301 (universal installer): a bare install with no opt-out flags installs
-    /// the FULL DIG stack — the digstore CLI, the dig-node service, the
+    /// the FULL DIG stack — the dig-store CLI, the dig-node service, the
     /// dig-dns service, AND the auto-update beacon (#514) — in one run.
     /// `InstallPlan::default()` is the single source of truth for that
     /// default; `main.rs` maps the `--no-<component>` opt-outs onto it.
@@ -3193,7 +3253,7 @@ mod tests {
             .iter()
             .map(|c| c.component.as_str())
             .collect();
-        assert!(names.contains(&"digstore"), "digstore in default plan");
+        assert!(names.contains(&"dig-store"), "digstore in default plan");
         assert!(names.contains(&"dig-node"), "dig-node in default plan");
         assert!(names.contains(&"dig-dns"), "dig-dns in default plan");
         assert!(
@@ -3231,7 +3291,7 @@ mod tests {
                 .as_bool()
                 .unwrap()
         };
-        assert!(by_id("digstore"), "digstore default: true");
+        assert!(by_id("dig-store"), "digstore default: true");
         assert!(by_id("dig-node"), "dig-node default: true (#301)");
         assert!(by_id("dig-dns"), "dig-dns default: true (#301)");
         assert!(by_id("dig-updater"), "dig-updater default: true (#514)");
@@ -3377,13 +3437,13 @@ mod tests {
         let report = run_dry(&plan, all_releases()).expect("digstore resolves");
         assert_eq!(report.components.len(), 2);
         let c = &report.components[0];
-        assert_eq!(c.component, "digstore");
+        assert_eq!(c.component, "dig-store");
         assert_eq!(c.version, "0.6.0");
         assert_eq!(c.tag, "v0.6.0");
-        assert!(c.asset.starts_with("digstore-0.6.0-"));
+        assert!(c.asset.starts_with("dig-store-0.6.0-"));
         assert!(c
             .url
-            .contains("github.com/DIG-Network/digstore/releases/download/v0.6.0/"));
+            .contains("github.com/DIG-Network/dig-store/releases/download/v0.6.0/"));
         // dry-run installs nothing on disk.
         assert!(report.installed.is_empty());
     }
@@ -3404,7 +3464,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["digstore", "digs"],
+            vec!["dig-store", "digs"],
             "digs installs right after digstore"
         );
 
@@ -3419,7 +3479,7 @@ mod tests {
         assert!(digs.asset.starts_with("digs-0.6.0-"));
         assert!(digs
             .url
-            .contains("github.com/DIG-Network/digstore/releases/download/v0.6.0/"));
+            .contains("github.com/DIG-Network/dig-store/releases/download/v0.6.0/"));
 
         // Same bin dir as digstore — no separate PATH entry is needed.
         let digstore_dir = std::path::Path::new(&digstore.dest).parent().unwrap();
@@ -3435,7 +3495,7 @@ mod tests {
 
     #[test]
     fn digs_alias_honors_the_pinned_digstore_version() {
-        // A pinned --digstore-version threads through to the digs resolution
+        // A pinned --dig-store-version threads through to the digs resolution
         // too, since digs is published in the same digstore release.
         let mut plan = base_plan();
         plan.with_digstore = true;
@@ -3816,7 +3876,7 @@ mod tests {
             .iter()
             .map(|c| c.component.as_str())
             .collect();
-        assert!(ids.contains(&"digstore"));
+        assert!(ids.contains(&"dig-store"));
         assert!(ids.contains(&"dig-relay"));
         assert!(
             !ids.contains(&"dig-dns"),
@@ -3850,7 +3910,7 @@ mod tests {
             plan.dns_service.node.as_deref(),
             Some("http://localhost:9778")
         );
-        // dig-dns places a raw PATH binary, same as digstore/dig-node.
+        // dig-dns places a raw PATH binary, same as dig-store/dig-node.
         let path = report
             .path
             .expect("path result present with only dig-dns selected");
@@ -3878,7 +3938,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "digstore",
+                "dig-store",
                 "digs",
                 "dig-node",
                 "dign",
@@ -3902,7 +3962,7 @@ mod tests {
         plan.with_digstore = true;
         let err = run_dry(&plan, HashMap::new()).unwrap_err();
         assert_eq!(err.code(), "ASSET_NOT_FOUND");
-        assert!(err.message().contains("digstore"));
+        assert!(err.message().contains("dig-store"));
         assert!(err.hint().is_some());
     }
 
@@ -3911,14 +3971,14 @@ mod tests {
         // The release exists but ships nothing for any OS/arch (only a tarball).
         let mut releases = HashMap::new();
         releases.insert(
-            "digstore",
+            "dig-store",
             ("v0.6.0", vec!["source-code.tar.gz", "notes.txt"]),
         );
         let mut plan = base_plan();
         plan.with_digstore = true;
         let err = run_dry(&plan, releases).unwrap_err();
         assert_eq!(err.code(), "ASSET_NOT_FOUND");
-        assert!(err.message().contains("no digstore asset"));
+        assert!(err.message().contains("no dig-store asset"));
     }
 
     #[test]
@@ -3930,6 +3990,55 @@ mod tests {
         plan.digstore_version = Some("0.6.0".to_string());
         let report = run_dry(&plan, all_releases()).expect("pinned resolves");
         assert_eq!(report.components[0].tag, "v0.6.0");
+    }
+
+    #[test]
+    fn dig_store_falls_back_to_the_pre_rename_asset_stem() {
+        // Epic #703: a transitional release that still carries ONLY the old
+        // `digstore-*` assets (no `dig-store-*` yet) must still install, via the
+        // legacy-stem fallback — and the resolved component/binary is normalized
+        // back to `dig-store` so the id + on-PATH name stay consistent.
+        let mut releases = HashMap::new();
+        releases.insert(
+            "dig-store",
+            (
+                "v0.13.0",
+                vec![
+                    "digstore-0.13.0-windows-x64.exe",
+                    "digstore-0.13.0-linux-x64",
+                    "digstore-0.13.0-macos-arm64",
+                    "digstore-0.13.0-macos-x64",
+                    // The `digs` alias is published alongside in the same release
+                    // and its stem is unchanged by the rename.
+                    "digs-0.13.0-windows-x64.exe",
+                    "digs-0.13.0-linux-x64",
+                    "digs-0.13.0-macos-arm64",
+                    "digs-0.13.0-macos-x64",
+                ],
+            ),
+        );
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        let report = run_dry(&plan, releases).expect("legacy stem resolves");
+        let cli = report
+            .components
+            .iter()
+            .find(|c| c.component == "dig-store")
+            .expect("component normalized to dig-store");
+        assert!(
+            cli.asset.starts_with("digstore-0.13.0-"),
+            "resolved the legacy digstore-* asset, got {}",
+            cli.asset
+        );
+        assert!(
+            std::path::Path::new(&cli.dest)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dig-store"),
+            "on-PATH binary normalized to dig-store, got {}",
+            cli.dest
+        );
     }
 
     #[test]
@@ -4021,7 +4130,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("dry run")));
         assert!(lines
             .iter()
-            .any(|l| l.contains("Installing the digstore CLI")));
+            .any(|l| l.contains("Installing the dig-store CLI")));
         assert!(lines
             .iter()
             .any(|l| l.contains("Installing the digs alias")));
@@ -4046,7 +4155,7 @@ mod tests {
             .map(|c| c["id"].as_str().unwrap())
             .collect();
         for id in [
-            "digstore",
+            "dig-store",
             "digs",
             "dig-node",
             "dign",
@@ -4369,7 +4478,7 @@ mod tests {
     #[test]
     fn requires_elevation_tracks_privileged_actions() {
         use target::Os;
-        // A service/hosts install needs elevation; a dry-run or a digstore-only
+        // A service/hosts install needs elevation; a dry-run or a dig-store-only
         // run into a CUSTOM (user-chosen) bin dir does not — an explicit
         // --bin-dir is the user's own choice (base_plan uses a custom temp dir).
         assert!(dig_node_service_plan().requires_elevation(Os::Linux));
@@ -4378,7 +4487,7 @@ mod tests {
         digstore_only.dry_run = false;
         assert!(
             !digstore_only.requires_elevation(Os::Windows),
-            "digstore-only into a custom --bin-dir does not force elevation"
+            "dig-store-only into a custom --bin-dir does not force elevation"
         );
         assert!(
             !base_plan().requires_elevation(Os::Windows),
@@ -4439,7 +4548,7 @@ mod tests {
             paths::protected_bin_dir()
         );
         assert_eq!(
-            plan.bin_dir_for("digstore", Os::Linux),
+            plan.bin_dir_for("dig-store", Os::Linux),
             paths::default_bin_dir()
         );
         assert_eq!(
@@ -4447,7 +4556,7 @@ mod tests {
             paths::default_bin_dir()
         );
         // Windows: every component lands in the single protected root.
-        for c in ["digstore", "dig-node", "dig-dns", "dig-updater"] {
+        for c in ["dig-store", "dig-node", "dig-dns", "dig-updater"] {
             assert_eq!(plan.bin_dir_for(c, Os::Windows), paths::protected_bin_dir());
         }
         // An explicit override wins for the WHOLE stack, on every OS.
@@ -4754,7 +4863,7 @@ mod tests {
     #[test]
     fn privileged_install_root_is_none_without_a_privileged_component() {
         use target::Os;
-        // digstore-only into a custom dir on unix: digstore is NOT privileged
+        // dig-store-only into a custom dir on unix: digstore is NOT privileged
         // there, so there is no service-executed binary to protect.
         let plan = InstallPlan {
             bin_dir: std::path::PathBuf::from("/home/me/.local/dig/bin"),
@@ -5074,7 +5183,7 @@ mod tests {
 
     #[test]
     fn digstore_wiring_installs_when_absent_and_updates_when_present_but_unreadable() {
-        let bin_dir = wiring_test_bin_dir("digstore");
+        let bin_dir = wiring_test_bin_dir("dig-store");
         let _ = std::fs::remove_dir_all(&bin_dir);
         let mut plan = base_plan();
         plan.with_digstore = true;
@@ -5084,18 +5193,18 @@ mod tests {
         let digstore = report
             .components
             .iter()
-            .find(|c| c.component == "digstore")
+            .find(|c| c.component == "dig-store")
             .expect("digstore present");
         assert_eq!(digstore.update_action, update::UpdateAction::Install);
         assert_eq!(digstore.previous_version, None);
 
         let target = Target::current().unwrap();
-        write_unrunnable_file(&bin_dir.join(target.exe_name("digstore")));
+        write_unrunnable_file(&bin_dir.join(target.exe_name("dig-store")));
         let report = run_dry(&plan, all_releases()).expect("resolves");
         let digstore = report
             .components
             .iter()
-            .find(|c| c.component == "digstore")
+            .find(|c| c.component == "dig-store")
             .expect("digstore present");
         assert_eq!(digstore.update_action, update::UpdateAction::Update);
         assert!(digstore.previous_version.is_some());
@@ -5193,7 +5302,7 @@ mod tests {
             assert_eq!(
                 c.update_action,
                 update::UpdateAction::Install,
-                "{id} is not update-tracked (#309 scope: digstore/dig-node/dig-dns only)"
+                "{id} is not update-tracked (#309 scope: dig-store/dig-node/dig-dns only)"
             );
             assert_eq!(c.previous_version, None);
         }
@@ -5229,7 +5338,7 @@ mod tests {
         );
 
         let target = Target::current().unwrap();
-        write_unrunnable_file(&bin_dir.join(target.exe_name("digstore")));
+        write_unrunnable_file(&bin_dir.join(target.exe_name("dig-store")));
         let mut lines = Vec::new();
         run_report_with(&plan, &resolve, &mut |l| lines.push(l.to_string())).expect("resolves");
         assert!(

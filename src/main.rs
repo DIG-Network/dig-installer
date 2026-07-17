@@ -1,7 +1,7 @@
 //! `dig-installer` — the universal DIG installer CLI (a thin shim).
 //!
 //! Resolves + downloads the LATEST per-OS/arch GitHub release asset for the
-//! selected components — the **digstore CLI**, the **dig-node** local node
+//! selected components — the **dig-store CLI**, the **dig-node** local node
 //! (installed as an OS service + a `dig.local` hosts entry), and the **DIG
 //! Browser** — at install time. Bundles nothing. See the README for the full
 //! flag list and the exit-code table.
@@ -20,18 +20,18 @@ use dig_installer::{error_json, help_json, paths, InstallPlan};
 #[command(
     name = "dig-installer",
     version,
-    about = "Universal DIG installer — installs the digstore CLI, the dig-node service, and the dig-dns service by default",
+    about = "Universal DIG installer — installs the dig-store CLI, the dig-node service, and the dig-dns service by default",
     long_about = "Resolves and downloads the latest per-OS/arch release asset for the selected \
 components from the DIG-Network GitHub releases (it bundles nothing).\n\n\
 By DEFAULT it installs the full DIG stack in one run:\n  \
-* the digstore CLI (added to PATH, along with its `digs` alias binary),\n  \
+* the dig-store CLI (added to PATH, along with its `digs` alias binary),\n  \
 * the dig-node local node (installed + started as a boot-start OS service, with a best-effort \
 127.0.0.2 dig.local hosts entry), and\n  \
 * the dig-dns local *.dig name resolver (installed + started as a boot-start OS service, with \
 the OS split-DNS/NRPT + browser DoH wiring), and\n  \
 * the DIG auto-update beacon (dig-updater, registered as a daily scheduled check that installs \
 new signed DIG releases automatically).\n\n\
-Opt OUT of any of the four with --no-digstore / --no-dig-node / --no-dig-dns / --no-auto-update. \
+Opt OUT of any of the four with --no-dig-store / --no-dig-node / --no-dig-dns / --no-auto-update. \
 The dig-relay (advanced, run-your-own-relay) and the DIG Browser stay OPT-IN (--with-relay / \
 --with-browser). Use --json for machine-readable output and --help-json for the full invocation \
 contract (incl. the exit-code table)."
@@ -41,21 +41,28 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     bin_dir: Option<std::path::PathBuf>,
 
-    /// Explicitly select the digstore CLI (it is installed by default anyway;
+    /// Explicitly select the dig-store CLI (it is installed by default anyway;
     /// this flag exists for symmetry/clarity with the --with-* opt-ins). Also
     /// controls the `digs` alias binary (issue #434), which has no flag of its
-    /// own and always installs alongside digstore.
-    #[arg(long)]
+    /// own and always installs alongside dig-store. The pre-rename `--with-digstore`
+    /// spelling (epic #703) stays accepted as a hidden alias.
+    #[arg(long = "with-dig-store", alias = "with-digstore")]
     with_digstore: bool,
 
-    /// Opt OUT of the digstore CLI (installed by default). Also skips its
-    /// `digs` alias binary.
-    #[arg(long = "no-digstore")]
+    /// Opt OUT of the dig-store CLI (installed by default). Also skips its
+    /// `digs` alias binary. The pre-rename `--no-digstore` spelling (epic #703)
+    /// stays accepted as a hidden alias so existing scripts keep working.
+    #[arg(long = "no-dig-store", alias = "no-digstore")]
     no_digstore: bool,
 
-    /// digstore version to install (e.g. 0.6.0); default: latest released.
-    /// Also pins the `digs` alias, published in the same release.
-    #[arg(long, value_name = "VERSION")]
+    /// dig-store version to install (e.g. 0.6.0); default: latest released.
+    /// Also pins the `digs` alias, published in the same release. The pre-rename
+    /// `--digstore-version` spelling (epic #703) stays accepted as a hidden alias.
+    #[arg(
+        long = "dig-store-version",
+        alias = "digstore-version",
+        value_name = "VERSION"
+    )]
     digstore_version: Option<String>,
 
     /// Explicitly select the dig-node local node + boot-start OS service (it is
@@ -83,7 +90,7 @@ struct Cli {
 
     /// Uninstall the dig-node OS service, the `dig.local` hosts entry, and the
     /// firewall rule this installer created (idempotent; does not touch the
-    /// digstore/browser/relay/dig-dns installs). Runs standalone — ignores
+    /// dig-store/browser/relay/dig-dns installs). Runs standalone — ignores
     /// every other install flag except --bin-dir/--dry-run/--json.
     #[arg(long = "uninstall-dig-node")]
     uninstall_dig_node: bool,
@@ -202,12 +209,12 @@ struct Cli {
 
     /// Remove the auto-update beacon's daily scheduler registration this
     /// installer created (idempotent; does not remove the downloaded binaries
-    /// or touch the digstore/browser/relay/dig-node/dig-dns installs). Runs
+    /// or touch the dig-store/browser/relay/dig-node/dig-dns installs). Runs
     /// standalone — ignores every other install flag.
     #[arg(long = "uninstall-dig-updater")]
     uninstall_dig_updater: bool,
 
-    /// Force a fresh reinstall of digstore/dig-node/dig-dns/dig-updater even
+    /// Force a fresh reinstall of dig-store/dig-node/dig-dns/dig-updater even
     /// when the version-aware updater (#309) would otherwise skip a component
     /// that's already up to date.
     #[arg(long = "force-reinstall")]
@@ -318,7 +325,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    // #301 — universal installer: digstore + dig-node + dig-dns ALL install by
+    // #301 — universal installer: dig-store + dig-node + dig-dns ALL install by
     // default (the full DIG stack in one run). Each has a `--no-<component>`
     // opt-out; the `--with-<component>` flags remain accepted as redundant,
     // explicit opt-ins (backwards compat + symmetry). `--no-*` wins if both are

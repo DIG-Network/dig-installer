@@ -286,7 +286,7 @@ pub fn live_latest_version_resolver(repo: &Repo) -> Result<String, String> {
 /// `bin_dir.join(target.exe_name(id))`.
 pub fn tracked_components() -> [(&'static str, Repo); 4] {
     [
-        ("digstore", Repo::digstore()),
+        ("dig-store", Repo::dig_store()),
         ("dig-node", Repo::dig_node()),
         ("dig-dns", Repo::dig_dns()),
         ("dig-updater", Repo::dig_updater()),
@@ -545,7 +545,7 @@ mod tests {
         let ids: Vec<&str> = statuses.iter().map(|s| s.component.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["digstore", "dig-node", "dig-dns", "dig-updater"],
+            vec!["dig-store", "dig-node", "dig-dns", "dig-updater"],
             "issue #514 extends the tracked set to include the auto-update beacon"
         );
         for s in &statuses {
