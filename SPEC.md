@@ -1064,11 +1064,10 @@ component. The pre-install elevation decision is `InstallPlan::requires_elevatio
 the default-on SYSTEM auto-update beacon) OR-ed with the GUI's own digstore protected-root placement
 (so a digstore-only Windows run still elevates), not a hand-maintained component-id list.
 
-The Done screen exposes a **Close** action (`bridge.js` `closeWindow` → Tauri `getCurrentWindow().close()`,
-the same window op the title-bar close control uses) beside the primary **Launch Terminal**, so the
-user always has a one-click exit on the final step (never trapped). The window opens at 1080×720 and
-enforces a minimum of **980×600** — 980 wide so the three-action Done footer (Open Documentation ·
-Close · Launch Terminal) always fits without clipping the primary action.
+The Done screen exposes two footer actions: **Open Documentation** (secondary) and **Close**
+(primary, `bridge.js` `closeWindow` → Tauri `getCurrentWindow().close()`, the same window op the
+title-bar close control uses), so the user always has a one-click exit on the final step (never trapped).
+The footer wraps responsively on narrower windows via `flex-wrap`. The window opens at 1080×720.
 
 ### 6.0 Internationalization (#642)
 
@@ -1093,9 +1092,6 @@ This includes the library crate's Windows console helpers (`sc`, `net`, `netsh`,
 version-probe spawns (checking the bundled digstore binary version during startup and verification
 post-install). This is applied consistently through the single `proc::HideConsole::hide_console()` helper
 (a no-op on non-Windows targets) rather than a flag sprinkled at each call site.
-
-User-initiated spawns — the `launch_terminal()` command that opens a terminal at the install directory —
-are intentionally launched with visible console windows so the user can interact with the terminal.
 
 The flag suppresses only the console: stdio capture (`.output()`) and child exit codes are unchanged.
 

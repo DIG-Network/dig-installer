@@ -131,6 +131,82 @@ fn program_data_known_folder() -> Option<PathBuf> {
     }
 }
 
+/// The app-owned WebView2 user-data directory for the installer GUI (#715): its
+/// PATH only. Creation + hardening go through [`ensure_webview_data_dir`], which
+/// callers MUST use — a bare `create_dir_all` here would be squattable (below).
+///
+/// The Tauri GUI renders in WebView2, whose user-data-folder otherwise defaults
+/// to `%LOCALAPPDATA%\<bundle-id>\EBWebView`. When the GUI runs elevated as
+/// **LocalSystem**, `%LOCALAPPDATA%` resolves to
+/// `C:\Windows\system32\config\systemprofile\AppData\Local`, where WebView2
+/// cannot create its data dir — a fatal "couldn't create the data directory"
+/// crash before the UI loads. Pointing `WEBVIEW2_USER_DATA_FOLDER` at this
+/// machine-wide dir makes the GUI launch regardless of which account runs it:
+/// `%ProgramData%\DigNetwork\installer\webview`, resolved via the same
+/// known-folder API [`program_data`] uses (never the systemprofile path).
+///
+/// Security (#715, corrected): this dir lives under world-writable
+/// `%ProgramData%` and is consumed by a SYSTEM/admin WebView2, so it is NOT a
+/// harmless cache. A non-privileged user could pre-create it (becoming CREATOR
+/// OWNER with `WRITE_DAC`) or plant a junction, then the elevated process would
+/// write the browser profile through an attacker-controlled path — a privileged
+/// arbitrary-write / profile-poisoning LPE. [`ensure_webview_data_dir`] therefore
+/// SYSTEM-owns + locks + reparse-checks it, fail-closed.
+pub fn webview_data_dir() -> PathBuf {
+    webview_own_subtree(&program_data())
+        .pop()
+        .expect("the own-subtree always ends at the webview leaf")
+}
+
+/// The SHARED DIG data root `%ProgramData%\DigNetwork` — the machine-wide root
+/// under which EVERY DIG service keeps state (dig-logging writes
+/// `…\DigNetwork\logs\<service>` here; more services adopt it). It is NOT owned
+/// by the installer: the installer only creates + hardens it (owner SYSTEM,
+/// protected `{SYSTEM:F, Administrators:F}`) so the parent-delete-child hole is
+/// closed — but does so NON-recursively and NEVER deletes it, so sibling
+/// subtrees like `logs\<service>` keep their own contents + ACLs. Pure.
+pub fn dig_shared_root(program_data: &std::path::Path) -> PathBuf {
+    program_data.join("DigNetwork")
+}
+
+/// The installer's OWN subtree beneath [`dig_shared_root`] that it fully owns +
+/// locks + may purge, shallowest first: `DigNetwork\installer`,
+/// `DigNetwork\installer\webview`.
+///
+/// Hardening only the leaf is insufficient (#715, §565): on Windows a child
+/// delete is governed by the PARENT's `FILE_DELETE_CHILD`, and `%ProgramData%`
+/// grants `CREATOR OWNER: Full`, so a non-admin who pre-creates the intermediate
+/// `installer` ancestor OWNS it and can delete + junction-swap even a SYSTEM-owned
+/// leaf after this returns. Every level of the installer's own subtree is
+/// therefore SYSTEM-owned + locked. The shared `DigNetwork` root above is locked
+/// too (via [`dig_shared_root`]) but NOT part of this purgeable set — deleting it
+/// would clobber sibling services' state (`logs\<service>`). Pure.
+pub fn webview_own_subtree(program_data: &std::path::Path) -> Vec<PathBuf> {
+    let installer = dig_shared_root(program_data).join("installer");
+    let webview = installer.join("webview");
+    vec![installer, webview]
+}
+
+/// Given each EXISTING installer-owned dir (shallowest first) paired with its
+/// current owner SID (`None` = unreadable), return the SHALLOWEST that must be
+/// PURGED because it is NOT trustably owned (owner is neither SYSTEM nor
+/// Administrators, or could not be read). Removing that dir removes every deeper
+/// dir with it, so a single purge from the shallowest offender closes the whole
+/// squat. `None` when every existing level is admin-owned. Only ever called for
+/// the installer's OWN subtree ([`webview_own_subtree`]) — NEVER the shared
+/// `DigNetwork` root. Pure — the §565 decision is unit-tested without the FS.
+pub fn shallowest_untrusted_managed_dir(owners: &[(PathBuf, Option<String>)]) -> Option<PathBuf> {
+    owners
+        .iter()
+        .find(|(_, owner)| {
+            !matches!(
+                owner.as_deref(),
+                Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
+            )
+        })
+        .map(|(path, _)| path.clone())
+}
+
 /// The two daemon state directories for `os` (dig-node then dig-dns). Pure
 /// given `os` + the resolved data root, so the path contract is unit-tested.
 pub fn daemon_dirs(os: Os) -> Vec<DaemonDir> {
@@ -217,6 +293,32 @@ pub fn setowner_system_args(dir: &str) -> Vec<String> {
     ]
 }
 
+/// `icacls <dir> /setowner *S-1-5-18 /C /Q` — force owner = SYSTEM on the dir
+/// ONLY (no `/T`). Used for the shared `DigNetwork` root and each installer-owned
+/// level so sibling subtrees (`logs\<service>`) are never recursively re-owned.
+/// Pure argv.
+pub fn setowner_system_args_here(dir: &str) -> Vec<String> {
+    vec![
+        dir.to_string(),
+        "/setowner".to_string(),
+        format!("*{SID_SYSTEM}"),
+        "/C".to_string(),
+        "/Q".to_string(),
+    ]
+}
+
+/// `icacls <dir> /reset /C /Q` — drop the dir's OWN explicit ACEs (no `/T`), so a
+/// following `/inheritance:r /grant:r` starts clean WITHOUT touching any child's
+/// DACL. Pure argv.
+pub fn reset_dacl_args_here(dir: &str) -> Vec<String> {
+    vec![
+        dir.to_string(),
+        "/reset".to_string(),
+        "/C".to_string(),
+        "/Q".to_string(),
+    ]
+}
+
 /// `icacls <dir> /reset /T /C /Q` — drop ALL explicit ACEs (purging any foreign
 /// ACE a squatter added) and restore the parent's inheritable ACEs, so the
 /// following `/inheritance:r /grant:r` starts from a known baseline. Pure argv.
@@ -247,6 +349,22 @@ pub fn windows_lockdown_grant_args(dir: &str, user_sid: &str) -> Vec<String> {
     ]
 }
 
+/// `icacls <dir> /inheritance:r /grant:r …` that REPLACES the WebView2 data
+/// dir's DACL with exactly `{SYSTEM:F, Administrators:F}` — inheritance disabled,
+/// NO Users/interactive-user grant (the GUI runs as SYSTEM/admin, so its browser
+/// profile needs no user ACE; #715). Principals by SID (locale-independent).
+/// Pure so the exact ACL is unit-tested without touching the FS.
+pub fn webview_lockdown_grant_args(dir: &str) -> Vec<String> {
+    vec![
+        dir.to_string(),
+        "/inheritance:r".to_string(),
+        "/grant:r".to_string(),
+        format!("*{SID_SYSTEM}:(OI)(CI)F"),
+        "/grant:r".to_string(),
+        format!("*{SID_ADMINISTRATORS}:(OI)(CI)F"),
+    ]
+}
+
 /// The PowerShell one-liner that emits the dir's owner + each access ACE as
 /// SID-based lines (`OWNER;<sid>` / `ACE;<sid>;<isInherited>`) for the read-back
 /// verification. SID-based (not name-based) so parsing is locale-independent.
@@ -269,6 +387,24 @@ pub fn acl_verify_ps_command(dir: &str) -> String {
 /// Authenticated Users ACE; and exactly the three required principals (SYSTEM,
 /// Administrators, `user_sid`) are present. `Err` on any violation. Pure.
 pub fn parse_acl_verify(output: &str, user_sid: &str) -> Result<(), String> {
+    verify_locked_dacl(output, &[SID_SYSTEM, SID_ADMINISTRATORS, user_sid])
+}
+
+/// Verify the WebView2 data dir's DACL (#715) against a TIGHTER gate than the
+/// token dir: owner SYSTEM/Administrators; inheritance disabled; no world/group
+/// ACE; and EXACTLY `{SYSTEM, Administrators}` — NO user-read ACE at all. The
+/// installer GUI runs as SYSTEM/Administrator, so its WebView2 profile needs no
+/// interactive-user grant; withholding one keeps a non-privileged user from even
+/// reading the SYSTEM/admin browser profile. `Err` on any violation. Pure.
+pub fn parse_webview_acl_verify(output: &str) -> Result<(), String> {
+    verify_locked_dacl(output, &[SID_SYSTEM, SID_ADMINISTRATORS])
+}
+
+/// The shared acceptance-gate check for a hardened, protected DACL: owner is
+/// SYSTEM or Administrators; every ACE is explicit (inheritance disabled); no
+/// world/group ACE; and the DACL's trustees are EXACTLY `required` — every
+/// required principal present, and no principal beyond them. Pure.
+fn verify_locked_dacl(output: &str, required: &[&str]) -> Result<(), String> {
     let mut owner: Option<String> = None;
     let mut ace_sids: Vec<String> = Vec::new();
     for line in output.lines() {
@@ -301,19 +437,19 @@ pub fn parse_acl_verify(output: &str, user_sid: &str) -> Result<(), String> {
             "owner is {owner}, expected SYSTEM ({SID_SYSTEM}) or Administrators ({SID_ADMINISTRATORS})"
         ));
     }
-    for required in [SID_SYSTEM, SID_ADMINISTRATORS, user_sid] {
-        if !ace_sids.iter().any(|s| s == required) {
-            return Err(format!("DACL is missing the required ACE for {required}"));
+    for req in required {
+        if !ace_sids.iter().any(|s| s == req) {
+            return Err(format!("DACL is missing the required ACE for {req}"));
         }
     }
-    // Exactly-the-trustees: NO principal other than {SYSTEM, Administrators,
-    // user_sid} may hold an ACE. A foreign user SID (e.g. a squatter granting
-    // their own account read/full) is NOT a well-known group so the group check
-    // above misses it — reject it here so the acceptance gate is truly closed.
+    // Exactly-the-trustees: NO principal beyond `required` may hold an ACE. A
+    // foreign user SID (e.g. a squatter granting their own account read/full) is
+    // NOT a well-known group so the group check above misses it — reject it here
+    // so the acceptance gate is truly closed.
     for sid in &ace_sids {
-        if sid != SID_SYSTEM && sid != SID_ADMINISTRATORS && sid != user_sid {
+        if !required.contains(&sid.as_str()) {
             return Err(format!(
-                "DACL grants an unexpected principal ({sid}) — only SYSTEM, Administrators, and the installing user may have access"
+                "DACL grants an unexpected principal ({sid}) — only {required:?} may have access"
             ));
         }
     }
@@ -408,6 +544,209 @@ fn read_and_verify_acl(path: &std::path::Path, user_sid: &str) -> Result<(), Str
         ));
     }
     parse_acl_verify(&String::from_utf8_lossy(&out.stdout), user_sid)
+}
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT` — set on junctions, symlinks, and mount points.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Is `path` itself (NOT its target) a reparse point? Uses `symlink_metadata` so
+/// the entry's own attributes are read without traversing the link, and checks
+/// the reparse attribute so NTFS junctions (which are not `is_symlink()`) are
+/// caught too. A non-existent component reads as `false`.
+#[cfg(windows)]
+fn is_reparse_point(path: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+
+/// Is ANY existing component of `path` a reparse point? Walking every ancestor
+/// (not just the leaf) defeats a junction planted on `…\DigNetwork` or
+/// `…\installer` that would redirect the privileged WebView2 write elsewhere.
+#[cfg(windows)]
+fn any_component_is_reparse_point(path: &std::path::Path) -> bool {
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        cur.push(comp);
+        if is_reparse_point(&cur) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read the WebView2 dir's ACL back and verify it against the tighter WebView2
+/// acceptance gate ([`parse_webview_acl_verify`]).
+#[cfg(windows)]
+fn read_and_verify_webview_acl(path: &std::path::Path) -> Result<(), String> {
+    let ps = acl_verify_ps_command(&path.to_string_lossy());
+    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .hide_console()
+        .output()
+        .map_err(|e| format!("Get-Acl read-back failed to run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Get-Acl read-back exited non-zero: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_webview_acl_verify(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Own + lock ONE directory NON-recursively: owner→SYSTEM, purge its own explicit
+/// ACEs (`/reset`), protected `{SYSTEM:F, Administrators:F}` DACL (`/inheritance:r`),
+/// then read-back-verify owner + DACL. No `/T` anywhere, so a child subtree
+/// (e.g. `logs\<service>`) is never re-owned or re-ACL'd. `Err` (caller decides
+/// how to fail closed) on any icacls/verify failure.
+#[cfg(windows)]
+fn lock_and_verify_here(dir: &std::path::Path) -> Result<(), String> {
+    let s = dir.to_string_lossy().into_owned();
+    run_icacls(&setowner_system_args_here(&s))
+        .and_then(|_| run_icacls(&reset_dacl_args_here(&s)))
+        .and_then(|_| run_icacls(&webview_lockdown_grant_args(&s)))?;
+    read_and_verify_webview_acl(dir)
+}
+
+/// Ensure the WebView2 user-data dir ([`webview_data_dir`]) exists as a
+/// SYSTEM-owned, non-squattable, hardened directory and return its path (#715).
+///
+/// The installer GUI runs ELEVATED (Administrator, sometimes LocalSystem) and
+/// hands this path to WebView2 via `WEBVIEW2_USER_DATA_FOLDER`. `%ProgramData%`
+/// grants `BUILTIN\Users` create-subfolder + `CREATOR OWNER: Full`, so without
+/// hardening a non-admin could pre-create the subtree (or an intermediate
+/// ancestor — a Windows child-delete is governed by the PARENT's
+/// `FILE_DELETE_CHILD`, so owning `…\installer` lets them delete + junction-swap
+/// even a SYSTEM-owned leaf) → a privileged arbitrary-write / profile-poisoning
+/// LPE (§565). See [`ensure_webview_data_dir_in`] for the exact model. Any failure
+/// returns `Err` (FAIL CLOSED). Off Windows this is unused (unelevated GUI).
+#[cfg(windows)]
+pub fn ensure_webview_data_dir() -> Result<PathBuf, String> {
+    ensure_webview_data_dir_in(&program_data())
+}
+
+/// The hardening body, rooted at `program_data` so it is testable against a temp
+/// dir. Distinguishes the SHARED `DigNetwork` root from the installer's OWN
+/// subtree so a sibling service's state (`logs\<service>`, written by
+/// dig-logging) is never clobbered:
+///
+/// 1. reject any reparse point on the path (junction/symlink redirection);
+/// 2. **shared `DigNetwork` root** — ensure it exists, then own + lock it
+///    NON-recursively (owner SYSTEM, protected `{SYSTEM:F, Administrators:F}`,
+///    no `/T`); a foreign owner is taken over in place, NEVER `remove_dir_all`'d
+///    (that would delete sibling `logs\<service>`). Locking the root's DACL —
+///    which removes non-admin `DELETE`/`FILE_DELETE_CHILD`/`WRITE_DAC` — is what
+///    keeps the parent-delete-child hole closed; `SYSTEM:F` still lets SYSTEM
+///    services create/write `logs\<service>`;
+/// 3. **`installer` + `webview` (own subtree)** — purge the shallowest level that
+///    is foreign-owned, then create each with a NON-recursive `create_dir` under
+///    its now-locked parent (so no planted junction/child can be followed) and
+///    own + lock each NON-recursively;
+/// 4. re-check reparse, then read-back-verify the root + each own level. Fail
+///    closed (removing only the installer's OWN subtree, never `DigNetwork`) on
+///    any violation.
+#[cfg(windows)]
+pub fn ensure_webview_data_dir_in(program_data: &std::path::Path) -> Result<PathBuf, String> {
+    let root = dig_shared_root(program_data);
+    let own = webview_own_subtree(program_data);
+    let leaf = own.last().expect("own-subtree ends at the leaf").clone();
+    let leaf_str = leaf.to_string_lossy().into_owned();
+    // Fail closed by removing ONLY the installer's own subtree — never the shared
+    // DigNetwork root (deleting it would clobber logs\<service>).
+    let purge_own = || {
+        let _ = std::fs::remove_dir_all(&own[0]);
+    };
+
+    // 1. Reject reparse points anywhere on the path BEFORE creating/writing.
+    if any_component_is_reparse_point(&leaf) {
+        return Err(format!(
+            "{leaf_str} (or an ancestor) is a reparse point — refusing to write a privileged WebView2 profile through a redirected path (fail closed)"
+        ));
+    }
+
+    // 2. Shared DigNetwork root: ensure it exists, take ownership in place if it
+    //    is foreign-owned (NEVER delete — siblings live here), then lock its DACL
+    //    non-recursively. This closes the parent-delete-child hole for `installer`
+    //    without touching `logs\<service>`.
+    if let Err(e) = create_dir_if_absent(&root) {
+        return Err(format!(
+            "could not create the shared root {}: {e}",
+            root.display()
+        ));
+    }
+    if !matches!(
+        dir_owner_sid(&root).as_deref(),
+        Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
+    ) {
+        // Take ownership in place (non-recursive) — do NOT purge the shared root.
+        let _ = run_icacls(&setowner_system_args_here(&root.to_string_lossy()));
+    }
+    if let Err(e) = lock_and_verify_here(&root) {
+        // Fail closed WITHOUT deleting the shared tree.
+        return Err(format!(
+            "could not secure the shared DigNetwork root {} ({e}); refusing (fail closed)",
+            root.display()
+        ));
+    }
+
+    // 3. Installer's own subtree: purge the shallowest foreign-owned level, then
+    //    create each level non-recursively under its locked parent and lock it.
+    let existing_owners: Vec<(PathBuf, Option<String>)> = own
+        .iter()
+        .filter(|d| d.exists())
+        .map(|d| (d.clone(), dir_owner_sid(d)))
+        .collect();
+    if let Some(bad) = shallowest_untrusted_managed_dir(&existing_owners) {
+        let _ = run_icacls(&setowner_system_args(&bad.to_string_lossy()));
+        std::fs::remove_dir_all(&bad).map_err(|e| {
+            format!(
+                "the installer dir {} pre-existed with an untrusted/unknown owner and could not be purged ({e}); refusing (fail closed)",
+                bad.display()
+            )
+        })?;
+    }
+    for dir in &own {
+        if let Err(e) = create_dir_if_absent(dir) {
+            purge_own();
+            return Err(format!(
+                "could not create {} ({e}); fail closed",
+                dir.display()
+            ));
+        }
+        if let Err(e) = lock_and_verify_here(dir) {
+            purge_own();
+            return Err(format!(
+                "ACL lockdown/verify FAILED on {} ({e}); removed the installer subtree (fail closed)",
+                dir.display()
+            ));
+        }
+    }
+
+    // 4. Re-check reparse (defense against a create/hardening-time swap). The
+    //    per-level read-back in step 3 already verified each own level; the root
+    //    was verified in step 2.
+    if any_component_is_reparse_point(&leaf) {
+        purge_own();
+        return Err(format!(
+            "{leaf_str} became a reparse point during hardening; refusing (fail closed)"
+        ));
+    }
+    Ok(leaf)
+}
+
+/// `create_dir` (NON-recursive) treating an already-existing dir as success — the
+/// caller creates each level only after its parent is locked, so a recursive
+/// `create_dir_all` (which would happily follow a planted intermediate junction)
+/// is deliberately avoided.
+#[cfg(windows)]
+fn create_dir_if_absent(dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Create the machine-wide daemon state directories + apply the hardened ACL
@@ -621,6 +960,28 @@ mod tests {
         assert!(dirs[1].path.ends_with("DigDns"));
     }
 
+    /// Regression for #715: the WebView2 data dir the elevated GUI hands to
+    /// WebView2 MUST be an app-owned dir under ProgramData — NEVER the
+    /// systemprofile `%LOCALAPPDATA%` path that fails to create when the GUI
+    /// runs as LocalSystem.
+    #[test]
+    fn webview_data_dir_is_app_owned_never_systemprofile() {
+        let dir = webview_data_dir();
+        assert!(
+            dir.ends_with("DigNetwork/installer/webview")
+                || dir.ends_with(r"DigNetwork\installer\webview")
+        );
+        let lossy = dir.to_string_lossy().to_lowercase();
+        assert!(
+            !lossy.contains("systemprofile"),
+            "webview data dir must not resolve under the SYSTEM profile: {dir:?}"
+        );
+        assert!(
+            !lossy.contains("ebwebview"),
+            "resolver returns the parent user-data dir, not WebView2's own EBWebView subfolder: {dir:?}"
+        );
+    }
+
     #[test]
     fn linux_dirs_are_under_var_lib() {
         let dirs = daemon_dirs(Os::Linux);
@@ -762,6 +1123,253 @@ mod tests {
         assert!(cmd.contains("SecurityIdentifier"));
         assert!(cmd.contains("OWNER;"));
         assert!(cmd.contains("ACE;"));
+    }
+
+    // -- WebView2 data-dir hardening (#715 HIGH: elevated ProgramData squat) -----
+
+    #[test]
+    fn webview_lockdown_grants_exactly_system_and_admins_no_user() {
+        let args = webview_lockdown_grant_args(r"C:\ProgramData\DigNetwork\installer\webview");
+        // Inheritance disabled + SYSTEM/Administrators full, both by SID.
+        assert!(args.contains(&"/inheritance:r".to_string()));
+        assert!(args.iter().any(|a| a == "*S-1-5-18:(OI)(CI)F"));
+        assert!(args.iter().any(|a| a == "*S-1-5-32-544:(OI)(CI)F"));
+        // NO Users/Everyone/Authenticated-Users ACE, and NO interactive-user ACE
+        // (unlike the token dir, WebView2-as-SYSTEM/admin needs no user grant).
+        assert!(!args.iter().any(|a| a.contains("S-1-1-0")
+            || a.contains("S-1-5-11")
+            || a.contains("S-1-5-32-545")));
+        assert!(!args.iter().any(|a| a.contains("S-1-5-21-"))); // no user SID
+                                                                // Exactly two grants (SYSTEM + Administrators).
+        assert_eq!(args.iter().filter(|a| *a == "/grant:r").count(), 2);
+    }
+
+    #[test]
+    fn shared_root_and_own_subtree_are_correctly_partitioned() {
+        let base = PathBuf::from(r"C:\ProgramData");
+        // The shared DigNetwork root is NOT part of the installer's own subtree.
+        assert!(dig_shared_root(&base).ends_with("DigNetwork"));
+        let own = webview_own_subtree(&base);
+        assert_eq!(own.len(), 2);
+        assert!(
+            own[0].ends_with(r"DigNetwork\installer") || own[0].ends_with("DigNetwork/installer")
+        );
+        assert_eq!(own[1], webview_data_dir_for(&base));
+        // The shared root must never appear in the purgeable own-subtree — deleting
+        // it would clobber sibling services' state (logs\<service>).
+        assert!(!own.iter().any(|d| d == &dig_shared_root(&base)));
+    }
+
+    fn webview_data_dir_for(base: &std::path::Path) -> PathBuf {
+        base.join("DigNetwork").join("installer").join("webview")
+    }
+
+    #[test]
+    fn setowner_here_and_reset_here_are_non_recursive() {
+        // The regression guard: the shared-root + per-level lockdown must NOT carry
+        // /T, or it would recursively re-own/re-ACL sibling logs\<service>.
+        let so = setowner_system_args_here(r"C:\ProgramData\DigNetwork");
+        assert!(so.iter().any(|a| a == "/setowner"));
+        assert!(so.iter().any(|a| a == "*S-1-5-18"));
+        assert!(
+            !so.iter().any(|a| a == "/T"),
+            "shared-root setowner must not recurse"
+        );
+        let rs = reset_dacl_args_here(r"C:\ProgramData\DigNetwork");
+        assert!(rs.iter().any(|a| a == "/reset"));
+        assert!(
+            !rs.iter().any(|a| a == "/T"),
+            "shared-root reset must not recurse"
+        );
+    }
+
+    #[test]
+    fn attacker_owned_installer_level_is_selected_for_purge() {
+        // The §565 parent-delete-child hole: a non-admin owns the INTERMEDIATE
+        // `installer` level. It must be the purge target so the whole squatted
+        // subtree is removed before we create + lock. (The shared DigNetwork root
+        // is handled separately and is never in this set.)
+        let own = webview_own_subtree(&PathBuf::from(r"C:\ProgramData"));
+        let attacker = "S-1-5-21-9-9-9-1001".to_string();
+        let owners = vec![
+            (own[0].clone(), Some(attacker)), // installer: ATTACKER
+            (own[1].clone(), Some("S-1-5-18".to_string())), // webview: SYSTEM
+        ];
+        assert_eq!(
+            shallowest_untrusted_managed_dir(&owners).as_ref(),
+            Some(&own[0]),
+            "the attacker-owned installer level must be purged"
+        );
+    }
+
+    #[test]
+    fn all_admin_owned_levels_need_no_purge() {
+        let own = webview_own_subtree(&PathBuf::from(r"C:\ProgramData"));
+        let owners = vec![
+            (own[0].clone(), Some("S-1-5-32-544".to_string())),
+            (own[1].clone(), Some("S-1-5-18".to_string())),
+        ];
+        assert_eq!(shallowest_untrusted_managed_dir(&owners), None);
+    }
+
+    #[test]
+    fn unreadable_owner_level_is_treated_as_untrusted() {
+        // A dir whose owner can't be read is not provably admin-owned → purge it.
+        let own = webview_own_subtree(&PathBuf::from(r"C:\ProgramData"));
+        let owners = vec![(own[0].clone(), None)];
+        assert_eq!(
+            shallowest_untrusted_managed_dir(&owners).as_ref(),
+            Some(&own[0])
+        );
+    }
+
+    #[test]
+    fn webview_verify_accepts_system_and_admins_only() {
+        let ok = "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\n";
+        assert!(parse_webview_acl_verify(ok).is_ok());
+    }
+
+    #[test]
+    fn webview_verify_rejects_a_world_readable_ace() {
+        // The squat priv-esc: Users/Everyone in the elevated dir's DACL.
+        let bad =
+            "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\nACE;S-1-5-32-545;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("world/group"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_an_inherited_ace() {
+        // Inheritance not disabled → the dir inherits ProgramData's Users ACE.
+        let bad = "OWNER;S-1-5-18\nACE;S-1-5-18;True\nACE;S-1-5-32-544;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("inheritance is NOT disabled"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_a_foreign_owner() {
+        // A squatter-owned dir keeps WRITE_DAC — must be rejected (fail closed).
+        let bad = "OWNER;S-1-5-21-1-2-3-1001\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("owner is"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_any_extra_user_ace() {
+        // Tighter than the token gate: even a lone interactive-user read ACE is an
+        // unexpected principal for the WebView2 dir (no user grant is allowed).
+        let bad = "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\nACE;S-1-5-21-9-9-9-1001;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("unexpected principal"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_a_missing_admins_ace() {
+        let bad = "OWNER;S-1-5-18\nACE;S-1-5-18;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("missing the required ACE"), "got: {e}");
+    }
+
+    /// Regression for #715 (reparse-point redirection): a junction planted on any
+    /// path component must be detected so the elevated write is refused. Creates a
+    /// real NTFS junction via `mklink /J`; skips if the environment forbids it.
+    #[cfg(windows)]
+    #[test]
+    fn reparse_point_on_a_component_is_detected() {
+        let base = std::env::temp_dir().join(format!("dig-webview-reparse-{}", std::process::id()));
+        let target = base.join("real-target");
+        let link = base.join("junction");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&target).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // environment forbids junction creation — decision logic covered elsewhere
+        }
+        // A plain dir is not a reparse point; the junction (and any path THROUGH
+        // it) is.
+        assert!(!is_reparse_point(&target));
+        assert!(is_reparse_point(&link));
+        assert!(any_component_is_reparse_point(&link.join("child")));
+        assert!(!any_component_is_reparse_point(&target.join("child")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Cross-repo regression (#715): `ensure_webview_data_dir` must NOT clobber
+    /// the SHARED `%ProgramData%\DigNetwork` root that dig-logging writes
+    /// `logs\<service>` into. Rooted at a temp base: a pre-existing
+    /// `DigNetwork\logs\svc\x.log` sibling must SURVIVE, `DigNetwork` must not be
+    /// `remove_dir_all`'d, and the installer's own `installer`+`webview` levels
+    /// must be created (and, where the runner can set owners, SYSTEM-owned +
+    /// {SYSTEM,Admins}-locked). ACL assertions are best-effort — a runner without
+    /// `SeRestorePrivilege` can't `setowner` SYSTEM, so `ensure` fails closed; even
+    /// then the sibling log must survive (that depends only on non-recursion + not
+    /// deleting the root, which need no privilege).
+    #[cfg(windows)]
+    #[test]
+    fn ensure_does_not_clobber_the_shared_dignetwork_logs_sibling() {
+        let base = std::env::temp_dir().join(format!("dig-webview-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let log = base
+            .join("DigNetwork")
+            .join("logs")
+            .join("svc")
+            .join("x.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, b"pre-existing log line").unwrap();
+
+        let result = ensure_webview_data_dir_in(&base);
+
+        // The anti-clobber invariant observable in ANY environment: the shared
+        // `DigNetwork` root dir is NEVER `remove_dir_all`'d (the original bug would
+        // delete it recursively). Its dir entry survives regardless of ACL state.
+        assert!(
+            base.join("DigNetwork").exists(),
+            "the shared DigNetwork root must never be deleted"
+        );
+
+        match result {
+            // Elevated runner with Get-Acl (CI): we retain Admins access after the
+            // lock, so the sibling log must be readable + byte-identical, the leaf
+            // exists, and the root + each own level pass the read-back gate — while
+            // the sibling `logs` subtree was NOT recursively re-owned/re-ACL'd.
+            Ok(leaf) => {
+                assert_eq!(
+                    std::fs::read(&log).unwrap(),
+                    b"pre-existing log line",
+                    "the sibling log contents must be untouched"
+                );
+                assert!(leaf.exists());
+                assert!(read_and_verify_webview_acl(&dig_shared_root(&base)).is_ok());
+                for dir in webview_own_subtree(&base) {
+                    assert!(
+                        read_and_verify_webview_acl(&dir).is_ok(),
+                        "own level {dir:?} must verify"
+                    );
+                }
+            }
+            // Sandbox without Get-Acl / `SeRestorePrivilege`: `ensure` failed closed
+            // WITHOUT deleting the shared tree (asserted above). icacls only
+            // re-ACLs, never removes, so the log was not deleted; if this
+            // de-privileged process can still read it, assert it is intact.
+            Err(_) => {
+                if let Ok(bytes) = std::fs::read(&log) {
+                    assert_eq!(bytes, b"pre-existing log line");
+                }
+            }
+        }
+        // Best-effort cleanup (a locked root may resist removal in a non-elevated
+        // sandbox; harmless temp residue).
+        let _ = run_icacls(&setowner_system_args(
+            &dig_shared_root(&base).to_string_lossy(),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
