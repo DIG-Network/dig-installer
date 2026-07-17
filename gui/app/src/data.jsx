@@ -1,26 +1,53 @@
 /* Static data arrays — copy lifted verbatim from the prototype
    (design/installer/installer-app.jsx). Keep technically accurate to
-   product/digstore-spec.txt (URN shape, AES-256-GCM, merkle, attestation). */
+   product/digstore-spec.txt (URN shape, AES-256-GCM, merkle, attestation).
+
+   #654: the human-readable copy is externalized to react-intl message
+   descriptors ({ id, defaultMessage }); the consuming step components format
+   them with `useIntl().formatMessage(...)`. The `defaultMessage` IS the English
+   source catalog (formatjs `extract` reads it), and non-English locales fall
+   back to it until translated — so the visible copy is unchanged. Structural
+   fields (`id`, `req`, `on`, `hidden`, `requires`, `ic`) stay plain data. */
+import { defineMessages } from "react-intl";
 import { Ic } from "./icons.jsx";
 
 export const STEPS = ["Welcome", "License", "Components", "Install", "Done"];
 
+// Feature-card copy for the Welcome step.
+const featureMessages = defineMessages({
+  gitHeading: {
+    id: "welcome.feature.git.heading",
+    defaultMessage: "A Git-shaped workflow",
+  },
+  gitBody: {
+    id: "welcome.feature.git.body",
+    defaultMessage:
+      "init, add, commit, log, diff, checkout, clone — the verbs you already know. Each commit advances your store to a new capsule; chunking, encryption and WASM compilation stay under the surface.",
+  },
+  lockHeading: {
+    id: "welcome.feature.lock.heading",
+    defaultMessage: "Encrypted at rest, by URN",
+  },
+  lockBody: {
+    id: "welcome.feature.lock.body",
+    defaultMessage:
+      "Every URN is a key. Content is chunked, SHA-256 addressed, and sealed with an AES-256-GCM key derived from the URN itself.",
+  },
+  shieldHeading: {
+    id: "welcome.feature.shield.heading",
+    defaultMessage: "Publish to DIGHUb, serve anywhere",
+  },
+  shieldBody: {
+    id: "welcome.feature.shield.body",
+    defaultMessage:
+      "Each capsule compiles to one portable .wasm that defends itself — merkle proofs and host attestation. Push it to DIGHUb (the blind host) and read it back through a local dig-node or any DIG client.",
+  },
+});
+
 export const FEATURES = [
-  {
-    ic: Ic.git,
-    h: "A Git-shaped workflow",
-    p: "init, add, commit, log, diff, checkout, clone — the verbs you already know. Each commit advances your store to a new capsule; chunking, encryption and WASM compilation stay under the surface.",
-  },
-  {
-    ic: Ic.lock,
-    h: "Encrypted at rest, by URN",
-    p: "Every URN is a key. Content is chunked, SHA-256 addressed, and sealed with an AES-256-GCM key derived from the URN itself.",
-  },
-  {
-    ic: Ic.shield,
-    h: "Publish to DIGHUb, serve anywhere",
-    p: "Each capsule compiles to one portable .wasm that defends itself — merkle proofs and host attestation. Push it to DIGHUb (the blind host) and read it back through a local dig-node or any DIG client.",
-  },
+  { ic: Ic.git, h: featureMessages.gitHeading, p: featureMessages.gitBody },
+  { ic: Ic.lock, h: featureMessages.lockHeading, p: featureMessages.lockBody },
+  { ic: Ic.shield, h: featureMessages.shieldHeading, p: featureMessages.shieldBody },
 ];
 
 // The REAL DIG component catalogue (task #234) — `id` values map 1:1 to the
@@ -35,41 +62,79 @@ export const FEATURES = [
 // and `Components.jsx` does not render a `hidden` component). This mirrors the
 // CLI defaults (`InstallPlan::default()`: dig-relay + browser are opt-in only,
 // `--with-relay`/`--with-browser`).
+const componentMessages = defineMessages({
+  digstoreName: { id: "component.digstore.name", defaultMessage: "DigStore CLI" },
+  digstoreDesc: {
+    id: "component.digstore.desc",
+    defaultMessage: "The digstore command — init, add, commit, log, clone. Added to PATH.",
+  },
+  digNodeName: { id: "component.dig-node.name", defaultMessage: "dig-node" },
+  digNodeDesc: {
+    id: "component.dig-node.desc",
+    defaultMessage:
+      "Your local DIG node — installed as an OS service so store reads/writes hit your own machine first.",
+  },
+  digDnsName: { id: "component.dig-dns.name", defaultMessage: "dig-dns" },
+  digDnsDesc: {
+    id: "component.dig-dns.desc",
+    defaultMessage:
+      "Local *.dig name resolution as an OS service, so a browser can open http://your-store.dig directly. Skipped automatically if not yet released.",
+  },
+  extensionName: { id: "component.extension.name", defaultMessage: "DIG browser extension" },
+  extensionDesc: {
+    id: "component.extension.desc",
+    defaultMessage:
+      "Installs the DIG extension as a managed extension in your Chromium browsers, so chia:// and dig:// links resolve through your node. Next you'll choose which browsers — uncheck any to skip.",
+  },
+  digRelayName: { id: "component.dig-relay.name", defaultMessage: "dig-relay (advanced)" },
+  digRelayDesc: {
+    id: "component.dig-relay.desc",
+    defaultMessage:
+      "Run your own NAT-traversal relay. Optional — every node already uses the canonical relay.dig.net by default.",
+  },
+  browserName: { id: "component.browser.name", defaultMessage: "DIG Browser" },
+  browserDesc: {
+    id: "component.browser.desc",
+    defaultMessage:
+      "The DIG-native desktop browser — chia:// and dig:// links resolve natively. Downloads the native installer.",
+  },
+});
+
 export const COMPONENTS = [
   {
     id: "digstore",
-    name: "DigStore CLI",
-    desc: "The digstore command — init, add, commit, log, clone. Added to PATH.",
+    name: componentMessages.digstoreName,
+    desc: componentMessages.digstoreDesc,
     req: true,
   },
   {
     id: "dig-node",
-    name: "dig-node",
-    desc: "Your local DIG node — installed as an OS service so store reads/writes hit your own machine first.",
+    name: componentMessages.digNodeName,
+    desc: componentMessages.digNodeDesc,
     on: true,
   },
   {
     id: "dig-dns",
-    name: "dig-dns",
-    desc: "Local *.dig name resolution as an OS service, so a browser can open http://<store>.dig directly. Skipped automatically if not yet released.",
+    name: componentMessages.digDnsName,
+    desc: componentMessages.digDnsDesc,
     on: true,
   },
   {
     id: "extension",
-    name: "DIG browser extension",
-    desc: "Installs the DIG extension as a managed extension in your Chromium browsers, so chia:// and dig:// links resolve through your node. Next you'll choose which browsers — uncheck any to skip.",
+    name: componentMessages.extensionName,
+    desc: componentMessages.extensionDesc,
     on: true,
   },
   {
     id: "dig-relay",
-    name: "dig-relay (advanced)",
-    desc: "Run your own NAT-traversal relay. Optional — every node already uses the canonical relay.dig.net by default.",
+    name: componentMessages.digRelayName,
+    desc: componentMessages.digRelayDesc,
     on: false,
   },
   {
     id: "browser",
-    name: "DIG Browser",
-    desc: "The DIG-native desktop browser — chia:// and dig:// links resolve natively. Downloads the native installer.",
+    name: componentMessages.browserName,
+    desc: componentMessages.browserDesc,
     hidden: true, // HIDDEN for now (re-enable later) — not offered in the installer.
   },
 ];
@@ -80,18 +145,39 @@ export const COMPONENTS = [
 // reads (`gui/app/src-tauri/src/install.rs` `plan_from_selection`). Each
 // entry's `requires` names the component id it only makes sense alongside —
 // `Components.jsx` hides it when that component is unchecked.
+const optionMessages = defineMessages({
+  firewallName: {
+    id: "option.open-firewall.name",
+    defaultMessage: "Open the firewall for dig-node",
+  },
+  firewallDesc: {
+    id: "option.open-firewall.desc",
+    defaultMessage:
+      "Lets other DIG nodes reach yours directly on its peer-to-peer port (9444), scoped to the dig-node program only. Declining is safe — your node still works via the relay fallback.",
+  },
+  autoUpdateName: {
+    id: "option.auto-update.name",
+    defaultMessage: "Keep DIG up to date automatically (recommended)",
+  },
+  autoUpdateDesc: {
+    id: "option.auto-update.desc",
+    defaultMessage:
+      "Installs the DIG update beacon, which checks daily for new signed releases of the DIG stack and installs them automatically. Turn this off any time.",
+  },
+});
+
 export const OPTIONS = [
   {
     id: "open-firewall",
-    name: "Open the firewall for dig-node",
-    desc: "Lets other DIG nodes reach yours directly on its peer-to-peer port (9444), scoped to the dig-node program only. Declining is safe — your node still works via the relay fallback.",
+    name: optionMessages.firewallName,
+    desc: optionMessages.firewallDesc,
     requires: "dig-node",
     on: true,
   },
   {
     id: "auto-update",
-    name: "Keep DIG up to date automatically (recommended)",
-    desc: "Installs the DIG update beacon, which checks daily for new signed releases of the DIG stack and installs them automatically. Turn this off any time.",
+    name: optionMessages.autoUpdateName,
+    desc: optionMessages.autoUpdateDesc,
     on: true,
   },
 ];

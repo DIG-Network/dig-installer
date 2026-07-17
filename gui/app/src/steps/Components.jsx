@@ -1,3 +1,4 @@
+import { FormattedMessage, useIntl } from "react-intl";
 import { Ic } from "../icons.jsx";
 import { COMPONENTS, OPTIONS } from "../data.jsx";
 
@@ -7,23 +8,29 @@ import { COMPONENTS, OPTIONS } from "../data.jsx";
 // "latest" to diff against; see `install.rs::component_update_status`).
 const UPDATE_TRACKED_IDS = ["dig-node", "dig-dns"];
 
-// Human label + CSS modifier for each machine-readable `action`.
-const ACTION_LABEL = { install: "Install", update: "Update available", skip: "Up to date" };
+// react-intl descriptors for each machine-readable `action` label.
+const ACTION_MESSAGES = {
+  install: { id: "components.action.install", defaultMessage: "Install" },
+  update: { id: "components.action.update", defaultMessage: "Update available" },
+  skip: { id: "components.action.skip", defaultMessage: "Up to date" },
+};
 
 /// A single status pill next to a tracked component: "Install" / "Update
 /// available" / "Up to date", or an honest "couldn't check" note when the
 /// backend's version lookup failed (e.g. offline) — never a guessed verdict.
 function StatusPill({ status }) {
+  const intl = useIntl();
   if (!status.action) {
     return (
       <span className="pill-status unknown" title={status.summary}>
-        update check unavailable
+        <FormattedMessage id="components.updateUnavailable" defaultMessage="update check unavailable" />
       </span>
     );
   }
+  const label = ACTION_MESSAGES[status.action];
   return (
     <span className={"pill-status " + status.action} title={status.summary}>
-      {ACTION_LABEL[status.action] || status.action}
+      {label ? intl.formatMessage(label) : status.action}
     </span>
   );
 }
@@ -37,8 +44,10 @@ function StatusPill({ status }) {
 // old bundled-digstore prototype — sizes aren't known ahead of time and are
 // intentionally not shown here (no invented numbers). `status` (#309) is the
 // live per-component Install/Update/Skip preview from `App.jsx`: `null` while
-// it's still loading, an array once the backend has answered.
+// it's still loading, an array once the backend has answered. Copy is
+// externalized to react-intl (#654).
 export function Components({ sel, toggle, path, onChange, status }) {
+  const intl = useIntl();
   // A `hidden` component (e.g. the DIG Browser, #491) is never offered.
   const offered = COMPONENTS.filter((c) => !c.hidden);
   const selectedCount = offered.filter((c) => c.req || sel[c.id]).length;
@@ -49,23 +58,33 @@ export function Components({ sel, toggle, path, onChange, status }) {
   const statusFor = (id) => (status || []).find((s) => s.component === id);
   return (
     <div className="fade-key">
-      <div className="eyebrow">Step 03 — Setup</div>
-      <h2>Choose Components</h2>
+      <div className="eyebrow">
+        <FormattedMessage id="components.eyebrow" defaultMessage="Step 03 — Setup" />
+      </div>
+      <h2>
+        <FormattedMessage id="components.title" defaultMessage="Choose Components" />
+      </h2>
       <p className="lead" style={{ marginBottom: 28 }}>
-        The core DIG stack is pre-selected — installing it is the default, one-click path. Check any
-        optional extras you want, or deselect anything you don't; the CLI is required.
+        <FormattedMessage
+          id="components.lead"
+          defaultMessage="The core DIG stack is pre-selected — installing it is the default, one-click path. Check any optional extras you want, or deselect anything you don't; the CLI is required."
+        />
       </p>
-      <p className="field-label">Install location</p>
+      <p className="field-label">
+        <FormattedMessage id="components.location" defaultMessage="Install location" />
+      </p>
       <div className="path-row">
         <div className="path-input">
           {Ic.folder}
           <span>{path}</span>
         </div>
         <button className="btn-ghost" onClick={onChange}>
-          Change…
+          <FormattedMessage id="components.change" defaultMessage="Change…" />
         </button>
       </div>
-      <p className="field-label">Components</p>
+      <p className="field-label">
+        <FormattedMessage id="components.components" defaultMessage="Components" />
+      </p>
       {offered.map((c) => {
         const on = c.req || sel[c.id];
         const st = statusFor(c.id);
@@ -76,18 +95,32 @@ export function Components({ sel, toggle, path, onChange, status }) {
               {Ic.check}
             </div>
             <div>
-              <div className="ci">{c.name}</div>
-              <div className="cd">{c.desc}</div>
+              <div className="ci">{intl.formatMessage(c.name)}</div>
+              <div className="cd">{intl.formatMessage(c.desc)}</div>
             </div>
-            {c.req && <span className="pill-req">REQUIRED</span>}
-            {!c.req && tracked && (st ? <StatusPill status={st} /> : status === null && <span className="pill-status checking">checking…</span>)}
+            {c.req && (
+              <span className="pill-req">
+                <FormattedMessage id="components.required" defaultMessage="REQUIRED" />
+              </span>
+            )}
+            {!c.req &&
+              tracked &&
+              (st ? (
+                <StatusPill status={st} />
+              ) : (
+                status === null && (
+                  <span className="pill-status checking">
+                    <FormattedMessage id="components.checking" defaultMessage="checking…" />
+                  </span>
+                )
+              ))}
           </div>
         );
       })}
       {activeOptions.length > 0 && (
         <>
           <p className="field-label" style={{ marginTop: 18 }}>
-            Options
+            <FormattedMessage id="components.options" defaultMessage="Options" />
           </p>
           {activeOptions.map((o) => {
             const on = sel[o.id];
@@ -97,8 +130,8 @@ export function Components({ sel, toggle, path, onChange, status }) {
                   {Ic.check}
                 </div>
                 <div>
-                  <div className="ci">{o.name}</div>
-                  <div className="cd">{o.desc}</div>
+                  <div className="ci">{intl.formatMessage(o.name)}</div>
+                  <div className="cd">{intl.formatMessage(o.desc)}</div>
                 </div>
               </div>
             );
@@ -107,9 +140,15 @@ export function Components({ sel, toggle, path, onChange, status }) {
       )}
       <div className="meta-chips" style={{ marginTop: 22 }}>
         <span className="chip">
-          <span className="k">selected</span>
+          <span className="k">
+            <FormattedMessage id="components.selected" defaultMessage="selected" />
+          </span>
           <b>
-            {selectedCount} of {offered.length}
+            <FormattedMessage
+              id="components.selectedCount"
+              defaultMessage="{count} of {total}"
+              values={{ count: selectedCount, total: offered.length }}
+            />
           </b>
         </span>
       </div>
