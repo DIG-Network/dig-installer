@@ -38,7 +38,7 @@ installer/app/
    ├─ resources/bin/          # staged digstore binary (+ .sha256) — bundled into the package
    └─ src/
       ├─ main.rs lib.rs       # Tauri commands: installer_meta, default_install_path,
-      │                       #   run_install, cancel_install, launch_terminal
+      │                       #   run_install, cancel_install
       └─ install.rs           # the real 6-phase install pipeline
 ```
 
