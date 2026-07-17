@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.1] - 2026-07-17
+
+### Bug Fixes
+- **gui:** Pin WEBVIEW2_USER_DATA_FOLDER + fix Done-screen footer overflow (#715 #716) (#41)
+
 ## [0.29.0] - 2026-07-17
 
 ### Features
