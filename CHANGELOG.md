@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.2] - 2026-07-17
+
+### Bug Fixes
+- **secure:** Force SYSTEM ownership on created Windows install-root levels (#732) (#42)
+
 ## [0.29.1] - 2026-07-17
 
 ### Bug Fixes
