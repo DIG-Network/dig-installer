@@ -131,8 +131,9 @@ fn program_data_known_folder() -> Option<PathBuf> {
     }
 }
 
-/// The writable, app-owned WebView2 user-data directory for the installer GUI
-/// (#715).
+/// The app-owned WebView2 user-data directory for the installer GUI (#715): its
+/// PATH only. Creation + hardening go through [`ensure_webview_data_dir`], which
+/// callers MUST use — a bare `create_dir_all` here would be squattable (below).
 ///
 /// The Tauri GUI renders in WebView2, whose user-data-folder otherwise defaults
 /// to `%LOCALAPPDATA%\<bundle-id>\EBWebView`. When the GUI runs elevated as
@@ -144,9 +145,13 @@ fn program_data_known_folder() -> Option<PathBuf> {
 /// `%ProgramData%\DigNetwork\installer\webview`, resolved via the same
 /// known-folder API [`program_data`] uses (never the systemprofile path).
 ///
-/// This is a browser CACHE dir, NOT a privileged-exec target (§565): nothing the
-/// installer runs as SYSTEM ever executes a binary out of it, so its being
-/// writable by non-privileged users is not an escalation.
+/// Security (#715, corrected): this dir lives under world-writable
+/// `%ProgramData%` and is consumed by a SYSTEM/admin WebView2, so it is NOT a
+/// harmless cache. A non-privileged user could pre-create it (becoming CREATOR
+/// OWNER with `WRITE_DAC`) or plant a junction, then the elevated process would
+/// write the browser profile through an attacker-controlled path — a privileged
+/// arbitrary-write / profile-poisoning LPE. [`ensure_webview_data_dir`] therefore
+/// SYSTEM-owns + locks + reparse-checks it, fail-closed.
 pub fn webview_data_dir() -> PathBuf {
     program_data()
         .join("DigNetwork")
@@ -270,6 +275,22 @@ pub fn windows_lockdown_grant_args(dir: &str, user_sid: &str) -> Vec<String> {
     ]
 }
 
+/// `icacls <dir> /inheritance:r /grant:r …` that REPLACES the WebView2 data
+/// dir's DACL with exactly `{SYSTEM:F, Administrators:F}` — inheritance disabled,
+/// NO Users/interactive-user grant (the GUI runs as SYSTEM/admin, so its browser
+/// profile needs no user ACE; #715). Principals by SID (locale-independent).
+/// Pure so the exact ACL is unit-tested without touching the FS.
+pub fn webview_lockdown_grant_args(dir: &str) -> Vec<String> {
+    vec![
+        dir.to_string(),
+        "/inheritance:r".to_string(),
+        "/grant:r".to_string(),
+        format!("*{SID_SYSTEM}:(OI)(CI)F"),
+        "/grant:r".to_string(),
+        format!("*{SID_ADMINISTRATORS}:(OI)(CI)F"),
+    ]
+}
+
 /// The PowerShell one-liner that emits the dir's owner + each access ACE as
 /// SID-based lines (`OWNER;<sid>` / `ACE;<sid>;<isInherited>`) for the read-back
 /// verification. SID-based (not name-based) so parsing is locale-independent.
@@ -292,6 +313,24 @@ pub fn acl_verify_ps_command(dir: &str) -> String {
 /// Authenticated Users ACE; and exactly the three required principals (SYSTEM,
 /// Administrators, `user_sid`) are present. `Err` on any violation. Pure.
 pub fn parse_acl_verify(output: &str, user_sid: &str) -> Result<(), String> {
+    verify_locked_dacl(output, &[SID_SYSTEM, SID_ADMINISTRATORS, user_sid])
+}
+
+/// Verify the WebView2 data dir's DACL (#715) against a TIGHTER gate than the
+/// token dir: owner SYSTEM/Administrators; inheritance disabled; no world/group
+/// ACE; and EXACTLY `{SYSTEM, Administrators}` — NO user-read ACE at all. The
+/// installer GUI runs as SYSTEM/Administrator, so its WebView2 profile needs no
+/// interactive-user grant; withholding one keeps a non-privileged user from even
+/// reading the SYSTEM/admin browser profile. `Err` on any violation. Pure.
+pub fn parse_webview_acl_verify(output: &str) -> Result<(), String> {
+    verify_locked_dacl(output, &[SID_SYSTEM, SID_ADMINISTRATORS])
+}
+
+/// The shared acceptance-gate check for a hardened, protected DACL: owner is
+/// SYSTEM or Administrators; every ACE is explicit (inheritance disabled); no
+/// world/group ACE; and the DACL's trustees are EXACTLY `required` — every
+/// required principal present, and no principal beyond them. Pure.
+fn verify_locked_dacl(output: &str, required: &[&str]) -> Result<(), String> {
     let mut owner: Option<String> = None;
     let mut ace_sids: Vec<String> = Vec::new();
     for line in output.lines() {
@@ -324,19 +363,19 @@ pub fn parse_acl_verify(output: &str, user_sid: &str) -> Result<(), String> {
             "owner is {owner}, expected SYSTEM ({SID_SYSTEM}) or Administrators ({SID_ADMINISTRATORS})"
         ));
     }
-    for required in [SID_SYSTEM, SID_ADMINISTRATORS, user_sid] {
-        if !ace_sids.iter().any(|s| s == required) {
-            return Err(format!("DACL is missing the required ACE for {required}"));
+    for req in required {
+        if !ace_sids.iter().any(|s| s == req) {
+            return Err(format!("DACL is missing the required ACE for {req}"));
         }
     }
-    // Exactly-the-trustees: NO principal other than {SYSTEM, Administrators,
-    // user_sid} may hold an ACE. A foreign user SID (e.g. a squatter granting
-    // their own account read/full) is NOT a well-known group so the group check
-    // above misses it — reject it here so the acceptance gate is truly closed.
+    // Exactly-the-trustees: NO principal beyond `required` may hold an ACE. A
+    // foreign user SID (e.g. a squatter granting their own account read/full) is
+    // NOT a well-known group so the group check above misses it — reject it here
+    // so the acceptance gate is truly closed.
     for sid in &ace_sids {
-        if sid != SID_SYSTEM && sid != SID_ADMINISTRATORS && sid != user_sid {
+        if !required.contains(&sid.as_str()) {
             return Err(format!(
-                "DACL grants an unexpected principal ({sid}) — only SYSTEM, Administrators, and the installing user may have access"
+                "DACL grants an unexpected principal ({sid}) — only {required:?} may have access"
             ));
         }
     }
@@ -431,6 +470,135 @@ fn read_and_verify_acl(path: &std::path::Path, user_sid: &str) -> Result<(), Str
         ));
     }
     parse_acl_verify(&String::from_utf8_lossy(&out.stdout), user_sid)
+}
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT` — set on junctions, symlinks, and mount points.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Is `path` itself (NOT its target) a reparse point? Uses `symlink_metadata` so
+/// the entry's own attributes are read without traversing the link, and checks
+/// the reparse attribute so NTFS junctions (which are not `is_symlink()`) are
+/// caught too. A non-existent component reads as `false`.
+#[cfg(windows)]
+fn is_reparse_point(path: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+
+/// Is ANY existing component of `path` a reparse point? Walking every ancestor
+/// (not just the leaf) defeats a junction planted on `…\DigNetwork` or
+/// `…\installer` that would redirect the privileged WebView2 write elsewhere.
+#[cfg(windows)]
+fn any_component_is_reparse_point(path: &std::path::Path) -> bool {
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        cur.push(comp);
+        if is_reparse_point(&cur) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read the WebView2 dir's ACL back and verify it against the tighter WebView2
+/// acceptance gate ([`parse_webview_acl_verify`]).
+#[cfg(windows)]
+fn read_and_verify_webview_acl(path: &std::path::Path) -> Result<(), String> {
+    let ps = acl_verify_ps_command(&path.to_string_lossy());
+    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .hide_console()
+        .output()
+        .map_err(|e| format!("Get-Acl read-back failed to run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Get-Acl read-back exited non-zero: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_webview_acl_verify(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Ensure the WebView2 user-data dir ([`webview_data_dir`]) exists as a
+/// SYSTEM-owned, non-squattable, hardened directory and return its path (#715).
+///
+/// The installer GUI runs ELEVATED (Administrator, sometimes LocalSystem) and
+/// hands this path to WebView2 via `WEBVIEW2_USER_DATA_FOLDER`. Because
+/// `%ProgramData%` grants `BUILTIN\Users` "create subfolder", a non-admin could
+/// otherwise pre-create `…\DigNetwork\…` (becoming CREATOR OWNER with
+/// `WRITE_DAC`) or plant a junction and have the elevated/SYSTEM process write
+/// the browser profile through an attacker-controlled path — a privileged
+/// arbitrary-write / profile-poisoning LPE. This mirrors the token-dir hardening
+/// ([`ensure_one_windows`]), with a tighter DACL (no user ACE):
+///
+/// 1. reject any reparse point on the path (junction/symlink redirection);
+/// 2. purge a pre-existing foreign-owned dir (fail closed if it can't be);
+/// 3. force owner SYSTEM, purge foreign ACEs, apply a PROTECTED
+///    `{SYSTEM:F, Administrators:F}` DACL;
+/// 4. verify by read-back.
+///
+/// Any failure returns `Err` (FAIL CLOSED): the caller must NOT point WebView2 at
+/// an unverified dir. Off Windows this is unused (the GUI is unelevated there).
+#[cfg(windows)]
+pub fn ensure_webview_data_dir() -> Result<PathBuf, String> {
+    let dir = webview_data_dir();
+    let path_str = dir.to_string_lossy().into_owned();
+
+    // 1. Reject reparse points anywhere on the path BEFORE creating/writing.
+    if any_component_is_reparse_point(&dir) {
+        return Err(format!(
+            "{path_str} (or an ancestor) is a reparse point — refusing to write a privileged WebView2 profile through a redirected path (fail closed)"
+        ));
+    }
+
+    // 2. Squatting defense: a pre-existing dir with an untrusted owner is purged
+    //    (take ownership so we can delete, then remove); fail closed if it can't.
+    if dir.exists() {
+        let trusted = matches!(
+            dir_owner_sid(&dir).as_deref(),
+            Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
+        );
+        if !trusted {
+            let _ = run_icacls(&setowner_system_args(&path_str));
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                format!("WebView2 dir pre-existed with an untrusted/unknown owner and could not be purged ({e}); refusing (fail closed)")
+            })?;
+        }
+    }
+
+    // 3. Create (idempotent if we just adopted a trusted pre-existing dir).
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {path_str}: {e}"))?;
+
+    // 4. Lock down: owner→SYSTEM, purge foreign ACEs (/reset), protected
+    //    {SYSTEM:F, Administrators:F} DACL. Fail closed on any icacls failure.
+    let lockdown = run_icacls(&setowner_system_args(&path_str))
+        .and_then(|_| run_icacls(&reset_dacl_args(&path_str)))
+        .and_then(|_| run_icacls(&webview_lockdown_grant_args(&path_str)));
+    if let Err(e) = lockdown {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "ACL lockdown FAILED ({e}); removed the dir (fail closed)"
+        ));
+    }
+
+    // 5. Re-check reparse (defense against a create/hardening-time swap) then
+    //    read the ACL back and verify the acceptance gate. Fail closed on either.
+    if any_component_is_reparse_point(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "{path_str} became a reparse point during hardening; refusing (fail closed)"
+        ));
+    }
+    if let Err(e) = read_and_verify_webview_acl(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "ACL read-back verification FAILED ({e}); removed the dir (fail closed)"
+        ));
+    }
+    Ok(dir)
 }
 
 /// Create the machine-wide daemon state directories + apply the hardened ACL
@@ -807,6 +975,103 @@ mod tests {
         assert!(cmd.contains("SecurityIdentifier"));
         assert!(cmd.contains("OWNER;"));
         assert!(cmd.contains("ACE;"));
+    }
+
+    // -- WebView2 data-dir hardening (#715 HIGH: elevated ProgramData squat) -----
+
+    #[test]
+    fn webview_lockdown_grants_exactly_system_and_admins_no_user() {
+        let args = webview_lockdown_grant_args(r"C:\ProgramData\DigNetwork\installer\webview");
+        // Inheritance disabled + SYSTEM/Administrators full, both by SID.
+        assert!(args.contains(&"/inheritance:r".to_string()));
+        assert!(args.iter().any(|a| a == "*S-1-5-18:(OI)(CI)F"));
+        assert!(args.iter().any(|a| a == "*S-1-5-32-544:(OI)(CI)F"));
+        // NO Users/Everyone/Authenticated-Users ACE, and NO interactive-user ACE
+        // (unlike the token dir, WebView2-as-SYSTEM/admin needs no user grant).
+        assert!(!args.iter().any(|a| a.contains("S-1-1-0")
+            || a.contains("S-1-5-11")
+            || a.contains("S-1-5-32-545")));
+        assert!(!args.iter().any(|a| a.contains("S-1-5-21-"))); // no user SID
+                                                                // Exactly two grants (SYSTEM + Administrators).
+        assert_eq!(args.iter().filter(|a| *a == "/grant:r").count(), 2);
+    }
+
+    #[test]
+    fn webview_verify_accepts_system_and_admins_only() {
+        let ok = "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\n";
+        assert!(parse_webview_acl_verify(ok).is_ok());
+    }
+
+    #[test]
+    fn webview_verify_rejects_a_world_readable_ace() {
+        // The squat priv-esc: Users/Everyone in the elevated dir's DACL.
+        let bad =
+            "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\nACE;S-1-5-32-545;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("world/group"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_an_inherited_ace() {
+        // Inheritance not disabled → the dir inherits ProgramData's Users ACE.
+        let bad = "OWNER;S-1-5-18\nACE;S-1-5-18;True\nACE;S-1-5-32-544;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("inheritance is NOT disabled"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_a_foreign_owner() {
+        // A squatter-owned dir keeps WRITE_DAC — must be rejected (fail closed).
+        let bad = "OWNER;S-1-5-21-1-2-3-1001\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("owner is"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_any_extra_user_ace() {
+        // Tighter than the token gate: even a lone interactive-user read ACE is an
+        // unexpected principal for the WebView2 dir (no user grant is allowed).
+        let bad = "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\nACE;S-1-5-21-9-9-9-1001;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("unexpected principal"), "got: {e}");
+    }
+
+    #[test]
+    fn webview_verify_rejects_a_missing_admins_ace() {
+        let bad = "OWNER;S-1-5-18\nACE;S-1-5-18;False\n";
+        let e = parse_webview_acl_verify(bad).unwrap_err();
+        assert!(e.contains("missing the required ACE"), "got: {e}");
+    }
+
+    /// Regression for #715 (reparse-point redirection): a junction planted on any
+    /// path component must be detected so the elevated write is refused. Creates a
+    /// real NTFS junction via `mklink /J`; skips if the environment forbids it.
+    #[cfg(windows)]
+    #[test]
+    fn reparse_point_on_a_component_is_detected() {
+        let base = std::env::temp_dir().join(format!("dig-webview-reparse-{}", std::process::id()));
+        let target = base.join("real-target");
+        let link = base.join("junction");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&target).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // environment forbids junction creation — decision logic covered elsewhere
+        }
+        // A plain dir is not a reparse point; the junction (and any path THROUGH
+        // it) is.
+        assert!(!is_reparse_point(&target));
+        assert!(is_reparse_point(&link));
+        assert!(any_component_is_reparse_point(&link.join("child")));
+        assert!(!any_component_is_reparse_point(&target.join("child")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

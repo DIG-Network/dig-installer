@@ -158,15 +158,30 @@ fn cancel_install(state: State<'_, InstallState>) {
 /// `C:\Windows\system32\config\systemprofile\AppData\Local` — a dir WebView2
 /// cannot create, so it dies with "couldn't create the data directory" before
 /// the UI loads. WebView2 reads `WEBVIEW2_USER_DATA_FOLDER` at init, so setting
-/// it here (before `tauri::Builder::run`) makes the GUI launch under any
-/// account. No-op off Windows, where WebView2 is not the renderer.
+/// it here (before `tauri::Builder::run`) makes the GUI launch under any account.
+///
+/// Because this process is elevated (admin, sometimes SYSTEM) and the target sits
+/// under the world-writable `%ProgramData%`, the dir is created through the
+/// HARDENED, fail-closed [`dig_installer::daemon_dir::ensure_webview_data_dir`]
+/// (SYSTEM-owned, protected `{SYSTEM:F, Administrators:F}` DACL, no reparse-point
+/// redirection) — never a bare `create_dir_all`, which a non-admin could
+/// pre-squat or junction into an attacker-controlled path a SYSTEM/admin WebView2
+/// would then write through. If hardening cannot be established + verified we
+/// FAIL CLOSED: surface a clear error and exit rather than pin WebView2 to an
+/// unverified dir (a controlled error beats a silent privileged write into an
+/// unsafe dir — or an opaque WebView2 crash). No-op off Windows.
 #[cfg(windows)]
 fn pin_webview_data_dir() {
-    let dir = dig_installer::daemon_dir::webview_data_dir();
-    // Best-effort create: WebView2 does not create missing parent levels, and a
-    // failure here should not mask the underlying error WebView2 would report.
-    let _ = std::fs::create_dir_all(&dir);
-    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir);
+    match dig_installer::daemon_dir::ensure_webview_data_dir() {
+        Ok(dir) => std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir),
+        Err(e) => {
+            eprintln!(
+                "DIG Installer: refusing to launch — could not secure the WebView2 data \
+                 directory: {e}"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
