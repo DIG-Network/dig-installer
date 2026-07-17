@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.0] - 2026-07-17
+
+### Features
+- Dig-store rename cutover + complete GUI i18n (#40)
+
 ## [0.28.0] - 2026-07-16
 
 ### Features
