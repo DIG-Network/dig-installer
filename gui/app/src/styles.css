@@ -933,10 +933,28 @@ body {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 16px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 16px;
   padding: 18px var(--pad-x);
   border-top: 1px solid var(--border-subtle);
   background: rgba(10, 8, 28, 0.5);
+}
+/* Left cluster (language selector + step dots) and the right-aligned action
+   row each stay intact; the action row wraps to its own line before any button
+   clips past the window edge (#716). */
+.foot-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.foot-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-left: auto;
 }
 .dots {
   display: flex;
@@ -954,9 +972,6 @@ body {
   width: 20px;
   border-radius: var(--r-pill);
 }
-.foot-spacer {
-  flex: 1;
-}
 .btn {
   font-family: var(--font-display);
   font-weight: 600;
@@ -967,6 +982,8 @@ body {
   border: 1px solid transparent;
   transition: 0.16s;
   letter-spacing: 0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .btn-secondary {
   background: transparent;

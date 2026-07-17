@@ -7,6 +7,7 @@ import { Browsers } from "./steps/Browsers.jsx";
 import { Installing } from "./steps/Installing.jsx";
 import { Finish } from "./steps/Finish.jsx";
 import { LanguageSelector } from "./i18n/LanguageSelector.jsx";
+import { FooterActions } from "./FooterActions.jsx";
 import { NOW_FILES } from "./data.jsx";
 import { computeSteps } from "./steps.js";
 import glowD from "./assets/logos/D-glow-logo.svg";
@@ -17,7 +18,6 @@ import {
   pickFolder,
   runInstall,
   cancelInstall,
-  launchTerminal,
   openDocs,
   closeWindow,
   copyText,
@@ -314,8 +314,6 @@ export function App() {
         : installDone
         ? "Continue"
         : "Installing…"
-      : cur === "finish"
-      ? "Launch Terminal"
       : nextId === "installing"
       ? "Install"
       : "Continue";
@@ -326,7 +324,6 @@ export function App() {
 
   const next = async () => {
     if (installing && error) return retry();
-    if (cur === "finish") return launchTerminal(installPath);
     if (canContinue) go(step + 1);
   };
 
@@ -409,49 +406,30 @@ export function App() {
             )}
           </div>
           <div className="footer">
-            <LanguageSelector />
-            <div className="dots">
-              {steps.map((s, i) => (
-                <span key={s.id} className={"d" + (i === step ? " on" : "")}></span>
-              ))}
+            <div className="foot-left">
+              <LanguageSelector />
+              <div className="dots">
+                {steps.map((s, i) => (
+                  <span key={s.id} className={"d" + (i === step ? " on" : "")}></span>
+                ))}
+              </div>
             </div>
-            <div className="foot-spacer"></div>
 
-            {/* Back: hidden on the first step and while installing/finishing. */}
-            {step > 0 && !installing && cur !== "finish" && (
-              <button className="btn btn-secondary" onClick={() => go(step - 1)}>
-                Back
-              </button>
-            )}
-
-            {/* Error state while installing gets a "View log" secondary action */}
-            {installing && error && (
-              <button className="btn btn-secondary" onClick={() => openLog(lines)}>
-                View log
-              </button>
-            )}
-
-            {/* Done step gets the "Open Documentation" secondary + a Close
-                escape hatch beside the primary Launch Terminal — the user is
-                never trapped on the final screen (§6.1). */}
-            {cur === "finish" && (
-              <button className="btn btn-secondary" onClick={openDocs}>
-                Open Documentation
-              </button>
-            )}
-            {cur === "finish" && (
-              <button className="btn btn-secondary" onClick={closeWindow}>
-                Close
-              </button>
-            )}
-
-            <button
-              className={"btn " + (installing && error ? "btn-danger" : "btn-primary")}
-              onClick={next}
-              disabled={!canContinue && !(installing && error)}
-            >
-              {primaryLabel}
-            </button>
+            {/* The action row wraps below the left cluster on a narrow window /
+                long-label locale rather than clipping past the edge (#716). */}
+            <FooterActions
+              cur={cur}
+              step={step}
+              installing={installing}
+              error={error}
+              canContinue={canContinue}
+              primaryLabel={primaryLabel}
+              onBack={() => go(step - 1)}
+              onViewLog={() => openLog(lines)}
+              onOpenDocs={openDocs}
+              onClose={closeWindow}
+              onNext={next}
+            />
           </div>
         </div>
       </div>

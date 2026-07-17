@@ -153,20 +153,6 @@ export async function copyText(text) {
   }
 }
 
-export async function launchTerminal(installPath) {
-  const a = await api();
-  if (a) {
-    try {
-      await a.invoke("launch_terminal", { installPath });
-      return;
-    } catch {
-      /* ignore; nothing else to do in a desktop context */
-    }
-  }
-  // browser fallback: no terminal available
-  console.info("[installer] launch terminal (no-op in browser)", installPath);
-}
-
 export async function openDocs() {
   const url = "https://docs.dig.net/docs/digstore/what-is-digstore";
   if (_tauri) {
