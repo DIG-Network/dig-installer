@@ -3,8 +3,8 @@
 //!
 //! Why this exists (thin-shim resilience): the producing repos do not all use
 //! the same asset-naming convention, and a convention can change between
-//! releases. digstore's CLI release publishes `digstore-<ver>-<os_arch>[.exe]`,
-//! while this repo's own GUI installer (migrated from digstore, built by
+//! releases. dig-store's CLI release publishes `dig-store-<ver>-<os_arch>[.exe]`,
+//! while this repo's own GUI installer (migrated from dig-store, built by
 //! `release.yml`) publishes `DIG-Installer-Setup-<ver>-<os>.{exe,dmg,
 //! AppImage}`; the DIG Browser publishes a native installer per OS
 //! (`.exe`/`.dmg`/`.AppImage`). Rather than re-encode a single brittle template
@@ -22,7 +22,7 @@ use crate::target::{Os, Target};
 /// file extensions count as a match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
-    /// A raw executable placed on PATH (digstore CLI, dig-node). Matched by the
+    /// A raw executable placed on PATH (dig-store CLI, dig-node). Matched by the
     /// `<os>-<arch>` slug and the platform exe extension (`.exe` / none).
     RawBinary,
     /// A native desktop installer (DIG Browser): `.exe` (Windows), `.dmg`
@@ -167,7 +167,7 @@ fn looks_like_it_has_a_file_extension(name_lc: &str) -> bool {
 const INSTALLER_NAME_MARKERS: &[&str] = &["setup", "installer", "-gui"];
 
 /// Pick the best asset for `target` of `kind` from a release's `asset_names`,
-/// where `stem` is the component's canonical binary stem (e.g. `digstore`,
+/// where `stem` is the component's canonical binary stem (e.g. `dig-store`,
 /// `dig-node`, `dig-browser`).
 ///
 /// Strategy (deterministic): among assets whose name contains an OS/arch token
@@ -237,12 +237,50 @@ mod tests {
     }
 
     #[test]
-    fn matches_canonical_digstore_cli_asset() {
+    fn matches_canonical_dig_store_cli_asset() {
+        // Post-#703 the CLI asset stem is `dig-store` (was `digstore`).
         let names = vec![
-            "digstore-0.6.0-windows-x64.exe".to_string(),
-            "digstore-0.6.0-linux-x64".to_string(),
-            "digstore-0.6.0-macos-arm64".to_string(),
-            "digstore-0.6.0-macos-x64".to_string(),
+            "dig-store-0.14.0-windows-x64.exe".to_string(),
+            "dig-store-0.14.0-linux-x64".to_string(),
+            "dig-store-0.14.0-macos-arm64".to_string(),
+            "dig-store-0.14.0-macos-x64".to_string(),
+        ];
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-store"
+            ),
+            Some("dig-store-0.14.0-linux-x64".to_string())
+        );
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Windows, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-store"
+            ),
+            Some("dig-store-0.14.0-windows-x64.exe".to_string())
+        );
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::MacOs, Arch::Arm64),
+                AssetKind::RawBinary,
+                "dig-store"
+            ),
+            Some("dig-store-0.14.0-macos-arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn matches_legacy_digstore_cli_asset_for_the_fallback() {
+        // The transitional legacy fallback (epic #703) resolves the pre-rename
+        // `digstore-*` stem against a release cut before the asset rename.
+        let names = vec![
+            "digstore-0.13.0-linux-x64".to_string(),
+            "digstore-0.13.0-windows-x64.exe".to_string(),
         ];
         assert_eq!(
             select_asset(
@@ -251,25 +289,7 @@ mod tests {
                 AssetKind::RawBinary,
                 "digstore"
             ),
-            Some("digstore-0.6.0-linux-x64".to_string())
-        );
-        assert_eq!(
-            select_asset(
-                &names,
-                &t(Os::Windows, Arch::X64),
-                AssetKind::RawBinary,
-                "digstore"
-            ),
-            Some("digstore-0.6.0-windows-x64.exe".to_string())
-        );
-        assert_eq!(
-            select_asset(
-                &names,
-                &t(Os::MacOs, Arch::Arm64),
-                AssetKind::RawBinary,
-                "digstore"
-            ),
-            Some("digstore-0.6.0-macos-arm64".to_string())
+            Some("digstore-0.13.0-linux-x64".to_string())
         );
     }
 

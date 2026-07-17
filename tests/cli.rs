@@ -52,7 +52,7 @@ fn help_json_emits_the_full_contract() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    assert!(ids.contains(&"digstore"));
+    assert!(ids.contains(&"dig-store"));
     assert!(ids.contains(&"digs"));
     assert!(ids.contains(&"dig-node"));
     assert!(ids.contains(&"dign"));
@@ -146,7 +146,7 @@ fn help_lists_the_selectable_component_flags() {
         "--with-browser",
         "--with-relay",
         "--relay-port",
-        "--no-digstore",
+        "--no-dig-store",
         // #301 opt-out flags for the two components now installed by default.
         "--no-dig-node",
         "--no-dig-dns",
@@ -194,7 +194,7 @@ fn help_json_advertises_the_update_policy_and_force_flag() {
         .collect();
     assert_eq!(
         components,
-        vec!["digstore", "dig-node", "dig-dns", "dig-updater"]
+        vec!["dig-store", "dig-node", "dig-dns", "dig-updater"]
     );
     assert_eq!(policy["force_flag"], "--force-reinstall");
     let force_flag_documented = doc["flags"]
@@ -219,7 +219,7 @@ fn help_json_advertises_the_update_policy_and_force_flag() {
 fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
     let out = bin()
         .args([
-            "--no-digstore",
+            "--no-dig-store",
             "--no-dig-dns",
             "--no-auto-update",
             "--dig-node-version",
@@ -248,7 +248,7 @@ fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
 fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
     let out = bin()
         .args([
-            "--no-digstore",
+            "--no-dig-store",
             "--no-dig-dns",
             "--no-open-firewall",
             "--no-auto-update",
@@ -273,7 +273,7 @@ fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
 fn dry_run_reports_the_beacon_intent_by_default() {
     let out = bin()
         .args([
-            "--no-digstore",
+            "--no-dig-store",
             "--no-dig-node",
             "--no-dig-dns",
             "--dig-updater-version",
@@ -307,7 +307,7 @@ fn dry_run_reports_the_beacon_intent_by_default() {
 fn no_auto_update_flag_skips_the_beacon_section_entirely() {
     let out = bin()
         .args([
-            "--no-digstore",
+            "--no-dig-store",
             "--no-dig-node",
             "--no-dig-dns",
             "--no-auto-update",
@@ -326,7 +326,7 @@ fn no_auto_update_flag_skips_the_beacon_section_entirely() {
 }
 
 /// #301: the machine contract must advertise the universal-installer default —
-/// digstore, dig-node AND dig-dns as `default: true` — so an agent driving the
+/// dig-store, dig-node AND dig-dns as `default: true` — so an agent driving the
 /// installer knows a bare run installs all three. dig-relay + browser stay
 /// `default: false` (opt-in). Drives the real built binary.
 #[test]
@@ -344,7 +344,7 @@ fn help_json_advertises_all_three_core_components_as_default() {
             .as_bool()
             .unwrap()
     };
-    assert!(default_of("digstore"), "digstore default: true");
+    assert!(default_of("dig-store"), "dig-store default: true");
     assert!(default_of("dig-node"), "dig-node default: true (#301)");
     assert!(default_of("dig-dns"), "dig-dns default: true (#301)");
     assert!(
@@ -356,7 +356,7 @@ fn help_json_advertises_all_three_core_components_as_default() {
 }
 
 /// #301: `--help` prose must frame the installer as installing the full stack by
-/// default with per-component opt-outs (not the old "digstore only" framing).
+/// default with per-component opt-outs (not the old "dig-store only" framing).
 #[test]
 fn help_prose_frames_the_universal_all_three_default() {
     let out = bin().arg("--help").assert().success();
@@ -365,10 +365,10 @@ fn help_prose_frames_the_universal_all_three_default() {
     assert!(low.contains("by default"), "--help must state the default");
     assert!(low.contains("dig-node"), "--help mentions dig-node");
     assert!(low.contains("dig-dns"), "--help mentions dig-dns");
-    // The stale "only the digstore CLI is installed" framing must be gone.
+    // The stale "only the dig-store CLI is installed" framing must be gone.
     assert!(
-        !low.contains("only the digstore cli is installed"),
-        "--help must not say only digstore is installed by default"
+        !low.contains("only the dig-store cli is installed"),
+        "--help must not say only dig-store is installed by default"
     );
 }
 
@@ -380,7 +380,7 @@ fn help_prose_frames_the_universal_all_three_default() {
 fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
     let out = bin()
         .args([
-            "--no-digstore",
+            "--no-dig-store",
             "--no-dig-node",
             "--no-dig-dns",
             "--no-auto-update",
@@ -401,8 +401,9 @@ fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
 /// #301 rebrand regression guard (the user's complaint): the shipped GUI must
 /// name itself "DIG Installer", never "DigStore Installer". Reads the actual
 /// user-facing identity surfaces (Tauri config, HTML title, the on-screen title
-/// bar) so the stale brand can never silently return. (The `digstore`/`DigStore`
-/// CLI *component* name is untouched — this guards the INSTALLER's own name.)
+/// bar) so the stale brand can never silently return. (The dig-store CLI
+/// *component*'s own DigStore wordmark is a separate concern — this guards the
+/// INSTALLER's own name.)
 #[test]
 fn installer_is_branded_dig_installer_not_digstore_installer() {
     use std::fs;
