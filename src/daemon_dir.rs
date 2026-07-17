@@ -131,6 +131,29 @@ fn program_data_known_folder() -> Option<PathBuf> {
     }
 }
 
+/// The writable, app-owned WebView2 user-data directory for the installer GUI
+/// (#715).
+///
+/// The Tauri GUI renders in WebView2, whose user-data-folder otherwise defaults
+/// to `%LOCALAPPDATA%\<bundle-id>\EBWebView`. When the GUI runs elevated as
+/// **LocalSystem**, `%LOCALAPPDATA%` resolves to
+/// `C:\Windows\system32\config\systemprofile\AppData\Local`, where WebView2
+/// cannot create its data dir — a fatal "couldn't create the data directory"
+/// crash before the UI loads. Pointing `WEBVIEW2_USER_DATA_FOLDER` at this
+/// machine-wide dir makes the GUI launch regardless of which account runs it:
+/// `%ProgramData%\DigNetwork\installer\webview`, resolved via the same
+/// known-folder API [`program_data`] uses (never the systemprofile path).
+///
+/// This is a browser CACHE dir, NOT a privileged-exec target (§565): nothing the
+/// installer runs as SYSTEM ever executes a binary out of it, so its being
+/// writable by non-privileged users is not an escalation.
+pub fn webview_data_dir() -> PathBuf {
+    program_data()
+        .join("DigNetwork")
+        .join("installer")
+        .join("webview")
+}
+
 /// The two daemon state directories for `os` (dig-node then dig-dns). Pure
 /// given `os` + the resolved data root, so the path contract is unit-tested.
 pub fn daemon_dirs(os: Os) -> Vec<DaemonDir> {
@@ -619,6 +642,28 @@ mod tests {
         assert!(dirs[0].path.ends_with("DigNode"));
         assert_eq!(dirs[1].daemon, "dig-dns");
         assert!(dirs[1].path.ends_with("DigDns"));
+    }
+
+    /// Regression for #715: the WebView2 data dir the elevated GUI hands to
+    /// WebView2 MUST be an app-owned dir under ProgramData — NEVER the
+    /// systemprofile `%LOCALAPPDATA%` path that fails to create when the GUI
+    /// runs as LocalSystem.
+    #[test]
+    fn webview_data_dir_is_app_owned_never_systemprofile() {
+        let dir = webview_data_dir();
+        assert!(
+            dir.ends_with("DigNetwork/installer/webview")
+                || dir.ends_with(r"DigNetwork\installer\webview")
+        );
+        let lossy = dir.to_string_lossy().to_lowercase();
+        assert!(
+            !lossy.contains("systemprofile"),
+            "webview data dir must not resolve under the SYSTEM profile: {dir:?}"
+        );
+        assert!(
+            !lossy.contains("ebwebview"),
+            "resolver returns the parent user-data dir, not WebView2's own EBWebView subfolder: {dir:?}"
+        );
     }
 
     #[test]

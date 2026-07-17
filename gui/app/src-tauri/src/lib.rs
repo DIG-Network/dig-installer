@@ -6,7 +6,6 @@
 //!   - component_update_status(path)     → per-component Install/Update/Skip preview (#309)
 //!   - run_install(opts)                 → runs the real pipeline, streams events
 //!   - cancel_install()                  → cooperatively cancels an in-flight install
-//!   - launch_terminal(path)             → opens a terminal at the install dir
 //!
 //! The install runs on a background thread so the UI stays responsive while it
 //! streams `install://progress` / `install://error` / `install://done`.
@@ -150,68 +149,31 @@ fn cancel_install(state: State<'_, InstallState>) {
     state.cancelled.store(true, Ordering::SeqCst);
 }
 
-#[tauri::command]
-fn launch_terminal(install_path: String) -> Result<(), String> {
-    let bin_dir = std::path::PathBuf::from(&install_path).join("bin");
-    let cwd = if bin_dir.exists() {
-        bin_dir
-    } else {
-        std::path::PathBuf::from(&install_path)
-    };
-
-    #[cfg(windows)]
-    {
-        // Open a new Command Prompt in the install dir.
-        Command::new("cmd")
-            .args([
-                "/C",
-                "start",
-                "cmd",
-                "/K",
-                "echo digstore installed. Try: digstore --version",
-            ])
-            .current_dir(&cwd)
-            .spawn()
-            .map_err(|e| format!("launch terminal: {e}"))?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .args(["-a", "Terminal"])
-            .arg(&cwd)
-            .spawn()
-            .map_err(|e| format!("launch terminal: {e}"))?;
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // Try common terminals in order.
-        let term = ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"]
-            .into_iter()
-            .find(|t| which(t));
-        match term {
-            Some(t) => {
-                Command::new(t)
-                    .current_dir(&cwd)
-                    .spawn()
-                    .map_err(|e| format!("launch terminal: {e}"))?;
-            }
-            None => return Err("no terminal emulator found".into()),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn which(bin: &str) -> bool {
-    Command::new("which")
-        .arg(bin)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Point WebView2 at a writable, app-owned user-data folder BEFORE the webview
+/// initializes (#715).
+///
+/// On Windows the Tauri UI renders in WebView2, whose data folder defaults to
+/// `%LOCALAPPDATA%\<bundle-id>\EBWebView`. The installer GUI runs elevated, and
+/// when it runs as **LocalSystem** `%LOCALAPPDATA%` is
+/// `C:\Windows\system32\config\systemprofile\AppData\Local` — a dir WebView2
+/// cannot create, so it dies with "couldn't create the data directory" before
+/// the UI loads. WebView2 reads `WEBVIEW2_USER_DATA_FOLDER` at init, so setting
+/// it here (before `tauri::Builder::run`) makes the GUI launch under any
+/// account. No-op off Windows, where WebView2 is not the renderer.
+#[cfg(windows)]
+fn pin_webview_data_dir() {
+    let dir = dig_installer::daemon_dir::webview_data_dir();
+    // Best-effort create: WebView2 does not create missing parent levels, and a
+    // failure here should not mask the underlying error WebView2 would report.
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    pin_webview_data_dir();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
@@ -226,8 +188,7 @@ pub fn run() {
             detect_browsers,
             component_update_status,
             run_install,
-            cancel_install,
-            launch_terminal
+            cancel_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running DIG Installer");

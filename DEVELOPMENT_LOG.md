@@ -3,6 +3,24 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## #715: the elevated GUI must pin WEBVIEW2_USER_DATA_FOLDER (SYSTEM has no LOCALAPPDATA)
+
+The Tauri GUI renders in WebView2, whose user-data folder defaults to
+`%LOCALAPPDATA%\<bundle-id>\EBWebView`. When the elevated install path runs the
+GUI as **LocalSystem** (not the interactive elevated user), `%LOCALAPPDATA%`
+resolves to `C:\Windows\system32\config\systemprofile\AppData\Local` — a dir
+WebView2 cannot create — so it dies with "couldn't create the data directory"
+before the UI ever loads (a P0 launch crash). Fix: set the
+`WEBVIEW2_USER_DATA_FOLDER` env var to a writable, app-owned dir
+(`%ProgramData%\DigNetwork\installer\webview`, via the known-folder ProgramData
+resolver) BEFORE `tauri::Builder::run` — WebView2 reads it at init and no longer
+falls back to the account default, so the GUI launches under SYSTEM or the
+interactive user alike. §565 note: a WebView2 CACHE dir is NOT a privileged-exec
+target (nothing SYSTEM runs a binary out of it), so its being user-writable is
+not an escalation. Open question (not fixed here): whether the GUI should run as
+SYSTEM at all, or as the interactive elevated user with only privileged ops
+brokered — the env-var override fixes the crash regardless.
+
 ## #565: a security-relevant predicate swap must sweep EVERY gate, not one
 
 Closing the #565 LPE decoupled the ACL verify from `installs_a_protected_component`
