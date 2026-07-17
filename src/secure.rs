@@ -683,35 +683,38 @@ mod tests {
         assert!(!is_privileged_owner_sid(""));
     }
 
+    // Paths are built with `join` (host-native separators) so the pure path
+    // arithmetic is exercised identically on a Windows or a unix CI runner — a
+    // literal `C:\…` string is ONE component on unix (backslash is not a
+    // separator there) and would make every ancestor check vacuously empty.
+
     #[test]
     fn created_levels_are_the_two_dig_scoped_dirs_under_program_files() {
-        // The installer creates `…\DIG` then `…\DIG\bin`; both must be owned, and
+        // The installer creates `…/DIG` then `…/DIG/bin`; both must be owned, and
         // Program Files itself (already TrustedInstaller-owned) must NOT be.
-        let pf = std::path::Path::new(r"C:\Program Files");
-        let bin = std::path::Path::new(r"C:\Program Files\DIG\bin");
-        let levels = windows_created_root_levels(bin, pf);
+        let pf = std::path::Path::new("C_drive").join("Program Files");
+        let dig = pf.join("DIG");
+        let bin = dig.join("bin");
+        let levels = windows_created_root_levels(&bin, &pf);
         assert_eq!(
             levels,
-            vec![
-                std::path::PathBuf::from(r"C:\Program Files\DIG"),
-                std::path::PathBuf::from(r"C:\Program Files\DIG\bin"),
-            ],
+            vec![dig, bin],
             "own the parent DIG level before its bin child, and never Program Files itself"
         );
     }
 
     #[test]
     fn created_levels_exclude_program_files_and_its_ancestors() {
-        let pf = std::path::Path::new(r"C:\Program Files");
-        let bin = std::path::Path::new(r"C:\Program Files\DIG\bin");
-        let levels = windows_created_root_levels(bin, pf);
+        let pf = std::path::Path::new("C_drive").join("Program Files");
+        let bin = pf.join("DIG").join("bin");
+        let levels = windows_created_root_levels(&bin, &pf);
         assert!(
-            !levels.iter().any(|l| l == pf),
+            !levels.iter().any(|l| *l == pf),
             "must never re-own the Program Files root"
         );
         assert!(
-            !levels.iter().any(|l| l == std::path::Path::new(r"C:\")),
-            "must never re-own the drive root"
+            !levels.iter().any(|l| l == std::path::Path::new("C_drive")),
+            "must never re-own an ancestor above Program Files"
         );
     }
 
@@ -719,9 +722,9 @@ mod tests {
     fn created_levels_ordered_shallowest_first() {
         // Parents must be owned before children so a child is never orphaned under
         // a not-yet-owned parent.
-        let pf = std::path::Path::new(r"C:\Program Files");
-        let bin = std::path::Path::new(r"C:\Program Files\DIG\bin");
-        let levels = windows_created_root_levels(bin, pf);
+        let pf = std::path::Path::new("C_drive").join("Program Files");
+        let bin = pf.join("DIG").join("bin");
+        let levels = windows_created_root_levels(&bin, &pf);
         for pair in levels.windows(2) {
             assert!(
                 pair[1].starts_with(&pair[0]),
