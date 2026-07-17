@@ -289,14 +289,75 @@ fn verify_unix(root_str: &str, root: &std::path::Path) -> InstallRootSecurity {
     }
 }
 
+// -- #732: force PRIVILEGED ownership on the created install-root levels --------
+//
+// dig-node's #712 hardening requires that EVERY ancestor of a privileged binary's
+// install root be owned by SYSTEM, Administrators, or TrustedInstaller before it
+// will run self-heal (#565), local-HTTPS provisioning (#661), or system-service
+// install (#46). On modern Windows a directory created by an elevated admin USER
+// is owned by that USER's SID (NOT one of the accepted groups), so a plain
+// `create_dir_all` of `%ProgramFiles%\DIG\bin` leaves the two DIG-scoped levels
+// owned by the installing user → dig-node's whole-ancestor walk false-rejects and
+// those capabilities SILENTLY degrade (an availability regression, not a hole).
+// The fix removes the dependency on the token's default-owner behaviour: the
+// installer explicitly FORCES owner = SYSTEM on every level it creates. (An MSI
+// deferred custom action runs as SYSTEM and would already satisfy this; forcing
+// it makes the plain elevated-admin path deterministic too.)
+
+/// SYSTEM's well-known SID.
+const SID_SYSTEM: &str = "S-1-5-18";
+/// The BUILTIN\Administrators group SID.
+const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
+/// `NT SERVICE\TrustedInstaller` — the default owner of the Program Files tree.
+/// Windows sets this on the Program Files root and its OS-managed subfolders.
+const SID_TRUSTED_INSTALLER: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Is `sid` a PRIVILEGED directory owner in the sense dig-node's #712 install-root
+/// ancestor walk requires — SYSTEM, Administrators, or TrustedInstaller? A level
+/// owned by anything else (e.g. the installing admin USER's own account SID) makes
+/// dig-node's whole-ancestor walk false-reject, silently degrading self-heal
+/// (#565) / local-HTTPS (#661) / service-install (#46). The installer forces every
+/// level it creates to one of these (SYSTEM), so the walk always accepts the tree.
+pub fn is_privileged_owner_sid(sid: &str) -> bool {
+    matches!(sid, SID_SYSTEM | SID_ADMINISTRATORS | SID_TRUSTED_INSTALLER)
+}
+
+/// The DIG-scoped install-root levels, UNDER `program_files`, that the Windows
+/// installer creates and must therefore own explicitly (#732): `…\DIG` and then
+/// `…\DIG\bin`, ordered shallowest→deepest. The `program_files` root itself and
+/// every ancestor above it are EXCLUDED — Windows already owns those as
+/// TrustedInstaller/SYSTEM, and re-owning them would be both unnecessary and
+/// hostile. Pure, so the exact set of levels is unit-tested without touching the
+/// filesystem.
+pub fn windows_created_root_levels(
+    bin_dir: &std::path::Path,
+    program_files: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let mut levels: Vec<std::path::PathBuf> = bin_dir
+        .ancestors()
+        .filter(|a| a.starts_with(program_files) && *a != program_files)
+        .map(|a| a.to_path_buf())
+        .collect();
+    // `ancestors()` yields deepest→shallowest; own the parent before the child.
+    levels.reverse();
+    levels
+}
+
 /// Ensure the protected install `root` exists and is hardened to admin-only
-/// write before any binary is placed in it (#565). Windows: create it — Program
-/// Files' inherited DACL is already admin-write / user-read+execute, so no
-/// custom ACL is applied (avoiding the [`crate::daemon_dir`]-style fragility a
-/// user-writable PARENT would introduce; Program Files has no such parent). unix:
-/// create it root-owned and `chmod 0755` (owner root writes; group/other
-/// read+execute only). Best-effort + never panics; the post-place
-/// [`verify_install_root`] is the authoritative gate.
+/// write before any binary is placed in it (#565 + #732). Windows: create it,
+/// then FORCE owner = SYSTEM + a clean inherited DACL on every DIG-scoped level
+/// created under Program Files ([`windows_created_root_levels`]) so dig-node's
+/// #712 whole-ancestor privileged-path walk accepts the tree — without this the
+/// levels are owned by the installing user and self-heal/HTTPS/service-install
+/// silently degrade. Program Files' inherited DACL is already admin-write /
+/// user-read+execute, so `/reset` (which restores exactly that inheritance) keeps
+/// the CLIs runnable by non-admin users while denying them write. unix: create it
+/// root-owned and `chmod 0755` (owner root writes; group/other read+execute only)
+/// — DIG deliberately roots at `/opt/dig/bin`, NOT a group-writable Homebrew-style
+/// `/usr/local`, which [`verify_install_root`] would (correctly) reject.
+/// Best-effort + never panics; the post-place [`verify_install_root`] is the
+/// authoritative gate.
 pub fn ensure_protected_dir(os: Os, root: &std::path::Path) -> Result<(), String> {
     let _ = os;
     std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
@@ -305,6 +366,46 @@ pub fn ensure_protected_dir(os: Os, root: &std::path::Path) -> Result<(), String
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod 0755 {}: {e}", root.display()))?;
+    }
+    #[cfg(windows)]
+    {
+        force_system_ownership(root)?;
+    }
+    Ok(())
+}
+
+/// Force owner = SYSTEM + a clean inherited DACL on each DIG-scoped level the
+/// installer created under Program Files, then read the owner back and confirm it
+/// is now a privileged principal ([`is_privileged_owner_sid`]) — the #732 fix.
+/// Non-recursive (`…_here`) so a binary later placed in `bin` is not re-owned.
+/// `Err` (the caller logs + falls back to the per-binary write) on any failure.
+#[cfg(windows)]
+fn force_system_ownership(root: &std::path::Path) -> Result<(), String> {
+    use crate::daemon_dir::{
+        dir_owner_sid, reset_dacl_args_here, run_icacls, setowner_system_args_here,
+    };
+
+    for level in windows_created_root_levels(root, &crate::paths::program_files()) {
+        let s = level.to_string_lossy().into_owned();
+        // Owner → SYSTEM, then drop this level's own explicit ACEs so it inherits
+        // Program Files' admin-write / user-read+execute DACL (users keep RX; the
+        // #565 no-user-write invariant is preserved by that inheritance).
+        run_icacls(&setowner_system_args_here(&s))?;
+        run_icacls(&reset_dacl_args_here(&s))?;
+        match dir_owner_sid(&level) {
+            Some(sid) if is_privileged_owner_sid(&sid) => {}
+            Some(sid) => {
+                return Err(format!(
+                    "{s} owner is {sid} after /setowner — expected a privileged principal \
+                     (SYSTEM/Administrators/TrustedInstaller) so dig-node's #712 walk accepts it"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "could not read the owner of {s} back after /setowner"
+                ))
+            }
+        }
     }
     Ok(())
 }
@@ -557,5 +658,80 @@ mod tests {
     fn md_uid(p: &std::path::Path) -> u32 {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(p).unwrap().uid()
+    }
+
+    // -- #732: privileged-owner classification + created-level computation ------
+
+    #[test]
+    fn privileged_owner_accepts_system_administrators_trustedinstaller() {
+        // Exactly dig-node's #712 accept list — the three principals whose
+        // ownership lets the whole-ancestor walk pass.
+        assert!(is_privileged_owner_sid(SID_SYSTEM));
+        assert!(is_privileged_owner_sid(SID_ADMINISTRATORS));
+        assert!(is_privileged_owner_sid(SID_TRUSTED_INSTALLER));
+    }
+
+    #[test]
+    fn privileged_owner_rejects_an_interactive_user_sid() {
+        // The exact #732 availability trap: a level owned by the installing admin
+        // USER's own account SID must NOT count as privileged (it fails the walk).
+        assert!(!is_privileged_owner_sid(
+            "S-1-5-21-1004336348-1177238915-682003330-1001"
+        ));
+        assert!(!is_privileged_owner_sid(SID_USERS)); // BUILTIN\Users is not an owner we accept
+        assert!(!is_privileged_owner_sid(SID_EVERYONE));
+        assert!(!is_privileged_owner_sid(""));
+    }
+
+    // Paths are built with `join` (host-native separators) so the pure path
+    // arithmetic is exercised identically on a Windows or a unix CI runner — a
+    // literal `C:\…` string is ONE component on unix (backslash is not a
+    // separator there) and would make every ancestor check vacuously empty.
+
+    #[test]
+    fn created_levels_are_the_two_dig_scoped_dirs_under_program_files() {
+        // The installer creates `…/DIG` then `…/DIG/bin`; both must be owned, and
+        // Program Files itself (already TrustedInstaller-owned) must NOT be.
+        let pf = std::path::Path::new("C_drive").join("Program Files");
+        let dig = pf.join("DIG");
+        let bin = dig.join("bin");
+        let levels = windows_created_root_levels(&bin, &pf);
+        assert_eq!(
+            levels,
+            vec![dig, bin],
+            "own the parent DIG level before its bin child, and never Program Files itself"
+        );
+    }
+
+    #[test]
+    fn created_levels_exclude_program_files_and_its_ancestors() {
+        let pf = std::path::Path::new("C_drive").join("Program Files");
+        let bin = pf.join("DIG").join("bin");
+        let levels = windows_created_root_levels(&bin, &pf);
+        assert!(
+            !levels.contains(&pf),
+            "must never re-own the Program Files root"
+        );
+        assert!(
+            !levels.contains(&std::path::PathBuf::from("C_drive")),
+            "must never re-own an ancestor above Program Files"
+        );
+    }
+
+    #[test]
+    fn created_levels_ordered_shallowest_first() {
+        // Parents must be owned before children so a child is never orphaned under
+        // a not-yet-owned parent.
+        let pf = std::path::Path::new("C_drive").join("Program Files");
+        let bin = pf.join("DIG").join("bin");
+        let levels = windows_created_root_levels(&bin, &pf);
+        for pair in levels.windows(2) {
+            assert!(
+                pair[1].starts_with(&pair[0]),
+                "{:?} should be a descendant of {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
     }
 }

@@ -59,7 +59,7 @@ pub fn protected_bin_dir() -> PathBuf {
 /// `C:\Program Files` (still not the env) only if the API itself fails. On
 /// non-Windows hosts (reached only by tests exercising the Windows path map) the
 /// literal is returned.
-fn program_files() -> PathBuf {
+pub(crate) fn program_files() -> PathBuf {
     #[cfg(windows)]
     {
         program_files_known_folder().unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))

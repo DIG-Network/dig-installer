@@ -239,9 +239,19 @@ therefore places binaries into two roots, chosen per component:
 - **Protected root** — admin-only-writable, for every binary a service/scheduled-task runs:
   - **Windows:** `%ProgramFiles%\DIG\bin`, resolved via the known-folder API
     (`SHGetKnownFolderPath(FOLDERID_ProgramFiles)`, never the spoofable `%ProgramFiles%` env). Program
-    Files' inherited DACL is admin-write / user-read+execute, so no custom ACL is applied. The ENTIRE
-    Windows stack (services + user CLIs + the installer self-copy) installs here — one root.
+    Files' inherited DACL is admin-write / user-read+execute, so no custom DACL is applied. The ENTIRE
+    Windows stack (services + user CLIs + the installer self-copy) installs here — one root. The
+    installer additionally FORCES owner = SYSTEM (`icacls /setowner`, then `/reset` to restore the
+    inherited DACL) on each DIG-scoped level it creates (`…\DIG` and `…\DIG\bin`), so EVERY ancestor of
+    the install root is owned by a privileged principal (SYSTEM/Administrators/TrustedInstaller). This
+    is required because dig-node's install-root check walks the WHOLE ancestor chain and accepts only
+    those owners; a level left owned by the installing admin USER's own SID would make dig-node
+    false-reject the tree and silently disable self-heal, local-HTTPS provisioning, and system-service
+    install (`secure::force_system_ownership` / `secure::windows_created_root_levels`).
   - **macOS/Linux:** `/opt/dig/bin`, root-owned `0755` (owner root writes; group/other read+execute).
+    DIG deliberately roots privileged binaries here, NOT under a group-writable Homebrew-style
+    `/usr/local` prefix — a group-writable install root lets any member of that group replace a
+    service binary, which `secure::verify_install_root` (and dig-node's own check) correctly rejects.
 - **User root** — the elevation-free per-user `~/.dig/bin` (unix only), for user-run binaries that no
   privileged service executes: `digstore`/`digs`/`digd` and the user-level `dig-node`/`dig-relay`.
   (On Windows there is no separate user root — everything is in the one protected root.)

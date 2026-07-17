@@ -485,7 +485,7 @@ fn current_user_sid() -> Result<String, String> {
 
 /// The dir's current owner SID via `Get-Acl`, or `None` if it can't be read.
 #[cfg(windows)]
-fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
+pub(crate) fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
     let dir = path.to_string_lossy().replace('\'', "''");
     let ps = format!(
         "(Get-Acl -LiteralPath '{dir}').GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
@@ -508,7 +508,7 @@ fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
 
 /// Run `icacls` with `args`; `Ok(())` iff it exits 0.
 #[cfg(windows)]
-fn run_icacls(args: &[String]) -> Result<(), String> {
+pub(crate) fn run_icacls(args: &[String]) -> Result<(), String> {
     let out = std::process::Command::new(crate::proc::system_tool("icacls"))
         .args(args)
         .hide_console()
