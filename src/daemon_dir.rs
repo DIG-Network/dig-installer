@@ -153,10 +153,48 @@ fn program_data_known_folder() -> Option<PathBuf> {
 /// arbitrary-write / profile-poisoning LPE. [`ensure_webview_data_dir`] therefore
 /// SYSTEM-owns + locks + reparse-checks it, fail-closed.
 pub fn webview_data_dir() -> PathBuf {
-    program_data()
-        .join("DigNetwork")
-        .join("installer")
-        .join("webview")
+    webview_managed_subtree(&program_data())
+        .pop()
+        .expect("the managed subtree always ends at the webview leaf")
+}
+
+/// The directories BENEATH `%ProgramData%` that the installer CREATES for the
+/// WebView2 profile and must therefore own + lock, shallowest first:
+/// `DigNetwork`, `DigNetwork\installer`, `DigNetwork\installer\webview`.
+///
+/// Hardening ONLY the leaf is insufficient (#715, §565 re-open): on Windows a
+/// child delete is governed by the PARENT's `FILE_DELETE_CHILD`, and
+/// `%ProgramData%` grants `CREATOR OWNER: Full`. If a non-admin pre-creates an
+/// intermediate ancestor (`…\DigNetwork\installer`) it OWNS it with Full control,
+/// so even a SYSTEM-owned leaf underneath can be DELETED via the parent and
+/// recreated as a junction after this function returns — a post-`Ok` swap → LPE.
+/// The whole created subtree must therefore be SYSTEM-owned + locked. Immune
+/// ancestors above (`%ProgramData%`, the drive root) are SYSTEM/TrustedInstaller-
+/// owned and NOT included. Pure.
+pub fn webview_managed_subtree(program_data: &std::path::Path) -> Vec<PathBuf> {
+    let l1 = program_data.join("DigNetwork");
+    let l2 = l1.join("installer");
+    let l3 = l2.join("webview");
+    vec![l1, l2, l3]
+}
+
+/// Given each EXISTING managed dir (shallowest first) paired with its current
+/// owner SID (`None` = unreadable), return the SHALLOWEST that must be purged
+/// because it is NOT trustably owned (owner is neither SYSTEM nor Administrators,
+/// or could not be read). Removing that dir removes every deeper managed dir with
+/// it, so a single purge from the shallowest offender closes the whole squat.
+/// `None` when every existing ancestor is admin-owned. Pure — the §565
+/// parent-delete-child decision is unit-tested without touching the FS.
+pub fn shallowest_untrusted_managed_dir(owners: &[(PathBuf, Option<String>)]) -> Option<PathBuf> {
+    owners
+        .iter()
+        .find(|(_, owner)| {
+            !matches!(
+                owner.as_deref(),
+                Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
+            )
+        })
+        .map(|(path, _)| path.clone())
 }
 
 /// The two daemon state directories for `os` (dig-node then dig-dns). Pure
@@ -532,73 +570,95 @@ fn read_and_verify_webview_acl(path: &std::path::Path) -> Result<(), String> {
 /// `WRITE_DAC`) or plant a junction and have the elevated/SYSTEM process write
 /// the browser profile through an attacker-controlled path — a privileged
 /// arbitrary-write / profile-poisoning LPE. This mirrors the token-dir hardening
-/// ([`ensure_one_windows`]), with a tighter DACL (no user ACE):
+/// ([`ensure_one_windows`]), with a tighter DACL (no user ACE), applied to the
+/// ENTIRE created subtree ([`webview_managed_subtree`]) — not just the leaf,
+/// because a child delete is governed by the PARENT's `FILE_DELETE_CHILD`, so an
+/// attacker-owned intermediate ancestor could delete + junction-swap even a
+/// SYSTEM-owned leaf after this returns (§565 parent-delete-child):
 ///
 /// 1. reject any reparse point on the path (junction/symlink redirection);
-/// 2. purge a pre-existing foreign-owned dir (fail closed if it can't be);
-/// 3. force owner SYSTEM, purge foreign ACEs, apply a PROTECTED
+/// 2. purge the shallowest managed ancestor that is foreign-owned — one
+///    `remove_dir_all` takes the whole squatted subtree with it (fail closed if
+///    it can't be removed);
+/// 3. own + lock EACH managed level (`DigNetwork`, `installer`, `webview`):
+///    owner→SYSTEM, purge foreign ACEs (`/reset`), protected
 ///    `{SYSTEM:F, Administrators:F}` DACL;
-/// 4. verify by read-back.
+/// 4. verify EACH level by read-back (owner + DACL) so no ancestor is left
+///    non-admin-owned.
 ///
 /// Any failure returns `Err` (FAIL CLOSED): the caller must NOT point WebView2 at
 /// an unverified dir. Off Windows this is unused (the GUI is unelevated there).
 #[cfg(windows)]
 pub fn ensure_webview_data_dir() -> Result<PathBuf, String> {
-    let dir = webview_data_dir();
-    let path_str = dir.to_string_lossy().into_owned();
+    let managed = webview_managed_subtree(&program_data());
+    let leaf = managed
+        .last()
+        .expect("subtree always ends at the leaf")
+        .clone();
+    let leaf_str = leaf.to_string_lossy().into_owned();
 
-    // 1. Reject reparse points anywhere on the path BEFORE creating/writing.
-    if any_component_is_reparse_point(&dir) {
+    // 1. Reject reparse points anywhere on the path BEFORE creating/writing —
+    //    a junction on ANY component redirects the privileged write.
+    if any_component_is_reparse_point(&leaf) {
         return Err(format!(
-            "{path_str} (or an ancestor) is a reparse point — refusing to write a privileged WebView2 profile through a redirected path (fail closed)"
+            "{leaf_str} (or an ancestor) is a reparse point — refusing to write a privileged WebView2 profile through a redirected path (fail closed)"
         ));
     }
 
-    // 2. Squatting defense: a pre-existing dir with an untrusted owner is purged
-    //    (take ownership so we can delete, then remove); fail closed if it can't.
-    if dir.exists() {
-        let trusted = matches!(
-            dir_owner_sid(&dir).as_deref(),
-            Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
-        );
-        if !trusted {
-            let _ = run_icacls(&setowner_system_args(&path_str));
-            std::fs::remove_dir_all(&dir).map_err(|e| {
-                format!("WebView2 dir pre-existed with an untrusted/unknown owner and could not be purged ({e}); refusing (fail closed)")
-            })?;
+    // 2. Squatting defense across the WHOLE subtree: find the shallowest managed
+    //    dir that exists with an untrusted owner and purge it (take ownership so
+    //    the delete is permitted, then remove — which drops every deeper managed
+    //    dir too). Fail closed if the offending subtree can't be removed.
+    let existing_owners: Vec<(PathBuf, Option<String>)> = managed
+        .iter()
+        .filter(|d| d.exists())
+        .map(|d| (d.clone(), dir_owner_sid(d)))
+        .collect();
+    if let Some(bad) = shallowest_untrusted_managed_dir(&existing_owners) {
+        let _ = run_icacls(&setowner_system_args(&bad.to_string_lossy()));
+        std::fs::remove_dir_all(&bad).map_err(|e| {
+            format!(
+                "the managed dir {} pre-existed with an untrusted/unknown owner and could not be purged ({e}); refusing (fail closed)",
+                bad.display()
+            )
+        })?;
+    }
+
+    // 3. Create the leaf (mkdir -p), then own + lock EACH managed level from the
+    //    shallowest down, so no intermediate ancestor is left attacker-owned.
+    std::fs::create_dir_all(&leaf).map_err(|e| format!("could not create {leaf_str}: {e}"))?;
+    for dir in &managed {
+        let s = dir.to_string_lossy().into_owned();
+        let lockdown = run_icacls(&setowner_system_args(&s))
+            .and_then(|_| run_icacls(&reset_dacl_args(&s)))
+            .and_then(|_| run_icacls(&webview_lockdown_grant_args(&s)));
+        if let Err(e) = lockdown {
+            let _ = std::fs::remove_dir_all(&managed[0]);
+            return Err(format!(
+                "ACL lockdown FAILED on {s} ({e}); removed the subtree (fail closed)"
+            ));
         }
     }
 
-    // 3. Create (idempotent if we just adopted a trusted pre-existing dir).
-    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {path_str}: {e}"))?;
-
-    // 4. Lock down: owner→SYSTEM, purge foreign ACEs (/reset), protected
-    //    {SYSTEM:F, Administrators:F} DACL. Fail closed on any icacls failure.
-    let lockdown = run_icacls(&setowner_system_args(&path_str))
-        .and_then(|_| run_icacls(&reset_dacl_args(&path_str)))
-        .and_then(|_| run_icacls(&webview_lockdown_grant_args(&path_str)));
-    if let Err(e) = lockdown {
-        let _ = std::fs::remove_dir_all(&dir);
+    // 4. Re-check reparse (defense against a create/hardening-time swap), then
+    //    read EACH level's ACL back and verify. Fail closed on any violation so
+    //    no ancestor is left non-admin-owned (the parent-delete-child hole).
+    if any_component_is_reparse_point(&leaf) {
+        let _ = std::fs::remove_dir_all(&managed[0]);
         return Err(format!(
-            "ACL lockdown FAILED ({e}); removed the dir (fail closed)"
+            "{leaf_str} became a reparse point during hardening; refusing (fail closed)"
         ));
     }
-
-    // 5. Re-check reparse (defense against a create/hardening-time swap) then
-    //    read the ACL back and verify the acceptance gate. Fail closed on either.
-    if any_component_is_reparse_point(&dir) {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!(
-            "{path_str} became a reparse point during hardening; refusing (fail closed)"
-        ));
+    for dir in &managed {
+        if let Err(e) = read_and_verify_webview_acl(dir) {
+            let _ = std::fs::remove_dir_all(&managed[0]);
+            return Err(format!(
+                "ACL read-back verification FAILED on {} ({e}); removed the subtree (fail closed)",
+                dir.display()
+            ));
+        }
     }
-    if let Err(e) = read_and_verify_webview_acl(&dir) {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!(
-            "ACL read-back verification FAILED ({e}); removed the dir (fail closed)"
-        ));
-    }
-    Ok(dir)
+    Ok(leaf)
 }
 
 /// Create the machine-wide daemon state directories + apply the hardened ACL
@@ -994,6 +1054,65 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("S-1-5-21-"))); // no user SID
                                                                 // Exactly two grants (SYSTEM + Administrators).
         assert_eq!(args.iter().filter(|a| *a == "/grant:r").count(), 2);
+    }
+
+    #[test]
+    fn webview_managed_subtree_is_every_created_level_shallowest_first() {
+        let base = PathBuf::from(r"C:\ProgramData");
+        let sub = webview_managed_subtree(&base);
+        assert_eq!(sub.len(), 3);
+        assert!(sub[0].ends_with("DigNetwork"));
+        assert!(
+            sub[1].ends_with(r"DigNetwork\installer") || sub[1].ends_with("DigNetwork/installer")
+        );
+        assert_eq!(sub[2], webview_data_dir_for(&base));
+        // %ProgramData% itself (SYSTEM/TrustedInstaller-owned) is NOT managed.
+        assert!(!sub.iter().any(|d| d == &base));
+    }
+
+    fn webview_data_dir_for(base: &std::path::Path) -> PathBuf {
+        base.join("DigNetwork").join("installer").join("webview")
+    }
+
+    #[test]
+    fn attacker_owned_ancestor_is_selected_for_purge() {
+        // The §565 parent-delete-child hole: a non-admin owns the INTERMEDIATE
+        // `installer` ancestor (not the leaf). It must be the purge target so the
+        // whole squatted subtree is removed before we create + lock.
+        let sub = webview_managed_subtree(&PathBuf::from(r"C:\ProgramData"));
+        let attacker = "S-1-5-21-9-9-9-1001".to_string();
+        let owners = vec![
+            (sub[0].clone(), Some("S-1-5-32-544".to_string())), // DigNetwork: Admins (ours)
+            (sub[1].clone(), Some(attacker.clone())),           // installer: ATTACKER
+            (sub[2].clone(), Some("S-1-5-18".to_string())),     // webview: SYSTEM
+        ];
+        assert_eq!(
+            shallowest_untrusted_managed_dir(&owners).as_ref(),
+            Some(&sub[1]),
+            "the attacker-owned intermediate ancestor must be purged"
+        );
+    }
+
+    #[test]
+    fn all_admin_owned_ancestors_need_no_purge() {
+        let sub = webview_managed_subtree(&PathBuf::from(r"C:\ProgramData"));
+        let owners = vec![
+            (sub[0].clone(), Some("S-1-5-18".to_string())),
+            (sub[1].clone(), Some("S-1-5-32-544".to_string())),
+            (sub[2].clone(), Some("S-1-5-18".to_string())),
+        ];
+        assert_eq!(shallowest_untrusted_managed_dir(&owners), None);
+    }
+
+    #[test]
+    fn unreadable_owner_ancestor_is_treated_as_untrusted() {
+        // A dir whose owner can't be read is not provably admin-owned → purge it.
+        let sub = webview_managed_subtree(&PathBuf::from(r"C:\ProgramData"));
+        let owners = vec![(sub[0].clone(), None)];
+        assert_eq!(
+            shallowest_untrusted_managed_dir(&owners).as_ref(),
+            Some(&sub[0])
+        );
     }
 
     #[test]
