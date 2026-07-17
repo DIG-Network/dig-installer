@@ -709,11 +709,11 @@ mod tests {
         let bin = pf.join("DIG").join("bin");
         let levels = windows_created_root_levels(&bin, &pf);
         assert!(
-            !levels.iter().any(|l| *l == pf),
+            !levels.contains(&pf),
             "must never re-own the Program Files root"
         );
         assert!(
-            !levels.iter().any(|l| l == std::path::Path::new("C_drive")),
+            !levels.contains(&std::path::PathBuf::from("C_drive")),
             "must never re-own an ancestor above Program Files"
         );
     }
