@@ -3970,10 +3970,7 @@ mod tests {
     fn release_present_but_no_matching_asset_is_asset_not_found() {
         // The release exists but ships nothing for any OS/arch (only a tarball).
         let mut releases = HashMap::new();
-        releases.insert(
-            "digs",
-            ("v0.6.0", vec!["source-code.tar.gz", "notes.txt"]),
-        );
+        releases.insert("digs", ("v0.6.0", vec!["source-code.tar.gz", "notes.txt"]));
         let mut plan = base_plan();
         plan.with_digstore = true;
         let err = run_dry(&plan, releases).unwrap_err();
