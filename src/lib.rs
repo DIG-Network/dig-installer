@@ -3,7 +3,7 @@
 //! It bundles nothing. At install time it resolves, per host OS/arch, the LATEST
 //! GitHub release asset for each selected component and downloads it:
 //!
-//! * the **dig-store CLI** (`DIG-Network/dig-store`) → placed on PATH, along with
+//! * the **dig-store CLI** (`DIG-Network/digs`) → placed on PATH, along with
 //!   its **`digs` alias binary** (issue #434) — published in the SAME digstore
 //!   release under a separate asset stem, installed alongside digstore in the
 //!   same bin dir (no separate flag or PATH entry),
@@ -2908,8 +2908,8 @@ pub fn help_json() -> String {
     resolving + downloading the latest per-OS/arch release asset for each. dig-relay and the DIG \
     Browser are opt-in.",
         "components": [
-            { "id": "dig-store", "repo": "DIG-Network/dig-store", "default": true, "flag": "--no-dig-store disables", "kind": "raw_binary" },
-            { "id": "digs", "repo": "DIG-Network/dig-store", "default": true, "flag": "alias of dig-store — no separate flag; follows --no-dig-store/--with-dig-store/--dig-store-version", "kind": "raw_binary_alias" },
+            { "id": "dig-store", "repo": "DIG-Network/digs", "default": true, "flag": "--no-dig-store disables", "kind": "raw_binary" },
+            { "id": "digs", "repo": "DIG-Network/digs", "default": true, "flag": "alias of dig-store — no separate flag; follows --no-dig-store/--with-dig-store/--dig-store-version", "kind": "raw_binary_alias" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dign", "repo": "DIG-Network/dig-node", "default": true, "flag": "alias of dig-node — no separate flag; follows --no-dig-node/--with-dig-node/--dig-node-version", "kind": "raw_binary_alias" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
@@ -3095,7 +3095,7 @@ mod tests {
             "dig-updater-worker-0.6.0-macos-x64",
         ];
         let mut m = HashMap::new();
-        m.insert("dig-store", ("v0.6.0", digstore));
+        m.insert("digs", ("v0.6.0", digstore));
         m.insert("dig-node", ("v0.2.0", node));
         m.insert("dig-relay", ("v0.1.0", relay));
         m.insert("DIG_Browser", ("v1.0.0", browser));
@@ -3443,7 +3443,7 @@ mod tests {
         assert!(c.asset.starts_with("dig-store-0.6.0-"));
         assert!(c
             .url
-            .contains("github.com/DIG-Network/dig-store/releases/download/v0.6.0/"));
+            .contains("github.com/DIG-Network/digs/releases/download/v0.6.0/"));
         // dry-run installs nothing on disk.
         assert!(report.installed.is_empty());
     }
@@ -3479,7 +3479,7 @@ mod tests {
         assert!(digs.asset.starts_with("digs-0.6.0-"));
         assert!(digs
             .url
-            .contains("github.com/DIG-Network/dig-store/releases/download/v0.6.0/"));
+            .contains("github.com/DIG-Network/digs/releases/download/v0.6.0/"));
 
         // Same bin dir as digstore — no separate PATH entry is needed.
         let digstore_dir = std::path::Path::new(&digstore.dest).parent().unwrap();
@@ -3962,7 +3962,7 @@ mod tests {
         plan.with_digstore = true;
         let err = run_dry(&plan, HashMap::new()).unwrap_err();
         assert_eq!(err.code(), "ASSET_NOT_FOUND");
-        assert!(err.message().contains("dig-store"));
+        assert!(err.message().contains("digs"));
         assert!(err.hint().is_some());
     }
 
@@ -3971,7 +3971,7 @@ mod tests {
         // The release exists but ships nothing for any OS/arch (only a tarball).
         let mut releases = HashMap::new();
         releases.insert(
-            "dig-store",
+            "digs",
             ("v0.6.0", vec!["source-code.tar.gz", "notes.txt"]),
         );
         let mut plan = base_plan();
@@ -4000,7 +4000,7 @@ mod tests {
         // back to `dig-store` so the id + on-PATH name stay consistent.
         let mut releases = HashMap::new();
         releases.insert(
-            "dig-store",
+            "digs",
             (
                 "v0.13.0",
                 vec![
