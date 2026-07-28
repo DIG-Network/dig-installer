@@ -27,11 +27,14 @@ By DEFAULT it installs the full DIG stack in one run:\n  \
 * the dig-store CLI (added to PATH, along with its `digs` alias binary),\n  \
 * the dig-node local node (installed + started as a boot-start OS service, with a best-effort \
 127.0.0.2 dig.local hosts entry), and\n  \
+* the dig-app identity agent (the tray/menu-bar app; added to PATH and registered to start at \
+LOGIN as a per-user app, never a service), and\n  \
 * the dig-dns local *.dig name resolver (installed + started as a boot-start OS service, with \
 the OS split-DNS/NRPT + browser DoH wiring), and\n  \
 * the DIG auto-update beacon (dig-updater, registered as a daily scheduled check that installs \
 new signed DIG releases automatically).\n\n\
-Opt OUT of any of the four with --no-dig-store / --no-dig-node / --no-dig-dns / --no-auto-update. \
+Opt OUT of any of the five with --no-dig-store / --no-dig-node / --no-dig-app / --no-dig-dns / \
+--no-auto-update (--no-dig-app-autostart keeps dig-app but skips the login registration). \
 The dig-relay (advanced, run-your-own-relay) and the DIG Browser stay OPT-IN (--with-relay / \
 --with-browser). Use --json for machine-readable output and --help-json for the full invocation \
 contract (incl. the exit-code table)."
@@ -117,6 +120,27 @@ struct Cli {
     /// the default node already points at relay.dig.net, so most users do NOT need this.
     #[arg(long)]
     with_relay: bool,
+
+    /// Explicitly select dig-app, the per-user DIG identity agent + tray (Windows system tray /
+    /// macOS menu bar / Linux AppIndicator). Installed by default; this flag is the redundant
+    /// explicit opt-in.
+    #[arg(long)]
+    with_dig_app: bool,
+
+    /// Opt OUT of dig-app (installed by default). Without it you get the node engine but no
+    /// user-facing identity agent.
+    #[arg(long = "no-dig-app")]
+    no_dig_app: bool,
+
+    /// dig-app version to install (e.g. 3.0.0); default: latest released.
+    #[arg(long, value_name = "VERSION")]
+    dig_app_version: Option<String>,
+
+    /// Do NOT register dig-app to start at login (registered by default, per-user + unelevated:
+    /// Windows Run key / macOS LaunchAgent / Linux systemd user unit). dig-app stays installed and
+    /// on PATH either way.
+    #[arg(long = "no-dig-app-autostart")]
+    no_dig_app_autostart: bool,
 
     /// Explicitly select dig-dns + its boot-start OS service (Windows Service /
     /// macOS LaunchDaemon / Linux systemd): local `*.dig` name resolution (a DNS
@@ -353,6 +377,9 @@ fn main() -> std::process::ExitCode {
             health_port: cli.relay_health_port,
             start: !cli.no_service_start,
         },
+        with_dig_app: cli.with_dig_app || !cli.no_dig_app,
+        dig_app_version: cli.dig_app_version,
+        dig_app_autostart: !cli.no_dig_app_autostart,
         with_dig_dns,
         dig_dns_version: cli.dig_dns_version,
         dns_service: dig_installer::dns::DnsInstallConfig {

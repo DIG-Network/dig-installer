@@ -166,3 +166,36 @@ node -e "
 ```
 
 Drive `button.btn-primary`/`.agree` clicks to advance through License → Components as needed.
+
+## Verifying the dig-app install (#912)
+
+A default install places the dig-app identity agent alongside the node and registers it to start at
+the next login. To check both halves without waiting for a reboot:
+
+```bash
+# 1. the binary resolves by bare name from a fresh shell
+dig-app --version           # Windows: dig-app.exe
+
+# 2. the per-user autostart artifact exists
+#    Windows
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "DIG App"
+#    macOS
+cat ~/Library/LaunchAgents/net.dig.dig-app.plist
+#    Linux
+cat "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/dig-app.service"
+
+# 3. start it now, without logging out
+#    Windows / macOS: run the binary (macOS may also `launchctl load` the agent)
+dig-app
+#    Linux: enable + start the user unit
+systemctl --user enable --now dig-app.service
+```
+
+dig-app is a tray / menu-bar agent: on a desktop session it appears in the tray, and on a GUI-less
+host it degrades to a headless agent and says so on stderr. It looks for a running dig-node over the
+§5.3 loopback ladder and reports which endpoints it tried, so "no node" is always explained rather
+than silent.
+
+`--no-dig-app` skips it entirely; `--no-dig-app-autostart` installs the binary without the login
+registration. `dig-installer --json` reports both under `components[]` (`"component": "dig-app"`)
+and `autostart` (`mechanism` / `artifact` / `registered` / `note`).

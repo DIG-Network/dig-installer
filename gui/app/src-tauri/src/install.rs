@@ -610,6 +610,7 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // download, and (task #232) stop-before-write/start-after-write service
     // lifecycle rather than re-implementing any of it in the GUI.
     if extra_plan.with_dig_node
+        || extra_plan.with_dig_app
         || extra_plan.with_dig_dns
         || extra_plan.with_relay
         || extra_plan.with_browser
@@ -751,6 +752,13 @@ fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::Insta
         with_relay: selected_on("dig-relay"),
         relay_version: None,
         relay_service: dig_installer::ServiceConfigRelay::default(),
+        // #912: dig-app is a per-user agent, so — unlike the daemons around it — the
+        // GUI installs it into the user bin dir and registers a LOGIN autostart, not a
+        // service. Its autostart follows the same absent-key-means-ON convention as the
+        // options below.
+        with_dig_app: selected_on("dig-app"),
+        dig_app_version: None,
+        dig_app_autostart: *selected.get("dig-app-autostart").unwrap_or(&true),
         with_dig_dns: selected_on("dig-dns"),
         dig_dns_version: None,
         dns_service: dig_installer::dns::DnsInstallConfig::default(),

@@ -14,6 +14,11 @@
 //!   under a separate asset stem, installed alongside dig-node in the same bin
 //!   dir — and (best-effort) a `127.0.0.2 dig.local` hosts entry so consumers
 //!   reach it port-free,
+//! * **dig-app** (`DIG-Network/dig-app`) → the per-user identity agent + tray
+//!   (issue #912), the user-facing half of the #908 engine/app split. Placed on
+//!   PATH like a user CLI and registered for PER-USER autostart at login (see
+//!   [`autostart`]) — Windows HKCU `Run` value / macOS LaunchAgent / Linux
+//!   systemd **user** unit — never a machine-wide service, never elevated,
 //! * the **DIG Browser** (`DIG-Network/DIG_Browser`) → the native installer
 //!   (`.exe`/`.dmg`/`.AppImage`) downloaded for the user to run, and
 //! * **dig-dns** (`DIG-Network/dig-dns`) → installed + registered as an OS
@@ -43,6 +48,7 @@
 //! is unit-tested; [`run`] is the imperative orchestration that performs I/O.
 
 pub mod asset;
+pub mod autostart;
 pub mod beacon;
 pub mod browsers;
 pub mod daemon_dir;
@@ -101,6 +107,20 @@ pub struct InstallPlan {
     pub dig_node_version: Option<String>,
     /// Service configuration when `with_dig_node` is set.
     pub service: ServiceConfig,
+    /// Install the **dig-app** per-user identity agent + tray (issue #912). Default
+    /// true — dig-app is the user-facing half of the #908 engine/app split, so a
+    /// default install ships it alongside the dig-node engine. Unlike the daemons it
+    /// is a per-user, unelevated component: on PATH plus a login autostart
+    /// ([`Self::dig_app_autostart`]), never a machine-wide service.
+    pub with_dig_app: bool,
+    /// dig-app version/tag to install: `None` ⇒ latest released (falling back to the
+    /// newest pre-release while dig-app publishes nightlies only).
+    pub dig_app_version: Option<String>,
+    /// Register dig-app to start at login (default true — a first-class, toggleable
+    /// install option, `--no-dig-app-autostart` opts out). Per-user, no elevation:
+    /// Windows HKCU `Run` value · macOS LaunchAgent · Linux systemd **user** unit.
+    /// Declining leaves dig-app installed and on PATH, just not auto-started.
+    pub dig_app_autostart: bool,
     /// Also download the DIG Browser native installer.
     pub with_browser: bool,
     /// DIG Browser version/tag to install: `None` ⇒ latest released.
@@ -187,7 +207,11 @@ impl InstallPlan {
         }
         // #565: a CLI-only install still writes binaries into the protected root
         // on a platform where that root is admin-only (Windows Program Files).
-        let places_a_binary = self.with_digstore || self.with_browser;
+        // dig-app counts here (#912): it registers no service — so it never trips the
+        // branch above — yet it IS a binary written into that root, and without this
+        // the pre-install guard would be skipped and the write would fail late with a
+        // raw permission error instead of the clean elevation verdict.
+        let places_a_binary = self.with_digstore || self.with_dig_app || self.with_browser;
         places_a_binary
             && !self.has_custom_bin_dir()
             && self.bin_dir_for("dig-store", os) == paths::protected_bin_dir()
@@ -287,6 +311,9 @@ impl InstallPlan {
         if self.with_dig_node {
             c.extend(["dig-node", "dign"]);
         }
+        if self.with_dig_app {
+            c.push("dig-app");
+        }
         if self.with_dig_dns {
             c.extend(["dig-dns", "digd"]);
         }
@@ -313,6 +340,9 @@ impl Default for InstallPlan {
             with_dig_node: true,
             dig_node_version: None,
             service: ServiceConfig::default(),
+            with_dig_app: true,
+            dig_app_version: None,
+            dig_app_autostart: true,
             with_browser: false,
             browser_version: None,
             with_relay: false,
@@ -447,6 +477,9 @@ pub struct InstallReport {
     /// The DIG auto-update beacon's daily scheduler registration result (only
     /// when `auto_update`) — #514.
     pub beacon: Option<beacon::BeaconResult>,
+    /// dig-app's per-user login-autostart registration (only when `with_dig_app &&
+    /// dig_app_autostart` and dig-app actually resolved) — #912.
+    pub autostart: Option<autostart::AutostartResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
     /// Per-CLI PATH-resolution checks (#496): confirms each required DIG CLI
@@ -746,6 +779,7 @@ fn run_report_gated(
         scheme: None,
         firewall: None,
         beacon: None,
+        autostart: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
@@ -853,7 +887,9 @@ fn run_report_gated(
         }
 
         // 2. PATH (only meaningful if we placed a PATH binary).
-        if plan.modify_path && (plan.with_digstore || plan.with_dig_node || plan.with_dig_dns) {
+        if plan.modify_path
+            && (plan.with_digstore || plan.with_dig_node || plan.with_dig_app || plan.with_dig_dns)
+        {
             log(&format!("Adding {} to PATH:", plan.bin_dir.display()));
             let dir = plan.bin_dir.to_string_lossy().into_owned();
             if plan.dry_run {
@@ -998,6 +1034,70 @@ fn run_report_gated(
                     f.note
                 ));
                 report.firewall = Some(f);
+            }
+        }
+
+        // 3c. dig-app (issue #912): the per-user identity agent + tray, the USER-FACING half of the
+        //     stack that pairs with the dig-node engine installed above (the #908 node↔app split —
+        //     the engine is identity-agnostic, the app IS the identity). Unlike every daemon here it
+        //     is NOT a machine-wide service: it runs in the user's own session, so it is placed on
+        //     PATH like a user CLI and registered for PER-USER autostart at login (`autostart`) —
+        //     Windows HKCU Run value, macOS LaunchAgent, Linux systemd user unit — with no
+        //     elevation. Both binary + autostart, because a binary a stranger cannot start is not a
+        //     distribution.
+        //
+        //     Resolution failure is gated gracefully, exactly as the `dign` alias above is: dig-app
+        //     publishes nightlies ahead of its first stable release, and a release that has no
+        //     asset for this OS/arch must never sink the otherwise-successful stack install.
+        if plan.with_dig_app {
+            log("Installing dig-app (the DIG identity agent + tray):");
+            match resolve_component(
+                resolve,
+                &Repo::dig_app(),
+                &plan.dig_app_version,
+                &target,
+                AssetKind::RawBinary,
+                &plan.bin_dir_for("dig-app", target.os),
+            ) {
+                Ok(mut c) => {
+                    log_component(log, &c);
+                    // #309 version-aware updater: dig-app is a tracked component (it is a
+                    // first-class installed binary, not an alias sharing another component's
+                    // version pin), so a re-run skips a download that would change nothing.
+                    let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
+                    if decision.action != update::UpdateAction::Skip {
+                        let outcome = download_component(&c, plan.dry_run)?;
+                        report.restart_required |= log_write_outcome(log, "dig-app", outcome);
+                    } else {
+                        log("    · already up to date — skipping the download");
+                    }
+                    if !plan.dry_run {
+                        note_binary_written(report, guard, &c.dest);
+                    }
+                    let dig_app_path = PathBuf::from(c.dest.clone());
+                    report.components.push(c);
+
+                    if plan.dig_app_autostart {
+                        log("Registering dig-app to start at login (per-user, no elevation):");
+                        let a = autostart::register(&dig_app_path, target.os, plan.dry_run);
+                        log(&format!(
+                            "    {} {}",
+                            if a.registered { "✓" } else { "·" },
+                            a.note
+                        ));
+                        if a.registered {
+                            guard.record(InstallAction::AutostartRegistered);
+                        }
+                        report.autostart = Some(a);
+                    }
+                }
+                Err(e) if e.code() == "ASSET_NOT_FOUND" => {
+                    log(&format!(
+                        "    · dig-app is not available for this target yet ({e}) — skipping; the \
+                         rest of the stack is unaffected"
+                    ));
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1403,7 +1503,9 @@ fn note_binary_written(report: &mut InstallReport, guard: &mut RollbackGuard, de
 ///     canonical id via the OS service manager,
 ///   * [`InstallAction::SchemeRegistered`] → unregister the `dig://`/`chia://`/
 ///     `urn:` handlers we created,
-///   * [`InstallAction::ArpEntryWritten`] → remove the Add/Remove Programs entry.
+///   * [`InstallAction::ArpEntryWritten`] → remove the Add/Remove Programs entry,
+///   * [`InstallAction::AutostartRegistered`] → remove dig-app's per-user login
+///     autostart artifact (#912).
 fn undo_install_action(action: &InstallAction) -> Result<(), String> {
     match action {
         InstallAction::FileCreated(path) => match std::fs::remove_file(path) {
@@ -1418,6 +1520,11 @@ fn undo_install_action(action: &InstallAction) -> Result<(), String> {
             // leaves the scheme registry no worse than pristine.
             scheme::unregister(false);
             Ok(())
+        }
+        InstallAction::AutostartRegistered => {
+            // `deregister` treats an already-absent artifact as success, so the
+            // reversal is idempotent like every other undo here.
+            autostart::deregister(Target::current().map(|t| t.os).unwrap_or(target::Os::Linux))
         }
         InstallAction::ArpEntryWritten => {
             #[cfg(windows)]
@@ -2904,7 +3011,7 @@ pub fn help_json() -> String {
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": SCHEMA_VERSION,
         "description": "Universal DIG installer: by default installs the full DIG stack (the \
-    dig-store CLI + the dig-node boot-start service + the dig-dns boot-start service) in one run, \
+    dig-store CLI + the dig-node boot-start service + the dig-app per-user identity agent + the     dig-dns boot-start service) in one run, \
     resolving + downloading the latest per-OS/arch release asset for each. dig-relay and the DIG \
     Browser are opt-in.",
         "components": [
@@ -2912,6 +3019,7 @@ pub fn help_json() -> String {
             { "id": "digs", "repo": "DIG-Network/digs", "default": true, "flag": "alias of dig-store — no separate flag; follows --no-dig-store/--with-dig-store/--dig-store-version", "kind": "raw_binary_alias" },
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dign", "repo": "DIG-Network/dig-node", "default": true, "flag": "alias of dig-node — no separate flag; follows --no-dig-node/--with-dig-node/--dig-node-version", "kind": "raw_binary_alias" },
+            { "id": "dig-app", "repo": "DIG-Network/dig-app", "default": true, "flag": "--no-dig-app disables; --with-dig-app redundant; --no-dig-app-autostart keeps the binary but skips the login registration", "kind": "raw_binary+per-user-login-autostart" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": true, "flag": "--no-dig-dns disables; --with-dig-dns redundant", "kind": "raw_binary+boot-start-service+split-dns+browser-policy" },
             { "id": "digd", "repo": "DIG-Network/dig-dns", "default": true, "flag": "alias of dig-dns — no separate flag; follows --no-dig-dns/--with-dig-dns/--dig-dns-version", "kind": "raw_binary_alias" },
@@ -2943,6 +3051,10 @@ pub fn help_json() -> String {
             { "flag": "--relay-version", "value": "VERSION", "description": "pin dig-relay version (default: latest)" },
             { "flag": "--relay-port", "value": "PORT", "default": 9450, "description": "relay WebSocket port for the relay service" },
             { "flag": "--relay-health-port", "value": "PORT", "default": 9451, "description": "relay HTTP /health port for the relay service" },
+            { "flag": "--no-dig-app", "description": "opt out of the dig-app identity agent (installed by default)" },
+            { "flag": "--with-dig-app", "description": "explicit (redundant) opt-in — dig-app installs + registers a per-user login autostart by default" },
+            { "flag": "--dig-app-version", "value": "VERSION", "description": "pin dig-app version (default: latest)" },
+            { "flag": "--no-dig-app-autostart", "description": "install dig-app without registering it to start at login (it stays on PATH)" },
             { "flag": "--no-dig-dns", "description": "opt out of dig-dns + its service (installed by default)" },
             { "flag": "--with-dig-dns", "description": "explicit (redundant) opt-in — dig-dns installs + registers as a boot-start OS service by default (local *.dig name resolution: DNS responder + HTTP gateway)" },
             { "flag": "--dig-dns-version", "value": "VERSION", "description": "pin dig-dns version (default: latest)" },
@@ -3094,7 +3206,23 @@ mod tests {
             "dig-updater-worker-0.6.0-macos-arm64",
             "dig-updater-worker-0.6.0-macos-x64",
         ];
+        // dig-app publishes BOTH first-class binaries of the #908 form-factor split from ONE
+        // release — the tray agent `dig-app` AND its own `dign` CLI (the U7 migration). The `dign`
+        // assets are deliberately present in this fixture: they are the reason asking this repo for
+        // `dig-app` must be stem-anchored. `dign` is the SHORTER name, and the selector's length
+        // tiebreak would hand it back for `dig-app` if the canonical-stem preference were dropped.
+        let app: Vec<&'static str> = vec![
+            "dig-app-3.0.0-windows-x64.exe",
+            "dig-app-3.0.0-linux-x64",
+            "dig-app-3.0.0-macos-arm64",
+            "dig-app-3.0.0-macos-x64",
+            "dign-3.0.0-windows-x64.exe",
+            "dign-3.0.0-linux-x64",
+            "dign-3.0.0-macos-arm64",
+            "dign-3.0.0-macos-x64",
+        ];
         let mut m = HashMap::new();
+        m.insert("dig-app", ("v3.0.0", app));
         m.insert("digs", ("v0.6.0", digstore));
         m.insert("dig-node", ("v0.2.0", node));
         m.insert("dig-relay", ("v0.1.0", relay));
@@ -3114,6 +3242,9 @@ mod tests {
             with_dig_node: false,
             dig_node_version: None,
             service: ServiceConfig::default(),
+            with_dig_app: false,
+            dig_app_version: None,
+            dig_app_autostart: false,
             with_browser: false,
             browser_version: None,
             with_relay: false,
@@ -3256,6 +3387,7 @@ mod tests {
         assert!(names.contains(&"dig-store"), "digstore in default plan");
         assert!(names.contains(&"dig-node"), "dig-node in default plan");
         assert!(names.contains(&"dig-dns"), "dig-dns in default plan");
+        assert!(names.contains(&"dig-app"), "dig-app in default plan (#912)");
         assert!(
             names.contains(&"dig-updater"),
             "the auto-update beacon is in the default plan (#514)"
@@ -3295,6 +3427,7 @@ mod tests {
         assert!(by_id("dig-node"), "dig-node default: true (#301)");
         assert!(by_id("dig-dns"), "dig-dns default: true (#301)");
         assert!(by_id("dig-updater"), "dig-updater default: true (#514)");
+        assert!(by_id("dig-app"), "dig-app default: true (#912)");
         assert!(
             by_id("dig-updater-worker"),
             "dig-updater-worker default: true (#514)"
@@ -4373,6 +4506,7 @@ mod tests {
             scheme: None,
             firewall: None,
             beacon: None,
+            autostart: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
@@ -5346,5 +5480,206 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // dig-app distribution (#912): the user-facing half of the #908 split must
+    // reach a stranger through the ordinary install, not a manual download.
+    // -----------------------------------------------------------------------
+
+    /// The default (universal) install SELECTS dig-app. This list drives placement, elevation, and
+    /// PATH decisions, so an implementation that downloaded dig-app without declaring it here would
+    /// route it wrongly — hence exact list equality.
+    #[test]
+    fn the_default_plan_selects_dig_app_912() {
+        let plan = InstallPlan::default();
+        assert!(plan.with_dig_app, "dig-app ships in the default stack");
+        assert!(plan.dig_app_autostart, "and starts at login by default");
+        assert_eq!(
+            plan.selected_components(),
+            vec![
+                "dig-store",
+                "digs",
+                "dig-node",
+                "dign",
+                "dig-app",
+                "dig-dns",
+                "digd",
+                "dig-updater",
+                "dig-updater-worker",
+            ]
+        );
+    }
+
+    /// A dig-app-only install registers no service, so it reaches the elevation gate only through
+    /// the "places a binary in the protected root" arm. On Windows the whole stack shares the
+    /// admin-only Program Files root, so it MUST still elevate — otherwise the guard is skipped and
+    /// the write fails late with a raw permission error instead of the clean verdict (#565).
+    #[test]
+    fn a_dig_app_only_windows_install_still_elevates_912() {
+        let mut plan = base_plan();
+        plan.bin_dir = paths::default_bin_dir();
+        plan.with_dig_app = true;
+        plan.dry_run = false;
+        assert_eq!(
+            plan.bin_dir_for("dig-app", target::Os::Windows),
+            paths::protected_bin_dir(),
+            "dig-app lands in the protected root on Windows"
+        );
+        assert!(plan.requires_elevation(target::Os::Windows));
+        // A dry-run never elevates, and an explicit --bin-dir is the user's own choice.
+        plan.dry_run = true;
+        assert!(!plan.requires_elevation(target::Os::Windows));
+    }
+
+    /// dig-app is a PER-USER agent, never a machine-wide service binary: on unix it lands in the
+    /// elevation-free user bin dir, NOT the admin-only protected root the daemons use. A dig-app in
+    /// the privileged set would demand root to install a tray app.
+    #[test]
+    fn dig_app_is_not_a_privileged_service_component_912() {
+        assert!(!paths::is_privileged_component(
+            target::Os::Linux,
+            "dig-app"
+        ));
+        assert!(!paths::is_privileged_component(
+            target::Os::MacOs,
+            "dig-app"
+        ));
+        // A dig-app-only plan therefore needs no elevation on unix.
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        plan.dry_run = false;
+        assert!(!plan.requires_elevation(target::Os::Linux));
+    }
+
+    /// The payload actually carries dig-app: resolved from the dig-app release, placed on PATH under
+    /// the canonical `dig-app` exe name.
+    ///
+    /// The load-bearing part is the second hop. The fixture release also contains `dign-*` assets
+    /// (as the real one does) and `dign` is the SHORTER name — so a stem-blind selector returns
+    /// dig-app's `dign` here and this test fails. Asserting only "a component resolved" would pass
+    /// on that wrong implementation.
+    #[test]
+    fn dig_app_is_carried_in_the_installer_payload_912() {
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-app resolves");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(ids, vec!["dig-app"]);
+
+        let app = &report.components[0];
+        assert_eq!(app.version, "3.0.0");
+        assert_eq!(app.tag, "v3.0.0");
+        assert!(
+            app.asset.starts_with("dig-app-3.0.0-"),
+            "resolved the dig-app asset, not the dign sibling in the same release: {}",
+            app.asset
+        );
+        assert!(app
+            .url
+            .contains("github.com/DIG-Network/dig-app/releases/download/v3.0.0/"));
+        let target = Target::current().expect("supported target");
+        assert_eq!(
+            std::path::Path::new(&app.dest).file_name().unwrap(),
+            std::ffi::OsStr::new(&target.exe_name("dig-app")),
+            "placed under the canonical dig-app exe name so it resolves by bare name on PATH"
+        );
+    }
+
+    /// `dign` keeps coming from the dig-NODE release even though dig-app publishes a `dign` of its
+    /// own — the `chia://` scheme handler is wired against `dign open` from the node, so silently
+    /// repointing it would change which binary answers every clicked link. Both components are
+    /// selected here so the two `dign` sources compete; the version + URL pin which one won.
+    #[test]
+    fn dign_still_resolves_from_the_dig_node_release_not_dig_app_912() {
+        let mut plan = base_plan();
+        plan.with_dig_node = true;
+        plan.with_dig_app = true;
+        let report = run_dry(&plan, all_releases()).expect("node + app resolve");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(ids, vec!["dig-node", "dign", "dig-app"]);
+
+        let dign = &report.components[1];
+        assert_eq!(dign.version, "0.2.0", "dign rides dig-node's version pin");
+        assert!(
+            dign.url.contains("/DIG-Network/dig-node/releases/"),
+            "dign comes from the dig-node release: {}",
+            dign.url
+        );
+        assert_eq!(report.components[2].version, "3.0.0");
+    }
+
+    /// Installed is not the same as launchable: selecting dig-app also registers the per-user login
+    /// autostart, with the mechanism appropriate to the host OS.
+    #[test]
+    fn dig_app_is_registered_to_start_at_login_912() {
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        plan.dig_app_autostart = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-app resolves");
+        let a = report
+            .autostart
+            .as_ref()
+            .expect("autostart was registered for the tray agent");
+        let os = Target::current().expect("supported target").os;
+        assert_eq!(a.mechanism, autostart::mechanism_for(os));
+        // Dry-run reports the intent without writing; the note is never silent.
+        assert!(!a.registered);
+        assert!(!a.note.is_empty());
+    }
+
+    /// The autostart is declinable (never trap the user) and is not registered at all when dig-app
+    /// itself was not selected.
+    #[test]
+    fn dig_app_autostart_is_declinable_and_absent_without_dig_app_912() {
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        plan.dig_app_autostart = false;
+        let report = run_dry(&plan, all_releases()).expect("dig-app resolves");
+        assert_eq!(report.components.len(), 1, "the binary is still installed");
+        assert!(
+            report.autostart.is_none(),
+            "declining autostart registers nothing"
+        );
+
+        let mut off = base_plan();
+        off.with_digstore = true;
+        let report = run_dry(&off, all_releases()).expect("digstore resolves");
+        assert!(report.autostart.is_none());
+    }
+
+    /// dig-app publishes nightlies ahead of its first stable release, so a release with no asset for
+    /// this OS/arch is SKIPPED gracefully — the rest of the stack still installs. (Same contract the
+    /// `dign` alias already has.)
+    #[test]
+    fn a_dig_app_release_without_an_asset_for_this_target_is_skipped_912() {
+        let mut releases = all_releases();
+        releases.remove("dig-app");
+        let mut plan = base_plan();
+        plan.with_digstore = true;
+        plan.with_dig_app = true;
+        let report = run_dry(&plan, releases).expect("the stack still installs");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(ids, vec!["dig-store", "digs"]);
+        assert!(report.autostart.is_none());
+    }
+
+    /// An uninstall must remove dig-app too — a stranger who removes DIG should not be left with a
+    /// tray agent still launching at every login.
+    #[test]
+    fn uninstall_covers_the_dig_app_binary_912() {
+        assert!(uninstall::COMPONENT_STEMS.contains(&"dig-app"));
     }
 }

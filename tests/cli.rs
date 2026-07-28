@@ -149,6 +149,8 @@ fn help_lists_the_selectable_component_flags() {
         "--no-dig-store",
         // #301 opt-out flags for the two components now installed by default.
         "--no-dig-node",
+        "--no-dig-app",
+        "--no-dig-app-autostart",
         "--no-dig-dns",
         "--dig-node-port",
         "--with-dig-dns",
@@ -220,6 +222,7 @@ fn dry_run_dig_node_reports_the_firewall_intent_by_default() {
     let out = bin()
         .args([
             "--no-dig-store",
+            "--no-dig-app",
             "--no-dig-dns",
             "--no-auto-update",
             "--dig-node-version",
@@ -249,6 +252,7 @@ fn no_open_firewall_flag_skips_the_firewall_section_entirely() {
     let out = bin()
         .args([
             "--no-dig-store",
+            "--no-dig-app",
             "--no-dig-dns",
             "--no-open-firewall",
             "--no-auto-update",
@@ -275,6 +279,7 @@ fn dry_run_reports_the_beacon_intent_by_default() {
         .args([
             "--no-dig-store",
             "--no-dig-node",
+            "--no-dig-app",
             "--no-dig-dns",
             "--dig-updater-version",
             PINNED_DIG_UPDATER_VERSION,
@@ -309,6 +314,7 @@ fn no_auto_update_flag_skips_the_beacon_section_entirely() {
         .args([
             "--no-dig-store",
             "--no-dig-node",
+            "--no-dig-app",
             "--no-dig-dns",
             "--no-auto-update",
             "--dry-run",
@@ -372,7 +378,7 @@ fn help_prose_frames_the_universal_all_three_default() {
     );
 }
 
-/// #301/#514: opting out of every default-on component is a valid,
+/// #301/#514/#912: opting out of every default-on component is a valid,
 /// network-free, side-effect-free run — proving the `--no-<component>`
 /// opt-outs parse and fully disable the default stack (nothing to resolve, so
 /// no HTTP call is made).
@@ -382,6 +388,7 @@ fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
         .args([
             "--no-dig-store",
             "--no-dig-node",
+            "--no-dig-app",
             "--no-dig-dns",
             "--no-auto-update",
             "--dry-run",
@@ -394,7 +401,7 @@ fn opting_out_of_every_component_is_network_free_and_installs_nothing() {
     assert_eq!(v["ok"], true);
     assert!(
         v["result"]["components"].as_array().unwrap().is_empty(),
-        "opting out of all three must resolve/install nothing"
+        "opting out of every default-on component must resolve/install nothing"
     );
 }
 

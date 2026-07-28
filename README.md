@@ -11,6 +11,12 @@ the latest DIG components for your OS/arch:
   service / systemd / launchd), along with its **`dign` alias binary** (same
   pattern as `digs` above), with a best-effort `127.0.0.2 dig.local` hosts
   entry so apps and the DIG Browser can reach it port-free at `http://dig.local`,
+- the **dig-app** DIG identity agent — the tray / menu-bar app that holds your
+  keys and talks to your local node. It is a **per-user** app, not a service:
+  it goes on your PATH and is registered to start at **login** (Windows Run key
+  / macOS LaunchAgent / Linux systemd *user* unit), with no elevation. Opt out
+  with `--no-dig-app`, or keep the app but skip the login registration with
+  `--no-dig-app-autostart`,
 - the **dig-dns** local `*.dig` name resolver — installed + started as an OS
   service (Windows Service / macOS LaunchDaemon / Linux systemd), along with
   its **`digd` alias binary** (same pattern as `digs`/`dign`), with the OS
@@ -34,6 +40,7 @@ downloads it. Sources:
 - the **digstore CLI** (and its `digs` alias) from [`DIG-Network/digstore`](https://github.com/DIG-Network/digstore/releases)
 - the **dig-node** local node (and its `dign` alias) from [`DIG-Network/dig-node`](https://github.com/DIG-Network/dig-node/releases)
   (formerly `dig-companion`)
+- the **dig-app** identity agent from [`DIG-Network/dig-app`](https://github.com/DIG-Network/dig-app/releases)
 - the **dig-dns** local resolver (and its `digd` alias) from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
 - the **auto-update beacon** (+ its worker sibling) from [`DIG-Network/dig-updater`](https://github.com/DIG-Network/dig-updater/releases)
 - the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
@@ -49,9 +56,10 @@ downloads it. Sources:
 
 **By default it installs the full DIG stack in one run** — the digstore CLI, the
 dig-node service, the dig-dns service (both boot-start OS services that come up
-automatically on every boot), and the auto-update beacon (a daily scheduled
+automatically on every boot), the dig-app identity agent (a per-user app that
+starts at login), and the auto-update beacon (a daily scheduled
 task/timer/LaunchDaemon). Opt out of any of them with `--no-digstore` /
-`--no-dig-node` / `--no-dig-dns` / `--no-auto-update`. The dig-relay *(advanced)*
+`--no-dig-node` / `--no-dig-app` / `--no-dig-dns` / `--no-auto-update`. The dig-relay *(advanced)*
 and the DIG Browser stay opt-in (`--with-relay` / `--with-browser`). This is the
 canonical home of the DIG installer, migrated out of `digstore`.
 

@@ -108,6 +108,9 @@ pub enum InstallAction {
     ArpEntryWritten,
     /// The URL-scheme handlers were registered (undo = unregister them).
     SchemeRegistered,
+    /// dig-app's per-user login autostart was registered (undo = remove the Run
+    /// value / LaunchAgent / systemd user unit — issue #912).
+    AutostartRegistered,
 }
 
 /// Records the actions an install performed and, on failure, reverses them in
