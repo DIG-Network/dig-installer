@@ -379,9 +379,12 @@ unsafe fn entry_from_passwd(pwd: &libc::passwd) -> Option<PasswdEntry> {
         return None;
     }
     Some(PasswdEntry {
+        // No cast: `uid_t`/`gid_t` are `u32` on both supported unix platforms, so a cast would be
+        // redundant (and `clippy::unnecessary_cast` rejects it). A platform where they widened would
+        // fail to compile here, which is the right way to find out.
         name,
-        uid: pwd.pw_uid as u32,
-        gid: pwd.pw_gid as u32,
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
         home: PathBuf::from(home),
     })
 }
