@@ -287,6 +287,84 @@ same as digstore/dig-node/dig-dns. `dig-updater-worker` is not independently tra
 Declining the beacon (or a registration failure) is always safe: DIG simply never auto-updates, and
 the user re-runs the installer manually to pick up new versions.
 
+### 1.5a The target user — an elevated install installs for the INVOKING account (#1748)
+
+The documented unix install path is `curl -fsSL https://dig.net/install.sh | sudo sh`, so the
+installer normally runs as **root while acting on behalf of somebody else**. Every per-user decision
+MUST therefore be made against the *invoking* account, never against the process's own environment:
+under `sudo`, `$HOME` is `/root` and `$PATH`, `$XDG_CONFIG_HOME` and the visible dotfiles are all
+root's.
+
+**Target-user resolution (`invoker::resolve`).** The invoking account is resolved from the escalation
+tool's own environment and the passwd database:
+
+| Source | Fields | Notes |
+|---|---|---|
+| `sudo` | `SUDO_USER`, `SUDO_UID`, `SUDO_GID` | Highest precedence |
+| `doas` | `DOAS_USER` | Name only; uid comes from the passwd record |
+| `pkexec` | `PKEXEC_UID` | uid only; resolved back to a name |
+
+- The hint is read **only when `geteuid() == 0`**. An unelevated process already IS the target user, so
+  a stale `SUDO_USER` inherited from an ancestor shell MUST NOT redirect the install.
+- A hint naming `root` is not an inversion and MUST be ignored.
+- The home directory MUST come from the **passwd database**, never from `$HOME`.
+- A named account takes precedence over a conflicting uid.
+- `TargetUser.via_elevation` is `true` exactly when we are root acting for a different account.
+
+**Placement.** On unix:
+
+| Situation | User-facing CLIs | Mechanism |
+|---|---|---|
+| Elevated (`geteuid()==0`) | `/usr/local/bin` (`paths::UNIX_MACHINE_BIN_DIR`) | Already on every login shell's `PATH`; root-owned `0755`, so the §1.6 no-LPE invariant holds |
+| Unelevated | `<invoking user>/.dig/bin` | Per-user profile append, elevation-free |
+
+An elevated install MUST NOT place user-facing CLIs under any home directory: root's is unreachable
+(mode `0700`), and one user's would privilege a single account on a multi-user machine.
+
+**PATH wiring is verified, not assumed.** An elevated install MUST NOT wire `PATH` through dotfiles
+(the only dotfiles it can see are root's). It instead:
+
+1. reads the target user's **login-shell** `PATH` and checks whether the bin dir is already present;
+2. only if absent, writes `paths::PROFILE_D_SCRIPT` (`/etc/profile.d/dig-path.sh`) — POSIX `sh`, with a
+   source-time `case` guard so a re-source cannot duplicate the entry; and
+3. **re-reads** the login-shell `PATH`. If the directory is still absent the result is an ERROR, not a
+   success note.
+
+**Protected-root CLIs are linked back onto PATH.** `/opt/dig/bin` is on no shell's default `PATH`, so a
+privileged binary a user is expected to invoke by name (`dig-dns doctor`) MUST be symlinked into
+`UNIX_MACHINE_BIN_DIR` (`paths::needs_machine_bin_link`). Both ends are root-owned `0755`, so
+reachability is added without making a service-executed binary unprivileged-writable.
+`dig-updater`/`dig-updater-worker` MUST NOT be linked — the beacon invokes them, a user never does.
+
+**Per-user artifacts.** The login autostart (§1.11), the `chia://` desktop entry (§1.3) and the
+legacy-root migration are all resolved against the target user's home and `chown`ed back to that
+account. `$XDG_CONFIG_HOME` MUST be ignored when `via_elevation` is `true`.
+
+**Printed remediation MUST be runnable in a scope where the thing exists.** `systemctl --user enable
+--now dig-app.service` is not a valid instruction from a `curl | sudo sh` shell — root has no session
+bus and the unit belongs to the user. Under elevation the printed command names the target user and
+their runtime dir; a readiness failure MUST NOT advise re-running elevated, because the failing install
+was already elevated.
+
+### 1.5b Post-install verification MUST be falsifiable (#496/#1748)
+
+Every post-install check MUST be capable of failing in the situation it exists to detect.
+
+- **The PATH consulted MUST be READ from the target environment and MUST NOT be modified.** Prepending
+  the install directory to the PATH being searched makes the check true by construction; it is then an
+  executability check misreported as a PATH check. Sources: the target user's fresh **login shell** on
+  unix (`su - <user>` under elevation, so `/etc/profile`, `/etc/profile.d/*` and their own profile are
+  sourced); the **persisted** machine + user `Environment` `Path` on Windows (never the current
+  process's `PATH`).
+- **A component MUST NOT be reported ready without its binary having been EXECUTED.** Resolution
+  proves a file is reachable; only running it proves it works. The resolved absolute path is executed
+  (`<exe> --version`), as the target user under elevation, and a non-zero exit is a failure carrying the
+  loader/stderr detail (for example `libxdo.so.3: cannot open shared object file`).
+- **The verified set is every user-facing binary the installer places**, including the alias binaries
+  and `dig-app`: `dig-store`, `digs`, `dig-node`, `dign`, `dig-dns`, `digd`, `dig-app`. A component that
+  is downloaded but never executed MUST NOT print `✓`.
+- Any check that cannot fail against the broken layout it guards is itself a defect.
+
 ### 1.6 Install locations — the protected install root (#565)
 
 A binary that a PRIVILEGED identity later executes MUST live in a directory an unprivileged user

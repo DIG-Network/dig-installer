@@ -142,33 +142,42 @@ pub fn windows_run_command(binary_path: &Path) -> String {
     format!("\"{}\"", binary_path.display())
 }
 
-/// Register `dig_app_bin` to start in the user's session at login on `os`.
+/// Register `dig_app_bin` to start at login, in the session of the [target
+/// user](crate::invoker::target_user) — the account that INVOKED the installer, which under `sudo` is
+/// NOT the account this process is running as (#1748).
 ///
 /// Best-effort by design: autostart is a convenience, so a failure is reported on the
 /// [`AutostartResult`] and never aborts an otherwise-successful install — the binary is still on
 /// PATH and the user can launch it by hand. A `dry_run` writes nothing and reports the intent.
+///
+/// This used to resolve `dirs::home_dir()`, which `sudo` sets to `/root`, so a "per-user" autostart
+/// was written to `/root/.config/systemd/user/dig-app.service`: a unit in root's systemd user scope,
+/// where the real user cannot see it and root has no session bus to start it. The printed advice
+/// (`systemctl --user enable --now dig-app.service`) then failed for both accounts — for the user
+/// because no such unit existed, for root because there was no bus.
 pub fn register(dig_app_bin: &Path, os: Os, dry_run: bool) -> AutostartResult {
+    register_for(dig_app_bin, os, dry_run, crate::invoker::target_user())
+}
+
+/// [`register`] against an explicit target user, so the elevated and unelevated paths are both
+/// testable.
+pub fn register_for(
+    dig_app_bin: &Path,
+    os: Os,
+    dry_run: bool,
+    user: &crate::invoker::TargetUser,
+) -> AutostartResult {
     let mechanism = mechanism_for(os).to_string();
-    let Some(home) = dirs::home_dir() else {
-        return AutostartResult {
-            registered: false,
-            mechanism,
-            artifact: String::new(),
-            note: "could not resolve the user's home directory, so no per-user autostart was \
-                   registered — launch dig-app manually or re-run the installer as the intended user"
-                .to_string(),
-        };
-    };
-    let artifact = artifact_path(&home, os);
+    let artifact = artifact_path(user, os);
     if dry_run {
         return AutostartResult {
             registered: false,
             mechanism,
             artifact,
-            note: "would register dig-app to start at login".to_string(),
+            note: format!("would register dig-app to start at {}'s login", user.name),
         };
     }
-    match apply(dig_app_bin, os, &home) {
+    match apply(dig_app_bin, os, user) {
         Ok(note) => AutostartResult {
             registered: true,
             mechanism,
@@ -187,40 +196,98 @@ pub fn register(dig_app_bin: &Path, os: Os, dry_run: bool) -> AutostartResult {
     }
 }
 
+/// `$XDG_CONFIG_HOME` for the TARGET user.
+///
+/// The environment variable is only consulted when we are running AS that user. Under elevation it
+/// describes root (`sudo` may carry root's own `XDG_CONFIG_HOME`, and `su` sets one), so honouring it
+/// would put the unit back in root's scope — the #1748 inversion in a second guise. The XDG spec's
+/// own default, `<home>/.config`, is the correct answer for another account.
+fn target_xdg_config_home(user: &crate::invoker::TargetUser) -> PathBuf {
+    let env = if user.via_elevation {
+        None
+    } else {
+        std::env::var("XDG_CONFIG_HOME").ok()
+    };
+    xdg_config_home(env.as_deref(), &user.home)
+}
+
 /// Where the autostart artifact lives for `os` — a registry path on Windows (so the `--json` record
 /// names something a user can actually inspect), a file path elsewhere.
-fn artifact_path(home: &Path, os: Os) -> String {
+fn artifact_path(user: &crate::invoker::TargetUser, os: Os) -> String {
     match os {
         Os::Windows => format!("HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"),
-        Os::MacOs => launch_agent_path(home).to_string_lossy().into_owned(),
-        Os::Linux => {
-            let xdg = xdg_config_home(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), home);
-            systemd_user_unit_path(&xdg).to_string_lossy().into_owned()
-        }
+        Os::MacOs => launch_agent_path(&user.home).to_string_lossy().into_owned(),
+        Os::Linux => systemd_user_unit_path(&target_xdg_config_home(user))
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
 /// Perform the per-OS registration, returning the success note.
-fn apply(dig_app_bin: &Path, os: Os, home: &Path) -> Result<String, String> {
+///
+/// On unix the written artifact is handed back to the target user ([`crate::invoker::chown_to_target`]):
+/// a root-owned file in someone's `~/.config` is not something they can manage, and `systemd --user`
+/// declines to load a unit it does not consider the user's own.
+fn apply(dig_app_bin: &Path, os: Os, user: &crate::invoker::TargetUser) -> Result<String, String> {
     match os {
         Os::Windows => register_windows(dig_app_bin),
         Os::MacOs => {
-            let path = install_launch_agent(home, dig_app_bin).map_err(|e| e.to_string())?;
+            let path = install_launch_agent(&user.home, dig_app_bin).map_err(|e| e.to_string())?;
+            hand_back_to_user(&path, user);
             Ok(format!(
-                "wrote the LaunchAgent {} — dig-app starts at your next login",
-                path.display()
+                "wrote the LaunchAgent {} — dig-app starts at {}'s next login",
+                path.display(),
+                user.name
             ))
         }
         Os::Linux => {
-            let xdg = xdg_config_home(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), home);
+            let xdg = target_xdg_config_home(user);
             let path = install_systemd_user_unit(&xdg, dig_app_bin).map_err(|e| e.to_string())?;
+            hand_back_to_user(&path, user);
             Ok(format!(
-                "wrote the systemd user unit {} — enable it now with `systemctl --user enable --now \
-                 dig-app.service`, or it starts at your next login once enabled",
-                path.display()
+                "wrote the systemd user unit {} — it starts at {}'s next login, or start it now \
+                 with: {}",
+                path.display(),
+                user.name,
+                enable_command(user)
             ))
         }
     }
+}
+
+/// The command that enables the unit, in a scope where the unit actually EXISTS.
+///
+/// A root install must not print `systemctl --user enable --now dig-app.service` verbatim: run by
+/// root it fails (`Failed to connect to bus` — root has no session bus during a `curl | sudo sh`), and
+/// the account that CAN run it is the target user, who has to get into their own session first. So
+/// under elevation the printed command names that user explicitly, via `machinectl shell`'s
+/// non-privileged stand-in `sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user`, which
+/// works from the same root shell the installer was launched from.
+fn enable_command(user: &crate::invoker::TargetUser) -> String {
+    const ENABLE: &str = "systemctl --user enable --now dig-app.service";
+    match (user.via_elevation, user.uid) {
+        (true, Some(uid)) => format!(
+            "sudo -u {} XDG_RUNTIME_DIR=/run/user/{uid} {ENABLE}",
+            user.name
+        ),
+        // Without a uid we cannot name a runtime dir, so tell the user what to do from their own
+        // shell rather than printing a command that will fail from this one.
+        (true, None) => format!("log in as {} and run: {ENABLE}", user.name),
+        (false, _) => ENABLE.to_string(),
+    }
+}
+
+/// Give a written per-user artifact back to the user it was written for. Best-effort by design —
+/// autostart never sinks an install — but the failure is not silent: it lands in the returned note via
+/// the caller's success string only when it succeeded, and is otherwise reported by
+/// [`crate::invoker::chown_to_target`]'s error path in the install log.
+fn hand_back_to_user(path: &Path, user: &crate::invoker::TargetUser) {
+    // The unit's parent dirs (`~/.config`, `~/.config/systemd/user`) may also have just been created
+    // by root, so ownership is fixed from the user's config root down.
+    if let Some(config_root) = path.parent().and_then(|p| p.parent()) {
+        let _ = crate::invoker::chown_to_target(config_root, user, true);
+    }
+    let _ = crate::invoker::chown_to_target(path, user, false);
 }
 
 /// Write the macOS LaunchAgent for `dig_app_bin` under `home`, creating `LaunchAgents/` if needed.
@@ -272,15 +339,13 @@ fn register_windows(_dig_app_bin: &Path) -> Result<String, String> {
 /// Remove the per-user autostart artifact for `os`, treating "already absent" as success (the
 /// uninstall idempotence contract, [`crate::uninstall`]).
 pub fn deregister(os: Os) -> Result<(), String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "could not resolve the home directory".to_string())?;
+    // The same target user the install registered for (#1748) — an uninstall run under `sudo` must
+    // remove the artifact from the USER's scope, not look for it in root's and declare success.
+    let user = crate::invoker::target_user();
     match os {
         Os::Windows => deregister_windows(),
-        Os::MacOs => remove_if_present(&launch_agent_path(&home)),
-        Os::Linux => {
-            let xdg = xdg_config_home(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), &home);
-            remove_if_present(&systemd_user_unit_path(&xdg))
-        }
+        Os::MacOs => remove_if_present(&launch_agent_path(&user.home)),
+        Os::Linux => remove_if_present(&systemd_user_unit_path(&target_xdg_config_home(user))),
     }
 }
 
@@ -469,5 +534,169 @@ WantedBy=default.target
         assert!(!r.registered);
         assert_eq!(r.mechanism, "systemd-user");
         assert!(r.note.contains("would register"));
+    }
+
+    // -- #1748: a sudo install registers autostart for the INVOKING user --------
+
+    /// The account `sudo` was invoked from, described exactly as the installer sees it.
+    fn sudoing_ubuntu() -> crate::invoker::TargetUser {
+        crate::invoker::TargetUser {
+            name: "ubuntu".to_string(),
+            home: PathBuf::from("/home/ubuntu"),
+            uid: Some(1000),
+            gid: Some(1000),
+            via_elevation: true,
+        }
+    }
+
+    /// THE regression: the "per-user" artifact must be written into the INVOKING user's scope, not
+    /// root's.
+    ///
+    /// The fixture is a dry run, which reports the artifact path it WOULD write without touching the
+    /// machine — so the assertion is on the path choice itself, which is the defect. A truthful
+    /// control follows in `an_unelevated_run_registers_in_its_own_scope`: the same code with
+    /// `via_elevation: false` and a different home must produce that home's path, so this test cannot
+    /// pass by hardcoding `/home/ubuntu`.
+    #[test]
+    fn a_sudo_install_writes_the_unit_into_the_invoking_users_scope_not_roots() {
+        let r = register_for(
+            Path::new("/usr/local/bin/dig-app"),
+            Os::Linux,
+            true,
+            &sudoing_ubuntu(),
+        );
+        // Compared as paths, not strings: `join` uses the HOST separator, so a literal
+        // forward-slash expectation would fail on a Windows CI runner for a reason that has
+        // nothing to do with the property under test.
+        assert_eq!(
+            Path::new(&r.artifact),
+            systemd_user_unit_path(Path::new("/home/ubuntu/.config"))
+        );
+        assert!(
+            !r.artifact.contains("root"),
+            "the shipped bug wrote /root/.config/systemd/user/dig-app.service: {}",
+            r.artifact
+        );
+    }
+
+    #[test]
+    fn an_unelevated_run_registers_in_its_own_scope() {
+        let alice = crate::invoker::TargetUser {
+            name: "alice".to_string(),
+            home: PathBuf::from("/home/alice"),
+            uid: None,
+            gid: None,
+            via_elevation: false,
+        };
+        let r = register_for(Path::new("/usr/local/bin/dig-app"), Os::Linux, true, &alice);
+        assert!(
+            Path::new(&r.artifact).starts_with("/home/alice"),
+            "got: {}",
+            r.artifact
+        );
+    }
+
+    /// macOS has the same inversion: the LaunchAgent belongs in the invoking user's `~/Library`.
+    #[test]
+    fn a_sudo_install_writes_the_launch_agent_into_the_invoking_users_library() {
+        let r = register_for(
+            Path::new("/usr/local/bin/dig-app"),
+            Os::MacOs,
+            true,
+            &sudoing_ubuntu(),
+        );
+        assert_eq!(
+            Path::new(&r.artifact),
+            launch_agent_path(Path::new("/home/ubuntu"))
+        );
+        assert!(!r.artifact.contains("root"));
+    }
+
+    /// Under elevation, `$XDG_CONFIG_HOME` describes ROOT (sudo/su set one), so honouring it would put
+    /// the unit back in root's scope — the same inversion wearing a different hat.
+    ///
+    /// The fixture sets the variable to an unmistakable value and asserts it is IGNORED for an
+    /// elevated target while being HONOURED for an unelevated one. Asserting only the elevated half
+    /// would also pass against an implementation that ignored the variable entirely, which would be a
+    /// different bug, so both halves are checked.
+    #[test]
+    fn xdg_config_home_is_ignored_under_elevation_and_honoured_otherwise() {
+        // A value only root could have.
+        std::env::set_var("XDG_CONFIG_HOME", "/root/.config");
+
+        let elevated = target_xdg_config_home(&sudoing_ubuntu());
+        assert_eq!(
+            elevated,
+            Path::new("/home/ubuntu/.config"),
+            "an elevated run must use the XDG default under the TARGET user's home"
+        );
+
+        let self_run = crate::invoker::TargetUser {
+            name: "root".to_string(),
+            home: PathBuf::from("/root"),
+            uid: None,
+            gid: None,
+            via_elevation: false,
+        };
+        assert_eq!(
+            target_xdg_config_home(&self_run),
+            Path::new("/root/.config"),
+            "when we ARE the user, their XDG_CONFIG_HOME is authoritative"
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    /// The printed remediation must be runnable in a scope where the unit exists.
+    ///
+    /// The shipped advice was a bare `systemctl --user enable --now dig-app.service`, which fails for
+    /// root (no session bus during `curl | sudo sh`) and for the user (no such unit, because it was
+    /// written to root's scope). Under elevation the command must therefore NAME the target user and
+    /// their runtime dir.
+    #[test]
+    fn the_enable_command_names_the_target_user_under_elevation() {
+        let cmd = enable_command(&sudoing_ubuntu());
+        assert!(cmd.contains("-u ubuntu"), "got: {cmd}");
+        assert!(
+            cmd.contains("XDG_RUNTIME_DIR=/run/user/1000"),
+            "systemctl --user needs the target user's runtime dir: {cmd}"
+        );
+        assert!(cmd.contains("systemctl --user enable --now dig-app.service"));
+    }
+
+    /// Run as the user themselves, the plain command IS correct — so the elevated decoration must not
+    /// leak into the unelevated case.
+    #[test]
+    fn the_enable_command_is_plain_when_we_are_the_user() {
+        let alice = crate::invoker::TargetUser {
+            name: "alice".to_string(),
+            home: PathBuf::from("/home/alice"),
+            uid: None,
+            gid: None,
+            via_elevation: false,
+        };
+        assert_eq!(
+            enable_command(&alice),
+            "systemctl --user enable --now dig-app.service"
+        );
+    }
+
+    /// Elevated but with no resolvable uid: we cannot name a runtime dir, so the advice must tell the
+    /// user what to do from their own shell rather than print a command that will fail from this one.
+    #[test]
+    fn without_a_uid_the_advice_does_not_print_a_command_that_cannot_work() {
+        let ghost = crate::invoker::TargetUser {
+            name: "ghost".to_string(),
+            home: PathBuf::from("/root"),
+            uid: None,
+            gid: None,
+            via_elevation: true,
+        };
+        let cmd = enable_command(&ghost);
+        assert!(cmd.contains("log in as ghost"), "got: {cmd}");
+        assert!(
+            !cmd.contains("XDG_RUNTIME_DIR"),
+            "no uid means no runtime dir to name: {cmd}"
+        );
     }
 }

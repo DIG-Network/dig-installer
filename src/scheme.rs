@@ -292,14 +292,22 @@ pub fn is_our_handler_command(command: &str) -> bool {
     dign_open || legacy
 }
 
+/// The per-user XDG desktop-entry that registers DIG as the `chia://` handler.
+///
+/// Resolved against the [invoking user](crate::invoker::target_user), not `$HOME` (#1748): under
+/// `sudo` this used to write `/root/.local/share/applications/…`, so the handler was registered in
+/// root's XDG scope and the user's browser never saw it — the same inversion that put the CLIs in
+/// `/root/.dig/bin`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn desktop_file_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".local")
+    Some(
+        crate::invoker::target_user()
+            .home
+            .join(".local")
             .join("share")
             .join("applications")
-            .join("dig-network-url-handler.desktop")
-    })
+            .join("dig-network-url-handler.desktop"),
+    )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -327,6 +335,9 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
             };
         }
     }
+    // Hand the written entry (and the XDG dirs we may have just created) back to the user it is for
+    // (#1748) — a root-owned file in someone's ~/.local/share is not theirs to manage, and the
+    // desktop database refresh below runs in their session, not ours.
     if let Err(e) = std::fs::write(&path, body) {
         return SchemeResult {
             registered: false,
@@ -334,6 +345,13 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
             note: format!("write {}: {e}", path.display()),
         };
     }
+    let user = crate::invoker::target_user();
+    // `~/.local` upward, so any level root had to create is owned by the user too.
+    if let Some(local_root) = path.ancestors().nth(3) {
+        let _ = crate::invoker::chown_to_target(local_root, user, true);
+    }
+    let _ = crate::invoker::chown_to_target(&path, user, false);
+
     let desktop_name = path.file_name().unwrap().to_string_lossy().into_owned();
     // Best-effort: refresh the desktop DB + set as default for each scheme.
     if let Some(dir) = path.parent() {

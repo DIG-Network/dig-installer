@@ -1,38 +1,75 @@
 //! Install-directory resolution and PATH wiring.
 //!
-//! The pure PATH-append logic (`user_path_append`) is unit-tested without
-//! touching the real machine PATH — it is the same idempotent, case-insensitive
-//! append that digstore's GUI installer used, migrated here so the universal
-//! installer keeps the proven behaviour. The actual registry write / symlink is
-//! in [`add_to_path`], which calls the pure helper.
+//! # Which directory
+//!
+//! [`default_bin_dir`] answers "where do this run's binaries go?" and the answer depends on WHO is
+//! installing, not merely on the OS: an elevated unix install is machine-wide
+//! ([`UNIX_MACHINE_BIN_DIR`]), an unelevated one is per-user, and Windows keeps the whole stack in the
+//! admin-only [`protected_bin_dir`] (#565). Privileged, service-executed binaries are routed to that
+//! protected root on every platform by [`is_privileged_component`], and the one privileged binary a
+//! user still runs by name is linked back onto PATH by [`needs_machine_bin_link`].
+//!
+//! # Which PATH, and whose
+//!
+//! [`add_to_path`] wires the chosen directory into the shell environment that will actually look for
+//! it. The string manipulation is pure and unit-tested ([`path_append`], [`path_remove`],
+//! [`profile_d_script`]); only the registry write / profile write / symlink touches the machine.
+//!
+//! The load-bearing subtlety is the SCOPE (#1748). An elevated install cannot wire PATH through
+//! dotfiles, because the only dotfiles it can see are root's — that is precisely how a whole install
+//! became invisible to the user who asked for it. So an elevated install works at the scope it has
+//! (`/etc/profile.d`, read by every login shell) and, before writing anything, asks the target user's
+//! own login shell whether the directory is reachable — then asks again afterwards, so the reported
+//! outcome is an observation rather than an assumption.
 
 use std::path::{Path, PathBuf};
 
 use crate::target::Os;
 
+/// The machine-wide unix bin directory for user-facing CLIs — the one an ELEVATED install uses.
+///
+/// `/usr/local/bin` is on the default login-shell `PATH` of every platform this installer supports
+/// (Debian/Ubuntu ship it in `/etc/environment`, and it is in macOS's `/etc/paths`), which is exactly
+/// the property a root install needs and the property a per-user directory cannot have. It is also
+/// root-owned `0755`, so it is NOT user-writable and satisfies the #565 no-LPE invariant at least as
+/// well as the per-user root it replaces.
+pub const UNIX_MACHINE_BIN_DIR: &str = "/usr/local/bin";
+
 /// Default install directory for DIG tool binaries.
 ///   Windows: `%ProgramFiles%\DIG\bin` (the admin-only protected root — #565)
-///   macOS/Linux: `~/.dig/bin`
+///   unix, elevated: [`UNIX_MACHINE_BIN_DIR`]
+///   unix, unelevated: `~/.dig/bin`
 ///
 /// On Windows the ENTIRE stack (services + user CLIs + the installer self-copy)
 /// installs into the admin-only [`protected_bin_dir`]: a user-writable bin dir
 /// underneath a LocalSystem service / SYSTEM beacon task is a local privilege
-/// escalation (#565), so no per-user, user-writable bin dir is used. On unix the
-/// user CLIs keep the elevation-free per-user `~/.dig/bin` (rather than
-/// `/usr/local/bin`), matching the dig-node service's user-level default; only
-/// the machine-wide PRIVILEGED service binaries move to [`protected_bin_dir`]
+/// escalation (#565), so no per-user, user-writable bin dir is used. On unix only
+/// the machine-wide PRIVILEGED service binaries go to [`protected_bin_dir`]
 /// (`/opt/dig/bin`), classified by [`is_privileged_component`].
+///
+/// # Why an elevated unix install is machine-wide (#1748)
+///
+/// The documented install path is `curl -fsSL https://dig.net/install.sh | sudo sh`, i.e. it runs as
+/// root. This used to resolve `dirs::home_dir()`, which `sudo` sets to `/root` — so the whole stack
+/// landed in `/root/.dig/bin` and the `export PATH` went into `/root/.bashrc`. Mode `0700` on `/root`
+/// means the real user could not have reached those binaries even if they had known the path.
+///
+/// Resolving the invoking user and installing into *their* `~/.dig/bin` would fix reachability but
+/// answers the wrong question: a person who typed `sudo` asked for a machine-wide install, and on a
+/// multi-user box only one account would get the CLIs. So an elevated install goes to
+/// [`UNIX_MACHINE_BIN_DIR`] — already on every login shell's PATH, so there is no PATH wiring left to
+/// get wrong. An UNELEVATED install keeps the elevation-free per-user `~/.dig/bin`, resolved against
+/// the [invoking user](crate::invoker::target_user) rather than `$HOME`.
 pub fn default_bin_dir() -> PathBuf {
     if cfg!(windows) {
         // #565: the whole Windows stack lives in the admin-only Program Files
         // root — there is no separate, user-writable per-user bin dir.
-        protected_bin_dir()
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/usr/local"))
-            .join(".dig")
-            .join("bin")
+        return protected_bin_dir();
     }
+    if crate::invoker::is_root() {
+        return PathBuf::from(UNIX_MACHINE_BIN_DIR);
+    }
+    crate::invoker::target_user().dig_bin_dir()
 }
 
 /// The admin-only-writable install root for any binary a PRIVILEGED
@@ -150,9 +187,19 @@ pub fn legacy_privileged_roots(os: Os) -> Vec<PathBuf> {
                 programs.join("DigStore").join("bin"),
             ]
         }
-        Os::Linux | Os::MacOs => dirs::home_dir()
-            .map(|h| vec![h.join(".dig").join("bin")])
-            .unwrap_or_default(),
+        // Resolved against the INVOKING user (#1748), not `$HOME`: a `sudo` re-run whose `$HOME` is
+        // `/root` would otherwise "migrate" root's empty bin dir and leave a real, pre-#565 privileged
+        // binary sitting in the user's `~/.dig/bin` where a non-admin could still replace it. Root's
+        // own dir is included too, because previous versions of this installer genuinely did put
+        // binaries there and an upgrade has to vacate them.
+        Os::Linux | Os::MacOs => {
+            let mut roots = vec![crate::invoker::target_user().dig_bin_dir()];
+            let roots_home = PathBuf::from("/root").join(".dig").join("bin");
+            if !roots.contains(&roots_home) {
+                roots.push(roots_home);
+            }
+            roots
+        }
     }
 }
 
@@ -216,6 +263,52 @@ pub fn path_append(current: &str, dir: &str, sep: char) -> Option<String> {
     }
 }
 
+/// Link `target` (a binary in the protected root) into [`UNIX_MACHINE_BIN_DIR`] under `name`, so a
+/// user-facing CLI that must LIVE in the root-owned protected root is still reachable by bare name.
+///
+/// Replaces an existing link/file at the destination so an upgrade re-points it rather than failing.
+/// unix only — on Windows the whole stack shares one root, so there is nothing to link.
+#[cfg(unix)]
+pub fn link_into_machine_bin(target: &Path, name: &str) -> Result<PathBuf, String> {
+    let link = Path::new(UNIX_MACHINE_BIN_DIR).join(name);
+    std::fs::create_dir_all(UNIX_MACHINE_BIN_DIR)
+        .map_err(|e| format!("create {UNIX_MACHINE_BIN_DIR}: {e}"))?;
+    // `symlink` fails on an existing path, and an upgrade legitimately re-points the link.
+    match std::fs::remove_file(&link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("replace {}: {e}", link.display())),
+    }
+    std::os::unix::fs::symlink(target, &link)
+        .map_err(|e| format!("link {} -> {}: {e}", link.display(), target.display()))?;
+    Ok(link)
+}
+
+/// Can `user` list and traverse `dir`? Asked of the user's own shell, because the answer differs from
+/// ours: root can stat every directory on the machine, so a root-side check would say "yes" for a mode
+/// `0700` directory the user cannot open.
+#[cfg(unix)]
+fn user_can_enter(dir: &str, user: &crate::invoker::TargetUser) -> bool {
+    use crate::proc::HideConsole;
+    // `-x` is traverse, `-r` is list; a bin dir needs both to be useful on PATH.
+    let script = format!(
+        "test -x '{d}' && test -r '{d}'",
+        d = dir.replace('\'', r"'\''")
+    );
+    let out = if user.via_elevation {
+        std::process::Command::new("su")
+            .args(["-", &user.name, "-c", &script])
+            .hide_console()
+            .status()
+    } else {
+        std::process::Command::new("sh")
+            .args(["-c", &script])
+            .hide_console()
+            .status()
+    };
+    out.map(|s| s.success()).unwrap_or(false)
+}
+
 /// Add `bin_dir` to the user's PATH.
 ///   Windows: append to HKCU\Environment\Path (REG_EXPAND_SZ, no truncation),
 ///            then broadcast WM_SETTINGCHANGE. No elevation.
@@ -262,10 +355,108 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<String, String> {
     Ok(format!("user PATH: {dir}"))
 }
 
+/// Is `component` a PRIVILEGED component that is ALSO a CLI the user is expected to run by name, so
+/// it needs a link from [`UNIX_MACHINE_BIN_DIR`] into [`protected_bin_dir`]?
+///
+/// `dig-dns` is the case that exists: users really do run `dig-dns doctor`, but the binary must live
+/// in the root-owned protected root because a machine-wide service executes it (#565). `/opt/dig/bin`
+/// is on no shell's default `PATH`, so before #1748 `dig-dns` was unreachable by name for EVERY user —
+/// including root — while the PATH check reported it resolved.
+///
+/// A symlink is safe here precisely because both ends are root-owned `0755`: it adds reachability
+/// without adding an unprivileged-writable path to a service-executed binary, so the #565 invariant is
+/// preserved rather than traded away. `dig-updater`/`dig-updater-worker` are deliberately excluded —
+/// the beacon invokes them, a user never does, so they stay off PATH entirely.
+pub fn needs_machine_bin_link(os: Os, component: &str) -> bool {
+    !matches!(os, Os::Windows) && component == "dig-dns"
+}
+
+/// The system-wide login-shell snippet an elevated install writes when its bin dir is not already on
+/// the login `PATH`. `/etc/profile.d/*.sh` is sourced by `/etc/profile`, i.e. by every LOGIN shell of
+/// every account — which is the scope an elevated install is entitled to and the scope a per-user
+/// dotfile edit cannot reach (#1748).
+pub const PROFILE_D_SCRIPT: &str = "/etc/profile.d/dig-path.sh";
+
+/// Render the `/etc/profile.d` snippet that puts `dir` on the login `PATH`.
+///
+/// POSIX `sh` only (the file is sourced by `/bin/sh`, which on Debian/Ubuntu is `dash`, so no
+/// bash-isms), and idempotent at SOURCE time as well as at write time: the `case` guard means a shell
+/// that already has `dir` on `PATH` — because it was inherited, or because the file got sourced twice —
+/// does not accumulate a duplicate entry.
+pub fn profile_d_script(dir: &str) -> String {
+    format!(
+        "# added by dig-installer: make the DIG CLIs resolvable in every login shell\n\
+         case \":${{PATH}}:\" in\n\
+         \x20 *\":{dir}:\"*) ;;\n\
+         \x20 *) PATH=\"{dir}:${{PATH}}\"; export PATH ;;\n\
+         esac\n"
+    )
+}
+
 #[cfg(not(windows))]
 fn unix_add_to_path(bin_dir: &Path) -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("no home directory")?;
-    unix_add_to_path_in(bin_dir, &home)
+    let user = crate::invoker::target_user();
+    if crate::invoker::is_root() {
+        return root_add_to_path(bin_dir, user);
+    }
+    // Unelevated: we ARE the target user, so their own profile is the right place.
+    unix_add_to_path_in(bin_dir, &user.home)
+}
+
+/// PATH wiring for an ELEVATED unix install: verify, remediate only if needed, then verify again.
+///
+/// Editing root's dotfiles — what this used to do — cannot help anybody, and editing one user's
+/// dotfiles would leave every other account on the box without the CLIs. So an elevated install works
+/// at the scope it actually has: `/etc/profile.d`.
+///
+/// The sequence is deliberately check → remediate → RE-CHECK, against the target user's real login
+/// shell each time. The default bin dir ([`UNIX_MACHINE_BIN_DIR`]) is already on that PATH on every
+/// supported platform, so the common case writes nothing; and because the final word is a re-read of
+/// the user's environment rather than our own belief about it, a remediation that did not take is
+/// reported as a FAILURE instead of a success note.
+#[cfg(not(windows))]
+fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result<String, String> {
+    use crate::pathcheck;
+
+    let dir = bin_dir.to_string_lossy().to_string();
+    let reachable = |note: &str| -> Option<String> {
+        match pathcheck::login_shell_path(user) {
+            Ok(path) if pathcheck::path_contains(&path, &dir, ':') => {
+                Some(format!("{dir} is on {}'s login PATH{note}", user.name))
+            }
+            _ => None,
+        }
+    };
+
+    if let Some(note) = reachable(" already — no PATH wiring needed") {
+        return Ok(note);
+    }
+
+    // Refuse to wire a directory the target user cannot even enter. `/etc/profile.d` is sourced by
+    // EVERY login shell on the machine, so putting an inaccessible dir on PATH would degrade every
+    // account's environment to no purpose — and it would let this function report success (the dir is
+    // "on PATH" after all) for an install nobody can run. Checked as the user, by the user's own shell.
+    if !user_can_enter(&dir, user) {
+        return Err(format!(
+            "{dir} is not accessible to {} (a directory the user cannot enter must not be wired \
+             into every login shell's PATH) — install into a directory {} can read, or run the \
+             installer as that user",
+            user.name, user.name
+        ));
+    }
+
+    std::fs::write(PROFILE_D_SCRIPT, profile_d_script(&dir))
+        .map_err(|e| format!("write {PROFILE_D_SCRIPT}: {e}"))?;
+
+    if let Some(note) = reachable(&format!(" (wired via {PROFILE_D_SCRIPT})")) {
+        return Ok(note);
+    }
+    let observed =
+        pathcheck::login_shell_path(user).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+    Err(format!(
+        "wrote {PROFILE_D_SCRIPT} but {dir} is STILL not on {}'s login PATH (it searches: {observed})",
+        user.name
+    ))
 }
 
 /// [`unix_add_to_path`] against an explicit `home` directory. The real call uses
@@ -591,6 +782,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // -- #1748: an elevated unix install is machine-wide, not root-scoped -------
+
+    /// The install root an ELEVATED unix install uses must be a machine-wide directory that is
+    /// already on the login PATH — never a per-user home directory, and above all never root's.
+    ///
+    /// The fixture asserts the constant itself rather than calling `default_bin_dir()`, because the
+    /// test process's own euid decides that function's answer and a test runner is not root. The
+    /// property under test is which DIRECTORY was chosen for the elevated case, which the constant
+    /// carries.
+    #[test]
+    fn the_elevated_unix_bin_dir_is_machine_wide_and_not_under_any_home() {
+        assert_eq!(UNIX_MACHINE_BIN_DIR, "/usr/local/bin");
+        assert!(
+            !UNIX_MACHINE_BIN_DIR.starts_with("/root"),
+            "the shipped bug: an elevated install must not land under root's home"
+        );
+        assert!(
+            !UNIX_MACHINE_BIN_DIR.contains("/home/"),
+            "an elevated install must not privilege one account's home over the others"
+        );
+        // It is on the stock Debian/Ubuntu and macOS login PATH, which is the whole reason it needs
+        // no PATH wiring. Asserted against the real stock value so the claim is checkable.
+        let stock_ubuntu_login_path =
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        assert!(
+            crate::pathcheck::path_contains(stock_ubuntu_login_path, UNIX_MACHINE_BIN_DIR, ':'),
+            "the elevated bin dir must already be on the stock login PATH"
+        );
+        // The directory the bug shipped to is NOT on it — the contrast is the point.
+        assert!(!crate::pathcheck::path_contains(
+            stock_ubuntu_login_path,
+            "/root/.dig/bin",
+            ':'
+        ));
+    }
+
+    /// An UNELEVATED install still uses the per-user root, and resolves it from the invoking account
+    /// rather than `$HOME`. Both halves matter: the per-user path is what keeps a non-root install
+    /// elevation-free, and the invoker resolution is what stops `sudo` redirecting it to `/root`.
+    #[test]
+    fn the_unelevated_unix_bin_dir_is_the_invoking_users_own_dig_bin() {
+        let sudoing = crate::invoker::TargetUser {
+            name: "ubuntu".to_string(),
+            home: PathBuf::from("/home/ubuntu"),
+            uid: Some(1000),
+            gid: Some(1000),
+            via_elevation: true,
+        };
+        assert_eq!(sudoing.dig_bin_dir(), Path::new("/home/ubuntu/.dig/bin"));
+        assert!(!sudoing.dig_bin_dir().starts_with("/root"));
+    }
+
+    // -- #1748: reachability of the protected-root CLIs -------------------------
+
+    /// `dig-dns` is a user-facing CLI (`dig-dns doctor`) that must LIVE in the root-owned protected
+    /// root, which is on no shell's default PATH — so it needs a link into the machine bin dir. The
+    /// beacon binaries must NOT get one: a user never invokes them, and putting them on PATH would
+    /// widen the surface for no benefit.
+    ///
+    /// Both directions are asserted, because a predicate that returned `true` for everything would
+    /// satisfy the dig-dns half on its own.
+    #[test]
+    fn only_the_user_facing_privileged_cli_gets_a_machine_bin_link() {
+        assert!(needs_machine_bin_link(Os::Linux, "dig-dns"));
+        assert!(needs_machine_bin_link(Os::MacOs, "dig-dns"));
+        for never in ["dig-updater", "dig-updater-worker"] {
+            assert!(
+                !needs_machine_bin_link(Os::Linux, never),
+                "{never} is invoked by the beacon, never by a user"
+            );
+        }
+        // Windows keeps one root for the whole stack, so there is nothing to link.
+        assert!(!needs_machine_bin_link(Os::Windows, "dig-dns"));
+    }
+
+    /// The link destination must be the machine bin dir that is already on the login PATH — a link
+    /// into a directory no shell searches would restate the bug it fixes.
+    #[test]
+    fn the_link_target_dir_is_the_one_on_the_login_path() {
+        let stock = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        assert!(crate::pathcheck::path_contains(
+            stock,
+            UNIX_MACHINE_BIN_DIR,
+            ':'
+        ));
+        assert!(
+            !crate::pathcheck::path_contains(stock, "/opt/dig/bin", ':'),
+            "the protected root is on no default PATH -- which is why the link exists"
+        );
+    }
+
+    // -- #1748: the /etc/profile.d login-shell snippet --------------------------
+
+    /// The snippet must put the dir on PATH, be POSIX `sh` (it is sourced by `dash` on Debian, so a
+    /// bash-ism like `[[` would break every login shell on the box), and be idempotent when sourced
+    /// twice.
+    #[test]
+    fn the_profile_d_snippet_is_posix_sh_and_guards_against_duplicating_the_entry() {
+        let s = profile_d_script("/usr/local/bin");
+        assert!(s.contains(r#"PATH="/usr/local/bin:${PATH}""#), "got: {s}");
+        assert!(s.contains("export PATH"));
+        // The source-time guard: a shell that already has the dir does nothing.
+        assert!(s.contains(r#"case ":${PATH}:" in"#), "got: {s}");
+        assert!(s.contains(r#"*":/usr/local/bin:"*) ;;"#), "got: {s}");
+        // POSIX sh only — no bash-only constructs.
+        for bashism in ["[[", "function ", "==", "${PATH,,}"] {
+            assert!(
+                !s.contains(bashism),
+                "the snippet is sourced by /bin/sh (dash) — {bashism} would break every login shell"
+            );
+        }
+    }
+
+    /// The snippet is written to `/etc/profile.d`, which every LOGIN shell sources — the scope an
+    /// elevated install has and a dotfile edit does not. A `.bashrc` path here would be the shipped
+    /// bug again (root's dotfiles), so the location is asserted.
+    #[test]
+    fn the_profile_d_location_is_system_wide_not_a_dotfile() {
+        assert_eq!(PROFILE_D_SCRIPT, "/etc/profile.d/dig-path.sh");
+        assert!(PROFILE_D_SCRIPT.starts_with("/etc/profile.d/"));
+        assert!(
+            !PROFILE_D_SCRIPT.contains(".bashrc") && !PROFILE_D_SCRIPT.contains("/root"),
+            "an elevated install must not wire PATH through anybody's dotfiles"
+        );
+        assert!(
+            PROFILE_D_SCRIPT.ends_with(".sh"),
+            "/etc/profile only sources *.sh from profile.d"
+        );
+    }
+
+    /// A dir containing a shell metacharacter must not break the generated snippet's `case` guard.
+    /// A `--bin-dir` can be anything, and a snippet that fails to parse breaks EVERY login shell on
+    /// the machine — a far worse outcome than the bug being fixed.
+    #[test]
+    fn the_profile_d_snippet_keeps_the_dir_inside_quotes() {
+        let s = profile_d_script("/opt/dig bin");
+        assert!(s.contains(r#"PATH="/opt/dig bin:${PATH}""#), "got: {s}");
     }
 
     #[cfg(not(windows))]

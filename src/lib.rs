@@ -61,6 +61,7 @@ pub mod forcelist;
 pub mod hardening;
 pub mod health;
 pub mod hosts;
+pub mod invoker;
 pub mod manifest;
 pub mod migrate;
 pub mod pathcheck;
@@ -1375,7 +1376,8 @@ fn run_report_gated(
         // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
         // immediately. Non-dry-run only (dry-run installs nothing to resolve).
         if !plan.dry_run {
-            verify_clis_on_path(&target, report, log);
+            link_protected_clis(&target, report, log);
+            verify_clis_on_path(&target, invoker::target_user(), report, log);
         }
 
         // #565: VERIFY the dir every privileged/service-executed binary landed in
@@ -1670,43 +1672,111 @@ fn register_scheme_handler(
     r
 }
 
-/// The user-facing DIG CLIs that MUST be runnable by bare name after install
-/// (#496): the dig-store CLI + the two node/dns CLIs a user drives directly
-/// (e.g. `dig-node pair approve <id>`). dig-relay is a background service (no
-/// user CLI surface required); the DIG Browser is a GUI installer.
-const REQUIRED_CLIS: &[&str] = &["dig-store", "dig-node", "dig-dns"];
+/// The user-facing DIG binaries that MUST be runnable by bare name after install.
+///
+/// The original set (#496) was the dig-store CLI plus the two node/dns CLIs a user drives directly
+/// (e.g. `dig-node pair approve <id>`). #1748 adds the ALIAS binaries and `dig-app`, because a
+/// component that was downloaded but never EXECUTED was earning a `✓` for existing on disk: a
+/// `dig-app` that cannot load its shared libraries was reported as installed successfully. Anything
+/// this installer places and a user is expected to run belongs here.
+///
+/// dig-relay is a background service (no user CLI surface required); the DIG Browser is a GUI
+/// installer, not a CLI; the privileged `dig-updater`/`dig-updater-worker` binaries are invoked by
+/// the beacon, never by the user, and live outside PATH by design (#565).
+const REQUIRED_CLIS: &[&str] = &[
+    "dig-store",
+    "digs",
+    "dig-node",
+    "dign",
+    "dig-dns",
+    "digd",
+    "dig-app",
+];
 
-/// Verify each installed required CLI resolves by bare name on the post-install
-/// PATH (#496) and record the result into `report.cli_path_checks`. Only checks
-/// CLIs actually placed this run (present in `report.components`). Logs each
-/// check; a failure is folded into the readiness verdict by
-/// [`evaluate_readiness`].
-fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dyn FnMut(&str)) {
-    let installed_clis: Vec<String> = report
+/// Link every installed user-facing CLI that lives in the protected root into the machine bin dir, so
+/// it is reachable by bare name (#1748).
+///
+/// `dig-dns` must live in `/opt/dig/bin` because a machine-wide service executes it (#565), and that
+/// directory is on no shell's default `PATH` — so `dig-dns doctor`, a command the docs tell users to
+/// run, resolved for nobody. Both ends of the link are root-owned `0755`, so reachability is gained
+/// without making a service-executed binary replaceable by an unprivileged user.
+///
+/// Best-effort: a link failure is logged and folded into readiness by the PATH verification that
+/// follows (which will find the CLI unreachable), rather than aborting an otherwise-complete install.
+fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dyn FnMut(&str)) {
+    #[cfg(unix)]
+    {
+        let to_link: Vec<(String, String)> = report
+            .components
+            .iter()
+            .filter(|c| paths::needs_machine_bin_link(target.os, &c.component))
+            .map(|c| (c.component.clone(), c.dest.clone()))
+            .collect();
+        if to_link.is_empty() {
+            return;
+        }
+        log(&format!(
+            "Linking the protected-root CLIs into {}:",
+            paths::UNIX_MACHINE_BIN_DIR
+        ));
+        for (component, dest) in to_link {
+            let exe = target.exe_name(&component);
+            match paths::link_into_machine_bin(std::path::Path::new(&dest), &exe) {
+                Ok(link) => log(&format!("    ✓ {} → {dest}", link.display())),
+                Err(e) => log(&format!("    ! could not link {component}: {e}")),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows installs the whole stack into one root, so there is nothing to link.
+        let _ = (target, report, log);
+    }
+}
+
+/// Verify each installed user-facing binary resolves by bare name **on the target user's own PATH**
+/// and actually RUNS (#496, corrected by #1748), recording the result into `report.cli_path_checks`.
+///
+/// Only binaries actually placed this run (present in `report.components`) are checked. A failure is
+/// folded into the readiness verdict by [`evaluate_readiness`].
+///
+/// # Why this no longer takes the install's bin dir
+///
+/// It used to: it read each component's install directory, prepended that directory to our own
+/// `PATH`, and checked the CLI resolved against the result — which is always true once the download
+/// succeeded, in every environment. The check therefore passed against a `sudo` install that had put
+/// the whole stack in `/root/.dig/bin`, where no user could reach it. The PATH is now READ from the
+/// target user's login shell and never modified, so the only way to pass is for the install to
+/// genuinely be reachable by the person who ran it. See [`pathcheck`].
+fn verify_clis_on_path(
+    target: &Target,
+    user: &invoker::TargetUser,
+    report: &mut InstallReport,
+    log: &mut dyn FnMut(&str),
+) {
+    // Each CLI is carried with the destination THIS run wrote it to, so the check can confirm the
+    // bare name resolves to that copy rather than to a stale one left on PATH by an earlier install.
+    let installed_clis: Vec<(String, String)> = report
         .components
         .iter()
-        .map(|c| c.component.clone())
-        .filter(|id| REQUIRED_CLIS.contains(&id.as_str()))
+        .filter(|c| REQUIRED_CLIS.contains(&c.component.as_str()))
+        .map(|c| (c.component.clone(), c.dest.clone()))
         .collect();
     if installed_clis.is_empty() {
         return;
     }
-    log("Verifying the DIG CLIs resolve on PATH:");
-    for cli in installed_clis {
+    log(&format!(
+        "Verifying the DIG CLIs resolve + run in {}'s login shell:",
+        user.name
+    ));
+    for (cli, dest) in installed_clis {
         let exe = target.exe_name(&cli);
-        let bin_dir = report
-            .components
-            .iter()
-            .find(|c| c.component == cli)
-            .and_then(|c| {
-                std::path::Path::new(&c.dest)
-                    .parent()
-                    .map(|p| p.to_path_buf())
-            })
-            .unwrap_or_else(paths::default_bin_dir);
-        let check = match pathcheck::cli_resolves(&bin_dir, &exe) {
+        let check = match pathcheck::verify_cli(user, &exe, std::path::Path::new(&dest)) {
             Ok(version) => {
-                let note = format!("`{cli} --version` resolved on PATH ({version})");
+                let note = format!(
+                    "`{cli} --version` resolved + ran as {} ({version})",
+                    user.name
+                );
                 log(&format!("    ✓ {note}"));
                 pathcheck::CliPathCheck {
                     cli: cli.clone(),
@@ -1715,9 +1785,7 @@ fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dy
                 }
             }
             Err(e) => {
-                log(&format!(
-                    "    ! {cli} is NOT resolvable on PATH: {e} — open a NEW terminal, or re-run elevated so the PATH change takes effect."
-                ));
+                log(&format!("    ! {cli} is NOT usable by {}: {e}", user.name));
                 pathcheck::CliPathCheck {
                     cli: cli.clone(),
                     resolved: false,
@@ -1749,11 +1817,11 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         match &report.service {
             None => failures.push("dig-node: the node service was not installed".to_string()),
             Some(s) if !s.installed => failures.push(format!(
-                "dig-node: the OS service did not register ({}); re-run elevated",
+                "dig-node: the OS service did not register ({})",
                 s.note
             )),
             Some(s) if plan.service.start && !s.health_ok => failures.push(format!(
-                "dig-node: the '{}' service is not running ({}); re-run elevated",
+                "dig-node: the '{}' service is not running ({})",
                 svc::DIG_NODE_SERVICE_ID,
                 s.health_note
             )),
@@ -1765,15 +1833,16 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         match &report.dns {
             None => failures.push("dig-dns: the resolver service was not installed".to_string()),
             Some(d) if !d.installed => failures.push(format!(
-                "dig-dns: the OS service did not register ({}); re-run elevated",
+                "dig-dns: the OS service did not register ({})",
                 d.note
             )),
             // F7: gate on the fail-loud service-manager RUNNING poll (mirror the
             // dig-node `health_ok` gate) — a live `paths_live` probe alone is NOT
             // sufficient (another process could satisfy it; #493 false-success).
             Some(d) if plan.dns_service.start && !d.service_running => failures.push(format!(
-                "dig-dns: installed but the '{}' service did not reach RUNNING ({}); re-run elevated",
-                svc::DIG_DNS_SERVICE_ID, d.note
+                "dig-dns: installed but the '{}' service did not reach RUNNING ({})",
+                svc::DIG_DNS_SERVICE_ID,
+                d.note
             )),
             Some(d) if plan.dns_service.start && d.paths_live.is_empty() => failures.push(format!(
                 "dig-dns: installed but no live resolution path — the service is not serving ({})",
@@ -1787,7 +1856,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         match &report.relay {
             None => failures.push("dig-relay: the relay service was not installed".to_string()),
             Some(r) if !r.installed => failures.push(format!(
-                "dig-relay: the OS service did not register ({}); re-run elevated",
+                "dig-relay: the OS service did not register ({})",
                 r.note
             )),
             Some(_) => {}
@@ -1800,11 +1869,11 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     // firewall rule/scheme handler.
     if plan.auto_update {
         match &report.beacon {
-            None => failures.push(
-                "dig-updater: the auto-update beacon was not installed".to_string(),
-            ),
+            None => {
+                failures.push("dig-updater: the auto-update beacon was not installed".to_string())
+            }
             Some(b) if !b.applied => failures.push(format!(
-                "dig-updater: the daily update-check scheduler did not register ({}); re-run elevated",
+                "dig-updater: the daily update-check scheduler did not register ({})",
                 b.note
             )),
             Some(_) => {}
@@ -1826,7 +1895,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         };
         if selected && !dir.acl_applied {
             failures.push(format!(
-                "{}: the machine-wide state directory could not be hardened + verified ({}); re-run elevated",
+                "{}: the machine-wide state directory could not be hardened + verified ({})",
                 dir.daemon, dir.note
             ));
         }
@@ -1844,7 +1913,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         if sec.checked && !sec.secure {
             failures.push(format!(
                 "install root {}: {} — a non-admin could replace a privileged service binary; \
-                 re-run elevated / repair the directory permissions",
+                 repair the directory permissions",
                 sec.root, sec.note
             ));
         }
@@ -1857,7 +1926,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     if let Some(m) = &report.migration {
         for f in &m.deregister_failures {
             failures.push(format!(
-                "migration: {f}; re-run elevated so the privileged registration is re-pointed \
+                "migration: {f}; the privileged registration must be re-pointed \
                  into the protected root"
             ));
         }
@@ -1870,15 +1939,18 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     // registration and a tolerated re-install that never re-pointed it.
     failures.extend(regaudit::audit_failures(&report.registration_audit));
 
-    // PATH resolution (#496): any required CLI that does not resolve by bare
-    // name from a fresh shell makes the install NOT ready — the user could not
-    // run `dig-node …` / `dig-dns …` otherwise.
+    // PATH resolution (#496): any required CLI the TARGET USER cannot resolve by bare name in a
+    // fresh login shell, or that resolves but does not run, makes the install NOT ready — the user
+    // could not run `dig-node …` / `dig-dns …` otherwise.
+    //
+    // The remediation is the check's own note and nothing more (#1748). It used to append "open a new
+    // terminal or re-run elevated", which was advice the reader could not act on: the check now runs
+    // in a *fresh* login shell, so opening another terminal changes nothing, and the failing install
+    // that prompted this was already elevated — being told to elevate it again sent people looking for
+    // a privilege problem that was never there.
     for check in &report.cli_path_checks {
         if !check.resolved {
-            failures.push(format!(
-                "{}: the CLI is not runnable from a fresh shell ({}); open a new terminal or re-run elevated",
-                check.cli, check.note
-            ));
+            failures.push(format!("{}: {}", check.cli, check.note));
         }
     }
 
@@ -1908,7 +1980,7 @@ fn log_readiness_verdict(report: &InstallReport, log: &mut dyn FnMut(&str)) {
         for f in &report.failures {
             log(&format!("    - {f}"));
         }
-        log("Fix the above (re-run as Administrator/root if elevation is the cause) and run the installer again.");
+        log("Fix the above and run the installer again.");
     }
 }
 
@@ -2077,7 +2149,7 @@ fn register_dig_dns(
             result.note.push_str("; service reached RUNNING");
         } else {
             log(&format!(
-                "    ! service health: {} — the resolver may not be serving; re-run elevated if it did not start.",
+                "    ! service health: {} — the resolver may not be serving.",
                 state.describe(svc::DIG_DNS_SERVICE_ID)
             ));
             result.note.push_str(&format!(
@@ -2368,9 +2440,7 @@ fn register_dig_node(
         if running {
             log(&format!("    ✓ health check: {note}"));
         } else {
-            log(&format!(
-                "    ! health check FAILED: {note} — re-run elevated so the service registers and starts."
-            ));
+            log(&format!("    ! health check FAILED: {note}"));
         }
         result.health_checked = true;
         result.health_ok = running;
@@ -5195,12 +5265,75 @@ mod tests {
         report.cli_path_checks.push(pathcheck::CliPathCheck {
             cli: "dig-node".to_string(),
             resolved: false,
-            note: "`dig-node` did not resolve on PATH".to_string(),
+            note:
+                "`dig-node` is not on ubuntu's PATH (a fresh login shell searches: /usr/bin:/bin)"
+                    .to_string(),
         });
         let failures = evaluate_readiness(&plan, &report);
         assert_eq!(failures.len(), 1, "got: {failures:?}");
         assert!(failures[0].contains("dig-node"));
-        assert!(failures[0].contains("fresh shell"));
+        // The check's own note IS the remediation — it names the user and the PATH actually searched.
+        assert!(failures[0].contains("ubuntu"));
+        assert!(failures[0].contains("/usr/bin:/bin"));
+    }
+
+    /// #1748: the readiness failure must NOT tell the reader to re-run elevated.
+    ///
+    /// The install that prompted this WAS elevated — that was the cause, not the cure — and "open a
+    /// new terminal" is equally useless now the check already uses a fresh login shell. Both phrases
+    /// sent a real reader hunting a privilege problem that did not exist, so their absence is asserted
+    /// rather than left to review.
+    #[test]
+    fn a_path_failure_does_not_advise_re_running_elevated() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.cli_path_checks.push(pathcheck::CliPathCheck {
+            cli: "dig-app".to_string(),
+            resolved: false,
+            note: "`/usr/local/bin/dig-app --version` resolved on PATH but did NOT run: \
+                   libxdo.so.3: cannot open shared object file"
+                .to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        let joined = failures.join(" ");
+        assert!(
+            !joined.contains("re-run elevated"),
+            "must not advise elevating an already-elevated install: {joined}"
+        );
+        assert!(
+            !joined.contains("open a new terminal"),
+            "the check already used a fresh login shell: {joined}"
+        );
+        // The actionable detail — the loader error — must survive into the verdict.
+        assert!(joined.contains("libxdo.so.3"), "got: {joined}");
+    }
+
+    /// #1748: the SERVICE readiness branch must not advise elevating either.
+    ///
+    /// This is a separate code path from the PATH branch above, and it is the one a real run hit:
+    /// `dig-node start` failed with `Failed to connect to bus: No medium found` — root having no
+    /// session bus — and the verdict said "re-run elevated" for an install that was already root.
+    /// The missing thing was a user SESSION, not privilege, so the advice sent the reader after the
+    /// wrong cause. A second actor (the failing service) is required to exercise this branch, which is
+    /// why the PATH-branch test above cannot stand in for it.
+    #[test]
+    fn a_service_failure_does_not_advise_re_running_elevated_either() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        let mut svc = running_service();
+        svc.health_ok = false;
+        svc.health_note = "dig-node start exited with 6: error: Failed to connect to bus: \
+                           No medium found"
+            .to_string();
+        report.service = Some(svc);
+        let joined = evaluate_readiness(&plan, &report).join(" ");
+        assert!(
+            !joined.contains("re-run elevated"),
+            "the failing install was already root: {joined}"
+        );
+        // The real cause must still reach the reader verbatim.
+        assert!(joined.contains("Failed to connect to bus"), "got: {joined}");
     }
 
     /// #514: an `auto_update`-only plan (the beacon is a privileged OS-scheduler

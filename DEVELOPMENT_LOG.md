@@ -3,6 +3,65 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## #1748: a self-check that supplies its own input cannot fail
+
+The post-install PATH check took the install's bin dir, prepended it to the current process's `PATH`,
+and then resolved the CLI by bare name against the result. Every part of that reads like verification
+and none of it is: the question it actually answers is "does this file run if I put its directory on
+PATH?", which is true by construction the moment a download succeeds, in every environment.
+
+So a `sudo` install that had put the entire stack in `/root/.dig/bin` printed
+`✓ 'dig-node --version' resolved on PATH (dig-node 0.65.0)` while `su - ubuntu -c 'dig-node --version'`
+said `command not found`. The check was green against the shipped bug for its whole life.
+
+Two lessons worth keeping:
+
+1. **Running the same check as the right user would NOT have caught it.** The scope error (root's
+   environment) and the injection are independent faults, and the injection alone is sufficient to make
+   the check unfalsifiable. When a check takes the thing it is verifying as a parameter, that parameter
+   is the bug.
+2. **Resolution is not execution.** `dig-app` was reported installed successfully while being unable to
+   load `libxdo.so.3`, because it was only ever downloaded, never run. A component gate that does not
+   execute the binary is reporting the outcome of `curl`, not of an install.
+
+The rule now: the PATH is READ from the target environment and used unmodified, and the resolved
+absolute path is executed. The regression tests assert the negative — a binary present on disk in a
+directory that is not on the searched PATH must NOT resolve — with a truthful control in the same
+fixture (a binary that IS on that PATH resolves), so they cannot pass by always failing.
+
+## #1748: under `sudo`, `$HOME` is `/root` and every per-user decision inverts
+
+`sudo` sets `HOME=/root`, so in an elevated installer *every* `dirs::home_dir()` call answers with
+root's home. This was not one bug with four symptoms so much as one wrong question asked in five
+places: the bin dir (`/root/.dig/bin`), the PATH export (`/root/.bashrc`), the dig-app systemd user
+unit (`/root/.config/systemd/user/`), the `chia://` desktop entry
+(`/root/.local/share/applications/`), and the legacy-root migration. `/root` is mode `0700`, so none of
+it was reachable even if the user had been told the path.
+
+Durable points:
+
+- The invoking account must be resolved from the escalation tool's environment (`SUDO_USER`/`SUDO_UID`,
+  `DOAS_USER`, `PKEXEC_UID`) and its home read from the **passwd database** — never from `$HOME`, which
+  has already been overwritten. Read the hint only when `geteuid()==0`, or a stale `SUDO_USER` from an
+  ancestor shell hijacks an unelevated install.
+- `$XDG_CONFIG_HOME` is the same trap wearing a different hat: `sudo`/`su` set one describing root, so
+  honouring it puts the "per-user" unit straight back into root's scope.
+- Resolving the invoking user is necessary but not sufficient for the CLIs: a person who typed `sudo`
+  asked for a machine-wide install. `/usr/local/bin` is already on every login shell's `PATH`, which
+  leaves no PATH wiring to get wrong, and being root-owned `0755` it is a strictly better answer for the
+  #565 no-LPE invariant than the user-writable per-user root it replaces.
+- `/opt/dig/bin` is on **no** shell's default PATH. `dig-dns` had to live there (#565) and is a CLI the
+  docs tell users to run, so it resolved for nobody — including root — while the check said otherwise.
+  A root-owned symlink into `/usr/local/bin` restores reachability without weakening #565.
+
+## #1748: remediation text must be runnable in a scope where the thing exists
+
+Two printed strings sent readers hunting problems that did not exist. `systemctl --user enable --now
+dig-app.service` fails for root (no session bus during `curl | sudo sh`) and for the user (the unit was
+in root's scope). "re-run elevated" was printed by an install that was *already* elevated — elevation
+was the cause, not the cure. Advice that names no runnable scope is worse than no advice, because it
+looks actionable.
+
 ## #715: the elevated GUI must pin WEBVIEW2_USER_DATA_FOLDER (SYSTEM has no LOCALAPPDATA)
 
 The Tauri GUI renders in WebView2, whose user-data folder defaults to

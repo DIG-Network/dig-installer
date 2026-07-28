@@ -528,3 +528,125 @@ jobs:
             seeded-task.xml
             migrated-task.xml
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # #1748: does the person who typed `sudo` actually end up with working CLIs?
+  #
+  # The `e2e` job above could not answer that, and passed against an install that
+  # left everything in /root/.dig/bin. FOUR independent factors each hid it:
+  #
+  #   1. it passes `--bin-dir "$BIN_DIR"`, which bypasses `default_bin_dir()`
+  #      entirely — the function that resolved `$HOME` was never called;
+  #   2. it elevates with `sudo -E`, which PRESERVES the runner's `HOME`, so the
+  #      `HOME=/root` inversion a real `curl | sudo sh` produces cannot occur;
+  #   3. it manufactures a systemd user session for root (`loginctl enable-linger
+  #      root` + `XDG_RUNTIME_DIR=/run/user/0`) that a real sudo install does not
+  #      have; and
+  #   4. every assertion runs AS ROOT, so a root-only PATH is never questioned.
+  #
+  # This job removes all four: the DEFAULT bin dir, `sudo -H` (which sets
+  # HOME=/root exactly as sudo does for `curl | sudo sh`), no fabricated session,
+  # and the acceptance assertions run as a NON-ROOT user in a FRESH LOGIN SHELL.
+  #
+  # Only the cheap CLI components are installed (`--no-dig-node --no-dig-dns
+  # --no-auto-update`): the question here is reachability of user-facing binaries,
+  # which needs no service registration, so the job stays fast.
+  sudo-install-is-reachable-by-the-user:
+    name: "#1748 a sudo install is reachable by the invoking user (non-root)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-1748-reach-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-1748-reach-
+
+      - name: Build the installer
+        run: cargo build --release --bin dig-installer
+
+      # `sudo -H` sets HOME=/root, which is what sudo does for the documented
+      # `curl -fsSL https://dig.net/install.sh | sudo sh`. No `--bin-dir`, so the
+      # real `default_bin_dir()` decision is exercised.
+      - name: Install as root with HOME=/root and the DEFAULT bin dir
+        run: |
+          sudo -H ./target/release/dig-installer \
+            --no-dig-node --no-dig-dns --no-auto-update --no-dig-app \
+            --json | tee install.json
+          echo "--- where did the binaries go? ---"
+          ls -l /usr/local/bin/ | grep -Ei 'dig' || true
+          echo "--- did anything land in root's home? ---"
+          sudo ls -l /root/.dig/bin 2>/dev/null || echo "(nothing in /root/.dig/bin — correct)"
+
+      # THE acceptance assertion, and the one the shipped bug would have failed:
+      # a NON-ROOT user, in a FRESH LOGIN SHELL, must resolve and run the CLIs.
+      # `su - $(id -un 1001)` is a login shell, so it reads /etc/profile and
+      # /etc/profile.d/* exactly as the user's next terminal will.
+      - name: A non-root user resolves + runs the CLIs in a fresh login shell
+        run: |
+          USER_NAME=$(id -un 1001)
+          echo "asserting as: $USER_NAME"
+          sudo su - "$USER_NAME" -c 'printf "login PATH: %s\n" "$PATH"'
+          for cli in dig-store digs; do
+            echo "--- $cli ---"
+            sudo su - "$USER_NAME" -c "command -v $cli" \
+              || { echo "FAIL: $cli is not on $USER_NAME's PATH"; exit 1; }
+            sudo su - "$USER_NAME" -c "$cli --version" \
+              || { echo "FAIL: $cli does not RUN for $USER_NAME"; exit 1; }
+          done
+
+      # The installer's own verdict must AGREE with what we just observed
+      # independently. Before #1748 it claimed every CLI resolved while the loop
+      # above would have failed, so agreement is the property under test.
+      - name: The installer's own report agrees with the observation
+        run: |
+          jq -e '.ok == true' install.json
+          jq -e '.result.ready == true' install.json
+          jq -e '.result.failures == []' install.json
+          jq -e '(.result.cli_path_checks | length) > 0' install.json
+          jq -e 'all(.result.cli_path_checks[]; .resolved == true)' install.json
+          # No user-facing binary may live under root's home.
+          jq -e 'all(.result.components[]; (.dest | startswith("/root")) | not)' install.json
+
+      # The other half of the bound: the check must be capable of going RED.
+      # Point an install at a root-only directory (mode 0700, unreachable by any
+      # unprivileged user) and require the readiness verdict to FAIL. A check that
+      # stays green here is worthless — and staying green here is exactly what
+      # shipped.
+      - name: The PATH check goes RED against a root-only layout
+        run: |
+          sudo mkdir -p /root/dig-only && sudo chmod 700 /root/dig-only
+          set +e
+          sudo -H ./target/release/dig-installer \
+            --no-dig-node --no-dig-dns --no-auto-update --no-dig-app \
+            --bin-dir /root/dig-only \
+            --json > broken.json
+          RC=$?
+          set -e
+          echo "installer exit code: $RC"
+          cat broken.json | jq '.result.cli_path_checks' || cat broken.json
+          # It must NOT report ready, and the failure must name the PATH problem.
+          jq -e '.result.ready == false' broken.json
+          jq -e 'any(.result.cli_path_checks[]; .resolved == false)' broken.json
+          jq -e '(.result.failures | length) > 0' broken.json
+          test "$RC" -ne 0 || { echo "FAIL: a broken install must exit non-zero"; exit 1; }
+          # And it must not have advised re-running elevated (it already was).
+          if jq -r '.result.failures[]' broken.json | grep -qi 're-run elevated'; then
+            echo "FAIL: must not advise elevating an already-elevated install"; exit 1
+          fi

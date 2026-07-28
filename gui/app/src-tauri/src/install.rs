@@ -1354,8 +1354,15 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = install_dir; // not needed on Linux (per-user XDG dirs)
-        let home = dirs::home_dir().ok_or("no home directory")?;
-        let share = home.join(".local").join("share");
+        // The INVOKING user's home, not `$HOME` (#1748). The Linux GUI relaunches itself as root via
+        // one-shot `pkexec` (SPEC §4.1b), and that root child sees `HOME=/root` — so registering the
+        // `.dig` association against `$HOME` would file it under root's XDG scope, where the desktop
+        // session that will open a `.dig` file never looks. `pkexec` sets `PKEXEC_UID`, which the
+        // resolver reads.
+        let share = dig_installer::invoker::target_user()
+            .home
+            .join(".local")
+            .join("share");
 
         // shared-mime-info package describing application/x-dig with *.dig.
         let mime_pkg_dir = share.join("mime").join("packages");
