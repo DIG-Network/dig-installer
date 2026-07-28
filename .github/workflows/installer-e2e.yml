@@ -181,6 +181,22 @@ jobs:
           done
           echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
 
+      # TEMPORARY DIAGNOSTIC (#1748): dig-app autostart regressed to "Permission
+      # denied" writing the systemd user unit on Linux only, while macOS's
+      # LaunchAgent (same delegated-write path) succeeded. Establish the REAL
+      # precondition -- who owns each level of the target user's XDG chain, and
+      # what HOME/XDG the elevated process actually sees -- rather than inferring
+      # it. Non-gating.
+      - name: (Linux) DIAGNOSTIC before install — ownership of the target user's XDG chain
+        if: always() && runner.os == 'Linux'
+        run: |
+          echo "whoami=$(whoami) HOME=$HOME SUDO=$SUDO XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+          echo "-- what the ELEVATED process will see:"
+          $SUDO sh -c 'echo "  root-side HOME=$HOME XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-<unset>} SUDO_USER=${SUDO_USER:-<unset>}"'
+          for d in /home/runner /home/runner/.config /home/runner/.config/systemd                    /home/runner/.config/systemd/user /home/runner/.local                    /home/runner/.local/share /home/runner/.local/share/applications; do
+            if [ -e "$d" ]; then ls -ldn "$d"; else echo "ABSENT  $d"; fi
+          done
+
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.
@@ -215,6 +231,14 @@ jobs:
           sudo systemctl status dignetwork-dig-dns --no-pager -l || true
           sudo journalctl -u dignetwork-dig-dns --no-pager -n 60 || true
           sudo ss -ltnp 2>/dev/null | grep -i ':80\|:8053' || true
+
+      - name: (Linux) DIAGNOSTIC after install — ownership of the XDG chain + autostart verdict
+        if: always() && runner.os == 'Linux'
+        run: |
+          for d in /home/runner/.config /home/runner/.config/systemd                    /home/runner/.config/systemd/user                    /home/runner/.config/systemd/user/dig-app.service                    /home/runner/.local/share/applications; do
+            if [ -e "$d" ]; then ls -ldn "$d"; else echo "ABSENT  $d"; fi
+          done
+          jq -c '.result.autostart' install.json || true
 
       - name: Assert the #493 fail-loud readiness verdict — both components ready
         run: |
