@@ -20,9 +20,10 @@
 //! sources, one per platform:
 //!
 //! * **unix** — the PATH of a fresh LOGIN shell belonging to the [target
-//!   user](crate::invoker::TargetUser). Under elevation that means `su - <user> -c …`, so the shell
-//!   sources that user's `/etc/profile`, `/etc/profile.d/*` and `~/.profile` exactly as their next
-//!   terminal will. Root's environment is never consulted.
+//!   user](crate::invoker::TargetUser). Under elevation that means `su - <user> -c 'sh -lc …'`, so the
+//!   shell sources that user's `/etc/profile` plus `/etc/profile.d/*` on Linux, or runs `path_helper`
+//!   over `/etc/paths` and `/etc/paths.d` on macOS, exactly as their next terminal will. The inner
+//!   `sh -lc` is load-bearing — see [`PRINT_PATH_VIA_LOGIN_SH`]. Root's environment is never consulted.
 //! * **Windows** — the PERSISTED `Path` values (`HKCU\Environment` + the machine `Environment` key),
 //!   which is what a newly-opened shell inherits, rather than the current process's `PATH` (which
 //!   may carry an in-process modification the user will never see).
@@ -116,18 +117,37 @@ pub fn login_shell_path(user: &TargetUser) -> Result<String, String> {
     }
 }
 
+/// Emit `$PATH` and nothing else. `printf` rather than `echo` so the value carries no trailing
+/// newline of its own and no shell-specific `echo` flag handling.
+#[cfg(unix)]
+const PRINT_PATH: &str = r#"printf '%s\n' "$PATH""#;
+
+/// [`PRINT_PATH`] re-entered through an explicit **login** shell.
+///
+/// The inner `sh -lc` is required, not belt-and-braces: `su - <user> -c CMD` does NOT produce a login
+/// shell on BSD/macOS, because `su`'s own `-c` flag takes a login CLASS there, so a `-c` after the
+/// login name is handed to the shell verbatim and no profile is read. Measured on a macos-14 runner:
+///
+/// ```text
+/// su - runner -c 'printf "%s\n" "$PATH"'             -> /bin:/usr/bin
+/// su - runner -c 'sh -lc '\''printf "%s\n" "$PATH"'\''' -> /usr/local/bin:…:/opt/homebrew/bin:…
+/// ```
+///
+/// The first is `su`'s bare built-in default — a PATH no real login shell ever has — so without the
+/// wrapper the elevated PATH check can never be satisfied on macOS, and `path_helper` (which is what
+/// makes `/etc/paths.d` effective) never runs (#1748).
+#[cfg(unix)]
+const PRINT_PATH_VIA_LOGIN_SH: &str = r#"sh -lc 'printf "%s\n" "$PATH"'"#;
+
 /// The unix login-shell PATH for `user` — `su - <user>` under elevation, else our own login shell.
 #[cfg(unix)]
 fn unix_login_shell_path(user: &TargetUser) -> Result<String, String> {
-    // `printf` rather than `echo` so the value is emitted with no trailing newline of its own and no
-    // shell-specific `echo` flag handling.
-    const PRINT_PATH: &str = r#"printf '%s\n' "$PATH""#;
     let out = if user.via_elevation {
         Command::new("su")
             .arg("-")
             .arg(&user.name)
             .arg("-c")
-            .arg(PRINT_PATH)
+            .arg(PRINT_PATH_VIA_LOGIN_SH)
             .hide_console()
             .output()
     } else {
@@ -596,5 +616,26 @@ mod tests {
             run_version(&file, &user("nobody", false)).is_err(),
             "a present-but-unrunnable binary must not be reported as working"
         );
+    }
+
+    /// THE macOS regression (#1748): the elevated probe must go through an explicit LOGIN shell.
+    ///
+    /// `su - <user> -c CMD` reads no profile on BSD/macOS, so probing with a bare command measures
+    /// `su`'s built-in `/bin:/usr/bin` instead of the user's real login PATH — which made every
+    /// `cli_path_checks` entry report "not on PATH" on macos-14 no matter what the installer wired.
+    /// Asserted on the constant because the behaviour itself needs a second account to observe.
+    #[cfg(unix)]
+    #[test]
+    fn the_elevated_path_probe_goes_through_a_login_shell() {
+        assert!(
+            PRINT_PATH_VIA_LOGIN_SH.contains("sh -lc"),
+            "without an explicit login shell macOS reports su's bare default PATH: {PRINT_PATH_VIA_LOGIN_SH}"
+        );
+        assert!(
+            PRINT_PATH_VIA_LOGIN_SH.contains("$PATH"),
+            "got: {PRINT_PATH_VIA_LOGIN_SH}"
+        );
+        // The un-wrapped form is what the bug used, so it must NOT be what the elevated probe sends.
+        assert_ne!(PRINT_PATH_VIA_LOGIN_SH, PRINT_PATH);
     }
 }

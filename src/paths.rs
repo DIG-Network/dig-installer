@@ -17,10 +17,11 @@
 //!
 //! The load-bearing subtlety is the SCOPE (#1748). An elevated install cannot wire PATH through
 //! dotfiles, because the only dotfiles it can see are root's — that is precisely how a whole install
-//! became invisible to the user who asked for it. So an elevated install works at the scope it has
-//! (`/etc/profile.d`, read by every login shell) and, before writing anything, asks the target user's
-//! own login shell whether the directory is reachable — then asks again afterwards, so the reported
-//! outcome is an observation rather than an assumption.
+//! became invisible to the user who asked for it. So an elevated install works at the scope it has —
+//! the system-wide fragment its login shells really read, which is `/etc/profile.d` on Linux but
+//! `/etc/paths.d` on macOS ([`login_path_fragment`]) — and, before writing anything, asks the target
+//! user's own login shell whether the directory is reachable, then asks again afterwards, so the
+//! reported outcome is an observation rather than an assumption.
 
 use std::path::{Path, PathBuf};
 
@@ -393,6 +394,33 @@ pub fn profile_d_script(dir: &str) -> String {
     )
 }
 
+/// The system-wide login-`PATH` fragment an elevated **macOS** install writes.
+///
+/// macOS has no `/etc/profile.d` at all, so [`PROFILE_D_SCRIPT`] would land in a directory that does
+/// not exist and no shell would ever source it. The macOS equivalent is `/usr/libexec/path_helper`,
+/// invoked by both `/etc/profile` (bash) and `/etc/zprofile` (zsh), which composes the login `PATH`
+/// from `/etc/paths` plus one fragment file per entry in `/etc/paths.d` (#1748).
+pub const PATHS_D_FILE: &str = "/etc/paths.d/dig";
+
+/// Render the `/etc/paths.d` fragment for `dir`.
+///
+/// `path_helper` reads these files as a plain list of directories, one per line — no quoting, no
+/// expansion, no shell syntax. A directory containing spaces is therefore written verbatim.
+pub fn paths_d_fragment(dir: &str) -> String {
+    format!("{dir}\n")
+}
+
+/// The file an elevated install writes to put `dir` on every login shell's `PATH`, and its contents,
+/// chosen for the platform whose login shells will actually read it.
+#[cfg(not(windows))]
+fn login_path_fragment(dir: &str) -> (&'static str, String) {
+    if cfg!(target_os = "macos") {
+        (PATHS_D_FILE, paths_d_fragment(dir))
+    } else {
+        (PROFILE_D_SCRIPT, profile_d_script(dir))
+    }
+}
+
 #[cfg(not(windows))]
 fn unix_add_to_path(bin_dir: &Path) -> Result<String, String> {
     let user = crate::invoker::target_user();
@@ -432,8 +460,16 @@ fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result
         return Ok(note);
     }
 
-    // Refuse to wire a directory the target user cannot even enter. `/etc/profile.d` is sourced by
-    // EVERY login shell on the machine, so putting an inaccessible dir on PATH would degrade every
+    // PATH is wired BEFORE the components are downloaded, so on an install that selects none of the
+    // early components (`--no-digstore`) the bin dir does not exist yet. A directory that is merely
+    // absent is not a directory the user cannot enter, and reporting it as one made the reachability
+    // guard below fire on a perfectly good install root. Create it in the shape the download path
+    // would: root-owned and world-traversable, which is also what the #565 install-root ACL verify
+    // requires (no group or other write).
+    ensure_bin_dir(bin_dir)?;
+
+    // Refuse to wire a directory the target user cannot even enter. The fragment is read by EVERY
+    // login shell on the machine, so putting an inaccessible dir on PATH would degrade every
     // account's environment to no purpose — and it would let this function report success (the dir is
     // "on PATH" after all) for an install nobody can run. Checked as the user, by the user's own shell.
     if !user_can_enter(&dir, user) {
@@ -445,18 +481,40 @@ fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result
         ));
     }
 
-    std::fs::write(PROFILE_D_SCRIPT, profile_d_script(&dir))
-        .map_err(|e| format!("write {PROFILE_D_SCRIPT}: {e}"))?;
+    let (fragment_file, fragment_body) = login_path_fragment(&dir);
+    if let Some(parent) = Path::new(fragment_file).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(fragment_file, fragment_body)
+        .map_err(|e| format!("write {fragment_file}: {e}"))?;
 
-    if let Some(note) = reachable(&format!(" (wired via {PROFILE_D_SCRIPT})")) {
+    if let Some(note) = reachable(&format!(" (wired via {fragment_file})")) {
         return Ok(note);
     }
     let observed =
         pathcheck::login_shell_path(user).unwrap_or_else(|e| format!("<unreadable: {e}>"));
     Err(format!(
-        "wrote {PROFILE_D_SCRIPT} but {dir} is STILL not on {}'s login PATH (it searches: {observed})",
+        "wrote {fragment_file} but {dir} is STILL not on {}'s login PATH (it searches: {observed})",
         user.name
     ))
+}
+
+/// Create `bin_dir` if it is absent, root-owned and world-traversable (0755).
+///
+/// Separate from the download path's own creation so PATH wiring — which runs first — can rely on the
+/// directory existing without depending on which components a given run happens to install.
+#[cfg(not(windows))]
+fn ensure_bin_dir(bin_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if bin_dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
+    // Explicit rather than umask-dependent: every login shell on the box will search this directory,
+    // so it must be traversable by every account regardless of the umask the installer inherited.
+    std::fs::set_permissions(bin_dir, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod 0755 {}: {e}", bin_dir.display()))
 }
 
 /// [`unix_add_to_path`] against an explicit `home` directory. The real call uses
@@ -912,6 +970,55 @@ mod tests {
             PROFILE_D_SCRIPT.ends_with(".sh"),
             "/etc/profile only sources *.sh from profile.d"
         );
+    }
+
+    // -- #1748: macOS wires the login PATH through /etc/paths.d, not /etc/profile.d ---------------
+
+    /// macOS has **no `/etc/profile.d`** — measured on a macos-14 runner, `ls /etc/profile.d` is
+    /// `No such file or directory`, so the Linux snippet is written into a directory that does not
+    /// exist and no login shell would ever source it. The macOS mechanism is
+    /// `/usr/libexec/path_helper`, run from `/etc/profile` and `/etc/zprofile`, which composes the
+    /// login PATH from `/etc/paths` plus one file per fragment in `/etc/paths.d`.
+    #[test]
+    fn the_macos_login_path_fragment_is_a_paths_d_entry() {
+        assert_eq!(PATHS_D_FILE, "/etc/paths.d/dig");
+        assert!(
+            PATHS_D_FILE.starts_with("/etc/paths.d/"),
+            "path_helper only reads fragments from /etc/paths.d"
+        );
+        assert!(
+            !PATHS_D_FILE.ends_with(".sh"),
+            "a paths.d fragment is a plain directory list, not a shell script"
+        );
+    }
+
+    /// `path_helper` parses one DIRECTORY PER LINE and nothing else — a shell snippet here would be
+    /// interpreted as a literal directory name and silently corrupt every login shell's PATH.
+    #[test]
+    fn the_paths_d_fragment_is_one_bare_directory_per_line() {
+        let s = paths_d_fragment("/opt/dig bin");
+        assert_eq!(s, "/opt/dig bin\n");
+        for shellism in ["export", "PATH=", "case", "$"] {
+            assert!(
+                !s.contains(shellism),
+                "path_helper reads paths.d literally — {shellism} would become a directory name"
+            );
+        }
+    }
+
+    /// The two mechanisms must not be confused: each OS gets the file its login shells actually read.
+    /// Asserting BOTH arms means an implementation that always returned one of them cannot pass.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_login_path_fragment_target_follows_the_platform() {
+        let (file, body) = login_path_fragment("/opt/dig-bin");
+        if cfg!(target_os = "macos") {
+            assert_eq!(file, PATHS_D_FILE);
+            assert_eq!(body, "/opt/dig-bin\n");
+        } else {
+            assert_eq!(file, PROFILE_D_SCRIPT);
+            assert!(body.contains("export PATH"), "got: {body}");
+        }
     }
 
     /// A dir containing a shell metacharacter must not break the generated snippet's `case` guard.

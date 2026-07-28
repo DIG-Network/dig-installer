@@ -325,10 +325,20 @@ An elevated install MUST NOT place user-facing CLIs under any home directory: ro
 (the only dotfiles it can see are root's). It instead:
 
 1. reads the target user's **login-shell** `PATH` and checks whether the bin dir is already present;
-2. only if absent, writes `paths::PROFILE_D_SCRIPT` (`/etc/profile.d/dig-path.sh`) — POSIX `sh`, with a
-   source-time `case` guard so a re-source cannot duplicate the entry; and
+2. only if absent, creates the bin dir when it does not yet exist (root-owned `0755`; `PATH` is wired
+   before any component is downloaded, so an absent directory MUST NOT be reported as one the user
+   cannot enter) and writes the system-wide fragment its login shells actually read:
+   * **Linux** — `paths::PROFILE_D_SCRIPT` (`/etc/profile.d/dig-path.sh`), POSIX `sh`, with a
+     source-time `case` guard so a re-source cannot duplicate the entry;
+   * **macOS** — `paths::PATHS_D_FILE` (`/etc/paths.d/dig`), one bare directory per line. macOS has no
+     `/etc/profile.d`; `/usr/libexec/path_helper`, run from `/etc/profile` and `/etc/zprofile`,
+     composes the login `PATH` from `/etc/paths` plus the `/etc/paths.d` fragments;
 3. **re-reads** the login-shell `PATH`. If the directory is still absent the result is an ERROR, not a
    success note.
+
+The login-shell probe MUST enter a real **login** shell. `su - <user> -c CMD` does not do so on
+BSD/macOS — `su`'s own `-c` takes a login CLASS there, so the command is handed to the shell verbatim
+and no profile is read — therefore the probed command is itself wrapped in `sh -lc`.
 
 **Protected-root CLIs are linked back onto PATH.** `/opt/dig/bin` is on no shell's default `PATH`, so a
 privileged binary a user is expected to invoke by name (`dig-dns doctor`) MUST be symlinked into
