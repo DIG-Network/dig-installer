@@ -4817,6 +4817,100 @@ mod tests {
         );
     }
 
+    /// #1748 + #565 together: an elevated unix install may put USER CLIs in `/usr/local/bin`, and MUST
+    /// NOT put a privileged/service-executed binary there.
+    ///
+    /// This is the invariant that reconciles the two things `SPEC.md` §1.5/§1.6 assert — that
+    /// `/usr/local/bin` is the right elevated user root, and that a Homebrew-style group-writable
+    /// prefix is the wrong home for a service binary. Both hold only because the two placements are
+    /// separate, so the separation is pinned here rather than left to prose.
+    ///
+    /// The fixture is the DEFAULT (un-overridden) plan, which is the only way to express "an elevated
+    /// install" without depending on the runner's uid. `has_custom_bin_dir()` compares `bin_dir`
+    /// against `default_bin_dir()`, and `default_bin_dir()` itself branches on the CURRENT process's
+    /// uid — so hardcoding `bin_dir = "/usr/local/bin"` would look like an OVERRIDE on a non-root test
+    /// runner and route the privileged set there, inverting the assertion. `InstallPlan::default()`
+    /// carries whatever the default is for the uid in play, so the routing under test is the real one
+    /// on a root and a non-root runner alike.
+    ///
+    /// Both classes of component are asked of the SAME plan, so a routing that collapsed them into one
+    /// dir — in either direction — is caught; a test that only asked about `dig-dns` would pass against
+    /// a build that also sent `dign` to the protected root, and vice versa.
+    #[cfg(unix)]
+    #[test]
+    fn an_elevated_unix_install_keeps_privileged_binaries_out_of_the_machine_bin_dir() {
+        use target::Os;
+        let machine = std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR);
+        let elevated_default = InstallPlan::default();
+        assert!(
+            !elevated_default.has_custom_bin_dir(),
+            "the default plan must not read as an override, or the routing under test is not \
+             exercised"
+        );
+        // The separation the SPEC's two claims both rest on, asserted directly: the machine-wide user
+        // root and the privileged root are different directories, so "user CLIs may sit in a
+        // possibly-group-writable /usr/local/bin" and "no service binary may" are both satisfiable.
+        assert_ne!(paths::protected_bin_dir(), machine);
+
+        // The privileged set stays in the root-owned protected root, which is the dir
+        // `secure::verify_install_root` then holds to the no-LPE bar.
+        for privileged in ["dig-dns", "dig-updater", "dig-updater-worker"] {
+            assert!(
+                paths::is_privileged_component(Os::Linux, privileged),
+                "{privileged} must be classified privileged for this test to mean anything"
+            );
+            assert_eq!(
+                elevated_default.bin_dir_for(privileged, Os::Linux),
+                paths::protected_bin_dir(),
+                "{privileged} is service-executed and must never land in {}, which Homebrew leaves \
+                 group-writable on an Intel Mac",
+                paths::UNIX_MACHINE_BIN_DIR
+            );
+        }
+
+        // The user CLIs go to the user root instead — `/usr/local/bin` when this process is root, which
+        // is the #1748 fix. Without this half the test would also pass against a build that routed
+        // EVERYTHING to the protected root.
+        for user_cli in ["dig-store", "digs", "dign", "digd", "dig-app"] {
+            assert!(
+                !paths::is_privileged_component(Os::Linux, user_cli),
+                "{user_cli} is a user-run CLI"
+            );
+            assert_eq!(
+                elevated_default.bin_dir_for(user_cli, Os::Linux),
+                paths::default_bin_dir(),
+                "a user-run CLI belongs in the §1.6 user root, not the privileged root"
+            );
+        }
+        // And that user root IS the machine-wide dir exactly when we are root — the elevation branch
+        // itself, asserted against the uid rather than assumed.
+        if invoker::is_root() {
+            assert_eq!(paths::default_bin_dir(), machine);
+        } else {
+            assert_eq!(
+                paths::default_bin_dir(),
+                invoker::target_user().dig_bin_dir()
+            );
+        }
+
+        // And the verify follows the privileged binaries, not the user CLIs: `/usr/local/bin` is never
+        // the dir handed to the ACL check on this plan, so a group-writable one cannot fail the
+        // install — while an override that genuinely routed a service binary there would be checked.
+        assert_eq!(
+            elevated_default.privileged_install_root(Os::Linux),
+            Some(paths::protected_bin_dir())
+        );
+        let overridden = InstallPlan {
+            bin_dir: std::path::PathBuf::from("/opt/somewhere-else"),
+            ..InstallPlan::default()
+        };
+        assert_eq!(
+            overridden.privileged_install_root(Os::Linux),
+            Some(std::path::PathBuf::from("/opt/somewhere-else")),
+            "an override redirects the privileged root, so the ACL verify must follow it there"
+        );
+    }
+
     /// #565: a definitive install-root ACL breach (an unprivileged principal
     /// CAN write where a privileged service binary lives) makes the install NOT
     /// ready; an inconclusive read is only a warning, never a false failure.

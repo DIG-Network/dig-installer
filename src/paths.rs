@@ -675,10 +675,24 @@ mod tests {
         );
     }
 
+    /// The UNELEVATED default install dir is a DIG-scoped bin dir on every platform.
+    ///
+    /// Scoped to the unelevated case deliberately. `default_bin_dir()` branches on
+    /// [`crate::invoker::is_root`], and the elevated unix answer is `/usr/local/bin`, which contains no
+    /// "dig" — so an unscoped version of this assertion is a claim about the TEST ENVIRONMENT (that the
+    /// runner is not root) dressed up as a claim about the code, and fails outright in a root
+    /// container. The elevated arm's real property is asserted by
+    /// `the_elevated_unix_bin_dir_is_machine_wide_and_not_under_any_home`.
     #[test]
-    fn default_bin_dir_is_under_a_dig_prefix() {
-        // The default install dir is a DIG-scoped bin dir on every platform.
-        let p = default_bin_dir().to_string_lossy().to_lowercase();
+    fn the_unelevated_default_bin_dir_is_under_a_dig_prefix() {
+        let p = if cfg!(windows) {
+            default_bin_dir()
+        } else {
+            // Ask for the unelevated answer directly rather than depending on the runner's uid.
+            crate::invoker::target_user().dig_bin_dir()
+        }
+        .to_string_lossy()
+        .to_lowercase();
         assert!(
             p.contains("dig"),
             "default bin dir should be DIG-scoped: {p}"

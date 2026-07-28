@@ -764,6 +764,61 @@ mod tests {
         );
     }
 
+    /// No root-side spawn anywhere in the crate may name its program by BARE NAME, because a bare name
+    /// is resolved through `$PATH` — and macOS's stock sudoers sets no `secure_path`, so under `sudo`
+    /// the inherited `$PATH` can begin with a user-writable Homebrew prefix. An attacker who can write
+    /// there supplies the very `su`/`sh`/`getent` that root is about to execute.
+    ///
+    /// [`resolve_system_tool_is_absolute_and_trusted_or_none`] proves the RESOLVER ignores `$PATH`, but
+    /// nothing proved the CALL SITES use it — reverting one to `Command::new("su")` left the whole
+    /// suite green. This asserts the property over the CLASS (no bare-name spawn of a privileged
+    /// helper, anywhere) rather than over the three call sites that exist today, so a fourth added
+    /// later is caught too.
+    ///
+    /// A source-level assertion is the honest tool here: the alternative is mutating the process-global
+    /// `$PATH`, which races every other test in the binary. The repo already uses this shape for the
+    /// release-workflow contract.
+    #[test]
+    fn no_privileged_spawn_resolves_its_program_through_the_path() {
+        // Each module that spawns a helper as root. `include_str!` binds at COMPILE time, so a renamed
+        // or deleted file breaks the build rather than silently vacating the check.
+        let sources: &[(&str, &str)] = &[
+            ("userwrite.rs", include_str!("userwrite.rs")),
+            ("pathcheck.rs", include_str!("pathcheck.rs")),
+            ("paths.rs", include_str!("paths.rs")),
+            ("invoker.rs", include_str!("invoker.rs")),
+            ("scheme.rs", include_str!("scheme.rs")),
+            ("autostart.rs", include_str!("autostart.rs")),
+        ];
+        // The helpers a root-side spawn must never name bare. `sh`/`su` are the shells root would be
+        // tricked into running; `getent`/`chown`/`chmod`/`id` are the rest of the privileged surface.
+        let helpers = ["su", "sh", "getent", "chown", "chmod", "id", "osascript"];
+        for (name, src) in sources {
+            // Only PRODUCTION code is in scope: a test helper spawning `sh` to sleep is not a root-side
+            // spawn, and flagging it would push the check toward being disabled rather than obeyed. The
+            // split is on the `mod tests` marker, and the assertion below fails loudly if a file's
+            // production half ever comes back empty, so the narrowing cannot silently vacate the check.
+            let production = src.split("\nmod tests {").next().unwrap_or("");
+            assert!(
+                production.len() > 200,
+                "{name}: the production half came back empty — the mod-tests split has drifted and \
+                 this check would pass vacuously"
+            );
+            for helper in helpers {
+                let bare = format!("Command::new(\"{helper}\")");
+                assert!(
+                    !production.contains(&bare),
+                    "{name} spawns `{helper}` by bare name, which resolves through $PATH — root must \
+                     resolve it with elevation::resolve_system_tool instead"
+                );
+            }
+        }
+        // A truthful control: the pattern being searched for is one that WOULD be found if present, so
+        // the assertions above cannot be passing merely because the needle can never match.
+        let planted = "fn demo() { Command::new(\"su\").arg(\"-\"); }";
+        assert!(planted.contains("Command::new(\"su\")"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_system_tool_is_absolute_and_trusted_or_none() {
