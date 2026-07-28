@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.30.0] - 2026-07-28
+
+### Features
+- **payload:** Install dig-app with per-user autostart on all four platforms
+
 ## [0.29.2] - 2026-07-17
 
 ### Bug Fixes
