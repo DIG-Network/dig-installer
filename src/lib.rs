@@ -1693,6 +1693,21 @@ const REQUIRED_CLIS: &[&str] = &[
     "dig-app",
 ];
 
+/// The subset of [`REQUIRED_CLIS`] that is a GUI application rather than a command-line tool.
+///
+/// `dig-app` is the per-user tray agent. It has no command-line surface — no subcommands, and on macOS
+/// `dig-app --version` never returns, because the binary enters its event loop instead of printing and
+/// exiting (measured on a macos-14 runner, where it held the whole install for the full 15-minute job
+/// timeout). Demanding a version string from it is a category error, so its check is RESOLUTION only:
+/// the invoking user's login shell must find the copy this run placed, which is the #1748 property.
+/// Whether it starts is proven by the autostart registration ([`autostart`]) instead.
+const GUI_APPS: &[&str] = &["dig-app"];
+
+/// Does `component` answer `--version`, so its install can be proven by RUNNING it?
+fn answers_version(component: &str) -> bool {
+    !GUI_APPS.contains(&component)
+}
+
 /// Link every installed user-facing CLI that lives in the protected root into the machine bin dir, so
 /// it is reachable by bare name (#1748).
 ///
@@ -1771,12 +1786,25 @@ fn verify_clis_on_path(
     ));
     for (cli, dest) in installed_clis {
         let exe = target.exe_name(&cli);
-        let check = match pathcheck::verify_cli(user, &exe, std::path::Path::new(&dest)) {
-            Ok(version) => {
-                let note = format!(
+        let dest_path = std::path::Path::new(&dest);
+        let outcome = if answers_version(&cli) {
+            pathcheck::verify_cli(user, &exe, dest_path).map(|version| {
+                format!(
                     "`{cli} --version` resolved + ran as {} ({version})",
                     user.name
-                );
+                )
+            })
+        } else {
+            pathcheck::verify_cli_resolves(user, &exe, dest_path).map(|resolved| {
+                format!(
+                    "`{cli}` resolves to {} on {}'s PATH (a GUI app — no `--version` to run)",
+                    resolved.display(),
+                    user.name
+                )
+            })
+        };
+        let check = match outcome {
+            Ok(note) => {
                 log(&format!("    ✓ {note}"));
                 pathcheck::CliPathCheck {
                     cli: cli.clone(),
@@ -5814,5 +5842,37 @@ mod tests {
     #[test]
     fn uninstall_covers_the_dig_app_binary_912() {
         assert!(uninstall::COMPONENT_STEMS.contains(&"dig-app"));
+    }
+
+    // -- #1748: a GUI app is proven by resolution, a CLI by running ---------------
+
+    /// `dig-app` must NOT be probed with `--version`: it is a tray app with no command-line surface,
+    /// and on macOS the probe never returns, which hung an entire install. Real CLIs must still be
+    /// RUN, so both arms are asserted — an implementation that exempted everything would be a
+    /// regression of #496 and cannot pass this.
+    #[test]
+    fn only_the_gui_app_is_exempt_from_the_version_probe() {
+        assert!(
+            !answers_version("dig-app"),
+            "dig-app has no --version to answer"
+        );
+        for cli in ["dig-node", "dign", "dig-dns", "digd", "dig-store", "digs"] {
+            assert!(
+                answers_version(cli),
+                "{cli} is a real CLI and must be RUN, not just resolved"
+            );
+        }
+    }
+
+    /// Every GUI app must still be a REQUIRED CLI — the exemption changes HOW it is proven, never
+    /// whether it is checked at all. A typo here would silently drop dig-app from the verdict.
+    #[test]
+    fn the_gui_app_is_still_a_required_cli() {
+        for app in GUI_APPS {
+            assert!(
+                REQUIRED_CLIS.contains(app),
+                "{app} is exempt from the version probe but is not checked at all"
+            );
+        }
     }
 }

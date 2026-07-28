@@ -32,7 +32,8 @@
 //! and [`verify_cli`] touch the machine.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::invoker::TargetUser;
 use crate::proc::HideConsole;
@@ -42,7 +43,8 @@ use crate::proc::HideConsole;
 pub struct CliPathCheck {
     /// The CLI id (e.g. `dig-node`).
     pub cli: String,
-    /// `true` iff the CLI resolved by bare name on the target user's own PATH **and** executed.
+    /// `true` iff the CLI resolved by bare name on the target user's own PATH to the copy this run
+    /// placed, **and** — for everything except a GUI app, which has no `--version` — executed.
     pub resolved: bool,
     /// Human-readable detail — never silent.
     pub note: String,
@@ -282,6 +284,23 @@ pub fn verify_cli(
     exe_name: &str,
     installed_at: &Path,
 ) -> Result<String, String> {
+    let resolved = verify_cli_resolves(user, exe_name, installed_at)?;
+    run_version(&resolved, user)
+}
+
+/// Steps 1–3 of [`verify_cli`] on their own: the bare name resolves, on the TARGET user's own login
+/// `PATH`, to the copy this run placed — returning that resolved path.
+///
+/// This is the whole guarantee available for a GUI application. `dig-app` is a tray agent with no
+/// command-line surface: it takes no subcommands, and on macOS `--version` enters its event loop and
+/// never returns. "Does it print a version?" is therefore a category error for it, while "can the
+/// invoking user reach the binary this install placed?" is exactly the #1748 property. Its ability to
+/// START is covered by the autostart registration ([`crate::autostart`]), not by a `--version` probe.
+pub fn verify_cli_resolves(
+    user: &TargetUser,
+    exe_name: &str,
+    installed_at: &Path,
+) -> Result<PathBuf, String> {
     let path = login_shell_path(user)?;
     let sep = separator();
     let resolved = resolve_in_path(&path, exe_name, sep, |p| p.is_file()).ok_or_else(|| {
@@ -299,7 +318,7 @@ pub fn verify_cli(
             installed_at.display()
         ));
     }
-    run_version(&resolved, user)
+    Ok(resolved)
 }
 
 /// Are `a` and `b` the same binary, following symlinks?
@@ -314,6 +333,56 @@ fn same_binary(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// How long a `--version` probe may take before it is declared hung and killed.
+///
+/// Generous enough for a cold start of a large binary on a loaded CI runner, and far short of any
+/// plausible job or user patience budget. The bound exists because a probe with NO bound once held an
+/// entire install for 15 minutes (#1748) — see [`output_within`].
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run `cmd` to completion, but never wait longer than `timeout` — on overrun the child is KILLED and
+/// an error naming `what` is returned.
+///
+/// `Command::output` waits forever, which makes any single misbehaving binary able to hang the whole
+/// install. That is not theoretical: a GUI application asked for `--version` on macOS enters its event
+/// loop and never exits. An install that reports "this binary did not answer" is strictly better than
+/// one that appears to freeze, so the deadline is enforced rather than trusted.
+///
+/// The pipes are deliberately NOT drained on the timeout path: a killed `su` may leave a grandchild
+/// holding the write end, and reading it would reintroduce exactly the hang being prevented. Dropping
+/// the child closes our read ends.
+fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{what} could not start: {e}"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{what} did not finish within {}s and was killed — the binary does not answer \
+                         `--version`",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("{what} could not be waited on: {e}")),
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("{what} output could not be read: {e}"))
+}
+
 /// Run `<binary> --version` and return its trimmed output.
 ///
 /// Under elevation the binary is run AS the target user (`su - <user> -c`), because "root can
@@ -321,21 +390,21 @@ fn same_binary(a: &Path, b: &Path) -> bool {
 /// present but unloadable surfaces its loader error here (for example a missing `libxdo.so.3`),
 /// which is the detail the failure note must carry.
 pub(crate) fn run_version(binary: &Path, user: &TargetUser) -> Result<String, String> {
-    let out = if user.via_elevation && cfg!(unix) {
-        Command::new("su")
-            .arg("-")
+    let mut cmd = if user.via_elevation && cfg!(unix) {
+        let mut c = Command::new("su");
+        c.arg("-")
             .arg(&user.name)
             .arg("-c")
-            .arg(format!("{} --version", shell_quote(binary)))
-            .hide_console()
-            .output()
+            .arg(format!("{} --version", shell_quote(binary)));
+        c
     } else {
-        Command::new(binary)
-            .arg("--version")
-            .hide_console()
-            .output()
+        let mut c = Command::new(binary);
+        c.arg("--version");
+        c
     };
-    let out = out.map_err(|e| format!("`{} --version` could not start: {e}", binary.display()))?;
+    cmd.hide_console();
+    let what = format!("`{} --version`", binary.display());
+    let out = output_within(&mut cmd, VERSION_PROBE_TIMEOUT, &what)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let detail = if stderr.is_empty() {
@@ -615,6 +684,56 @@ mod tests {
         assert!(
             run_version(&file, &user("nobody", false)).is_err(),
             "a present-but-unrunnable binary must not be reported as working"
+        );
+    }
+
+    // -- #1748: no single binary may hang the whole install -----------------------
+
+    /// A probe that never returns must be KILLED and reported, not waited on forever.
+    ///
+    /// This is not hypothetical: `dig-app --version` on macos-14 never returns (it is a tray app and
+    /// enters its event loop), which held the installer for the full 15-minute job timeout. An install
+    /// that hangs is worse than one that reports a failure, so the deadline is enforced.
+    #[test]
+    fn a_probe_that_never_returns_is_killed_and_reported() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "ping 127.0.0.1 -n 30 > NUL"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 30"]);
+            c
+        };
+        let started = std::time::Instant::now();
+        let err = output_within(&mut cmd, Duration::from_millis(600), "the probe").unwrap_err();
+        assert!(err.contains("did not finish"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the deadline was not enforced — took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The deadline must not break the ordinary case: a command that exits promptly still yields its
+    /// output. Asserting this stops the timeout from being "fixed" by failing everything.
+    #[test]
+    fn a_prompt_probe_still_returns_its_output() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "echo hello"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo hello"]);
+            c
+        };
+        let out = output_within(&mut cmd, Duration::from_secs(30), "the probe").unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("hello"),
+            "got: {:?}",
+            String::from_utf8_lossy(&out.stdout)
         );
     }
 

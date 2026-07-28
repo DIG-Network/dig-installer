@@ -181,29 +181,6 @@ jobs:
           done
           echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
 
-      # `dig-app` is a Tauri tray application, so the PATH check added in #1748 —
-      # which now EXECUTES each installed CLI rather than only resolving its name —
-      # needs dig-app's GUI runtime libraries present. A bare runner image has
-      # none, and `dig-app --version` fails with
-      # `libxdo.so.3: cannot open shared object file`. Installing them here keeps
-      # the stronger check (and dig-app's #1748 autostart coverage) intact instead
-      # of excluding dig-app from the run. Best-effort: a package rename in a
-      # future image must not red the job, since the readiness verdict is what
-      # actually gates.
-      #
-      # NOTE: a real Ubuntu user needs these too — that the payload ships a
-      # dig-app which cannot start on a fresh desktop is a genuine defect, tracked
-      # separately, NOT something this job should paper over silently.
-      - name: (Linux) install dig-app's Tauri runtime libraries
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxdo3 \
-            libwebkit2gtk-4.1-0 \
-            libayatana-appindicator3-1 \
-            librsvg2-2 || true
-
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.

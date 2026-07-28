@@ -336,6 +336,13 @@ An elevated install MUST NOT place user-facing CLIs under any home directory: ro
 3. **re-reads** the login-shell `PATH`. If the directory is still absent the result is an ERROR, not a
    success note.
 
+Every required CLI MUST be verified to resolve, by bare name, on the target user's own login `PATH`,
+to the copy the run placed. A binary with a command-line surface MUST additionally be RUN
+(`--version`). A **GUI application** (`dig-app`) MUST NOT be probed with `--version` — it has no
+command-line surface and on macOS the probe never returns — so resolution alone proves it; its ability
+to start is proven by the autostart registration. Every `--version` probe MUST be bounded by a
+deadline and the child killed on overrun: no single binary may hang an install.
+
 The login-shell probe MUST enter a real **login** shell. `su - <user> -c CMD` does not do so on
 BSD/macOS — `su`'s own `-c` takes a login CLASS there, so the command is handed to the shell verbatim
 and no profile is read — therefore the probed command is itself wrapped in `sh -lc`.
