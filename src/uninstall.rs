@@ -48,6 +48,11 @@ pub const COMPONENT_STEMS: &[&str] = &[
     "digstore",
     "digs",
     "digd",
+    // The per-user identity agent (#912). Listed after the daemons and before the
+    // installer's own copy: it is a user-session process, so nothing machine-wide
+    // ever points at it — its per-user autostart artifact is torn down separately
+    // (`autostart::deregister`).
+    "dig-app",
     "dig-installer",
 ];
 

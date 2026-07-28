@@ -74,6 +74,12 @@ const componentMessages = defineMessages({
     defaultMessage:
       "Your local DIG node — installed as an OS service so store reads/writes hit your own machine first.",
   },
+  digAppName: { id: "component.dig-app.name", defaultMessage: "DIG app" },
+  digAppDesc: {
+    id: "component.dig-app.desc",
+    defaultMessage:
+      "The DIG app that lives in your system tray: it holds your keys and talks to your local node. It starts automatically when you log in, and you can quit it any time.",
+  },
   digDnsName: { id: "component.dig-dns.name", defaultMessage: "dig-dns" },
   digDnsDesc: {
     id: "component.dig-dns.desc",
@@ -111,6 +117,12 @@ export const COMPONENTS = [
     id: "dig-node",
     name: componentMessages.digNodeName,
     desc: componentMessages.digNodeDesc,
+    on: true,
+  },
+  {
+    id: "dig-app",
+    name: componentMessages.digAppName,
+    desc: componentMessages.digAppDesc,
     on: true,
   },
   {
@@ -155,6 +167,15 @@ const optionMessages = defineMessages({
     defaultMessage:
       "Lets other DIG nodes reach yours directly on its peer-to-peer port (9444), scoped to the dig-node program only. Declining is safe — your node still works via the relay fallback.",
   },
+  digAppAutostartName: {
+    id: "option.dig-app-autostart.name",
+    defaultMessage: "Start the DIG app when I log in (recommended)",
+  },
+  digAppAutostartDesc: {
+    id: "option.dig-app-autostart.desc",
+    defaultMessage:
+      "Opens the DIG app in your system tray automatically each time you log in, so your keys are ready when a site asks. Turn this off to start it yourself instead — the app stays installed either way.",
+  },
   autoUpdateName: {
     id: "option.auto-update.name",
     defaultMessage: "Keep DIG up to date automatically (recommended)",
@@ -167,6 +188,13 @@ const optionMessages = defineMessages({
 });
 
 export const OPTIONS = [
+  {
+    id: "dig-app-autostart",
+    name: optionMessages.digAppAutostartName,
+    desc: optionMessages.digAppAutostartDesc,
+    requires: "dig-app",
+    on: true,
+  },
   {
     id: "open-firewall",
     name: optionMessages.firewallName,

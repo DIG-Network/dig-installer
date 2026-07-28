@@ -66,6 +66,23 @@ impl Repo {
         Repo::new("DIG-Network", "dig-companion", "dig-companion")
     }
 
+    /// The dig-app release source (`DIG-Network/dig-app`) — the per-user identity
+    /// agent + tray (issue #912, epic #908 U8). Publishes a raw per-OS/arch binary
+    /// `dig-app-<ver>-<os>-<arch>[.exe]` (matched as a
+    /// [`AssetKind::RawBinary`](crate::asset::AssetKind::RawBinary)) from its
+    /// reusable `build-binaries.yml`, whose asset naming exists specifically for
+    /// this installer to resolve.
+    ///
+    /// The SAME release also carries dig-app's own `dign-*` assets (the #908 U7 CLI
+    /// migration). This installer deliberately does NOT take `dign` from here:
+    /// [`Repo::dign`] still resolves it from the dig-node release, which is what the
+    /// `chia://` scheme handler (`dign open`) is wired against. The asset selector
+    /// prefers a canonical-stem match, so asking this repo for `dig-app` never
+    /// returns dig-app's `dign` by accident.
+    pub fn dig_app() -> Repo {
+        Repo::new("DIG-Network", "dig-app", "dig-app")
+    }
+
     /// The DIG Browser release source (`DIG-Network/DIG_Browser`). Publishes a
     /// native installer per OS (`.exe` / `.dmg` / `.AppImage`), so it is matched
     /// as an [`AssetKind::Installer`](crate::asset::AssetKind::Installer), not a

@@ -14,11 +14,12 @@ selecting the matching asset from the release's actual asset list (`src/asset.rs
 guessed filename.
 
 **The default install is the full DIG stack in one run** — the `digstore` CLI, the `dig-node`
-service, the `dig-dns` service, and the `dig-updater` auto-update beacon are ALL installed by
-default (a bare `dig-installer` with no flags installs all four; `InstallPlan::default()` encodes
-this). `dig-node` and `dig-dns` are registered as **boot-start** OS services (§2.1); `dig-updater`
-registers its own **daily scheduler artifact** (§1.5). Opt out of any of the four with the matching
-`--no-<component>` flag. `dig-relay` (advanced, run-your-own-relay) and the DIG Browser stay
+service, the `dig-app` identity agent, the `dig-dns` service, and the `dig-updater` auto-update
+beacon are ALL installed by default (a bare `dig-installer` with no flags installs all five;
+`InstallPlan::default()` encodes this). `dig-node` and `dig-dns` are registered as **boot-start** OS
+services (§2.1); `dig-updater` registers its own **daily scheduler artifact** (§1.5); `dig-app` is
+registered for **per-user login autostart** (§1.11) — it is a user-session agent, never a service.
+Opt out of any of the five with the matching `--no-<component>` flag. `dig-relay` (advanced, run-your-own-relay) and the DIG Browser stay
 opt-in.
 
 | id         | repo                          | kind                              | CLI flag(s)                          | Selected in the GUI wizard by default |
@@ -27,6 +28,7 @@ opt-in.
 | `digs`     | `DIG-Network/digstore` (alias, issue #434) | raw binary, added to PATH (same bin dir as `digstore`) | NO separate flag — follows `digstore`'s `--no-digstore`/`--with-digstore`/`--digstore-version` | follows `digstore` |
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dign`     | `DIG-Network/dig-node` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-node`) | NO separate flag — follows `dig-node`'s `--no-dig-node`/`--with-dig-node`/`--dig-node-version` | follows `dig-node` |
+| `dig-app`  | `DIG-Network/dig-app`         | raw binary, added to PATH + **per-user login autostart** (§1.11) — never a machine-wide service | on by default; `--no-dig-app` opts out; `--with-dig-app` (redundant); `--no-dig-app-autostart` keeps the binary but skips the login registration | yes |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
 | `digd`     | `DIG-Network/dig-dns` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-dns`) | NO separate flag — follows `dig-dns`'s `--no-dig-dns`/`--with-dig-dns`/`--dig-dns-version` | follows `dig-dns` |
 | `dig-updater` | `DIG-Network/dig-updater`  | raw binary + a daily OS-scheduled task/timer/LaunchDaemon (issue #514, §1.5) | on by default; `--no-auto-update` opts out; `--auto-update` (redundant) | yes, as the "Keep DIG up to date automatically" option |
@@ -81,6 +83,62 @@ the modern `DIG-Network/dig-node` repo), so a dig-node install that fell back to
 resolves dig-node itself successfully while having no `dign` asset to find. That must never sink
 the otherwise-successful install — `digd` needs no equivalent gate, since it resolves against the
 identical repo + version pin as `dig-dns` itself with no such divergence.
+
+### 1.11 dig-app — the per-user identity agent + login autostart (#912)
+
+`dig-app` is the USER-FACING half of the node/app split (`SYSTEM.md` → dig-node ⇄ dig-app, epic
+#908): the dig-node engine is identity-agnostic, and `dig-app` is the identity — the tray /
+menu-bar agent that holds the user's keys and answers the app-sign channel. The installer therefore
+treats it unlike every daemon in this catalogue:
+
+- **Placed like a user CLI.** Resolved as an `AssetKind::RawBinary` from `DIG-Network/dig-app`
+  (asset stem `dig-app-<ver>-<os>-<arch>[.exe]`, produced by dig-app's reusable
+  `build-binaries.yml` for `windows-x64` / `linux-x64` / `macos-arm64` / `macos-x64`), written under
+  the canonical `dig-app` exe name into the same bin dir as the other user CLIs, and covered by the
+  PATH wiring — so `dig-app` resolves by bare name from a fresh shell.
+- **NOT a privileged component.** `paths::is_privileged_component` MUST NOT classify `dig-app` as
+  privileged on unix: it is executed by the logged-in user, not by a service manager, so it stays in
+  the elevation-free user bin dir and a `dig-app`-only install requires no elevation on unix.
+  (On Windows the whole stack shares the protected root, §1.6.)
+- **Registered for autostart, never as a service.** `src/autostart.rs` writes ONE per-user,
+  unelevated artifact per OS:
+
+  | OS | mechanism (`InstallReport.autostart.mechanism`) | artifact |
+  |----|-----------------------------------------------|----------|
+  | Windows | `run-key` | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `DIG App` = the QUOTED dig-app path |
+  | macOS | `launch-agent` | `~/Library/LaunchAgents/net.dig.dig-app.plist` (`RunAtLoad` + `KeepAlive`) |
+  | Linux | `systemd-user` | `$XDG_CONFIG_HOME/systemd/user/dig-app.service` (`Restart=on-failure`; `$XDG_CONFIG_HOME` defaults to `~/.config`) |
+
+  `HKCU`, never `HKLM`: a machine-wide Run entry would launch one user's identity agent in every
+  account on the machine. The Windows command string is quoted, because the default install root
+  (`%ProgramFiles%\DIG\bin`) contains a space and an unquoted Run value would never start.
+  The Linux unit is WRITTEN, not enabled — the install log names the exact
+  `systemctl --user enable --now dig-app.service` command, since enabling a user unit is a user-session
+  action the installer must not assume it can perform.
+- **The macOS + Linux artifacts are BYTE-IDENTICAL to dig-app's own renderers**
+  (`dig_app::autostart::{macos,linux}`, which likewise use the shared `net.dig.dig-app` label);
+  dig-app's module documentation assigns Windows autostart to this installer. dig-app exposes those
+  renderers as a library only — its binary has no subcommands — so unlike `dig-node install` there is
+  nothing to delegate to, and the templates are reproduced here under conformance tests that fail on
+  any drift. Should dig-app ever grow an `autostart` subcommand, this installer MUST delegate to it
+  and retire the local copies.
+- **Autostart is declinable and best-effort.** `--no-dig-app-autostart` installs the binary without
+  registering it. A registration FAILURE never fails the install: it is recorded on
+  `InstallReport.autostart` with `registered: false` and a note telling the user dig-app is installed
+  and can be launched manually. Autostart does not gate `ready` (§4.2).
+- **Availability-gated like `dign`.** dig-app publishes nightly pre-releases ahead of its first
+  stable `vX.Y.Z`; release lookup already falls back from `/releases/latest` to the newest
+  pre-release. A release carrying no asset for the host OS/arch (an `ASSET_NOT_FOUND`-classified
+  lookup) is logged and SKIPPED — the rest of the stack still installs.
+- **`dign` is unaffected.** dig-app's release also publishes a `dign` asset (the #908 U7 CLI
+  migration), but `Repo::dign()` continues to resolve `dign` from the **dig-node** release: the
+  `chia://` scheme handler is wired against `dign open` (§1.3), so the binary answering every clicked
+  link MUST NOT change as a side effect of shipping dig-app. Resolving `dig-app` from a release
+  containing both stems is safe because `select_asset` prefers the canonical-stem match.
+- **Uninstalled with the stack.** `dig-app` is in `uninstall::COMPONENT_STEMS`, and the autostart
+  artifact is removed by `autostart::deregister` (idempotent — an already-absent artifact is a clean
+  success), so no removed install leaves an agent launching at every login. A mid-install failure
+  reverses the registration through `InstallAction::AutostartRegistered` (§3.11).
 
 ### 1.2 dig-dns availability gate
 
@@ -740,12 +798,13 @@ Windows the write fallback stages a reboot-time replace, while on Linux the writ
 
 Stable, versioned (`schema_version`) JSON shape emitted by `--json` on success:
 `{schema_version, installer_version, target, dry_run, components[], path, service, relay, dns,
-scheme, firewall, beacon, installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc
+scheme, firewall, beacon, autostart, installed[], cli_path_checks[], ready, failures[]}`. See `src/lib.rs` doc
 comments on `InstallReport`/`ComponentResult`/`PathResult`/`ServiceResult`/`RelayResult`/
 `dns::DnsInstallResult`/`scheme::SchemeResult`/`firewall::FirewallResult`/`beacon::BeaconResult`/
 `pathcheck::CliPathCheck` for the exact field set; every boolean field has a paired human-readable
 `*_note` — no field is ever silently omitted to signal failure. `firewall`/`beacon` are `None` when
-`open_firewall`/`auto_update` are off (§1.4/§1.5) — distinct from a present-but-`applied: false`
+`open_firewall`/`auto_update` are off (§1.4/§1.5); `autostart` is `None` when `dig_app_autostart` is
+off or dig-app was not selected/resolved (§1.11) — distinct from a present-but-`applied: false`
 result, so a caller can tell "declined" apart from "attempted and failed". `ready`/`failures` are
 the aggregate readiness verdict (§4.2) — the firewall rule and the scheme handler are best-effort
 and never gate `ready`; the beacon's scheduler registration DOES gate `ready` (§1.5, like
