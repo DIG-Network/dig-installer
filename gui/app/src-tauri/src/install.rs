@@ -1354,6 +1354,7 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = install_dir; // not needed on Linux (per-user XDG dirs)
+
         // The INVOKING user's home, not `$HOME` (#1748). The Linux GUI relaunches itself as root via
         // one-shot `pkexec` (SPEC §4.1b), and that root child sees `HOME=/root` — so registering the
         // `.dig` association against `$HOME` would file it under root's XDG scope, where the desktop
