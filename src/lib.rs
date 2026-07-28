@@ -76,6 +76,7 @@ pub mod svc;
 pub mod target;
 pub mod uninstall;
 pub mod update;
+pub mod userwrite;
 
 use std::path::PathBuf;
 
@@ -1695,17 +1696,28 @@ const REQUIRED_CLIS: &[&str] = &[
 
 /// The subset of [`REQUIRED_CLIS`] that is a GUI application rather than a command-line tool.
 ///
-/// `dig-app` is the per-user tray agent. It has no command-line surface — no subcommands, and on macOS
-/// `dig-app --version` never returns, because the binary enters its event loop instead of printing and
-/// exiting (measured on a macos-14 runner, where it held the whole install for the full 15-minute job
-/// timeout). Demanding a version string from it is a category error, so its check is RESOLUTION only:
-/// the invoking user's login shell must find the copy this run placed, which is the #1748 property.
-/// Whether it starts is proven by the autostart registration ([`autostart`]) instead.
+/// `dig-app` is the per-user tray agent, so it has no `--version` subcommand to answer. This is NOT a
+/// blanket exemption from executability, and must not become one: see [`answers_version`].
 const GUI_APPS: &[&str] = &["dig-app"];
 
-/// Does `component` answer `--version`, so its install can be proven by RUNNING it?
+/// Does `component` answer `--version` on THIS OS, so its install can be proven by RUNNING it?
+///
+/// Every real CLI does, everywhere. A GUI app is exempt on **macOS only**, and for one narrow measured
+/// reason: there, `dig-app --version` never returns — the binary enters its event loop instead of
+/// printing and exiting — so the probe is answered by the [`pathcheck::VERSION_PROBE_TIMEOUT`] kill
+/// rather than by the app, which yields a guaranteed 20s stall and a failure that says nothing.
+///
+/// It is deliberately NOT exempt on Linux or Windows. There the binary does exit, so the probe is
+/// meaningful — and it is exactly where `dig-app` is known to be broken today: on stock Ubuntu it dies
+/// with `libxdo.so.3: cannot open shared object file`. Exempting it there would report a `✓` for a
+/// binary that cannot start, which is the precise defect [`REQUIRED_CLIS`] was extended to close.
+///
+/// Note what does NOT justify this: the autostart registration proves nothing about executability.
+/// [`autostart::register`] WRITES a unit file; nothing in this crate ever enables or starts `dig-app`
+/// ([`autostart::enable_command`] only prints advice a human must run), so a written unit is fully
+/// consistent with a binary that cannot load.
 fn answers_version(component: &str) -> bool {
-    !GUI_APPS.contains(&component)
+    !GUI_APPS.contains(&component) || !cfg!(target_os = "macos")
 }
 
 /// Link every installed user-facing CLI that lives in the protected root into the machine bin dir, so
@@ -1797,7 +1809,8 @@ fn verify_clis_on_path(
         } else {
             pathcheck::verify_cli_resolves(user, &exe, dest_path).map(|resolved| {
                 format!(
-                    "`{cli}` resolves to {} on {}'s PATH (a GUI app — no `--version` to run)",
+                    "`{cli}` resolves to {} on {}'s PATH — NOT verified to run (a GUI app with \
+                     no `--version`; on macOS the probe never returns)",
                     resolved.display(),
                     user.name
                 )
@@ -5311,6 +5324,11 @@ mod tests {
     /// new terminal" is equally useless now the check already uses a fresh login shell. Both phrases
     /// sent a real reader hunting a privilege problem that did not exist, so their absence is asserted
     /// rather than left to review.
+    ///
+    /// The `dig-app` loader failure used as the fixture is a state production really does reach on
+    /// Linux and Windows, where [`answers_version`] does NOT exempt a GUI app — stock Ubuntu is where
+    /// the `libxdo.so.3` note comes from. It is unreachable for `dig-app` on macOS alone, so this
+    /// exercises `evaluate_readiness`'s formatting directly rather than depending on the host OS.
     #[test]
     fn a_path_failure_does_not_advise_re_running_elevated() {
         let plan = dig_node_service_plan();
@@ -5852,9 +5870,14 @@ mod tests {
     /// regression of #496 and cannot pass this.
     #[test]
     fn only_the_gui_app_is_exempt_from_the_version_probe() {
-        assert!(
-            !answers_version("dig-app"),
-            "dig-app has no --version to answer"
+        // The exemption is macOS-ONLY. On Linux and Windows `dig-app` DOES exit, so the probe is
+        // meaningful there — and that is exactly where dig-app is known broken (`libxdo.so.3` on
+        // stock Ubuntu), so exempting it would hand a tick to a binary that cannot start.
+        assert_eq!(
+            answers_version("dig-app"),
+            !cfg!(target_os = "macos"),
+            "the GUI exemption must apply on macOS only — its sole justification is that the macOS \
+             probe never returns"
         );
         for cli in ["dig-node", "dign", "dig-dns", "digd", "dig-store", "digs"] {
             assert!(

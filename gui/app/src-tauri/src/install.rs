@@ -1360,14 +1360,16 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
         // `.dig` association against `$HOME` would file it under root's XDG scope, where the desktop
         // session that will open a `.dig` file never looks. `pkexec` sets `PKEXEC_UID`, which the
         // resolver reads.
-        let share = dig_installer::invoker::target_user()
-            .home
-            .join(".local")
-            .join("share");
+        let target = dig_installer::invoker::target_user();
+        let share = target.home.join(".local").join("share");
 
         // shared-mime-info package describing application/x-dig with *.dig.
+        //
+        // Written with the TARGET USER's authority, never root's (#1748): under `pkexec` this runs as
+        // root, `~/.local/share/**` is user-controlled, and these filenames are deterministic — so a
+        // root-authored write here follows any symlink an attacker planted at them. Writing as the
+        // user also leaves the files theirs to manage, which a root-owned XDG data dir is not.
         let mime_pkg_dir = share.join("mime").join("packages");
-        fs::create_dir_all(&mime_pkg_dir).map_err(|e| format!("create mime dir: {e}"))?;
         let mime_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/x-dig">
@@ -1376,8 +1378,12 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
   </mime-type>
 </mime-info>
 "#;
-        fs::write(mime_pkg_dir.join("digstore.xml"), mime_xml)
-            .map_err(|e| format!("write mime xml: {e}"))?;
+        dig_installer::userwrite::write_as_user(
+            &mime_pkg_dir.join("digstore.xml"),
+            mime_xml,
+            target,
+        )
+        .map_err(|e| format!("write mime xml: {e}"))?;
 
         // hicolor mimetype icon: application-x-dig.png (freedesktop naming).
         let icon_dir = share
@@ -1385,9 +1391,12 @@ fn register_dig_association(install_dir: &Path) -> Result<String, String> {
             .join("hicolor")
             .join("128x128")
             .join("mimetypes");
-        fs::create_dir_all(&icon_dir).map_err(|e| format!("create icon dir: {e}"))?;
-        fs::write(icon_dir.join("application-x-dig.png"), DIG_ICON_PNG)
-            .map_err(|e| format!("write icon: {e}"))?;
+        dig_installer::userwrite::write_bytes_as_user(
+            &icon_dir.join("application-x-dig.png"),
+            DIG_ICON_PNG,
+            target,
+        )
+        .map_err(|e| format!("write icon: {e}"))?;
 
         // Refresh caches (best-effort; ignore failures / missing tools). Each
         // tool is resolved to an ABSOLUTE path from a trusted system directory,

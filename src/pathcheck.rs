@@ -44,7 +44,8 @@ pub struct CliPathCheck {
     /// The CLI id (e.g. `dig-node`).
     pub cli: String,
     /// `true` iff the CLI resolved by bare name on the target user's own PATH to the copy this run
-    /// placed, **and** — for everything except a GUI app, which has no `--version` — executed.
+    /// placed, **and** — except for a GUI app on macOS, where the `--version` probe never returns —
+    /// actually executed. Where the probe is skipped this bit does NOT claim the binary can start.
     pub resolved: bool,
     /// Human-readable detail — never silent.
     pub note: String,
@@ -144,8 +145,15 @@ const PRINT_PATH_VIA_LOGIN_SH: &str = r#"sh -lc 'printf "%s\n" "$PATH"'"#;
 /// The unix login-shell PATH for `user` — `su - <user>` under elevation, else our own login shell.
 #[cfg(unix)]
 fn unix_login_shell_path(user: &TargetUser) -> Result<String, String> {
+    // `su`/`sh` are resolved from the trusted system directories, NEVER `$PATH`
+    // (`elevation::resolve_system_tool`). This runs as root, and macOS's stock sudoers sets no
+    // `secure_path`, so a `$PATH` led by a user-writable Homebrew prefix would let an attacker supply
+    // the very shell root spawns. Fail-closed: an unresolvable tool is an error, never a fallback to
+    // a `$PATH` lookup.
     let out = if user.via_elevation {
-        Command::new("su")
+        let su = crate::elevation::resolve_system_tool("su")
+            .ok_or_else(|| "su not found in any trusted system directory".to_string())?;
+        Command::new(su)
             .arg("-")
             .arg(&user.name)
             .arg("-c")
@@ -153,7 +161,9 @@ fn unix_login_shell_path(user: &TargetUser) -> Result<String, String> {
             .hide_console()
             .output()
     } else {
-        Command::new("sh")
+        let sh = crate::elevation::resolve_system_tool("sh")
+            .ok_or_else(|| "sh not found in any trusted system directory".to_string())?;
+        Command::new(sh)
             .arg("-lc")
             .arg(PRINT_PATH)
             .hide_console()
@@ -291,11 +301,15 @@ pub fn verify_cli(
 /// Steps 1–3 of [`verify_cli`] on their own: the bare name resolves, on the TARGET user's own login
 /// `PATH`, to the copy this run placed — returning that resolved path.
 ///
-/// This is the whole guarantee available for a GUI application. `dig-app` is a tray agent with no
-/// command-line surface: it takes no subcommands, and on macOS `--version` enters its event loop and
-/// never returns. "Does it print a version?" is therefore a category error for it, while "can the
-/// invoking user reach the binary this install placed?" is exactly the #1748 property. Its ability to
-/// START is covered by the autostart registration ([`crate::autostart`]), not by a `--version` probe.
+/// Used on its own only for a GUI application on macOS, where the `--version` probe never returns
+/// (`dig-app` enters its event loop instead of printing and exiting). It is a STRICTLY WEAKER claim
+/// than [`verify_cli`]: it says the invoking user can reach the binary this install placed — the #1748
+/// property — and says NOTHING about whether that binary can actually start.
+///
+/// Nothing else in the crate makes up the difference: `autostart` writes a unit file but never enables
+/// or starts `dig-app`, so a successful registration is fully consistent with a binary that cannot
+/// load. That is why the exemption is confined to macOS (see `crate::answers_version`) and why this
+/// returning `Ok` must not be read as an executability guarantee.
 pub fn verify_cli_resolves(
     user: &TargetUser,
     exe_name: &str,
@@ -383,6 +397,36 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
         .map_err(|e| format!("{what} output could not be read: {e}"))
 }
 
+/// The `su - <user> -c '<binary> --version'` form, when there is a user boundary to cross.
+///
+/// `None` means "run it directly" (we are already that user, or this is Windows). `Some(Err(..))` is
+/// fail-closed: `su` is resolved from the trusted system directories, never `$PATH`
+/// ([`crate::elevation::resolve_system_tool`]), because this spawn happens as root.
+#[cfg(unix)]
+fn as_user_command(binary: &Path, user: &TargetUser) -> Option<Result<Command, String>> {
+    if !user.via_elevation {
+        return None;
+    }
+    Some(
+        crate::elevation::resolve_system_tool("su")
+            .ok_or_else(|| "su not found in any trusted system directory".to_string())
+            .map(|su| {
+                let mut c = Command::new(su);
+                c.arg("-")
+                    .arg(&user.name)
+                    .arg("-c")
+                    .arg(format!("{} --version", shell_quote(binary)));
+                c
+            }),
+    )
+}
+
+/// Windows has no `su` boundary to cross — the probe always runs directly.
+#[cfg(not(unix))]
+fn as_user_command(_binary: &Path, _user: &TargetUser) -> Option<Result<Command, String>> {
+    None
+}
+
 /// Run `<binary> --version` and return its trimmed output.
 ///
 /// Under elevation the binary is run AS the target user (`su - <user> -c`), because "root can
@@ -390,17 +434,13 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
 /// present but unloadable surfaces its loader error here (for example a missing `libxdo.so.3`),
 /// which is the detail the failure note must carry.
 pub(crate) fn run_version(binary: &Path, user: &TargetUser) -> Result<String, String> {
-    let mut cmd = if user.via_elevation && cfg!(unix) {
-        let mut c = Command::new("su");
-        c.arg("-")
-            .arg(&user.name)
-            .arg("-c")
-            .arg(format!("{} --version", shell_quote(binary)));
-        c
-    } else {
-        let mut c = Command::new(binary);
-        c.arg("--version");
-        c
+    let mut cmd = match as_user_command(binary, user) {
+        Some(c) => c?,
+        None => {
+            let mut c = Command::new(binary);
+            c.arg("--version");
+            c
+        }
     };
     cmd.hide_console();
     let what = format!("`{} --version`", binary.display());
@@ -429,6 +469,10 @@ pub(crate) fn run_version(binary: &Path, user: &TargetUser) -> Result<String, St
 
 /// Single-quote `path` for a POSIX shell, escaping any embedded single quote, so a path containing
 /// spaces or shell metacharacters is passed to `su -c` as one word.
+///
+/// unix-only, like its sole caller [`as_user_command`]: Windows has no `su` boundary to cross, so the
+/// probe there runs the binary directly and never composes a shell command line.
+#[cfg(unix)]
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
@@ -576,6 +620,7 @@ mod tests {
 
     /// The default Windows root contains a space and the `su -c` path must survive it as one word;
     /// an embedded single quote must not break out of the quoting.
+    #[cfg(unix)]
     #[test]
     fn shell_quote_survives_spaces_and_quotes() {
         assert_eq!(

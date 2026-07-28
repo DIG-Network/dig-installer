@@ -33,9 +33,10 @@ pub struct TargetUser {
     pub name: String,
     /// The account's home directory — the one per-user artifacts belong under.
     pub home: PathBuf,
-    /// The account's numeric uid, when known. `Some` under elevation (so written artifacts can be
-    /// `chown`ed back to the user); `None` when we are already running as that user and ownership
-    /// is correct by construction.
+    /// The account's numeric uid, when known. `Some` under elevation (so the account can be named
+    /// precisely — e.g. its `XDG_RUNTIME_DIR`); `None` when we are already running as that user.
+    /// Per-user artifacts are written BY the user ([`crate::userwrite`]), so this is never used to
+    /// `chown` a root-authored file back — that shape was the #1748 privilege escalation.
     pub uid: Option<u32>,
     /// The account's numeric gid, when known.
     pub gid: Option<u32>,
@@ -277,7 +278,15 @@ fn read_passwd_database() -> String {
         return flat;
     }
     // No unprivileged account in the flat file — the box is likely directory-backed.
-    let out = std::process::Command::new("getent")
+    //
+    // `getent` is resolved from the trusted system directories, NEVER `$PATH`
+    // (`elevation::resolve_system_tool`): this runs as root, and macOS's stock sudoers sets no
+    // `secure_path`, so a `$PATH` led by a user-writable Homebrew prefix would let an attacker supply
+    // it. Fail-closed — without a trusted `getent` we keep the flat file rather than run theirs.
+    let Some(getent) = crate::elevation::resolve_system_tool("getent") else {
+        return flat;
+    };
+    let out = std::process::Command::new(getent)
         .arg("passwd")
         .hide_console()
         .output();
@@ -289,47 +298,6 @@ fn read_passwd_database() -> String {
             merged
         }
         _ => flat,
-    }
-}
-
-/// Give `path` (and, when `recursive`, everything beneath it) to `user`, so an artifact root wrote
-/// into a user's home is owned by that user rather than by root.
-///
-/// A no-op when the target user has no known uid (we are already running as them). Best-effort:
-/// ownership is a correctness nicety for the user's own files, and a `chown` failure must not sink
-/// an otherwise-complete install — it is reported, never fatal.
-pub fn chown_to_target(path: &Path, user: &TargetUser, recursive: bool) -> Result<(), String> {
-    let Some(uid) = user.uid else {
-        return Ok(());
-    };
-    #[cfg(unix)]
-    {
-        use crate::proc::HideConsole;
-        let gid = user.gid.unwrap_or(uid);
-        let mut cmd = std::process::Command::new("chown");
-        if recursive {
-            cmd.arg("-R");
-        }
-        let status = cmd
-            .arg(format!("{uid}:{gid}"))
-            .arg(path)
-            .hide_console()
-            .status()
-            .map_err(|e| format!("chown {}: {e}", path.display()))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "chown {} to {uid}:{gid} exited with {}",
-                path.display(),
-                status.code().unwrap_or(-1)
-            ))
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, recursive, uid);
-        Ok(())
     }
 }
 
@@ -549,18 +517,5 @@ mod tests {
     fn a_non_numeric_uid_is_ignored_rather_than_panicking() {
         let get = |k: &str| (k == "SUDO_UID").then(|| "not-a-uid".to_string());
         assert!(elevation_hint(0, get).is_empty());
-    }
-
-    #[test]
-    fn chown_is_a_noop_when_we_are_already_the_user() {
-        let t = TargetUser {
-            name: "alice".into(),
-            home: PathBuf::from("/home/alice"),
-            uid: None,
-            gid: None,
-            via_elevation: false,
-        };
-        // No uid ⇒ nothing to change, and certainly no error.
-        assert!(chown_to_target(Path::new("/nonexistent/path"), &t, false).is_ok());
     }
 }

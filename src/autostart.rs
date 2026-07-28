@@ -225,15 +225,14 @@ fn artifact_path(user: &crate::invoker::TargetUser, os: Os) -> String {
 
 /// Perform the per-OS registration, returning the success note.
 ///
-/// On unix the written artifact is handed back to the target user ([`crate::invoker::chown_to_target`]):
-/// a root-owned file in someone's `~/.config` is not something they can manage, and `systemd --user`
-/// declines to load a unit it does not consider the user's own.
+/// On unix the artifact is written BY the target user ([`crate::userwrite`]), so it is theirs to manage
+/// and `systemd --user` will load it — and so a privileged install never follows a symlink planted in
+/// the user-writable directories it has to write into (#1748).
 fn apply(dig_app_bin: &Path, os: Os, user: &crate::invoker::TargetUser) -> Result<String, String> {
     match os {
         Os::Windows => register_windows(dig_app_bin),
         Os::MacOs => {
-            let path = install_launch_agent(&user.home, dig_app_bin).map_err(|e| e.to_string())?;
-            hand_back_to_user(&path, user);
+            let path = install_launch_agent(&user.home, dig_app_bin, user)?;
             Ok(format!(
                 "wrote the LaunchAgent {} — dig-app starts at {}'s next login",
                 path.display(),
@@ -242,8 +241,7 @@ fn apply(dig_app_bin: &Path, os: Os, user: &crate::invoker::TargetUser) -> Resul
         }
         Os::Linux => {
             let xdg = target_xdg_config_home(user);
-            let path = install_systemd_user_unit(&xdg, dig_app_bin).map_err(|e| e.to_string())?;
-            hand_back_to_user(&path, user);
+            let path = install_systemd_user_unit(&xdg, dig_app_bin, user)?;
             Ok(format!(
                 "wrote the systemd user unit {} — it starts at {}'s next login, or start it now \
                  with: {}",
@@ -277,40 +275,39 @@ fn enable_command(user: &crate::invoker::TargetUser) -> String {
     }
 }
 
-/// Give a written per-user artifact back to the user it was written for. Best-effort by design —
-/// autostart never sinks an install — but the failure is not silent: it lands in the returned note via
-/// the caller's success string only when it succeeded, and is otherwise reported by
-/// [`crate::invoker::chown_to_target`]'s error path in the install log.
-fn hand_back_to_user(path: &Path, user: &crate::invoker::TargetUser) {
-    // The unit's parent dirs (`~/.config`, `~/.config/systemd/user`) may also have just been created
-    // by root, so ownership is fixed from the user's config root down.
-    if let Some(config_root) = path.parent().and_then(|p| p.parent()) {
-        let _ = crate::invoker::chown_to_target(config_root, user, true);
-    }
-    let _ = crate::invoker::chown_to_target(path, user, false);
-}
-
 /// Write the macOS LaunchAgent for `dig_app_bin` under `home`, creating `LaunchAgents/` if needed.
-pub fn install_launch_agent(home: &Path, dig_app_bin: &Path) -> io::Result<PathBuf> {
+///
+/// Written with `user`'s own authority, never root's — see [`crate::userwrite`].
+pub fn install_launch_agent(
+    home: &Path,
+    dig_app_bin: &Path,
+    user: &crate::invoker::TargetUser,
+) -> Result<PathBuf, String> {
     let path = launch_agent_path(home);
-    write_artifact(&path, &launch_agent_plist(&dig_app_bin.to_string_lossy()))?;
+    crate::userwrite::write_as_user(
+        &path,
+        &launch_agent_plist(&dig_app_bin.to_string_lossy()),
+        user,
+    )?;
     Ok(path)
 }
 
 /// Write the Linux systemd user unit for `dig_app_bin` under `xdg`, creating `systemd/user/` if
 /// needed.
-pub fn install_systemd_user_unit(xdg: &Path, dig_app_bin: &Path) -> io::Result<PathBuf> {
+///
+/// Written with `user`'s own authority, never root's — see [`crate::userwrite`].
+pub fn install_systemd_user_unit(
+    xdg: &Path,
+    dig_app_bin: &Path,
+    user: &crate::invoker::TargetUser,
+) -> Result<PathBuf, String> {
     let path = systemd_user_unit_path(xdg);
-    write_artifact(&path, &systemd_user_unit(&dig_app_bin.to_string_lossy()))?;
+    crate::userwrite::write_as_user(
+        &path,
+        &systemd_user_unit(&dig_app_bin.to_string_lossy()),
+        user,
+    )?;
     Ok(path)
-}
-
-/// Create the artifact's parent directory and write `contents` to `path`.
-fn write_artifact(path: &Path, contents: &str) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, contents)
 }
 
 /// Windows: set the per-user `Run` value to the quoted dig-app path.
@@ -504,7 +501,10 @@ WantedBy=default.target
     #[test]
     fn install_writes_the_artifact_and_creates_missing_parent_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let plist = install_launch_agent(tmp.path(), Path::new("/usr/local/bin/dig-app"))
+        // Unelevated: we ARE the user, so the write is direct — the elevated path delegates to the
+        // user's own shell instead (`crate::userwrite`), which is what closes the #1748 symlink LPE.
+        let me = unelevated_alice();
+        let plist = install_launch_agent(tmp.path(), Path::new("/usr/local/bin/dig-app"), &me)
             .expect("launch agent written");
         assert_eq!(plist, launch_agent_path(tmp.path()));
         assert_eq!(
@@ -512,7 +512,7 @@ WantedBy=default.target
             launch_agent_plist("/usr/local/bin/dig-app")
         );
 
-        let unit = install_systemd_user_unit(tmp.path(), Path::new("/usr/bin/dig-app"))
+        let unit = install_systemd_user_unit(tmp.path(), Path::new("/usr/bin/dig-app"), &me)
             .expect("unit written");
         assert_eq!(unit, systemd_user_unit_path(tmp.path()));
         assert_eq!(
@@ -537,6 +537,17 @@ WantedBy=default.target
     }
 
     // -- #1748: a sudo install registers autostart for the INVOKING user --------
+
+    /// The account running the installer itself — no elevation, so no privilege boundary to cross.
+    fn unelevated_alice() -> crate::invoker::TargetUser {
+        crate::invoker::TargetUser {
+            name: "alice".to_string(),
+            home: PathBuf::from("/home/alice"),
+            uid: None,
+            gid: None,
+            via_elevation: false,
+        }
+    }
 
     /// The account `sudo` was invoked from, described exactly as the installer sees it.
     fn sudoing_ubuntu() -> crate::invoker::TargetUser {

@@ -296,13 +296,24 @@ fn user_can_enter(dir: &str, user: &crate::invoker::TargetUser) -> bool {
         "test -x '{d}' && test -r '{d}'",
         d = dir.replace('\'', r"'\''")
     );
+    // `su`/`sh` are resolved from the trusted system directories, NEVER `$PATH`
+    // (`elevation::resolve_system_tool`) — this runs as root, and macOS's stock sudoers sets no
+    // `secure_path`, so a `$PATH` led by a user-writable Homebrew prefix would let an attacker supply
+    // the shell root is about to spawn. Fail-closed: an unresolvable tool answers "cannot enter",
+    // which only ever declines to wire PATH.
     let out = if user.via_elevation {
-        std::process::Command::new("su")
+        let Some(su) = crate::elevation::resolve_system_tool("su") else {
+            return false;
+        };
+        std::process::Command::new(su)
             .args(["-", &user.name, "-c", &script])
             .hide_console()
             .status()
     } else {
-        std::process::Command::new("sh")
+        let Some(sh) = crate::elevation::resolve_system_tool("sh") else {
+            return false;
+        };
+        std::process::Command::new(sh)
             .args(["-c", &script])
             .hide_console()
             .status()
