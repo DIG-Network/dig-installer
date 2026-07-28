@@ -579,8 +579,19 @@ WantedBy=default.target
         );
     }
 
+    /// The control for the test above: the same code path with `via_elevation: false` must land under
+    /// the TARGET user's home, so the elevated fixture cannot be satisfied by an implementation that
+    /// hardcodes `/home/ubuntu` or simply ignores elevation.
+    ///
+    /// An unelevated run deliberately honours `$XDG_CONFIG_HOME` (SPEC §4.2 — when we ARE the user,
+    /// their override is authoritative), so the fixture must remove it to observe the home-derived
+    /// default. Without that, the ambient value a CI runner exports (`/home/runner/.config`) is
+    /// returned and the assertion fails for a reason unrelated to the property. `nextest` runs each
+    /// test in its own process, so mutating the variable cannot leak into a sibling test.
     #[test]
     fn an_unelevated_run_registers_in_its_own_scope() {
+        std::env::remove_var("XDG_CONFIG_HOME");
+
         let alice = crate::invoker::TargetUser {
             name: "alice".to_string(),
             home: PathBuf::from("/home/alice"),
@@ -589,10 +600,10 @@ WantedBy=default.target
             via_elevation: false,
         };
         let r = register_for(Path::new("/usr/local/bin/dig-app"), Os::Linux, true, &alice);
-        assert!(
-            Path::new(&r.artifact).starts_with("/home/alice"),
-            "got: {}",
-            r.artifact
+        assert_eq!(
+            Path::new(&r.artifact),
+            systemd_user_unit_path(Path::new("/home/alice/.config")),
+            "an unelevated run must register under its own home, not the ambient process home"
         );
     }
 
