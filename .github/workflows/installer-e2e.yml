@@ -181,29 +181,6 @@ jobs:
           done
           echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
 
-      # TEMPORARY (#1748 diagnosis) — remove before merge. Establishes, as fact,
-      # what `su` actually does on each platform, since pathcheck::login_shell_path
-      # and paths::user_can_enter both depend on it.
-      - name: DIAGNOSE su semantics + bin-dir reachability
-        if: runner.os != 'Windows'
-        run: |
-          TU=$(id -un 1001 2>/dev/null || echo "$USER")
-          echo "target user guess: $TU / actual runner: $USER"
-          echo "--- login shell of $USER ---"
-          getent passwd "$USER" 2>/dev/null || dscl . -read "/Users/$USER" UserShell 2>/dev/null || true
-          echo "--- ancestors of BIN_DIR ---"
-          d="$BIN_DIR"; while [ "$d" != "/" ]; do ls -ld "$d" 2>&1; d=$(dirname "$d"); done
-          echo "--- su - USER -c 'printf PATH'  (what login_shell_path does) ---"
-          sudo su - "$USER" -c 'printf "%s\n" "$PATH"' 2>&1 || echo "EXIT=$?"
-          echo "--- su - USER -c 'sh -lc printf PATH'  (candidate fix) ---"
-          sudo su - "$USER" -c 'sh -lc '"'"'printf "%s\n" "$PATH"'"'"'' 2>&1 || echo "EXIT=$?"
-          echo "--- su - USER -c test -x BIN_DIR  (what user_can_enter does) ---"
-          sudo su - "$USER" -c "test -x '$BIN_DIR' && test -r '$BIN_DIR'" && echo "CAN_ENTER" || echo "CANNOT_ENTER rc=$?"
-          echo "--- /etc/paths.d + /etc/profile.d ---"
-          ls -l /etc/paths.d/ 2>&1 | head; ls -l /etc/profile.d/ 2>&1 | head
-          echo "--- does path_helper exist? ---"
-          ls -l /usr/libexec/path_helper 2>&1 || true
-
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.
@@ -216,6 +193,35 @@ jobs:
             --dig-updater-version "$DIG_UPDATER_VERSION" \
             --bin-dir "$BIN_DIR" \
             --json | tee install.json
+
+      # TEMPORARY (#1748 diagnosis) — remove before merge. Runs AFTER the install
+      # so the bin dir exists, always runs, and never fails the job itself.
+      - name: DIAGNOSE su semantics + bin-dir reachability
+        if: always() && runner.os != 'Windows'
+        run: |
+          set +e
+          echo "runner=$USER  BIN_DIR=$BIN_DIR"
+          echo "--- login shell ---"
+          getent passwd "$USER" 2>/dev/null; dscl . -read "/Users/$USER" UserShell 2>/dev/null
+          echo "--- ancestors of BIN_DIR ---"
+          d="$BIN_DIR"; while [ "$d" != "/" ]; do ls -ld "$d" 2>&1; d=$(dirname "$d"); done
+          echo "--- su - USER -c 'printf PATH'   (what login_shell_path does today) ---"
+          sudo su - "$USER" -c 'printf "%s\n" "$PATH"' 2>&1; echo "rc=$?"
+          echo "--- su - USER -c 'sh -lc printf PATH'   (candidate fix) ---"
+          sudo su - "$USER" -c 'sh -lc '\''printf "%s\n" "$PATH"'\''' 2>&1; echo "rc=$?"
+          echo "--- su - USER -c test -x/-r BIN_DIR   (what user_can_enter does) ---"
+          sudo su - "$USER" -c "test -x '$BIN_DIR' && test -r '$BIN_DIR'"; echo "rc=$? (0 => CAN_ENTER)"
+          echo "--- each ancestor, tested as the user ---"
+          d="$BIN_DIR"; while [ "$d" != "/" ]; do \
+            sudo su - "$USER" -c "test -x '$d'"; echo "  x $d rc=$?"; d=$(dirname "$d"); done
+          echo "--- /etc/paths, /etc/paths.d, /etc/profile.d, path_helper ---"
+          cat /etc/paths 2>&1
+          ls -la /etc/paths.d/ 2>&1
+          ls -la /etc/profile.d/ 2>&1
+          ls -l /usr/libexec/path_helper 2>&1
+          echo "--- did the installer write anything? ---"
+          ls -la /etc/profile.d/dig-path.sh /etc/paths.d/dig 2>&1
+          exit 0
 
       # Diagnostics only — never gates the job (`if: always()`). Surfaces the
       # REAL systemd-level reason if dig-node's `--user` unit reports
