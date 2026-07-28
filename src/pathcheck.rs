@@ -44,7 +44,7 @@ pub struct CliPathCheck {
     /// The CLI id (e.g. `dig-node`).
     pub cli: String,
     /// `true` iff the CLI resolved by bare name on the target user's own PATH to the copy this run
-    /// placed, **and** — except for a GUI app on macOS, where the `--version` probe never returns —
+    /// placed, **and** — except for a GUI app, whose `--version` probe never returns on any platform —
     /// actually executed. Where the probe is skipped this bit does NOT claim the binary can start.
     pub resolved: bool,
     /// Human-readable detail — never silent.
@@ -301,15 +301,15 @@ pub fn verify_cli(
 /// Steps 1–3 of [`verify_cli`] on their own: the bare name resolves, on the TARGET user's own login
 /// `PATH`, to the copy this run placed — returning that resolved path.
 ///
-/// Used on its own only for a GUI application on macOS, where the `--version` probe never returns
+/// Used on its own only for a GUI application, whose `--version` probe never returns on any platform
 /// (`dig-app` enters its event loop instead of printing and exiting). It is a STRICTLY WEAKER claim
 /// than [`verify_cli`]: it says the invoking user can reach the binary this install placed — the #1748
 /// property — and says NOTHING about whether that binary can actually start.
 ///
 /// Nothing else in the crate makes up the difference: `autostart` writes a unit file but never enables
 /// or starts `dig-app`, so a successful registration is fully consistent with a binary that cannot
-/// load. That is why the exemption is confined to macOS (see `crate::answers_version`) and why this
-/// returning `Ok` must not be read as an executability guarantee.
+/// load. So `crate::answers_version` documents the exemption as a known GAP, and this returning `Ok`
+/// must not be read as an executability guarantee.
 pub fn verify_cli_resolves(
     user: &TargetUser,
     exe_name: &str,

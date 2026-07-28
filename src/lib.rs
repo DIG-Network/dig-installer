@@ -1700,24 +1700,37 @@ const REQUIRED_CLIS: &[&str] = &[
 /// blanket exemption from executability, and must not become one: see [`answers_version`].
 const GUI_APPS: &[&str] = &["dig-app"];
 
-/// Does `component` answer `--version` on THIS OS, so its install can be proven by RUNNING it?
+/// Does `component` answer `--version`, so its install can be proven by RUNNING it?
 ///
-/// Every real CLI does, everywhere. A GUI app is exempt on **macOS only**, and for one narrow measured
-/// reason: there, `dig-app --version` never returns — the binary enters its event loop instead of
-/// printing and exiting — so the probe is answered by the [`pathcheck::VERSION_PROBE_TIMEOUT`] kill
-/// rather than by the app, which yields a guaranteed 20s stall and a failure that says nothing.
+/// Every real CLI does. A GUI app does not, on any platform: `dig-app --version` never returns,
+/// because the binary enters its event loop instead of printing and exiting. The probe is then answered
+/// by the [`pathcheck::VERSION_PROBE_TIMEOUT`] kill rather than by the app, which costs a guaranteed
+/// 20-second stall and then FAILS the whole install (`✗ DIG is NOT ready`, exit 12) for a tray agent
+/// that is behaving normally.
 ///
-/// It is deliberately NOT exempt on Linux or Windows. There the binary does exit, so the probe is
-/// meaningful — and it is exactly where `dig-app` is known to be broken today: on stock Ubuntu it dies
-/// with `libxdo.so.3: cannot open shared object file`. Exempting it there would report a `✓` for a
-/// binary that cannot start, which is the precise defect [`REQUIRED_CLIS`] was extended to close.
+/// # This exemption is a known GAP, not a clean bill of health
 ///
-/// Note what does NOT justify this: the autostart registration proves nothing about executability.
-/// [`autostart::register`] WRITES a unit file; nothing in this crate ever enables or starts `dig-app`
+/// Narrowing it to macOS was tried and REVERTED, on evidence. The claim was that Linux and Windows
+/// `dig-app` does exit, so the probe would be meaningful there and would catch the real defect — on
+/// stock Ubuntu `dig-app` dies with `libxdo.so.3: cannot open shared object file`. On a headless
+/// ubuntu-latest runner it does NOT exit: the e2e install failed with
+/// `dig-app --version did not finish within 20s and was killed` (run 30400688672). So the probe cannot
+/// distinguish "cannot load" from "started fine" for this binary, and demanding it turns every headless
+/// Linux install red.
+///
+/// What remains for `dig-app` is therefore RESOLUTION only ([`pathcheck::verify_cli_resolves`]) — the
+/// #1748 property that the invoking user's login shell finds the copy this run placed — and the note it
+/// emits says so explicitly rather than printing a bare `✓`. Nothing else makes up the difference:
+/// [`autostart::register`] WRITES a unit file and never enables or starts it
 /// ([`autostart::enable_command`] only prints advice a human must run), so a written unit is fully
 /// consistent with a binary that cannot load.
+///
+/// Closing the gap needs a probe that does not require the process to EXIT — spawn it, observe briefly,
+/// and treat "still running" as loaded while treating a loader failure (exit 126/127, or
+/// `error while loading shared libraries` on stderr) as a hard failure. That is tracked separately
+/// because it must be verified against a real headless box before it can gate an install.
 fn answers_version(component: &str) -> bool {
-    !GUI_APPS.contains(&component) || !cfg!(target_os = "macos")
+    !GUI_APPS.contains(&component)
 }
 
 /// Link every installed user-facing CLI that lives in the protected root into the machine bin dir, so
@@ -5419,10 +5432,11 @@ mod tests {
     /// sent a real reader hunting a privilege problem that did not exist, so their absence is asserted
     /// rather than left to review.
     ///
-    /// The `dig-app` loader failure used as the fixture is a state production really does reach on
-    /// Linux and Windows, where [`answers_version`] does NOT exempt a GUI app — stock Ubuntu is where
-    /// the `libxdo.so.3` note comes from. It is unreachable for `dig-app` on macOS alone, so this
-    /// exercises `evaluate_readiness`'s formatting directly rather than depending on the host OS.
+    /// The `libxdo.so.3` loader failure used as the fixture is a real state — it is what `dig-app`
+    /// does on stock Ubuntu — but note that `dig-app` itself is exempt from the version probe
+    /// ([`answers_version`]), so production does not currently SURFACE it for that component. The
+    /// fixture drives `evaluate_readiness`'s formatting directly, which is the code under test here,
+    /// and the message shape is what any real CLI's loader failure produces.
     #[test]
     fn a_path_failure_does_not_advise_re_running_elevated() {
         let plan = dig_node_service_plan();
@@ -5964,14 +5978,13 @@ mod tests {
     /// regression of #496 and cannot pass this.
     #[test]
     fn only_the_gui_app_is_exempt_from_the_version_probe() {
-        // The exemption is macOS-ONLY. On Linux and Windows `dig-app` DOES exit, so the probe is
-        // meaningful there — and that is exactly where dig-app is known broken (`libxdo.so.3` on
-        // stock Ubuntu), so exempting it would hand a tick to a binary that cannot start.
-        assert_eq!(
-            answers_version("dig-app"),
-            !cfg!(target_os = "macos"),
-            "the GUI exemption must apply on macOS only — its sole justification is that the macOS \
-             probe never returns"
+        // The exemption is unconditional, and is a KNOWN GAP rather than a claim that dig-app is fine
+        // (see `answers_version`). Narrowing it to macOS was tried and reverted on evidence: on a
+        // headless ubuntu runner `dig-app --version` does not exit either, so the probe stalls 20s and
+        // then fails the whole install (run 30400688672).
+        assert!(
+            !answers_version("dig-app"),
+            "dig-app has no --version to answer on any platform"
         );
         for cli in ["dig-node", "dign", "dig-dns", "digd", "dig-store", "digs"] {
             assert!(
