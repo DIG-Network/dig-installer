@@ -1084,7 +1084,10 @@ fn run_report_gated(
                         let a = autostart::register(&dig_app_path, target.os, plan.dry_run);
                         log(&format!(
                             "    {} {}",
-                            if a.registered { "✓" } else { "·" },
+                            // `!`, never `·`: an install that silently produces no autostart is a
+                            // dig-app that never starts at login, which is the false-tick class this
+                            // verification exists to remove. The note carries the actionable reason.
+                            if a.registered { "✓" } else { "!" },
                             a.note
                         ));
                         if a.registered {

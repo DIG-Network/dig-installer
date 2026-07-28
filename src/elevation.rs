@@ -917,7 +917,16 @@ mod tests {
             resolve_system_tool("id").is_some(),
             "the elevation probe depends on a trusted absolute `id`"
         );
-        // And the public probe stays panic-free + honest (CI is not root).
-        assert!(!is_elevated_unix(), "CI runs unprivileged");
+        // And the public probe stays panic-free + AGREES with the real uid, asserted both ways rather
+        // than assuming the runner is unprivileged. `assert!(!is_elevated_unix())` was an assertion
+        // about the TEST ENVIRONMENT dressed as one about the code, and it made the suite unrunnable as
+        // root — which the #1748 root-owned-ancestor tests need in order to exercise their branch at all.
+        // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
+        let really_root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(
+            is_elevated_unix(),
+            really_root,
+            "the probe must report the privilege this process actually has"
+        );
     }
 }

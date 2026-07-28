@@ -181,21 +181,21 @@ jobs:
           done
           echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
 
-      # TEMPORARY DIAGNOSTIC (#1748): dig-app autostart regressed to "Permission
-      # denied" writing the systemd user unit on Linux only, while macOS's
-      # LaunchAgent (same delegated-write path) succeeded. Establish the REAL
-      # precondition -- who owns each level of the target user's XDG chain, and
-      # what HOME/XDG the elevated process actually sees -- rather than inferring
-      # it. Non-gating.
-      - name: (Linux) DIAGNOSTIC before install — ownership of the target user's XDG chain
-        if: always() && runner.os == 'Linux'
+      # #1748 REGRESSION GATE (part 1 of 2): reproduce the precondition that broke
+      # dig-app autostart. An earlier PRIVILEGED step leaves root-owned levels in the
+      # target user's XDG config chain -- `sudo -E` leaks
+      # XDG_CONFIG_HOME=/home/runner/.config into the root process, and a
+      # `systemctl --user` run as root then creates `.config/systemd/user` as root:root
+      # (observed in run 30402180957). `mkdir -p` is then a silent no-op and only the
+      # redirect fails, so the unit is never written while the install still reports
+      # ready. Created explicitly here so the ordering is driven by THIS job rather than
+      # by whatever a future dig-node happens to do.
+      - name: (Linux) #1748 precondition — an earlier component leaves a root-owned XDG level
+        if: runner.os == 'Linux'
         run: |
-          echo "whoami=$(whoami) HOME=$HOME SUDO=$SUDO XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
-          echo "-- what the ELEVATED process will see:"
-          $SUDO sh -c 'echo "  root-side HOME=$HOME XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-<unset>} SUDO_USER=${SUDO_USER:-<unset>}"'
-          for d in /home/runner /home/runner/.config /home/runner/.config/systemd                    /home/runner/.config/systemd/user /home/runner/.local                    /home/runner/.local/share /home/runner/.local/share/applications; do
-            if [ -e "$d" ]; then ls -ldn "$d"; else echo "ABSENT  $d"; fi
-          done
+          sudo mkdir -p /home/runner/.config/systemd/user
+          sudo chown root:root /home/runner/.config/systemd /home/runner/.config/systemd/user
+          ls -ldn /home/runner/.config /home/runner/.config/systemd /home/runner/.config/systemd/user
 
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
@@ -232,13 +232,29 @@ jobs:
           sudo journalctl -u dignetwork-dig-dns --no-pager -n 60 || true
           sudo ss -ltnp 2>/dev/null | grep -i ':80\|:8053' || true
 
-      - name: (Linux) DIAGNOSTIC after install — ownership of the XDG chain + autostart verdict
-        if: always() && runner.os == 'Linux'
+      # #1748 REGRESSION GATE (part 2 of 2): dig-app MUST be registered to start at
+      # login. Nothing asserted this before, which is exactly why the regression was
+      # invisible -- autostart is best-effort, so `ready` stayed true while dig-app
+      # would never start. A tray agent that installs and never launches is the failure
+      # this contract exists to prevent, one layer over.
+      - name: Assert dig-app autostart registered (#1748)
         run: |
-          for d in /home/runner/.config /home/runner/.config/systemd                    /home/runner/.config/systemd/user                    /home/runner/.config/systemd/user/dig-app.service                    /home/runner/.local/share/applications; do
-            if [ -e "$d" ]; then ls -ldn "$d"; else echo "ABSENT  $d"; fi
-          done
-          jq -c '.result.autostart' install.json || true
+          jq -e '.result.autostart.registered == true' install.json
+          jq -c '.result.autostart' install.json
+
+      # And on Linux the artifact must really exist AND belong to the invoking user --
+      # a unit root owns is one `systemd --user` declines to load, so ownership is part
+      # of the property, not a nicety.
+      - name: (Linux) Assert the systemd user unit exists and is owned by the invoking user (#1748)
+        if: runner.os == 'Linux'
+        run: |
+          unit=/home/runner/.config/systemd/user/dig-app.service
+          ls -ldn "$unit" /home/runner/.config/systemd/user
+          test -f "$unit"
+          owner=$(stat -c %u "$unit")
+          test "$owner" = "$(id -u runner)"             || { echo "unit is owned by uid $owner, not by runner"; exit 1; }
+          dir_owner=$(stat -c %u /home/runner/.config/systemd/user)
+          test "$dir_owner" = "$(id -u runner)"             || { echo "unit DIR is owned by uid $dir_owner, not by runner"; exit 1; }
 
       - name: Assert the #493 fail-loud readiness verdict — both components ready
         run: |
