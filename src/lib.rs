@@ -655,7 +655,19 @@ fn apply_update_decision(
     force_reinstall: bool,
     log: &mut dyn FnMut(&str),
 ) -> update::UpdateDecision {
-    let detected = update::detect_installed_version(std::path::Path::new(&c.dest));
+    let dest = std::path::Path::new(&c.dest);
+    // The probe RUNS the installed binary, as root, before anything has been downloaded or written. If
+    // it sits where an unprivileged account could have replaced it, that is arbitrary root code
+    // execution, so the probe is SKIPPED rather than the install failed: an unknown version is
+    // unparseable, which `decide` already treats as "reinstall" — the safe answer, and a strictly better
+    // outcome than trusting a version string an attacker chose (#1748 F1).
+    let detected = match secure::root_exec_guard(dest) {
+        Ok(()) => update::detect_installed_version(dest),
+        Err(why) => {
+            log(&format!("    ! not probing the installed version — {why}"));
+            update::detect_installed_version_with(dest, |_| None)
+        }
+    };
     let decision = update::decide_with_force(&detected, &c.version, force_reinstall);
     log(&format!("    {}", decision.summary));
     c.update_action = decision.action;
@@ -4870,7 +4882,16 @@ mod tests {
 
         // The privileged set stays in the root-owned protected root, which is the dir
         // `secure::verify_install_root` then holds to the no-LPE bar.
-        for privileged in ["dig-dns", "dig-updater", "dig-updater-worker"] {
+        // dig-node and dig-relay joined this set in #1748 F1: the installer EXECUTES them as root
+        // (their own `install` verb), so where they SIT is a root-exec surface regardless of the
+        // identity their service later runs under.
+        for privileged in [
+            "dig-dns",
+            "dig-updater",
+            "dig-updater-worker",
+            "dig-node",
+            "dig-relay",
+        ] {
             assert!(
                 paths::is_privileged_component(Os::Linux, privileged),
                 "{privileged} must be classified privileged for this test to mean anything"

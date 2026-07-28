@@ -337,6 +337,12 @@ pub(crate) fn run_capturing(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<(), String> {
+    // The single choke point for every privileged delegation this crate performs — dig-node's and
+    // dig-relay's own `install`/`start` verbs and dig-updater's `schedule` verbs (`crate::beacon`) — so
+    // the no-root-exec-of-a-user-writable-binary invariant is enforced once, here, for all of them
+    // rather than per call site. Unlike the version probe this cannot degrade: a service that must be
+    // registered by running a binary we do not trust has no safe fallback, so it fails LOUDLY (#1748 F1).
+    crate::secure::root_exec_guard(bin)?;
     let mut cmd = Command::new(bin);
     cmd.args(args);
     for (k, v) in env {
@@ -559,7 +565,12 @@ mod tests {
 
     #[test]
     fn install_service_errors_when_binary_is_missing() {
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-xyz");
+        // A dedicated subdirectory, not bare `temp_dir()`: `/tmp` is mode 01777, so running the suite
+        // as root the `root_exec_guard` (correctly) refuses a world-writable dir before the
+        // missing-binary path under test is ever reached. The subdir is owned by whoever runs the test
+        // and is not group/other-writable, so the guard passes and EXECUTION is what fails.
+        let missing =
+            tmp_subdir("node-install-missing").join("definitely-not-a-real-dig-node-binary-xyz");
         let err = install_service(&missing, &ServiceConfig::default()).unwrap_err();
         // start:true (the default) is still attempted (and still fails) against
         // the same missing binary, so the surfaced error is the start failure.
@@ -585,7 +596,10 @@ mod tests {
 
     #[test]
     fn uninstall_service_errors_when_binary_is_missing() {
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-abc");
+        // See `install_service_errors_when_binary_is_missing`: a dedicated subdir, so the guard is not
+        // what fails.
+        let missing =
+            tmp_subdir("node-uninstall-missing").join("definitely-not-a-real-dig-node-binary-abc");
         let err = uninstall_service(&missing).unwrap_err();
         assert!(err.contains("dig-node uninstall failed"), "got: {err}");
         assert!(err.contains("could not run"), "got: {err}");

@@ -6,8 +6,10 @@
 //! installing, not merely on the OS: an elevated unix install is machine-wide
 //! ([`UNIX_MACHINE_BIN_DIR`]), an unelevated one is per-user, and Windows keeps the whole stack in the
 //! admin-only [`protected_bin_dir`] (#565). Privileged, service-executed binaries are routed to that
-//! protected root on every platform by [`is_privileged_component`], and the one privileged binary a
-//! user still runs by name is linked back onto PATH by [`needs_machine_bin_link`].
+//! protected root on every platform by [`is_privileged_component`] — which includes every binary the
+//! installer EXECUTES AS ROOT, not only those that later run under a privileged identity (#1748) — and
+//! the privileged binaries a user still runs by name are linked back onto PATH by
+//! [`needs_machine_bin_link`].
 //!
 //! # Which PATH, and whose
 //!
@@ -152,19 +154,33 @@ fn program_files_known_folder() -> Option<PathBuf> {
 ///   LocalSystem services, the SYSTEM dig-updater beacon task) executes as a
 ///   privileged identity — so the whole stack is protected. Returns `true` for
 ///   all.
-/// * **unix:** only the machine-wide privileged binaries must be protected — the
-///   dig-dns service (a dedicated-account systemd unit / root LaunchDaemon) and
-///   the root-run dig-updater beacon (+ its `dig-updater-worker` sibling the
-///   beacon spawns). The user CLIs (`digstore`/`digs`/`digd`) and the
-///   user-level dig-node/dig-relay services run AS the user, so a user-writable
-///   binary is not an escalation there — they stay in the elevation-free
-///   `~/.dig/bin`.
+/// * **unix:** the machine-wide privileged binaries — the dig-dns service (a
+///   dedicated-account systemd unit / root LaunchDaemon) and the root-run
+///   dig-updater beacon (+ its `dig-updater-worker` sibling the beacon spawns) —
+///   PLUS every binary this installer EXECUTES AS ROOT: `dig-node` and
+///   `dig-relay`, which register themselves through their own `install` verb
+///   ([`crate::service::run_capturing`]). The user CLIs
+///   (`digstore`/`digs`/`dign`/`digd`/`dig-app`) are never run as root and stay
+///   in the user root.
+///
+/// # Why "executed as root" belongs in this classification (#1748)
+///
+/// The original rule reasoned about who the binary later runs AS: dig-node's
+/// unit is user-level, so a user-writable binary looked harmless. But the
+/// INSTALLER runs `dig-node install` as root, and an elevated unix install put
+/// dig-node in [`UNIX_MACHINE_BIN_DIR`] — which Homebrew on an Intel Mac leaves
+/// `<user>:admin 0775`. Anyone able to write there could drop a binary and have
+/// root execute it on the next `sudo` install. Placement must therefore follow
+/// "does root ever EXECUTE this?", not only "who does it run as afterwards".
+/// Reachability on `PATH` is preserved by [`needs_machine_bin_link`], exactly as
+/// dig-dns has always done it.
 pub fn is_privileged_component(os: Os, component: &str) -> bool {
     match os {
         Os::Windows => true,
-        Os::Linux | Os::MacOs => {
-            matches!(component, "dig-dns" | "dig-updater" | "dig-updater-worker")
-        }
+        Os::Linux | Os::MacOs => matches!(
+            component,
+            "dig-dns" | "dig-updater" | "dig-updater-worker" | "dig-node" | "dig-relay"
+        ),
     }
 }
 
@@ -370,17 +386,23 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<String, String> {
 /// Is `component` a PRIVILEGED component that is ALSO a CLI the user is expected to run by name, so
 /// it needs a link from [`UNIX_MACHINE_BIN_DIR`] into [`protected_bin_dir`]?
 ///
-/// `dig-dns` is the case that exists: users really do run `dig-dns doctor`, but the binary must live
-/// in the root-owned protected root because a machine-wide service executes it (#565). `/opt/dig/bin`
-/// is on no shell's default `PATH`, so before #1748 `dig-dns` was unreachable by name for EVERY user —
+/// `dig-dns` is the original case: users really do run `dig-dns doctor`, but the binary must live in
+/// the root-owned protected root because a machine-wide service executes it (#565). `/opt/dig/bin` is
+/// on no shell's default `PATH`, so before #1748 `dig-dns` was unreachable by name for EVERY user —
 /// including root — while the PATH check reported it resolved.
+///
+/// `dig-node` and `dig-relay` join it for the same reason in the other direction: they moved INTO the
+/// protected root because this installer executes them as root
+/// ([`is_privileged_component`]), and they are commands a user runs by name, so the link is what keeps
+/// them reachable after the move. Without it, hardening the exec path would have silently taken
+/// `dig-node` off every user's `PATH`.
 ///
 /// A symlink is safe here precisely because both ends are root-owned `0755`: it adds reachability
 /// without adding an unprivileged-writable path to a service-executed binary, so the #565 invariant is
 /// preserved rather than traded away. `dig-updater`/`dig-updater-worker` are deliberately excluded —
 /// the beacon invokes them, a user never does, so they stay off PATH entirely.
 pub fn needs_machine_bin_link(os: Os, component: &str) -> bool {
-    !matches!(os, Os::Windows) && component == "dig-dns"
+    !matches!(os, Os::Windows) && matches!(component, "dig-dns" | "dig-node" | "dig-relay")
 }
 
 /// The system-wide login-shell snippet an elevated install writes when its bin dir is not already on
@@ -761,24 +783,48 @@ mod tests {
         }
     }
 
+    /// The unix protected set is "machine-wide service binaries PLUS everything the installer executes
+    /// as root" (#1748 F1) — not merely "binaries that later run under a privileged identity".
+    ///
+    /// `dig-node` and `dig-relay` are the ones that moved. Their SERVICES are user-level, which is why
+    /// they were classified unprotected; but this installer runs their own `install` verb AS ROOT, so a
+    /// user-writable location for them is a root-exec surface no matter who the resulting service runs
+    /// as. Both halves are asserted here so the set cannot drift in either direction.
     #[test]
-    fn unix_protects_only_the_machine_wide_service_binaries() {
-        // Root/dedicated-account service binaries MUST be protected …
-        for c in ["dig-dns", "dig-updater", "dig-updater-worker"] {
+    fn unix_protects_the_machine_wide_and_the_root_executed_binaries() {
+        // Root/dedicated-account service binaries, and the binaries root EXECUTES, MUST be protected …
+        for c in [
+            "dig-dns",
+            "dig-updater",
+            "dig-updater-worker",
+            "dig-node",
+            "dig-relay",
+        ] {
             assert!(
                 is_privileged_component(Os::Linux, c),
-                "{c} runs machine-wide on unix and must be protected"
+                "{c} is machine-wide or root-executed on unix and must be protected"
             );
             assert!(is_privileged_component(Os::MacOs, c));
         }
-        // … while the user CLIs + user-level services stay in the user root
-        // (they run AS the user, so a user-writable binary is not an escalation).
-        for c in ["digstore", "digs", "digd", "dig-node", "dign", "dig-relay"] {
+        // … while the CLIs a user runs and root never executes stay in the user root.
+        for c in ["digstore", "digs", "digd", "dign", "dig-app"] {
             assert!(
                 !is_privileged_component(Os::Linux, c),
-                "{c} runs as the user on unix — not a protected component"
+                "{c} is only ever run by the user on unix — not a protected component"
             );
             assert!(!is_privileged_component(Os::MacOs, c));
+        }
+        // And each protected binary a user runs BY NAME is linked back onto PATH, so hardening the
+        // exec path cannot silently take `dig-node` off every user's PATH.
+        for c in ["dig-dns", "dig-node", "dig-relay"] {
+            assert!(
+                needs_machine_bin_link(Os::Linux, c),
+                "{c} is protected AND user-facing, so it must be linked onto PATH"
+            );
+        }
+        // The beacon binaries are protected but deliberately NOT linked — a user never invokes them.
+        for c in ["dig-updater", "dig-updater-worker"] {
+            assert!(!needs_machine_bin_link(Os::Linux, c));
         }
     }
 

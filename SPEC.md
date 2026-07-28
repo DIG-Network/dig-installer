@@ -369,6 +369,8 @@ and no profile is read — therefore the probed command is itself wrapped in `sh
 privileged binary a user is expected to invoke by name (`dig-dns doctor`) MUST be symlinked into
 `UNIX_MACHINE_BIN_DIR` (`paths::needs_machine_bin_link`). Both ends are root-owned `0755`, so
 reachability is added without making a service-executed binary unprivileged-writable.
+`dig-node` and `dig-relay` are linked for the same reason: they live in the protected root because root
+executes them (§1.6), and they are commands a user runs by name.
 `dig-updater`/`dig-updater-worker` MUST NOT be linked — the beacon invokes them, a user never does.
 
 **Per-user artifacts.** The login autostart (§1.11), the `chia://` desktop entry (§1.3) and the
@@ -436,10 +438,25 @@ therefore places binaries into two roots, chosen per component:
   (On Windows there is no separate user root — everything is in the one protected root.)
 
 The component→root map is `paths::is_privileged_component`: on Windows every component is protected;
-on unix the protected set is exactly `dig-dns`, `dig-updater`, and `dig-updater-worker` (the
-machine-wide / root-run binaries). An explicit `--bin-dir <DIR>` OVERRIDE wins for the whole stack
-(the user's chosen dir, their responsibility). `InstallPlan::bin_dir_for(component, os)` is the
-single resolver.
+on unix the protected set is `dig-dns`, `dig-updater`, `dig-updater-worker`, `dig-node` and
+`dig-relay`. An explicit `--bin-dir <DIR>` OVERRIDE wins for the whole stack (the user's chosen dir,
+their responsibility). `InstallPlan::bin_dir_for(component, os)` is the single resolver.
+
+The membership test is **"is this binary ever EXECUTED BY ROOT?"** — NOT "does the service it registers
+run under a privileged identity?". Those differ, and the difference was a root code-execution defect:
+`dig-node` and `dig-relay` register themselves by their own `install` verb, which this installer runs as
+root, and their services are user-level — so classifying them by the identity of the resulting service
+left them in the elevated user root (`/usr/local/bin`), which Homebrew on an Intel Mac leaves
+`<user>:admin 0775`. Any unprivileged account able to write there could drop a binary and have root
+execute it on the next `sudo` install, with no race. A binary root executes MUST therefore be
+root-owned, whatever it later runs as.
+
+Two consequences a reimplementation MUST reproduce:
+
+* the migration (§5) vacates `dig-node`/`dig-relay` from a legacy user-writable root on upgrade, since a
+  copy left there is exactly what root would later execute;
+* `needs_machine_bin_link` (§1.5) links `dig-node` and `dig-relay` back onto `PATH`, because protecting
+  them would otherwise remove commands users invoke by name.
 
 **Elevation.** Writing into the protected root requires elevation, so even a CLI-only install
 elevates on Windows (the CLI lands in Program Files); a CLI-only unix install into the user root does
@@ -1000,7 +1017,8 @@ foundation for the mac/linux GUI elevation #638/#639) is:
   any `admin`-group member could have swapped.
 - **Association cache-refresh tools resolve to ABSOLUTE paths.** `register_dig_association` (per-user,
   unelevated) runs `update-mime-database` / `gtk-update-icon-cache` from a fixed allowlist of trusted
-  system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) via `resolve_system_tool`, never as a bare
+  system directories (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` — NOT `/usr/local/bin`, §7.5) via
+  `resolve_system_tool`, never as a bare
   command name resolved through `$PATH` — removing the root-`PATH`-hijack / pwnkit-class surface if the
   path is ever reached under elevation. A missing tool fails soft (the refresh is best-effort). The
   resolver is `elevation::resolve_system_tool` (the single source of truth, in the `dig-installer`
@@ -1378,6 +1396,57 @@ to date"; a resolution failure (e.g. offline) reads "update check unavailable" r
 components, §7.3) but the Components screen renders no row for the beacon (it is an OPTIONS
 checkbox, not a COMPONENTS entry, §1.5) — that entry is simply unused by the current UI rather than
 displayed.
+
+### 7.5 Root MUST NOT execute a binary from a directory an unprivileged account can write
+
+An elevated run MUST NOT execute any binary whose containing directory is group/other-writable or not
+root-owned. This generalises §4.1a/§4.1c ("the privileged process never execs the user root's
+`digstore`", "NEVER execs a user-writable binary") from the GUI's `should_exec_verify` to EVERY root-side
+exec in the library, because the library is what the GUI's root child calls into and it execs earlier in
+the run.
+
+`secure::root_exec_guard` is the single decision. It is applied at both root-side exec surfaces:
+
+1. **the version probe (§7.1).** `update::detect_installed_version` RUNS `<dest> --version`, as root,
+   for every component, BEFORE anything is downloaded or written. When the guard refuses, the probe is
+   SKIPPED and the version treated as undetectable — which §7.1 already resolves to *reinstall*. The
+   install proceeds: an unknown version is a safe answer, and strictly better than trusting a version
+   string an attacker chose.
+2. **every privileged delegation.** `service::run_capturing` is the one choke point for `dig-node
+   install`/`start`, `dig-relay install` and dig-updater's `schedule` verbs, so the guard covers all of
+   them. Here there is no safe degradation — a service that can only be registered by executing an
+   untrusted binary MUST fail LOUDLY rather than proceed.
+
+Unelevated the guard is inert by construction: executing a binary the user can already write is their
+own authority, not an escalation. An INDETERMINATE permission read is also permitted, matching §1.6's
+posture that an unreadable directory is never a false refusal. Only a DEFINITIVE breach refuses.
+
+### 7.6 Trusted system-tool resolution
+
+A well-known system tool (`id`, `su`, `sh`, `osascript`, `pkexec`) MUST be resolved to an absolute path
+from a fixed list of directories and NEVER through `$PATH`, because macOS's stock sudoers sets no
+`secure_path` and an inherited `$PATH` can begin with a user-writable prefix.
+
+The list is `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`. **`/usr/local/bin` MUST NOT appear in it.** It is a
+system directory only by convention: Homebrew on an Intel Mac owns it as `<user>:admin 0775`, so
+including it put a user-writable directory inside the trusted set — a planted `/usr/local/bin/<tool>`
+was resolved and executed by root, and no `$PATH` hardening could help, because `$PATH` was never
+consulted. No supported platform ships any of these tools there.
+
+A resolved candidate MUST additionally be owned by uid 0 with no group/other write bit, so a tool that
+only root could have placed is the only one root will execute; unreadable metadata is a refusal, not a
+pass.
+
+**The passwd database is read WITHOUT spawning anything.** `/etc/passwd` is parsed directly, and an
+account it does not list is resolved through libc's own `getpwnam_r`/`getpwuid_r` — in-process, so there
+is no tool to plant and no directory to trust, and the platform's real name service (nsswitch/LDAP/SSSD
+on Linux, Open Directory on macOS) answers. A `getent passwd` SPAWN MUST NOT be used: on macOS the
+branch is unconditional (stock `/etc/passwd` lists no account with uid >= 1000) while macOS ships no
+`getent` at all, so its only successful outcome was a planted binary whose stdout the installer then
+parsed as the passwd database — letting the attacker choose the account the rest of the install trusts.
+This is also a correctness requirement, not only a hardening one: without it the lookup always failed on
+macOS, §1.6's resolution fell back to the CALLING process's home (`/root` under `sudo`), and the §1.6
+home inversion was therefore never fixed on that platform.
 
 ## 8. Release pipeline — nightly cron + manual dispatch
 

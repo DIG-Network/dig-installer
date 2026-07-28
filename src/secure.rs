@@ -136,6 +136,55 @@ pub fn parse_acl_write_grants(output: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse to EXECUTE `bin` while running as root when the directory it sits in is not
+/// privilege-safe — the write→exec local privilege escalation, checked at the EXEC rather than only at
+/// the placement.
+///
+/// # Why an exec-time check, when the install root is already verified
+///
+/// [`verify_install_root`] is applied to [`crate::InstallPlan::privileged_install_root`] — the dir
+/// PRIVILEGED binaries land in — and it runs AFTER placement. Neither property covers this: an elevated
+/// unix install puts USER CLIs in `paths::UNIX_MACHINE_BIN_DIR` (`/usr/local/bin`), which Homebrew on an
+/// Intel Mac leaves `<user>:admin 0775`, and root then executes them — the `--version` probe runs
+/// BEFORE any download or write, on every component. No race is needed: unprivileged code running as
+/// that user drops an executable at `/usr/local/bin/dig-node` and waits for the next
+/// `curl … | sudo sh`, which the documented install path makes routine.
+///
+/// `SPEC.md` already forbids exactly this (§4.1a "the privileged process never execs the user root's
+/// `digstore`", §4.1c "NEVER execs a user-writable binary"), and the GUI honours it via
+/// `should_exec_verify`. This is that same rule, enforced in the library the GUI's root child calls
+/// into, so the invariant holds on every path rather than one.
+///
+/// Unelevated it is always `Ok`: executing a binary the user themselves can write is not an escalation,
+/// it is their own authority. An INDETERMINATE permission read (`checked: false`) is also `Ok` — the
+/// same posture [`verify_install_root`]'s callers take, so an unreadable dir is never a false refusal.
+/// Only a DEFINITIVE breach refuses.
+pub fn root_exec_guard(bin: &std::path::Path) -> Result<(), String> {
+    if !crate::invoker::is_root() {
+        return Ok(());
+    }
+    let Some(dir) = bin.parent() else {
+        return Ok(());
+    };
+    // `os` is vestigial in `verify_install_root` (each arm is selected by `cfg`, not by this value), so
+    // the host's own OS is the honest thing to pass.
+    let os =
+        crate::target::Os::from_consts(std::env::consts::OS).unwrap_or(crate::target::Os::Linux);
+    let verdict = verify_install_root(os, dir);
+    if verdict.checked && !verdict.secure {
+        return Err(format!(
+            "refusing to run {} as root: {} — a binary in a directory an unprivileged account can \
+             write is one they can REPLACE, so running it as root would execute their code with full \
+             privilege. Install the privileged components into a root-owned directory (the default \
+             {}) and re-run.",
+            bin.display(),
+            verdict.note,
+            crate::paths::protected_bin_dir().display()
+        ));
+    }
+    Ok(())
+}
+
 /// The verdict of verifying the install root denies unprivileged write (#565) —
 /// part of the `--json` [`crate::InstallReport`]. Never silent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -610,6 +659,102 @@ mod tests {
         assert_eq!(v["checked"], true);
         assert_eq!(v["secure"], true);
         assert_eq!(v["root"], r"C:\Program Files\DIG\bin");
+    }
+
+    // -- #1748 F1: root must never EXECUTE a binary out of a user-writable directory ----
+
+    /// The guard is only worth anything if it is WIRED IN, and its behavioural tests need root — so the
+    /// wiring itself is pinned here, mechanically, where it gates in CI on every platform.
+    ///
+    /// Both root-side exec surfaces are covered: the version probe, which runs a component binary
+    /// before anything is downloaded, and `service::run_capturing`, the single choke point for every
+    /// privileged delegation (dig-node/dig-relay `install`, dig-updater `schedule`). A guard that
+    /// existed but was called from neither would pass every behavioural test in this file.
+    #[test]
+    fn the_root_exec_guard_is_wired_into_every_root_side_exec() {
+        let sites: &[(&str, &str)] = &[
+            ("lib.rs (the --version probe)", include_str!("lib.rs")),
+            ("service.rs (run_capturing)", include_str!("service.rs")),
+        ];
+        for (what, src) in sites {
+            let production = src.split("\nmod tests {").next().unwrap_or("");
+            assert!(
+                production.len() > 200,
+                "{what}: the production half came back empty — the mod-tests split has drifted and \
+                 this check would pass vacuously"
+            );
+            assert!(
+                production.contains("root_exec_guard"),
+                "{what} performs a root-side exec but never calls secure::root_exec_guard — the \
+                 no-root-exec-of-a-user-writable-binary invariant would be unenforced there"
+            );
+        }
+        // Truthful control: the needle is one that WOULD be found if present.
+        assert!("fn x(){ secure::root_exec_guard(p) }".contains("root_exec_guard"));
+    }
+
+    /// The exploit, in the shape it actually has: a Homebrew-style `0775` directory holding a binary
+    /// this installer would otherwise run as root. No race is involved — the attacker writes the file
+    /// and waits for the next `sudo` install.
+    ///
+    /// Root-gated because the guard is a no-op unelevated by design (running a binary you can already
+    /// write is your own authority, not an escalation), so unprivileged this test would assert nothing.
+    /// The unprivileged half of the property — that the guard is WIRED INTO the probe at all — is
+    /// asserted by `update::tests`' no-spawn test, which does gate in CI.
+    #[cfg(unix)]
+    #[test]
+    fn root_refuses_to_exec_a_binary_from_a_group_writable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        if !crate::invoker::is_root() {
+            eprintln!("skipped: the guard is deliberately inert unelevated");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dig-rootexec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("dig-node");
+        std::fs::write(&bin, b"#!/bin/sh\necho pwned\n").unwrap();
+
+        // The Homebrew posture: group+other writable, so an unprivileged account can replace the binary.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = root_exec_guard(&bin).expect_err("a world-writable dir must refuse a root exec");
+        assert!(
+            err.contains("refusing to run") && err.contains("as root"),
+            "the refusal must name what it declined to run: {err}"
+        );
+
+        // The truthful control, in the SAME test and on the SAME binary: tighten only the directory's
+        // mode and the very same exec is permitted. So the refusal above is about the writability, not
+        // about the guard rejecting everything it is shown.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            root_exec_guard(&bin).is_ok(),
+            "a root-owned 0755 directory is exactly where a root-executed binary belongs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard must not become a blanket refusal on the unelevated path, where the same directory
+    /// posture is normal and harmless — a user's own `~/.dig/bin` is theirs to write.
+    #[cfg(unix)]
+    #[test]
+    fn an_unelevated_process_may_exec_its_own_writable_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::invoker::is_root() {
+            eprintln!("skipped: asserts the UNELEVATED arm");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dig-userexec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let bin = dir.join("digstore");
+        std::fs::write(&bin, b"x").unwrap();
+        assert!(
+            root_exec_guard(&bin).is_ok(),
+            "unelevated, executing a binary in your own writable dir is not an escalation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

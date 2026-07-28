@@ -81,18 +81,44 @@ fn is_elevated_unix() -> bool {
 /// `$PATH` under (or on the way to) elevation is a root-`PATH`-hijack /
 /// pwnkit-class surface. Every tool the elevation path spawns — `id`, `pkexec`
 /// — is looked up here instead.
+///
+/// `/usr/local/bin` is deliberately ABSENT (#1748 F2). It is a system directory only by convention: on
+/// an Intel Mac, Homebrew owns it as `<user>:admin 0775`, so including it meant the "trusted" list
+/// itself named a user-writable directory — a planted `/usr/local/bin/<tool>` was resolved and run by
+/// root, and no `$PATH` hardening could help, because the hole was in the list. No supported platform
+/// ships `id`, `su`, `sh`, `getent`, `osascript` or `pkexec` there; they live in `/usr/bin` or `/bin`.
 #[cfg(unix)]
-const TRUSTED_SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"];
+const TRUSTED_SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// Resolve a well-known system tool to an ABSOLUTE path from [`TRUSTED_SYSTEM_DIRS`],
 /// NEVER via `$PATH`. Returns `None` (fail-closed) when the tool is absent from
-/// every trusted directory.
+/// every trusted directory, or when the file found there is not one only root could have placed.
+///
+/// The ownership check is belt-and-braces behind the list itself: a trusted directory is expected to be
+/// root-owned and not group/other-writable, so a tool inside it that is NOT — because the directory was
+/// re-owned, or the file was dropped by a package that widened it — is refused rather than executed as
+/// root. Fail-closed in both directions: an unreadable candidate is skipped, never assumed good.
 #[cfg(unix)]
 pub fn resolve_system_tool(name: &str) -> Option<PathBuf> {
     TRUSTED_SYSTEM_DIRS
         .iter()
         .map(|dir| Path::new(dir).join(name))
-        .find(|path| path.is_file())
+        .find(|path| path.is_file() && is_root_owned_and_not_group_writable(path))
+}
+
+/// Is `path` owned by uid 0 with no group/other write bit — i.e. could only root have put it there?
+///
+/// Follows symlinks deliberately: `/usr/bin/<tool>` is legitimately a symlink on several distributions,
+/// and it is the TARGET that gets executed, so the target's ownership is the property that matters.
+#[cfg(unix)]
+fn is_root_owned_and_not_group_writable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(md) => md.uid() == 0 && md.permissions().mode() & 0o022 == 0,
+        // Unreadable metadata is not a pass: root must not execute what it cannot vet.
+        Err(_) => false,
+    }
 }
 
 /// The fixed subcommand token the bundled installer recognises to run ONLY the
@@ -817,6 +843,103 @@ mod tests {
         // the assertions above cannot be passing merely because the needle can never match.
         let planted = "fn demo() { Command::new(\"su\").arg(\"-\"); }";
         assert!(planted.contains("Command::new(\"su\")"));
+    }
+
+    // -- #1748 F2: the TRUSTED list must not itself name a user-writable directory ----
+
+    /// `/usr/local/bin` must never be a trusted source for a tool root executes. On an Intel Mac
+    /// Homebrew owns it as `<user>:admin 0775`, so its presence in this list meant a planted
+    /// `/usr/local/bin/<tool>` was resolved and run by root — a hole no amount of `$PATH` hardening
+    /// could close, because the resolver never consulted `$PATH` in the first place.
+    ///
+    /// Gates in CI on every platform, unprivileged, because it is a property of the list itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_trusted_dirs_exclude_every_user_writable_prefix() {
+        for banned in [
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/opt/homebrew/bin",
+            "/home",
+            "/tmp",
+        ] {
+            assert!(
+                !TRUSTED_SYSTEM_DIRS.contains(&banned),
+                "{banned} is writable by a non-root account on at least one supported platform and \
+                 must not be a source for a tool root executes"
+            );
+        }
+        // The control: the list is not merely empty, it still contains the real system dirs, so the
+        // assertions above are about exclusion rather than about a vacuous list.
+        assert!(TRUSTED_SYSTEM_DIRS.contains(&"/usr/bin"));
+        assert!(TRUSTED_SYSTEM_DIRS.contains(&"/bin"));
+    }
+
+    /// A tool PLANTED in `/usr/local/bin` must not be resolved — the exploit, executed rather than
+    /// argued. Root-gated only because writing there requires it; the property is the resolver's.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_planted_in_usr_local_bin_is_not_resolved() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to plant a binary in /usr/local/bin");
+            return;
+        }
+        let name = format!("dig-planted-probe-{}", std::process::id());
+        let planted = Path::new("/usr/local/bin").join(&name);
+        if std::fs::create_dir_all("/usr/local/bin").is_err() {
+            return;
+        }
+        std::fs::write(&planted, b"#!/bin/sh\necho pwned\n").unwrap();
+        let resolved = resolve_system_tool(&name);
+        let _ = std::fs::remove_file(&planted);
+        assert_eq!(
+            resolved, None,
+            "a binary in /usr/local/bin must never be handed back as a trusted system tool"
+        );
+    }
+
+    /// Belt-and-braces behind the list: a file sitting in a genuinely trusted directory but NOT owned by
+    /// root — or group/other-writable — is refused too, because it is not one only root could have put
+    /// there. Root-gated for the same reason (writing to `/usr/bin`).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_root_owned_tool_in_a_trusted_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to place a file in /usr/bin");
+            return;
+        }
+        let name = format!("dig-owned-probe-{}", std::process::id());
+        let path = Path::new("/usr/bin").join(&name);
+        std::fs::write(&path, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root-owned 0755 in a trusted dir: the legitimate case, and the control that proves the
+        // fixture is capable of resolving at all.
+        assert_eq!(
+            resolve_system_tool(&name).as_deref(),
+            Some(path.as_path()),
+            "a root-owned 0755 tool in a trusted dir is exactly what may be resolved"
+        );
+
+        // Same path, same directory — only the OWNER changes, and it must now be refused.
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; test-only fixture setup.
+        assert_eq!(unsafe { libc::lchown(c.as_ptr(), 1000, 1000) }, 0);
+        let after_chown = resolve_system_tool(&name);
+
+        // And with root ownership restored but the group-write bit set.
+        assert_eq!(unsafe { libc::lchown(c.as_ptr(), 0, 0) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let after_widen = resolve_system_tool(&name);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(after_chown, None, "a non-root-owned tool must be refused");
+        assert_eq!(
+            after_widen, None,
+            "a group-writable tool must be refused — the group could replace it"
+        );
     }
 
     #[cfg(unix)]

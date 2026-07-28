@@ -249,9 +249,21 @@ fn resolve_live() -> TargetUser {
         .unwrap_or_else(|_| "root".to_string());
     #[cfg(unix)]
     {
+        // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        let contents = read_passwd_database();
-        let entries = parse_passwd(&contents);
+        let contents = read_passwd_file();
+        let mut entries = parse_passwd(&contents);
+        // The flat file is the fast, common answer. When it cannot name the invoking account — a
+        // directory-backed box, or macOS, whose stock `/etc/passwd` lists no ordinary user at all — ask
+        // the OS resolver for that ONE account and append it, so `resolve` can apply its normal
+        // precedence to a complete list. Done here rather than inside `resolve` to keep that function
+        // pure and exhaustively unit-testable (#1748 F2).
+        let hint = elevation_hint(euid, |k| std::env::var(k).ok());
+        if !hint.is_empty() && passwd_lookup(&entries, &hint).is_none() {
+            if let Some(entry) = directory_lookup(&hint) {
+                entries.push(entry);
+            }
+        }
         resolve(
             euid,
             |k| std::env::var(k).ok(),
@@ -266,44 +278,215 @@ fn resolve_live() -> TargetUser {
     }
 }
 
-/// The passwd database as text: `/etc/passwd` first, falling back to `getent passwd` so accounts
-/// served by LDAP/SSSD (absent from the flat file) still resolve.
+/// The flat `/etc/passwd`, as text. The authoritative answer for a directory-backed account comes from
+/// [`directory_lookup`] instead — see there for why this is no longer a `getent` spawn.
 #[cfg(unix)]
-fn read_passwd_database() -> String {
-    use crate::proc::HideConsole;
+fn read_passwd_file() -> String {
+    std::fs::read_to_string("/etc/passwd").unwrap_or_default()
+}
 
-    let flat = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-    let has_real_user = parse_passwd(&flat).iter().any(|e| e.uid >= 1000);
-    if has_real_user {
-        return flat;
-    }
-    // No unprivileged account in the flat file — the box is likely directory-backed.
-    //
-    // `getent` is resolved from the trusted system directories, NEVER `$PATH`
-    // (`elevation::resolve_system_tool`): this runs as root, and macOS's stock sudoers sets no
-    // `secure_path`, so a `$PATH` led by a user-writable Homebrew prefix would let an attacker supply
-    // it. Fail-closed — without a trusted `getent` we keep the flat file rather than run theirs.
-    let Some(getent) = crate::elevation::resolve_system_tool("getent") else {
-        return flat;
-    };
-    let out = std::process::Command::new(getent)
-        .arg("passwd")
-        .hide_console()
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let mut merged = flat;
-            merged.push('\n');
-            merged.push_str(&String::from_utf8_lossy(&o.stdout));
-            merged
+/// Ask the OS itself for ONE account, through libc's own resolver — `getpwnam_r`/`getpwuid_r`.
+///
+/// # Why not `getent passwd` (#1748 F2)
+///
+/// This used to spawn `getent`, resolved from a fixed list of trusted directories. That list included
+/// `/usr/local/bin`, which Homebrew on an Intel Mac leaves `<user>:admin 0775` — so the "trusted" list
+/// itself contained a user-writable directory, and the hole was in the list rather than in `$PATH`. Two
+/// things made that acute rather than theoretical on macOS: stock `/etc/passwd` there has no account
+/// with uid >= 1000, so the fallback branch was UNCONDITIONAL; and macOS ships no `getent` at all under
+/// `/usr/bin` or `/bin`. The only way that spawn could ever SUCCEED on a Mac was if someone had planted
+/// a binary at `/usr/local/bin/getent` — which root would then run, and whose stdout was parsed as the
+/// passwd database, letting the attacker also choose the account the rest of the install trusts.
+///
+/// `getpwnam_r` closes it by construction: it is an in-process libc call, so there is no tool to plant,
+/// no directory to trust, and no child to spawn or bound. It also consults the platform's real name
+/// service — nsswitch (LDAP/SSSD) on Linux, Open Directory on macOS — so it answers for
+/// directory-backed accounts that the flat file omits, which is the reason the fallback existed.
+///
+/// It also fixes a CORRECTNESS bug, not only the exposure: with no `getent` on macOS the lookup always
+/// failed, [`resolve`] fell to its `None` arm, and that returns OUR home — `/root` under `sudo`. So
+/// #1748's home inversion was never actually fixed on macOS. This is what fixes it.
+#[cfg(unix)]
+fn directory_lookup(hint: &ElevationHint) -> Option<PasswdEntry> {
+    // A generous first buffer, grown on ERANGE: a record with many long fields (a directory-served
+    // account with a long gecos) can exceed a small one, and a truncated read must never silently
+    // become a wrong home directory.
+    let mut capacity = 4096;
+    loop {
+        let mut buf = vec![0 as libc::c_char; capacity];
+        // SAFETY: `pwd` is a plain C struct fully written by a successful lookup; `buf` outlives the
+        // call and is sized by `capacity`; `found` is only dereferenced after a zero return AND a
+        // non-null check, which is exactly the contract `getpw*_r` documents.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            match (&hint.name, hint.uid) {
+                (Some(name), _) => {
+                    let Ok(c_name) = std::ffi::CString::new(name.as_bytes()) else {
+                        return None;
+                    };
+                    libc::getpwnam_r(
+                        c_name.as_ptr(),
+                        &mut pwd,
+                        buf.as_mut_ptr(),
+                        capacity,
+                        &mut found,
+                    )
+                }
+                (None, Some(uid)) => libc::getpwuid_r(
+                    uid as libc::uid_t,
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    capacity,
+                    &mut found,
+                ),
+                (None, None) => return None,
+            }
+        };
+        if rc == libc::ERANGE && capacity < 1 << 20 {
+            capacity *= 4;
+            continue;
         }
-        _ => flat,
+        if rc != 0 || found.is_null() {
+            // Not found, or the resolver failed. Fail-closed: the caller keeps whatever the flat file
+            // said, and `resolve` applies its own precedence to that.
+            return None;
+        }
+        // SAFETY: `found` is non-null and `rc == 0`, so libc has fully populated `pwd`, and its
+        // `pw_name`/`pw_dir` point into `buf`, which is still alive here.
+        return unsafe { entry_from_passwd(&pwd) };
     }
+}
+
+/// Copy a libc `passwd` record into an owned [`PasswdEntry`].
+///
+/// # Safety
+///
+/// `pwd` must be a record libc populated successfully, with `pw_name`/`pw_dir` pointing at NUL-
+/// terminated strings whose backing buffer is still alive.
+#[cfg(unix)]
+unsafe fn entry_from_passwd(pwd: &libc::passwd) -> Option<PasswdEntry> {
+    if pwd.pw_name.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let name = std::ffi::CStr::from_ptr(pwd.pw_name)
+        .to_string_lossy()
+        .into_owned();
+    let home = std::ffi::CStr::from_ptr(pwd.pw_dir)
+        .to_string_lossy()
+        .into_owned();
+    if name.is_empty() || home.is_empty() {
+        return None;
+    }
+    Some(PasswdEntry {
+        name,
+        uid: pwd.pw_uid as u32,
+        gid: pwd.pw_gid as u32,
+        home: PathBuf::from(home),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #1748 F2: the account lookup no longer spawns a plantable tool ----------
+
+    /// The OS resolver must actually answer for a real account, because it REPLACED the `getent` spawn
+    /// as the fallback for an account the flat file does not list. If it answered nothing, `resolve`
+    /// would fall to its `None` arm and return OUR home — `/root` under `sudo` — which IS #1748.
+    ///
+    /// Asked about the account this test process runs as, so there is a real record to find on any host
+    /// and the assertion is about the resolver rather than about a fixture.
+    #[cfg(unix)]
+    #[test]
+    fn the_os_resolver_answers_for_a_real_account() {
+        // SAFETY: `getuid` takes no arguments, touches no memory, and cannot fail.
+        let me = unsafe { libc::getuid() } as u32;
+        let by_uid = directory_lookup(&ElevationHint {
+            name: None,
+            uid: Some(me),
+            gid: None,
+        })
+        .expect("the OS must resolve the uid this process is running as");
+        assert_eq!(by_uid.uid, me);
+        assert!(
+            by_uid.home.is_absolute(),
+            "a home directory must be absolute, or the artifact paths built from it are nonsense: {}",
+            by_uid.home.display()
+        );
+        assert!(!by_uid.name.is_empty());
+
+        // And by NAME, which is the form `SUDO_USER` supplies — the path that matters most.
+        let by_name = directory_lookup(&ElevationHint {
+            name: Some(by_uid.name.clone()),
+            uid: None,
+            gid: None,
+        })
+        .expect("the OS must resolve the account by name too");
+        assert_eq!(
+            by_name.home, by_uid.home,
+            "the same account must resolve to the same home by name and by uid"
+        );
+    }
+
+    /// Fail-closed: an account that does not exist yields `None` rather than a partially-filled record
+    /// (which would become a bogus home directory the installer then wrote into).
+    #[cfg(unix)]
+    #[test]
+    fn the_os_resolver_declines_an_account_that_does_not_exist() {
+        assert_eq!(
+            directory_lookup(&ElevationHint {
+                name: Some("definitely-not-a-real-account-xyz-1748".to_string()),
+                uid: None,
+                gid: None,
+            }),
+            None
+        );
+        assert_eq!(
+            directory_lookup(&ElevationHint {
+                name: None,
+                uid: Some(4_000_000_000),
+                gid: None,
+            }),
+            None
+        );
+    }
+
+    /// The macOS shape of the bug, as a unit: stock `/etc/passwd` there lists no ordinary user, so the
+    /// flat file cannot answer `SUDO_USER` — and with the old `getent` fallback dead on that platform
+    /// (macOS ships none), `resolve` returned ROOT's home while claiming `via_elevation`. Every per-user
+    /// artifact then went to `/root`, which is #1748 itself.
+    ///
+    /// Both arms are asserted on the same hint so the contrast is the test: absent from the passwd list
+    /// → the inversion; present (which is what the OS resolver now supplies) → the user's own home.
+    #[test]
+    fn an_account_the_flat_file_cannot_name_must_not_resolve_to_our_own_home() {
+        let hint_only = resolve(0, sudo_env, &[], "root", Path::new("/root"));
+        assert_eq!(
+            hint_only.home,
+            Path::new("/root"),
+            "with NO passwd record this is the documented fallback — and exactly why the OS resolver \
+             must supply one on macOS, where the flat file never can"
+        );
+
+        // With the record the OS resolver now contributes, the same hint resolves correctly.
+        let found = resolve(
+            0,
+            sudo_env,
+            &[PasswdEntry {
+                name: "ubuntu".to_string(),
+                uid: 1000,
+                gid: 1000,
+                home: PathBuf::from("/home/ubuntu"),
+            }],
+            "root",
+            Path::new("/root"),
+        );
+        assert_eq!(found.home, Path::new("/home/ubuntu"));
+        assert_eq!(found.uid, Some(1000));
+        assert!(found.via_elevation);
+    }
 
     /// The exact environment `curl … | sudo sh` produces on Ubuntu: root's euid, root's `HOME`, and
     /// `SUDO_USER`/`SUDO_UID`/`SUDO_GID` naming the human. This is the #1748 fixture.

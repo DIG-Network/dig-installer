@@ -255,7 +255,7 @@ pub fn detect_installed_version(bin_path: &Path) -> DetectedVersion {
 /// [`detect_installed_version`] with an injectable version probe — production
 /// passes [`spawn_version_probe`]; tests pass a fixed answer so detection is
 /// exercised without a real spawnable binary.
-fn detect_installed_version_with(
+pub(crate) fn detect_installed_version_with(
     bin_path: &Path,
     probe: impl Fn(&Path) -> Option<String>,
 ) -> DetectedVersion {
