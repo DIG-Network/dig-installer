@@ -1963,8 +1963,21 @@ fn report_preceding_unsafe_path_dirs(
     if !invoker::is_root() {
         return;
     }
-    let user = invoker::target_user();
-    let Ok(path) = pathcheck::login_shell_path(user) else {
+    // ROOT's login PATH, not the target user's. The threat this check exists for is "root executes a binary
+    // an unprivileged account planted", so root's own resolution order is the one that matters.
+    //
+    // Measuring the TARGET USER's PATH instead flags their own directories — `~/.local/bin`, `~/.cargo/bin`
+    // — which precede ours on any developer machine and are not an escalation at all: they are that user
+    // running their own binaries with their own authority. Doing so failed a clean CI install with six
+    // false positives, which is how the wrong principal was caught.
+    let root_account = invoker::TargetUser {
+        name: "root".to_string(),
+        home: std::path::PathBuf::from("/root"),
+        uid: Some(0),
+        gid: Some(0),
+        via_elevation: false,
+    };
+    let Ok(path) = pathcheck::login_shell_path(&root_account) else {
         // The PATH itself could not be read; `verify_clis_on_path` already reports that failure, and
         // guessing here would only duplicate it.
         return;
@@ -1980,8 +1993,7 @@ fn report_preceding_unsafe_path_dirs(
         return;
     }
     log(&format!(
-        "    ! these directories come BEFORE {wired_str} on {}'s PATH and are not safe: {}",
-        user.name,
+        "    ! these directories come BEFORE {wired_str} on ROOT's PATH and are not safe: {}",
         unsafe_before.join(", ")
     ));
     log("    · a non-root account can create a DIG command name there and win the resolution");
