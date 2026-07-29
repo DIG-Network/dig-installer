@@ -3354,31 +3354,57 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             Err(_) => return Vec::new(),
         };
         let current = std::env::current_exe().ok();
-        // The VENEER is scanned as a root of its own (#1748 F4): its links live in neither bin dir, so an
-        // uninstall used to report `residue: []` with `/usr/local/bin/digs` still present and dangling.
-        // `--uninstall` promises zero residue, and a stale DIG-named entry is also the starting state the
-        // stale-link escalation needs.
-        let mut roots = vec![self.bin_dir.clone(), paths::protected_bin_dir()];
-        #[cfg(unix)]
-        roots.push(std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR));
-        let mut residue = Vec::new();
-        for stem in uninstall::COMPONENT_STEMS {
-            for root in &roots {
-                let path = root.join(target.exe_name(stem));
-                // The running installer image is exempt (self-delete is impossible
-                // while running; OS cleanup handles it).
-                if current.as_deref() == Some(path.as_path()) {
-                    continue;
-                }
-                // `symlink_metadata`, not `exists()`: a DANGLING symlink left in the veneer is exactly the
-                // residue this scan exists to find, and `exists()` follows the link and reports nothing.
-                if std::fs::symlink_metadata(&path).is_ok() {
-                    residue.push(path.display().to_string());
-                }
+        residue_in(&residue_roots(&self.bin_dir), &target, current.as_deref())
+    }
+}
+
+/// Every directory a completed uninstall must leave free of DIG-named entries.
+///
+/// # Why the veneer is a root of its own (#1748 F4)
+///
+/// `/usr/local/bin` holds symlinks, not binaries, so it is neither of the two bin roots and the residue scan
+/// never looked at it. An uninstall therefore reported `residue: []` with `/usr/local/bin/digs` still present
+/// and dangling — a false machine-consumed claim against a `--uninstall` that promises zero residue, and the
+/// exact starting state the stale-link escalation needs: the next time that directory becomes writable there
+/// is a DIG-named entry sitting in it for the taking.
+///
+/// Split out from [`Installer::scan_residue`] because the decision is the ROOT LIST, and dropping the veneer
+/// from it left the whole suite green — the scan was only ever exercised against directories the test owned.
+fn residue_roots(bin_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![bin_dir.to_path_buf(), paths::protected_bin_dir()];
+    #[cfg(unix)]
+    roots.push(std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR));
+    roots
+}
+
+/// The DIG-named entries still present under `roots`, i.e. what an uninstall failed to take.
+///
+/// `current` is the running installer's own image, which is exempt: a process cannot delete itself on
+/// Windows, so OS cleanup handles it rather than the uninstall reporting a residue it cannot act on.
+///
+/// # `symlink_metadata`, never `exists` (#1748 F4)
+///
+/// A DANGLING symlink is the single most likely residue here — the binary it pointed at has just been
+/// deleted — and `exists()` FOLLOWS the link, finds nothing, and reports the directory clean. So the one
+/// entry this scan exists to catch is the one an existence check cannot see.
+fn residue_in(
+    roots: &[std::path::PathBuf],
+    target: &Target,
+    current: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut residue = Vec::new();
+    for stem in uninstall::COMPONENT_STEMS {
+        for root in roots {
+            let path = root.join(target.exe_name(stem));
+            if current == Some(path.as_path()) {
+                continue;
+            }
+            if std::fs::symlink_metadata(&path).is_ok() {
+                residue.push(path.display().to_string());
             }
         }
-        residue
     }
+    residue
 }
 
 /// Run the first-class whole-stack `uninstall` (#568): stop + deregister ALL
@@ -5630,6 +5656,145 @@ mod tests {
                 "unelevated, the veneer's posture is the user's own authority"
             );
         }
+    }
+
+    /// A DANGLING veneer link is residue, and the veneer is one of the directories scanned (#1748 F4).
+    ///
+    /// # Two decisions, each of which was green when deleted
+    ///
+    /// `--uninstall` promises "leaving ZERO residue", and the scan reported `residue: []` with
+    /// `/usr/local/bin/digs` still sitting there. Two separate things had to be true to fix that, and
+    /// removing either one left all 692 tests passing:
+    ///
+    /// 1. the **veneer must be in the root list** — it holds symlinks rather than binaries, so it is neither
+    ///    bin root and was simply never looked at;
+    /// 2. the check must be **`symlink_metadata`, not `exists`** — the likeliest residue here is a link whose
+    ///    target this uninstall just deleted, and `exists()` follows it, finds nothing, and calls the
+    ///    directory clean.
+    ///
+    /// So the fixture is a link that points at a path which does NOT exist. That input is what distinguishes
+    /// the two implementations: against a link with a live target, both agree, which is why every earlier
+    /// fixture here proved nothing. The controls pin it from the other side — a clean directory yields
+    /// nothing (so this is not "always reports something"), and the running image is exempt.
+    #[test]
+    fn a_dangling_link_is_residue_and_the_veneer_is_scanned() {
+        let target = Target::current().expect("host target");
+        let tmp = tempfile::tempdir().unwrap();
+        let veneer = tmp.path().join("usr-local-bin");
+        std::fs::create_dir_all(&veneer).unwrap();
+
+        // THE fixture: the target is deliberately absent, which is the state an uninstall leaves behind
+        // after deleting the binary the link pointed at.
+        let digs = veneer.join(target.exe_name("digs"));
+        let vanished = tmp.path().join("opt-dig-bin").join(target.exe_name("digs"));
+        assert!(
+            std::fs::symlink_metadata(&vanished).is_err(),
+            "the link's target must be ABSENT, or this fixture cannot tell the two checks apart"
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&vanished, &digs).unwrap();
+        #[cfg(windows)]
+        std::fs::write(&digs, b"stale").unwrap();
+
+        let found = residue_in(std::slice::from_ref(&veneer), &target, None);
+        assert_eq!(
+            found,
+            vec![digs.display().to_string()],
+            "a stale DIG entry in the veneer is residue - `--uninstall` promises zero, and this one is also \
+             the starting state the stale-link escalation needs"
+        );
+
+        // CONTROL — an empty directory yields nothing, so the assertion above is about the entry and not
+        // about this scan reporting a path per root regardless.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        assert!(
+            residue_in(std::slice::from_ref(&clean), &target, None).is_empty(),
+            "a directory with no DIG entries has no residue"
+        );
+
+        // CONTROL — the running installer's own image is exempt: it cannot delete itself while running.
+        assert!(
+            residue_in(std::slice::from_ref(&veneer), &target, Some(&digs)).is_empty(),
+            "the running image must not be reported as residue it could have taken"
+        );
+
+        // The ROOT LIST decision, which the scan above cannot see because it is handed its roots. On unix
+        // the veneer must be one of them; dropping that push left the whole suite green.
+        let roots = residue_roots(std::path::Path::new("/tmp/some-bin-dir"));
+        assert!(
+            roots.contains(&std::path::PathBuf::from("/tmp/some-bin-dir")),
+            "the run's own bin dir must be scanned: {roots:?}"
+        );
+        assert!(
+            roots.contains(&paths::protected_bin_dir()),
+            "the protected root must be scanned: {roots:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            roots.contains(&std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR)),
+            "the veneer holds links rather than binaries, so it is neither bin root and must be scanned \
+             explicitly or its stale entries are invisible: {roots:?}"
+        );
+    }
+
+    /// A directory that merely PRECEDES ours on root's `PATH` fails an elevated install (#1748 F2).
+    ///
+    /// # The fixture is the point: position with nothing planted yet
+    ///
+    /// The nearest wrong implementation is the one that shipped — the `same_binary` shadow check
+    /// (`pathcheck.rs`), which compares what root resolves against what we installed. That check only fires
+    /// once the attacker's file is ALREADY THERE, so a clean-but-losing `PATH` reported a fully green,
+    /// ready install: every DIG command was ours today and hers the moment she chose to create the name.
+    ///
+    /// So this report carries **no shadow, no unsafe veneer and no writable bin dir** — nothing an
+    /// existence-based check could catch. The only defect present is the ORDER, which is what makes the
+    /// assertion attributable to the positional rule rather than to any of the checks that surround it.
+    ///
+    /// Both controls are load-bearing in opposite directions, because two trivially wrong implementations
+    /// would otherwise satisfy the first assertion: an empty list must NOT fail (or "elevated always fails"
+    /// passes), and the same non-empty list unelevated must NOT fail (or "any non-empty list fails" passes,
+    /// which would refuse every developer box whose `~/.local/bin` comes first — the false-positive that
+    /// failed a clean CI install six times over).
+    #[test]
+    fn a_directory_preceding_ours_on_roots_path_is_fatal_when_elevated() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            ..InstallPlan::default()
+        };
+        // A name that could not plausibly appear in any other failure message, so `contains` cannot pass on
+        // a message some unrelated gate produced.
+        const LOSING: &str = "/opt/attacker-owned-and-earlier";
+
+        let mut losing = report_shell();
+        losing.preceding_unsafe_path_dirs = vec![LOSING.to_string()];
+        let elevated = evaluate_readiness_when(&plan, &losing, true);
+        assert!(
+            elevated.iter().any(|f| f.contains(LOSING)),
+            "a directory a non-root account can write that comes BEFORE ours on root's PATH means she can \
+             claim any DIG command name at will; the install must not report ready: {elevated:?}"
+        );
+
+        // CONTROL 1 — the same report unelevated must pass. Unprivileged, a directory earlier on the user's
+        // own PATH is the user running their own binaries with their own authority.
+        let unelevated = evaluate_readiness_when(&plan, &losing, false);
+        assert!(
+            !unelevated.iter().any(|f| f.contains(LOSING)),
+            "unelevated, PATH order is the user's own authority and must not fail: {unelevated:?}"
+        );
+
+        // CONTROL 2 — an elevated install with a WINNING order must pass. Without this, a rule that failed
+        // every elevated install would satisfy the assertion above.
+        let winning = report_shell();
+        assert!(
+            winning.preceding_unsafe_path_dirs.is_empty(),
+            "the control must start from a clean PATH order"
+        );
+        let clean = evaluate_readiness_when(&plan, &winning, true);
+        assert!(
+            !clean.iter().any(|f| f.contains("PATH order")),
+            "an elevated install that wins the resolution must report ready: {clean:?}"
+        );
     }
 
     /// An ELEVATED install into a group/world-writable directory is FATAL, not a note.
