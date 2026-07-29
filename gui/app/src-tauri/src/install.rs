@@ -38,7 +38,6 @@ use tauri::{AppHandle, Emitter};
 #[cfg(not(embed_digstore))]
 use tauri::Manager;
 
-use dig_installer::proc::HideConsole;
 use dig_installer::target::Os;
 
 // ---- Embedded payload (single-file install) ----------------------------------
