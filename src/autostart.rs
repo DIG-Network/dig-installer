@@ -56,7 +56,12 @@ pub struct AutostartResult {
     pub registered: bool,
     /// The per-OS mechanism used: `run-key` | `launch-agent` | `systemd-user`.
     pub mechanism: String,
-    /// The artifact written — a registry path on Windows, a file path elsewhere.
+    /// The artifact path this mechanism uses — a registry path on Windows, a file path elsewhere.
+    ///
+    /// Where the artifact GOES, which is not the same as where one was written: it is populated on the
+    /// dry-run and failure arms too, so it must be read together with [`Self::registered`]. Named for the
+    /// path rather than the act deliberately — a field that claimed a write on a run that made none would
+    /// be the planned-vs-effective defect #1748 fixed twice elsewhere in this report.
     pub artifact: String,
     /// Human-readable detail behind [`Self::registered`].
     pub note: String,

@@ -207,9 +207,13 @@ Default install location (override with `--bin-dir <DIR>`):
   elevation-free `~/.dig/bin`, which is wired onto your own `PATH`. Nothing runs as root, so no
   machine-wide directory is involved.
 
-An explicit `--bin-dir <DIR>` overrides both for the whole stack. Upgrading an install that predates
-this (binaries in `%LOCALAPPDATA%\Programs\...` / `~/.dig/bin`) migrates them to the protected root
-automatically and re-points the services — no manual steps.
+An explicit `--bin-dir <DIR>` overrides both for the whole stack.
+
+Upgrading an install that predates this migrates every PRIVILEGED binary — the ones a service or the
+installer itself runs as root — out of the old user-writable location into the protected root, and
+re-points the services at it, with no manual steps. On unix a leftover *user* CLI in `~/.dig/bin` is
+deliberately left alone: nothing runs it as root, so removing a binary out of somebody's home would be a
+liberty rather than a fix. It is shadowed by the newer copy on `PATH` and can be deleted at leisure.
 
 ---
 

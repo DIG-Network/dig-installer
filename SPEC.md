@@ -1481,7 +1481,13 @@ explicit `--bin-dir` override redirects the whole stack into a directory the inv
    root-shell install, or the macOS GUI's `osascript` child, §1.5a);
 4. `dns::doctor`'s two `dig-dns` invocations.
 
-The set is closed and test-locked: a fifth root-side exec added without the guard MUST fail the suite.
+The set is DERIVED from the source, not enumerated: every function that spawns an installer-placed binary
+MUST call the guard, and a check that walks the crate enforces it. A hardcoded list was tried and failed
+exactly as lists do — it named four sites and asserted a count of four while a FIFTH
+(`dns::os_config::run_os_config`, reached on the default plan, on every OS, on install AND uninstall) had no
+guard at all and was proved to root code execution. The guard MUST also be called in the function that
+performs the spawn, not merely in its caller: a guard one frame away is one the next caller does not
+inherit.
 Earlier revisions of this section claimed placement covered (3) and (4); it does not under an override,
 and a normative claim the code does not satisfy tells a reimplementation to reproduce the gap.
 
@@ -1501,12 +1507,26 @@ Unelevated the guard is inert by construction: executing a binary the user can a
 own authority, not an escalation. An INDETERMINATE permission read is also permitted, matching §1.6's
 posture that an unreadable directory is never a false refusal. Only a DEFINITIVE breach refuses.
 
-**Being root is the condition; how root was reached is irrelevant.** Any predicate deciding whether to
-drop privilege for an exec MUST test the effective uid, NOT whether an elevation HINT
-(`SUDO_USER`/`DOAS_USER`/`PKEXEC_UID`) is present. The macOS GUI elevates through `osascript … with
-administrator privileges`, which inherits neither environment nor stdin, so the root child has NO hint:
-a hint-based predicate reports "not elevated" while running as uid 0. `pathcheck::as_user_command`
-therefore tests `invoker::is_root()`.
+**Being root is the condition; how root was reached is irrelevant.** Every predicate deciding whether to
+drop privilege MUST ask "am I root, acting for an account that is not root?" — the EFFECTIVE UID plus the
+resolved account — and MUST NOT ask whether an elevation HINT
+(`SUDO_USER`/`DOAS_USER`/`PKEXEC_UID`) is present. A hint answers how root was REACHED, and it is absent in
+uid-0 contexts that really occur: `su -m`/`su -p` preserve the environment, so a non-root account is
+resolved with no hint, and a hint-based predicate then reports "not elevated" while holding root — writing
+root-owned files into that account's home and executing its binaries as root.
+
+The comparison is by UID, not by the name `root`: a uid-0 account under another name (`toor`) is still root,
+and a name comparison would try to drop privilege to it.
+
+The account this process runs AS MUST come from the passwd database (`getpwuid_r(geteuid())`), never from
+`$USER`/`$USERNAME`, which the caller controls and which feeds this predicate.
+
+Each decision point MUST read the effective uid itself; a hardcoded answer is the defect, and there are
+seven such points (`invoker::TargetUser::acting_for_another_account`).
+
+**This does NOT close the macOS GUI case.** The `osascript` root child inherits no environment, so no
+account other than root is knowable there and the predicate answers `false` exactly as a hint-based one
+would. That limitation is §1.5a, and a reimplementation MUST NOT read this section as fixing it.
 
 **Root MUST NOT write through a symlink it did not create.** A destination is unlinked and then created
 with `O_EXCL` (plus `O_NOFOLLOW`), never opened with a following `O_CREAT|O_TRUNC`
@@ -1526,6 +1546,25 @@ links resolve into them, and root-side execs and services run them, so a group/o
 is an escalation. Unelevated, a user-writable directory holding binaries only that same user runs is
 their own authority, and failing on it would refuse every ordinary per-user install and every Homebrew
 Mac.
+
+**An install root MUST be an absolute, already-normalized path.** A path containing `.` or `..` MUST be
+REFUSED, not resolved. Every permission statement here is about the LEVELS of a path, and `..` breaks that
+in both directions: a walk that skips it verifies a different directory than the one in use, and a walk that
+treats it as a level walks OUTWARD — measured, from one `--bin-dir` argument, as `chown root:root` +
+`chmod 0755` on an operator's `~/.ssh` and the loss of `/tmp`'s sticky bit. Resolving it is not an option
+either: lexical normalization disagrees with the kernel when a component is a symlink, and `canonicalize`
+FOLLOWS symlinks, which is the attack the descriptor discipline exists to prevent.
+
+**Creating a level MUST pass the mode to the SYSCALL** (`mkdirat`), never create-then-`chmod`. `mkdir` masks
+the mode it is given, so the result can only be NARROWER than requested; the create-then-fix pair leaves a
+window in which the directory carries the umask's permissions, which an unprivileged racer won 12 times in
+3000 iterations. This applies to every level this installer brings into existence, including the levels
+above the `/usr/local/bin` veneer.
+
+**A symlink or non-directory where a level is expected is a DEFINITIVE refusal**, distinct from a level that
+could not be read. `ELOOP` from `O_NOFOLLOW` is the DETECTION, not a failure to inspect; reporting it as
+indeterminate makes it a PASS at every gate, because each is written "definitively insecure fails". An
+install root symlinked onto another volume therefore MUST fail loudly rather than print a tick.
 
 **The privileged install root is a CHAIN, and EVERY level of it is normative.** Creating `/opt/dig/bin`
 with a recursive `mkdir -p` and pinning only that leaf leaves the PARENT at the process umask — measured

@@ -1835,10 +1835,11 @@ fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dy
 /// was neither checked nor mentioned. That is precisely how `/usr/local/bin`, user-writable under
 /// Homebrew, became the install root without anything noticing.
 ///
-/// Deliberately a REPORT, not a gate. A user-writable directory holding binaries only that same user
-/// runs is their own authority, so failing the install would refuse every ordinary unelevated install
-/// and every Homebrew Mac. What must not happen is SILENCE: the posture is logged and lands in
-/// `install.json` as [`InstallReport::bin_dir_security`], so a reviewer or a script can see it.
+/// Always REPORTED; fatal only under ELEVATION ([`evaluate_readiness`]). Root wrote those binaries and
+/// root-side execs and services resolve them, so a writable directory is an escalation there — whereas
+/// unelevated it is the user's own authority, and refusing would turn away every ordinary per-user install
+/// and every Homebrew Mac. What must never happen either way is SILENCE: the posture is logged and lands
+/// in `install.json` as [`InstallReport::bin_dir_security`], so a reviewer or a script can see it.
 fn report_bin_dir_posture(
     plan: &InstallPlan,
     target: &Target,
@@ -5123,9 +5124,10 @@ mod tests {
     /// to and executed from went unchecked and unmentioned on every elevated unix install — which is how
     /// a user-writable `/usr/local/bin` became the install root with nothing noticing.
     ///
-    /// A REPORT, not a gate: the verdict must appear in `install.json` while readiness is untouched.
-    /// Asserted on a world-writable directory, the posture that matters, with the untouched-readiness
-    /// half asserted too so this cannot be "fixed" into a refusal.
+    /// The verdict must appear in `install.json`, and UNELEVATED it must not sink the install. Asserted on
+    /// a world-writable directory, the posture that matters, with the untouched-readiness half asserted too
+    /// so this cannot be "fixed" into a blanket refusal. The elevated arm, where the same posture IS fatal,
+    /// is `an_elevated_install_into_a_writable_directory_is_fatal`.
     ///
     /// unix-only because on Windows EVERY component is privileged (`is_privileged_component`), so the
     /// privileged root always equals the bin dir and the verdict would be a duplicate — the case the

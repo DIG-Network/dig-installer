@@ -581,7 +581,46 @@ mod tests {
         assert!(!elsewhere.join("bin").exists());
     }
 
-    /// A newly created level is never even briefly wider than `0755`, whatever the umask.    /// A newly created level is never even briefly wider than `0755`, whatever the umask.
+    /// A permissive DISTRIBUTION-OWNED level is reported and NOT repaired - loud, never silent, and never
+    /// overreach.
+    ///
+    /// This is the state that caught a real incomplete fix in this very release (a world-writable `/opt` on
+    /// the CI image), and the e2e now normalises `/opt` before installing - so without this unit test the
+    /// case would have ZERO coverage anywhere. Both halves are asserted because each alone is satisfiable by
+    /// a wrong implementation: reporting without repairing looks identical to doing nothing unless the mode
+    /// is checked to be untouched, and repairing would silently re-mode a directory the distribution owns.
+    #[test]
+    fn a_permissive_distribution_owned_level_is_reported_and_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `anchor` stands in for `/opt`: not a DIG-owned level, so not ours to re-mode.
+        let anchor = tmp.path().join("opt");
+        std::fs::create_dir(&anchor).unwrap();
+        set_mode(&anchor, 0o777);
+        let dig = anchor.join("dig");
+        let leaf = dig.join("bin");
+
+        ensure_levels(&[dig.clone(), leaf.clone()]).expect("the DIG levels must still be created");
+
+        // Ours: created and pinned.
+        assert_eq!(mode_of(&dig), 0o755);
+        assert_eq!(mode_of(&leaf), 0o755);
+        // Theirs: untouched. Re-moding `/opt` would be overreach, and this module's contract says so.
+        assert_eq!(
+            mode_of(&anchor),
+            0o777,
+            "a distribution-owned level must not be silently re-moded"
+        );
+
+        // And it is REPORTED rather than ignored: the walk names the offending ancestor, so readiness can
+        // fail the install loudly instead of shipping a chain anybody can rename levels inside.
+        let bad = verify_within(tmp.path(), &leaf)
+            .expect("the walk must complete")
+            .expect("a world-writable ancestor must be reported even though it is not ours to fix");
+        assert_eq!(bad.level, anchor);
+        assert!(bad.reason.contains("write"), "got: {}", bad.reason);
+    }
+
+    /// A newly created level is never even briefly wider than `0755`, whatever the umask.
     ///
     /// `mkdir` masks the mode it is GIVEN, so passing `0755` to the syscall can only ever yield something
     /// narrower — whereas creating at the umask and then `fchmod`ing leaves a window an unprivileged

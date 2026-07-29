@@ -486,14 +486,21 @@ mod tests {
     #[test]
     fn the_running_account_is_not_taken_from_a_caller_controlled_variable() {
         let src = include_str!("invoker.rs");
-        let production = src.split("
-mod tests {").next().unwrap_or("");
+        let production = src
+            .split(
+                "
+mod tests {",
+            )
+            .next()
+            .unwrap_or("");
         let resolver = production
             .split("fn self_account_name()")
             .nth(1)
             .expect("self_account_name must exist — it is the authoritative lookup")
-            .split("
-fn ")
+            .split(
+                "
+fn ",
+            )
             .next()
             .unwrap_or("");
         assert!(
