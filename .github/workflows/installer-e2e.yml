@@ -520,7 +520,10 @@ jobs:
             /TR "\"$LEGACY_WIN\" run" /SC DAILY /ST 03:00 /RU SYSTEM /RL HIGHEST /F
           echo "Seeded task now resolves to:"
           MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater' /XML \
-            | tee seeded-task.xml | grep -qi 'Programs.DIG.bin'
+            > seeded-task.xml
+          # NOT `| grep -q`: under `pipefail` a matching `grep -q` exits immediately, SIGPIPEs
+          # schtasks, and the step fails with 141 having actually PASSED. Read the file instead.
+          grep -i 'Programs.DIG.bin' seeded-task.xml > /dev/null
 
       # Install the beacon into the DEFAULT protected root (NO --bin-dir). The
       # hosted Windows runner is already Administrator (see the `e2e` job's note),
@@ -561,7 +564,10 @@ jobs:
       - name: Assert the re-registered task points at the protected root + the legacy binary is gone
         run: |
           MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater' /XML \
-            | tee migrated-task.xml | grep -qi 'Program Files.DIG.bin'
+            > migrated-task.xml
+          # NOT `| grep -q`: under `pipefail` a matching `grep -q` exits immediately, SIGPIPEs
+          # schtasks, and the step fails with 141 having actually PASSED. Read the file instead.
+          grep -i 'Program Files.DIG.bin' migrated-task.xml > /dev/null
           test ! -f "$LEGACY_DIR/dig-updater.exe"
 
       - name: Cleanup — uninstall the beacon
