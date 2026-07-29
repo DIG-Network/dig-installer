@@ -806,33 +806,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A root-owned `0755` directory whose WHOLE CHAIN is root-owned is accepted.
+    ///
+    /// The fixture is `/usr/bin` — a real directory whose every level (`/`, `/usr`, `/usr/bin`) is
+    /// root-owned `0755` on every supported platform. A temp directory cannot express this property any
+    /// more: `/tmp` is mode `1777`, so since #1748 the walk correctly refuses anything beneath it, and
+    /// the old fixture asserted "secure" about a chain that never was.
     #[cfg(unix)]
     #[test]
-    fn unix_verify_accepts_a_0755_owner_writable_root() {
+    fn unix_verify_accepts_a_root_owned_chain() {
+        let v = verify_install_root(Os::Linux, std::path::Path::new("/usr/bin"));
+        assert!(v.checked, "the walk must run: {}", v.note);
+        assert!(
+            v.secure,
+            "every level of /usr/bin is root-owned 0755, so it must verify clean: {}",
+            v.note
+        );
+    }
+
+    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory
+    /// under a WORLD-WRITABLE ancestor is NOT secure, and the verdict names the ANCESTOR.
+    ///
+    /// `/tmp` is mode `1777` on every unix box, which makes it a truthful stand-in for the `0777`
+    /// `/opt/dig` this release fixes: write permission on the parent is permission to rename the leaf
+    /// aside and substitute an attacker-owned directory of the same name.
+    #[cfg(unix)]
+    #[test]
+    fn unix_verify_rejects_a_perfect_leaf_under_a_writable_ancestor() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("dig-secure-ok-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dig-secure-chain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let v = verify_install_root(Os::Linux, &dir);
         assert!(v.checked);
-        // The test process owns the dir (uid == its own). In CI that is uid 0
-        // (root container) → secure; as a normal dev user (uid != 0) the
-        // ownership check correctly reports NOT secure. Assert on whichever
-        // ownership the runner has, so the test is deterministic either way.
-        if md_uid(&dir) == 0 {
-            assert!(v.secure, "root-owned 0755 must be secure: {}", v.note);
-        } else {
-            assert!(!v.secure, "non-root-owned must be flagged: {}", v.note);
-            assert!(v.note.contains("not root"), "got: {}", v.note);
-        }
+        assert!(
+            !v.secure,
+            "a 0755 leaf under a 1777 ancestor must NOT be reported secure: {}",
+            v.note
+        );
+        assert!(
+            v.note.contains("/tmp") || v.note.contains(&dir.display().to_string()),
+            "the verdict must name the offending level: {}",
+            v.note
+        );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    fn md_uid(p: &std::path::Path) -> u32 {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(p).unwrap().uid()
     }
 
     // -- #732: privileged-owner classification + created-level computation ------
