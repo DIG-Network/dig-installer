@@ -3,6 +3,65 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## #1748: a self-check that supplies its own input cannot fail
+
+The post-install PATH check took the install's bin dir, prepended it to the current process's `PATH`,
+and then resolved the CLI by bare name against the result. Every part of that reads like verification
+and none of it is: the question it actually answers is "does this file run if I put its directory on
+PATH?", which is true by construction the moment a download succeeds, in every environment.
+
+So a `sudo` install that had put the entire stack in `/root/.dig/bin` printed
+`✓ 'dig-node --version' resolved on PATH (dig-node 0.65.0)` while `su - ubuntu -c 'dig-node --version'`
+said `command not found`. The check was green against the shipped bug for its whole life.
+
+Two lessons worth keeping:
+
+1. **Running the same check as the right user would NOT have caught it.** The scope error (root's
+   environment) and the injection are independent faults, and the injection alone is sufficient to make
+   the check unfalsifiable. When a check takes the thing it is verifying as a parameter, that parameter
+   is the bug.
+2. **Resolution is not execution.** `dig-app` was reported installed successfully while being unable to
+   load `libxdo.so.3`, because it was only ever downloaded, never run. A component gate that does not
+   execute the binary is reporting the outcome of `curl`, not of an install.
+
+The rule now: the PATH is READ from the target environment and used unmodified, and the resolved
+absolute path is executed. The regression tests assert the negative — a binary present on disk in a
+directory that is not on the searched PATH must NOT resolve — with a truthful control in the same
+fixture (a binary that IS on that PATH resolves), so they cannot pass by always failing.
+
+## #1748: under `sudo`, `$HOME` is `/root` and every per-user decision inverts
+
+`sudo` sets `HOME=/root`, so in an elevated installer *every* `dirs::home_dir()` call answers with
+root's home. This was not one bug with four symptoms so much as one wrong question asked in five
+places: the bin dir (`/root/.dig/bin`), the PATH export (`/root/.bashrc`), the dig-app systemd user
+unit (`/root/.config/systemd/user/`), the `chia://` desktop entry
+(`/root/.local/share/applications/`), and the legacy-root migration. `/root` is mode `0700`, so none of
+it was reachable even if the user had been told the path.
+
+Durable points:
+
+- The invoking account must be resolved from the escalation tool's environment (`SUDO_USER`/`SUDO_UID`,
+  `DOAS_USER`, `PKEXEC_UID`) and its home read from the **passwd database** — never from `$HOME`, which
+  has already been overwritten. Read the hint only when `geteuid()==0`, or a stale `SUDO_USER` from an
+  ancestor shell hijacks an unelevated install.
+- `$XDG_CONFIG_HOME` is the same trap wearing a different hat: `sudo`/`su` set one describing root, so
+  honouring it puts the "per-user" unit straight back into root's scope.
+- Resolving the invoking user is necessary but not sufficient for the CLIs: a person who typed `sudo`
+  asked for a machine-wide install. `/usr/local/bin` is already on every login shell's `PATH`, which
+  leaves no PATH wiring to get wrong, and being root-owned `0755` it is a strictly better answer for the
+  #565 no-LPE invariant than the user-writable per-user root it replaces.
+- `/opt/dig/bin` is on **no** shell's default PATH. `dig-dns` had to live there (#565) and is a CLI the
+  docs tell users to run, so it resolved for nobody — including root — while the check said otherwise.
+  A root-owned symlink into `/usr/local/bin` restores reachability without weakening #565.
+
+## #1748: remediation text must be runnable in a scope where the thing exists
+
+Two printed strings sent readers hunting problems that did not exist. `systemctl --user enable --now
+dig-app.service` fails for root (no session bus during `curl | sudo sh`) and for the user (the unit was
+in root's scope). "re-run elevated" was printed by an install that was *already* elevated — elevation
+was the cause, not the cure. Advice that names no runnable scope is worse than no advice, because it
+looks actionable.
+
 ## #715: the elevated GUI must pin WEBVIEW2_USER_DATA_FOLDER (SYSTEM has no LOCALAPPDATA)
 
 The Tauri GUI renders in WebView2, whose user-data folder defaults to
@@ -506,3 +565,47 @@ Tier 3 automates a real Chrome policy-file write on Linux CI, with the in-browse
 auto-updates" step documented manual per `runbooks/cross-browser-ext-acceptance.md`. Force-install
 via managed policy + a live `update_url` needs a REAL browser reading enterprise policy off the
 network — not reliably CI-drivable headless for most brands, hence the honest auto-vs-manual split.
+
+## `/bin` is a SYMLINK on modern Linux, so an inode-walk permission check refuses `/bin/sh` (#1748)
+
+Every current Debian/Ubuntu (and most other distributions) ships **usrmerge**: `/bin`, `/sbin`, `/lib` are
+symlinks into `/usr`. This matters for any check that verifies a path *level by level through `O_NOFOLLOW`
+descriptors*, which is what `dig-installer`'s install-root verify does to avoid being redirected by a planted
+link: a symlinked level cannot be traversed without following it, so the honest answer is to REFUSE — and
+`/bin/anything` is therefore refused as an exec target when running as root.
+
+The behaviour is correct and must not be relaxed. DIG's own roots (`/opt/dig/bin`, `%ProgramFiles%\DIG\bin`)
+are real directories, so nothing in production is affected. What it breaks is **test fixtures**: stubs that
+point at `/bin/sh` or `/bin/true` pass unprivileged and fail as root, with an error about symlinks that has
+nothing to do with the property under test. Prefer `/usr/bin/...`, and check that the parent is not itself a
+symlink before using it.
+
+Two general lessons, both of which cost real time here:
+
+- **A permission model that reasons about path levels meets platform conventions that reasoning did not
+  anticipate.** `/var` → `private/var`, `/etc` → `private/etc` and `/tmp` → `private/tmp` on macOS are the
+  same shape.
+- **This is only discoverable by RUNNING as root on the target platform.** It surfaced the first time the
+  suite ran as root inside a container and was invisible to five rounds of unprivileged CI. `/tmp` being mode
+  `1777` bit the same way: 23 tests failed as root purely because their fixtures lived under a
+  world-writable ancestor the verify correctly condemned. Fix the fixture location, never the check.
+
+## GitHub Actions runner images have surprising filesystem ownership — never assert on ambient posture (#1748)
+
+Three fixtures in `dig-installer` broke on assumptions about directories the test did not create, each
+costing a CI round:
+
+- **`/tmp` is mode `1777`.** Any fixture built under it sits beneath a world-writable ancestor, which a
+  whole-chain install-root verify correctly condemns. 23 tests failed as root for this reason alone.
+- **`/bin` and `/sbin` are symlinks** on any usrmerge distribution, so a descriptor walk refuses them.
+- **`/usr` is owned by uid 1001 on the `ubuntu-latest` image**, and `/opt` and `/usr/local/bin` ship mode
+  `0777`. A test asserting "`/usr/bin` is root-owned on every supported platform" is simply false there —
+  and the *verify was right*: uid 1001 really can rename `/usr/bin` on that machine.
+
+The rule: **a security test must build the posture it asserts on, or assert a property that holds in either
+direction.** Anything else measures the CI image. When a fixture genuinely needs a clean chain, bake one into
+the image (`/dig-fixtures`, root-owned `0755`, not sticky) and point the tests at it through an env var —
+never at `/tmp`, and never at a system directory whose ownership the image may have changed.
+
+Corollary worth keeping: when a check flags a CI machine, check whether the machine is actually
+misconfigured before weakening the check. In all three cases here the check was correct.

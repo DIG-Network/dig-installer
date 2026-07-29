@@ -241,7 +241,10 @@ fn verify_and_write(
         }
     }
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        // NOT a bare `create_dir_all`: that applies the process umask, and an inherited `umask 000`
+        // produced a world-writable `/opt/dig/bin` — every local account able to replace a binary root
+        // executes (#1748). `ensure_bin_dir` pins the protected root's mode instead.
+        crate::paths::ensure_bin_dir(parent)?;
     }
     replace_binary(dest, bytes)
 }
@@ -277,9 +280,10 @@ fn replace_binary_with(
     bytes: &[u8],
     schedule_on_reboot: impl Fn(&Path, &[u8]) -> Result<(), String>,
 ) -> Result<WriteOutcome, String> {
-    match std::fs::write(dest, bytes) {
+    match write_without_following_a_symlink(dest, bytes) {
         Ok(()) => {
-            set_executable(dest);
+            // Executability is set INSIDE the write, on the descriptor it holds — never by path
+            // afterwards (#1748, F4).
             Ok(WriteOutcome::Replaced)
         }
         Err(e) if is_sharing_violation(&e) => {
@@ -289,6 +293,70 @@ fn replace_binary_with(
         Err(e) => Err(format!("write {}: {e}", dest.display())),
     }
 }
+
+/// Write `bytes` to `dest` without ever following a symlink that is already there.
+///
+/// # Why a plain `std::fs::write` is not safe here (#1748)
+///
+/// `std::fs::write` opens with `O_CREAT|O_TRUNC` and FOLLOWS an existing symlink, so a link planted at
+/// the destination redirects the write to its target. Under an elevated install that is a root
+/// arbitrary-file-create-and-overwrite primitive: `ln -s /etc/ld.so.preload /usr/local/bin/dign` and the
+/// next `sudo` install has root create and populate that file — and the `0755` that follows marks the
+/// TARGET executable. No race is required, because the destination filenames are deterministic and
+/// published. `same_binary` cannot catch it either: it canonicalises both sides, so a link and its
+/// target compare equal.
+///
+/// The destination is therefore UNLINKED first and then created with `O_EXCL`, which cannot follow
+/// anything: after the unlink there is no symlink left to follow, and `O_EXCL` refuses to open a path
+/// that reappeared in between — so a concurrent re-plant loses rather than wins. `O_NOFOLLOW` is set as
+/// well, making the refusal explicit rather than incidental.
+///
+/// # The mode is set on the DESCRIPTOR, not on the path afterwards (#1748)
+///
+/// Creating the file safely and then calling `metadata` + `set_permissions` on `dest` re-resolves the
+/// path twice more, and both calls follow symlinks — a TOCTOU pair that was WON in practice: 9 hijacks
+/// in 6000 iterations turned a root-owned `0600` victim into `mode=755 uid=0`, aimed at `/etc/shadow`.
+/// So `fchmod` is applied to the descriptor this function already holds, which names the inode it just
+/// created and cannot be redirected to another one.
+///
+/// Removing the destination first is what an upgrade does anyway (the old binary is being replaced), and
+/// it does not change the Windows behaviour this function exists to preserve: `remove_file` on a running
+/// Windows executable fails, so the sharing-violation path in [`replace_binary_with`] still sees its
+/// error and still schedules the reboot-time replace.
+fn write_without_following_a_symlink(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // `remove_file` unlinks a symlink itself rather than its target, so this cannot damage whatever a
+    // planted link pointed at. A missing destination is the ordinary first-install case.
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Anything else (a running Windows executable, a permission problem) is surfaced unchanged, so
+        // the caller's sharing-violation handling still applies.
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(dest)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    // Executable, through the descriptor. On Windows executability is by extension, so there is no mode
+    // to set and nothing to race.
+    #[cfg(unix)]
+    {
+        crate::dirfd::fchmod_file(&file, EXECUTABLE_MODE, dest).map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// The mode an installed binary is created with: owner writes, everybody executes.
+#[cfg(unix)]
+const EXECUTABLE_MODE: u32 = 0o755;
 
 /// Does this write error mean the destination is a RUNNING executable that
 /// could not be opened for writing — the one recoverable case (#544)?
@@ -315,24 +383,6 @@ fn is_sharing_violation(e: &std::io::Error) -> bool {
     {
         let _ = e;
         false
-    }
-}
-
-/// Mark `dest` executable (owner/group/other) on unix; a no-op on Windows,
-/// where executability is by extension, not a permission bit.
-fn set_executable(dest: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(dest) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o755);
-            let _ = std::fs::set_permissions(dest, perms);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dest;
     }
 }
 
@@ -409,6 +459,92 @@ fn schedule_replace_on_reboot(dest: &Path, _bytes: &[u8]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #1748: the install write must never follow a planted symlink ------------
+
+    /// THE root arbitrary-file-write primitive: a symlink pre-planted at the destination must NOT be
+    /// followed, so the file it points at is left untouched and the binary lands at the destination
+    /// itself.
+    ///
+    /// The install filenames are deterministic and published, and the destination directory was (before
+    /// this release) user-writable on a Homebrew Mac — so `ln -s /etc/ld.so.preload <bin_dir>/dign` and
+    /// the next `sudo` install had root create and populate that file, then the mode change mark it
+    /// `0755`. No race is required.
+    ///
+    /// Runs UNPRIVILEGED, which is the point: the fix is a property of how the file is opened, not of
+    /// who opens it, so it gates in CI. The fixture points the link at a file with known contents rather
+    /// than at a missing path, so "did not follow" is observable as the victim being INTACT rather than
+    /// merely absent.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_write_does_not_follow_a_symlink_planted_at_the_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("etc-ld-so-preload");
+        std::fs::write(&victim, b"ORIGINAL").unwrap();
+        let dest = tmp.path().join("dign");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        write_without_following_a_symlink(&dest, b"NEW-BINARY").expect("the write must succeed");
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"ORIGINAL",
+            "the write followed a planted symlink — root would have overwritten the target and then \
+             chmod'ed it 0755 (#1748)"
+        );
+        // And the binary really landed at the destination, as a regular file rather than a link — a
+        // "fix" that merely refused to write anything would fail here.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW-BINARY");
+        assert!(
+            !std::fs::symlink_metadata(&dest).unwrap().is_symlink(),
+            "the destination must be a real file afterwards, not the attacker's link"
+        );
+    }
+
+    /// The installed binary is made executable by the SAME call that wrote it, so there is no window in
+    /// which the mode is applied to a path rather than to the descriptor.
+    ///
+    /// A `metadata` + `set_permissions` pair after the write re-resolves `dest` twice, and both follow
+    /// symlinks: the race was won 9 times in 6000 iterations, turning a root-owned `0600` victim into
+    /// `mode=755 uid=0`. This asserts the observable consequence — the write alone leaves the file
+    /// executable — which a fix that merely reordered the two path calls would NOT satisfy, because the
+    /// separate `set_executable` step no longer exists to be called.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_itself_leaves_the_binary_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dig-node");
+        write_without_following_a_symlink(&dest, b"ELF").expect("the write must succeed");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the binary must be executable when the write returns — no separate chmod-by-path step"
+        );
+    }
+
+    /// The ordinary upgrade path must still work: an existing REGULAR file at the destination is
+    /// replaced. Asserted so the symlink fix cannot be satisfied by refusing to overwrite anything.
+    #[test]
+    fn an_install_write_replaces_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dig-node");
+        std::fs::write(&dest, b"OLD").unwrap();
+        write_without_following_a_symlink(&dest, b"NEW").expect("an upgrade must overwrite");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+    }
+
+    /// A first install (nothing at the destination) is the common case and must not be treated as an
+    /// error by the unlink-first step.
+    #[test]
+    fn an_install_write_creates_a_missing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("nested").join("dig-dns");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        write_without_following_a_symlink(&dest, b"FRESH").expect("a first install must succeed");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"FRESH");
+    }
 
     #[test]
     fn extracts_tag_name() {
@@ -559,7 +695,8 @@ mod tests {
 
     #[test]
     fn verify_and_write_writes_bytes_when_no_checksum_given() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-nohash-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-nohash-{}", std::process::id()));
         let dest = dir.join("nested").join("artifact.bin");
         let outcome = verify_and_write(b"hello dig", &dest, None).expect("write ok");
         assert_eq!(outcome, WriteOutcome::Replaced);
@@ -569,7 +706,7 @@ mod tests {
 
     #[test]
     fn verify_and_write_accepts_a_matching_checksum() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-ok-{}", std::process::id()));
+        let dir = crate::sources::fixture_root().join(format!("dig-dl-ok-{}", std::process::id()));
         let dest = dir.join("artifact.bin");
         let data = b"verified payload";
         let sum = sha256_hex(data);
@@ -581,7 +718,7 @@ mod tests {
 
     #[test]
     fn verify_and_write_rejects_a_mismatched_checksum_and_writes_nothing() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-bad-{}", std::process::id()));
+        let dir = crate::sources::fixture_root().join(format!("dig-dl-bad-{}", std::process::id()));
         let dest = dir.join("artifact.bin");
         let err = verify_and_write(b"payload", &dest, Some("deadbeef")).unwrap_err();
         assert!(err.contains("checksum mismatch"), "got: {err}");
@@ -593,7 +730,8 @@ mod tests {
     #[test]
     fn verify_and_write_marks_the_file_executable_on_unix() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("dig-dl-exec-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-exec-{}", std::process::id()));
         let dest = dir.join("tool");
         verify_and_write(b"#!/bin/sh\n", &dest, None).expect("ok");
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
@@ -704,7 +842,8 @@ mod tests {
 
     #[test]
     fn replace_binary_writes_in_place_when_the_destination_is_free() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-free-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-free-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("dig-dns-free.bin");
         let outcome = replace_binary(&dest, b"NEW").expect("an unlocked write applies in place");
@@ -750,7 +889,8 @@ mod tests {
     /// write-time failure (ERROR_LOCK_VIOLATION 33 included).
     #[test]
     fn replace_binary_hard_errors_on_a_non_sharing_violation_write_failure() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-harderr-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-harderr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let scheduled = std::cell::Cell::new(false);
         // `dir` is a directory → std::fs::write fails with a non-32 error.
@@ -781,7 +921,8 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
 
-        let dir = std::env::temp_dir().join(format!("dig-dl-locked-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-locked-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("dig-dns.exe");
         std::fs::write(&dest, b"OLD BINARY").unwrap();

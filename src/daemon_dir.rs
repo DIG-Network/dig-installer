@@ -42,6 +42,12 @@
 //! verification parser are PURE and unit-tested; the create + ACL calls are the
 //! thin I/O layer.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 
 use crate::proc::HideConsole;
@@ -1276,7 +1282,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn reparse_point_on_a_component_is_detected() {
-        let base = std::env::temp_dir().join(format!("dig-webview-reparse-{}", std::process::id()));
+        let base = crate::sources::fixture_root()
+            .join(format!("dig-webview-reparse-{}", std::process::id()));
         let target = base.join("real-target");
         let link = base.join("junction");
         let _ = std::fs::remove_dir_all(&base);
@@ -1314,7 +1321,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ensure_does_not_clobber_the_shared_dignetwork_logs_sibling() {
-        let base = std::env::temp_dir().join(format!("dig-webview-shared-{}", std::process::id()));
+        let base = crate::sources::fixture_root()
+            .join(format!("dig-webview-shared-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let log = base
             .join("DigNetwork")

@@ -19,6 +19,12 @@
 //! where there is no console to flash, it is a no-op, so the same call site
 //! compiles and behaves identically on every platform.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 /// The Win32 [`CREATE_NO_WINDOW`] process-creation flag: run a console child
 /// without allocating a console, so no window flashes and the installer keeps
 /// foreground focus.

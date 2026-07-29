@@ -41,6 +41,12 @@
 //! The installer contributes only the static, non-interpolated argv shape
 //! (`open` + placeholder); the node's `dign open` is the sole parser.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 /// The schemes this installer registers, in registration order. `dig` and
@@ -292,14 +298,22 @@ pub fn is_our_handler_command(command: &str) -> bool {
     dign_open || legacy
 }
 
+/// The per-user XDG desktop-entry that registers DIG as the `chia://` handler.
+///
+/// Resolved against the [invoking user](crate::invoker::target_user), not `$HOME` (#1748): under
+/// `sudo` this used to write `/root/.local/share/applications/…`, so the handler was registered in
+/// root's XDG scope and the user's browser never saw it — the same inversion that put the CLIs in
+/// `/root/.dig/bin`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn desktop_file_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".local")
+    Some(
+        crate::invoker::target_user()
+            .home
+            .join(".local")
             .join("share")
             .join("applications")
-            .join("dig-network-url-handler.desktop")
-    })
+            .join("dig-network-url-handler.desktop"),
+    )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -318,22 +332,19 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
             }
         }
     };
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return SchemeResult {
-                registered: false,
-                schemes: schemes.to_vec(),
-                note: format!("create {}: {e}", parent.display()),
-            };
-        }
-    }
-    if let Err(e) = std::fs::write(&path, body) {
+    // Written BY the user it is for (#1748), never by root: `~/.local/share/applications` is
+    // user-controlled, so a root-authored write there follows any symlink planted at this
+    // deterministic filename. Writing as the user also leaves the entry theirs to manage, and the
+    // desktop-database refresh below runs in their session, not ours.
+    let user = crate::invoker::target_user();
+    if let Err(e) = crate::userwrite::write_as_user(&path, &body, user) {
         return SchemeResult {
             registered: false,
             schemes: schemes.to_vec(),
-            note: format!("write {}: {e}", path.display()),
+            note: e,
         };
     }
+
     let desktop_name = path.file_name().unwrap().to_string_lossy().into_owned();
     // Best-effort: refresh the desktop DB + set as default for each scheme.
     if let Some(dir) = path.parent() {

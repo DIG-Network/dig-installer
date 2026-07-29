@@ -114,7 +114,7 @@ jobs:
           else
             echo "INSTALLER=$(pwd)/target/release/dig-installer" >> "$GITHUB_ENV"
           fi
-          if [ "${{ runner.os }}" = "Linux" ]; then
+          if [ "${{ runner.os }}" != "Windows" ]; then
             # dig-dns's Linux systemd unit runs as a DEDICATED, unprivileged
             # service account (CAP_NET_BIND_SERVICE only, dns/linux.rs) —
             # `${{ runner.temp }}` lives under `/home/runner`, whose default
@@ -123,9 +123,27 @@ jobs:
             # job). `/opt` is world-traversable, matching what a real Linux
             # package (`.deb`) would install into. Root-owned 0755 also satisfies
             # the #565 H3 install-root ACL verify (no group/other write).
+            #
+            # macOS uses the same directory (#1748): `${{ runner.temp }}` lives
+            # under `/Users/runner`, owned by uid 501, and an ELEVATED install
+            # into a directory a non-root account owns is now refused outright —
+            # correctly, since that account could replace a binary root executes.
+            #
+            # `/opt` itself is normalised to 755 FIRST. The GitHub runner image
+            # ships it mode 777, and since #1748 the install-root verify walks
+            # EVERY level: write permission on `/opt` is permission to rename
+            # `/opt/dig-bin` aside and substitute an attacker-owned directory of
+            # the same name, so a root-owned leaf under a world-writable parent is
+            # correctly refused. Repairing the image's own `/opt` is the honest
+            # fix here; the installer deliberately does not re-mode a directory
+            # the distribution owns.
+            sudo chmod 755 /opt
+            # And the veneer: the runner image ships /usr/local/bin world-writable, which the install now
+            # refuses because it is where root's PATH resolves DIG commands from (#1748 WU3).
+            sudo chmod 755 /usr/local/bin && sudo chown 0:0 /usr/local/bin
             sudo mkdir -p /opt/dig-bin && sudo chmod 755 /opt/dig-bin
             echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
-          elif [ "${{ runner.os }}" = "Windows" ]; then
+          else
             # #565 H3: a privileged (service-executed) install into a custom
             # --bin-dir is now ACL-verified fail-loud, exactly like the protected
             # root — a LocalSystem service must not run a binary from a
@@ -142,8 +160,6 @@ jobs:
               /grant:r '*S-1-5-32-544:(OI)(CI)F' \
               /grant:r '*S-1-5-32-545:(OI)(CI)RX'
             echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
-          else
-            echo "BIN_DIR=${{ runner.temp }}/dig-bin" >> "$GITHUB_ENV"
           fi
 
       # The installer registers OS services and writes the hosts file — the
@@ -181,6 +197,22 @@ jobs:
           done
           echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
 
+      # #1748 REGRESSION GATE (part 1 of 2): reproduce the precondition that broke
+      # dig-app autostart. An earlier PRIVILEGED step leaves root-owned levels in the
+      # target user's XDG config chain -- `sudo -E` leaks
+      # XDG_CONFIG_HOME=/home/runner/.config into the root process, and a
+      # `systemctl --user` run as root then creates `.config/systemd/user` as root:root
+      # (observed in run 30402180957). `mkdir -p` is then a silent no-op and only the
+      # redirect fails, so the unit is never written while the install still reports
+      # ready. Created explicitly here so the ordering is driven by THIS job rather than
+      # by whatever a future dig-node happens to do.
+      - name: (Linux) #1748 precondition — an earlier component leaves a root-owned XDG level
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /home/runner/.config/systemd/user
+          sudo chown root:root /home/runner/.config/systemd /home/runner/.config/systemd/user
+          ls -ldn /home/runner/.config /home/runner/.config/systemd /home/runner/.config/systemd/user
+
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.
@@ -215,6 +247,30 @@ jobs:
           sudo systemctl status dignetwork-dig-dns --no-pager -l || true
           sudo journalctl -u dignetwork-dig-dns --no-pager -n 60 || true
           sudo ss -ltnp 2>/dev/null | grep -i ':80\|:8053' || true
+
+      # #1748 REGRESSION GATE (part 2 of 2): dig-app MUST be registered to start at
+      # login. Nothing asserted this before, which is exactly why the regression was
+      # invisible -- autostart is best-effort, so `ready` stayed true while dig-app
+      # would never start. A tray agent that installs and never launches is the failure
+      # this contract exists to prevent, one layer over.
+      - name: Assert dig-app autostart registered (#1748)
+        run: |
+          jq -e '.result.autostart.registered == true' install.json
+          jq -c '.result.autostart' install.json
+
+      # And on Linux the artifact must really exist AND belong to the invoking user --
+      # a unit root owns is one `systemd --user` declines to load, so ownership is part
+      # of the property, not a nicety.
+      - name: (Linux) Assert the systemd user unit exists and is owned by the invoking user (#1748)
+        if: runner.os == 'Linux'
+        run: |
+          unit=/home/runner/.config/systemd/user/dig-app.service
+          ls -ldn "$unit" /home/runner/.config/systemd/user
+          test -f "$unit"
+          owner=$(stat -c %u "$unit")
+          test "$owner" = "$(id -u runner)"             || { echo "unit is owned by uid $owner, not by runner"; exit 1; }
+          dir_owner=$(stat -c %u /home/runner/.config/systemd/user)
+          test "$dir_owner" = "$(id -u runner)"             || { echo "unit DIR is owned by uid $dir_owner, not by runner"; exit 1; }
 
       - name: Assert the #493 fail-loud readiness verdict — both components ready
         run: |
@@ -284,18 +340,21 @@ jobs:
       - name: Windows — verify the SCM display names via `sc qc` (#494)
         if: runner.os == 'Windows'
         run: |
+          # `grep` over a HERE-STRING rather than a pipe: a matching `grep -q` exits early and SIGPIPEs its
+          # producer, which under `pipefail` fails the step after the assertion has already passed.
           NODE_QC="$(sc.exe qc net.dignetwork.dig-node)"
           echo "$NODE_QC"
-          echo "$NODE_QC" | grep -q "DIG NETWORK: NODE"
+          grep -q "DIG NETWORK: NODE" <<< "$NODE_QC"
           DNS_QC="$(sc.exe qc net.dignetwork.dig-dns)"
           echo "$DNS_QC"
-          echo "$DNS_QC" | grep -q "DIG NETWORK: DNS"
+          grep -q "DIG NETWORK: DNS" <<< "$DNS_QC"
 
       - name: Windows — both services RUNNING per `sc query` (belt-and-braces)
         if: runner.os == 'Windows'
         run: |
-          sc.exe query net.dignetwork.dig-node | grep -q "RUNNING"
-          sc.exe query net.dignetwork.dig-dns | grep -q "RUNNING"
+          # Captured first, then matched: see the `sc qc` step above for why a pipe into `grep -q` is unsafe.
+          grep -q "RUNNING" <<< "$(sc.exe query net.dignetwork.dig-node)"
+          grep -q "RUNNING" <<< "$(sc.exe query net.dignetwork.dig-dns)"
 
       - name: Linux — both units active per `systemctl` (belt-and-braces)
         if: runner.os == 'Linux'
@@ -315,8 +374,10 @@ jobs:
       - name: macOS — both jobs running per `launchctl` (belt-and-braces)
         if: runner.os == 'macOS'
         run: |
-          sudo launchctl print system/net.dignetwork.dig-node | grep -q "state = running"
-          sudo launchctl print system/net.dignetwork.dig-dns | grep -q "state = running"
+          # `launchctl print` emits multi-KB output and the match is near the top, so a piped `grep -q`
+          # SIGPIPEs it almost every time — the most likely of these to fail after passing.
+          grep -q "state = running" <<< "$(sudo launchctl print system/net.dignetwork.dig-node)"
+          grep -q "state = running" <<< "$(sudo launchctl print system/net.dignetwork.dig-dns)"
 
       - name: Uninstall dig-node via the installer flag + assert deregistered
         run: |
@@ -467,7 +528,10 @@ jobs:
             /TR "\"$LEGACY_WIN\" run" /SC DAILY /ST 03:00 /RU SYSTEM /RL HIGHEST /F
           echo "Seeded task now resolves to:"
           MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater' /XML \
-            | tee seeded-task.xml | grep -qi 'Programs.DIG.bin'
+            > seeded-task.xml
+          # NOT `| grep -q`: under `pipefail` a matching `grep -q` exits immediately, SIGPIPEs
+          # schtasks, and the step fails with 141 having actually PASSED. Read the file instead.
+          grep -i 'Programs.DIG.bin' seeded-task.xml > /dev/null
 
       # Install the beacon into the DEFAULT protected root (NO --bin-dir). The
       # hosted Windows runner is already Administrator (see the `e2e` job's note),
@@ -508,7 +572,10 @@ jobs:
       - name: Assert the re-registered task points at the protected root + the legacy binary is gone
         run: |
           MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN '\DIG\dig-updater' /XML \
-            | tee migrated-task.xml | grep -qi 'Program Files.DIG.bin'
+            > migrated-task.xml
+          # NOT `| grep -q`: under `pipefail` a matching `grep -q` exits immediately, SIGPIPEs
+          # schtasks, and the step fails with 141 having actually PASSED. Read the file instead.
+          grep -i 'Program Files.DIG.bin' migrated-task.xml > /dev/null
           test ! -f "$LEGACY_DIR/dig-updater.exe"
 
       - name: Cleanup — uninstall the beacon
@@ -528,3 +595,271 @@ jobs:
             seeded-task.xml
             migrated-task.xml
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # #1748: does the person who typed `sudo` actually end up with working CLIs?
+  #
+  # The `e2e` job above could not answer that, and passed against an install that
+  # left everything in /root/.dig/bin. FOUR independent factors each hid it:
+  #
+  #   1. it passes `--bin-dir "$BIN_DIR"`, which bypasses `default_bin_dir()`
+  #      entirely — the function that resolved `$HOME` was never called;
+  #   2. it elevates with `sudo -E`, which PRESERVES the runner's `HOME`, so the
+  #      `HOME=/root` inversion a real `curl | sudo sh` produces cannot occur;
+  #   3. it manufactures a systemd user session for root (`loginctl enable-linger
+  #      root` + `XDG_RUNTIME_DIR=/run/user/0`) that a real sudo install does not
+  #      have; and
+  #   4. every assertion runs AS ROOT, so a root-only PATH is never questioned.
+  #
+  # This job removes all four: the DEFAULT bin dir, `sudo -H` (which sets
+  # HOME=/root exactly as sudo does for `curl | sudo sh`), no fabricated session,
+  # and the acceptance assertions run as a NON-ROOT user in a FRESH LOGIN SHELL.
+  #
+  # Only the cheap CLI components are installed (`--no-dig-node --no-dig-dns
+  # --no-auto-update`): the question here is reachability of user-facing binaries,
+  # which needs no service registration, so the job stays fast.
+  sudo-install-is-reachable-by-the-user:
+    name: "#1748 a sudo install is reachable by the invoking user (non-root)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-1748-reach-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-1748-reach-
+
+      - name: Build the installer
+        run: cargo build --release --bin dig-installer
+
+      # `sudo -H` sets HOME=/root, which is what sudo does for the documented
+      # `curl -fsSL https://dig.net/install.sh | sudo sh`. No `--bin-dir`, so the
+      # real `default_bin_dir()` decision is exercised.
+      # The runner image ships `/opt` mode 777, and since #1748 the install-root
+      # verify walks EVERY level of the chain: write permission on `/opt` is
+      # permission to rename `/opt/dig` aside and substitute an attacker-owned
+      # directory of the same name, so a root-owned `/opt/dig/bin` beneath a
+      # world-writable `/opt` is correctly refused. The installer does not re-mode
+      # a directory the distribution owns, so the image's own `/opt` is repaired
+      # here. Asserted, not assumed: if a future image ships it correctly this
+      # still passes, and the check below proves the level really is safe.
+      - name: Normalise the runner image's world-writable /opt and /usr/local/bin
+        run: |
+          stat -c '%n %U %a' /opt /usr/local/bin
+          # BOTH are shipped permissive by the runner image, and both are directories the installer
+          # deliberately does not re-mode because the distribution owns them. /usr/local/bin matters as much
+          # as /opt now: it is where root's own login PATH resolves DIG commands from, so an account that can
+          # write it replaces a planted link and root runs whatever it points at. The image's own posture is
+          # repaired here, and asserted rather than assumed.
+          sudo chmod 755 /opt /usr/local/bin
+          sudo chown 0:0 /usr/local/bin
+          for level in /opt /usr/local/bin; do
+            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))"               || { echo "FAIL: $level is still group- or world-writable"; exit 1; }
+          done
+
+      - name: Install as root with HOME=/root and the DEFAULT bin dir
+        run: |
+          sudo -H ./target/release/dig-installer \
+            --no-dig-node --no-dig-dns --no-auto-update --no-dig-app \
+            --json | tee install.json
+          echo "--- where did the binaries go? ---"
+          ls -l /usr/local/bin/ | grep -Ei 'dig' || true
+          echo "--- did anything land in root's home? ---"
+          sudo ls -l /root/.dig/bin 2>/dev/null || echo "(nothing in /root/.dig/bin — correct)"
+
+      # THE acceptance assertion, and the one the shipped bug would have failed:
+      # a NON-ROOT user, in a FRESH LOGIN SHELL, must resolve and run the CLIs.
+      # `su - $(id -un 1001)` is a login shell, so it reads /etc/profile and
+      # /etc/profile.d/* exactly as the user's next terminal will.
+      - name: A non-root user resolves + runs the CLIs in a fresh login shell
+        run: |
+          USER_NAME=$(id -un 1001)
+          echo "asserting as: $USER_NAME"
+          sudo su - "$USER_NAME" -c 'printf "login PATH: %s\n" "$PATH"'
+          for cli in dig-store digs; do
+            echo "--- $cli ---"
+            sudo su - "$USER_NAME" -c "command -v $cli" \
+              || { echo "FAIL: $cli is not on $USER_NAME's PATH"; exit 1; }
+            sudo su - "$USER_NAME" -c "$cli --version" \
+              || { echo "FAIL: $cli does not RUN for $USER_NAME"; exit 1; }
+          done
+
+      # THE PLACEMENT invariant, and the reason `/usr/local/bin` is a veneer:
+      # root must never write to, or execute from, a directory a non-root account
+      # can modify (Homebrew leaves `/usr/local/bin` group-writable). So every
+      # binary an elevated install places lives in the root-owned protected root,
+      # and `/usr/local/bin` holds only SYMLINKS. Asserted BOTH ways: a regression
+      # that installs into the veneer again keeps `command -v` green above, so the
+      # reachability assertion alone cannot see it.
+      - name: Every binary lives in the protected root; the veneer holds only links
+        run: |
+          jq -e '(.result.components | length) > 0' install.json
+          jq -e 'all(.result.components[]; .dest | startswith("/opt/dig/bin/"))' install.json \
+            || { echo "FAIL: an elevated install placed a binary outside the protected root"; exit 1; }
+          for cli in dig-store digs; do
+            test -L "/usr/local/bin/$cli" \
+              || { echo "FAIL: /usr/local/bin/$cli must be a symlink, not an installed binary"; exit 1; }
+            printf '%s -> %s\n' "$cli" "$(readlink -f "/usr/local/bin/$cli")"
+            case "$(readlink -f "/usr/local/bin/$cli")" in
+              /opt/dig/bin/*) ;;
+              *) echo "FAIL: $cli link does not resolve into the protected root"; exit 1 ;;
+            esac
+          done
+          # EVERY LEVEL of the chain, not just the leaf. Write permission on /opt/dig is
+          # permission to rename /opt/dig/bin aside and substitute an attacker-owned
+          # directory of the same name, so a 0777 parent is a complete escalation on its
+          # own -- and checking only the leaf is what shipped.
+          for level in /opt /opt/dig /opt/dig/bin; do
+            stat -c '%n %U %a' "$level"
+            test "$(stat -c '%U' "$level")" = root \
+              || { echo "FAIL: $level is not root-owned"; exit 1; }
+            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+              || { echo "FAIL: $level is group- or world-writable"; exit 1; }
+          done
+
+          # And the REPAIR path: a pre-existing permissive level must be FIXED by an
+          # install, not merely left alone. A box that installed 0.30.0 under umask 000
+          # already has one, and 0.31.0 routes every binary and every service ExecStart
+          # through it. umask 000 is set for the re-run, so a fix that only pins newly
+          # created directories fails here too.
+          sudo chmod 0777 /opt/dig
+          test "$(stat -c '%a' /opt/dig)" = 777
+          sudo -H sh -c 'umask 000; ./target/release/dig-installer \
+            --no-dig-node --no-dig-dns --no-auto-update --no-dig-app --json' > repaired.json
+          stat -c '%n %U %a' /opt/dig
+          test -z "$(find /opt/dig -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+            || { echo "FAIL: a permissive /opt/dig was NOT repaired by the install"; exit 1; }
+          jq -e '.result.ready == true' repaired.json
+
+      # The DEFAULT selection — every component, dig-app included — must obey the
+      # same placement rule. Run as a dry-run so the full default set is covered
+      # without installing services or importing dig-app's own start-up defect
+      # (#1753) into this gate: placement is decided before anything is fetched.
+      - name: The DEFAULT component selection places everything in the protected root
+        run: |
+          sudo -H ./target/release/dig-installer --dry-run --json > planned.json
+          jq -r '.result.components[] | "\(.component) -> \(.dest)"' planned.json
+          # An EXACT count plus explicit membership: "> 2" stayed green if a plan
+          # regression silently dropped dig-app (or anything else) from the default set.
+          jq -e '(.result.components | length) == 9' planned.json \
+            || { echo "FAIL: the default component set changed -- update this count deliberately"; \
+                 jq -r '.result.components | length' planned.json; exit 1; }
+          for want in dig-store digs dig-node dign dig-app dig-dns digd dig-updater dig-updater-worker; do
+            jq -e --arg c "$want" 'any(.result.components[]; .component == $c)' planned.json \
+              || { echo "FAIL: $want is missing from the DEFAULT plan"; exit 1; }
+          done
+          jq -e 'all(.result.components[]; .dest | startswith("/opt/dig/bin/"))' planned.json \
+            || { echo "FAIL: the default plan places a binary outside the protected root"; exit 1; }
+
+      # The installer's own verdict must AGREE with what we just observed
+      # independently. Before #1748 it claimed every CLI resolved while the loop
+      # above would have failed, so agreement is the property under test.
+      - name: The installer's own report agrees with the observation
+        run: |
+          jq -e '.ok == true' install.json
+          jq -e '.result.ready == true' install.json
+          jq -e '.result.failures == []' install.json
+          jq -e '(.result.cli_path_checks | length) > 0' install.json
+          jq -e 'all(.result.cli_path_checks[]; .resolved == true)' install.json
+          # No user-facing binary may live under root's home.
+          jq -e 'all(.result.components[]; (.dest | startswith("/root")) | not)' install.json
+          # And the PATH result must name the dir that actually has to be searchable — the veneer, not
+          # the install dir, which is deliberately never on any PATH. This field is machine-consumed.
+          jq -e '.result.path.dir == "/usr/local/bin"' install.json \
+            || { echo "FAIL: report.path.dir names a directory that is not on the user's PATH"; exit 1; }
+
+      # The other half of the bound: the check must be capable of going RED.
+      # Point an install at a root-only directory (mode 0700, unreachable by any
+      # unprivileged user) and require the readiness verdict to FAIL. A check that
+      # stays green here is worthless — and staying green here is exactly what
+      # shipped.
+      - name: The PATH check goes RED against a root-only layout
+        run: |
+          sudo mkdir -p /root/dig-only && sudo chmod 700 /root/dig-only
+          set +e
+          sudo -H ./target/release/dig-installer \
+            --no-dig-node --no-dig-dns --no-auto-update --no-dig-app \
+            --bin-dir /root/dig-only \
+            --json > broken.json
+          RC=$?
+          set -e
+          echo "installer exit code: $RC"
+          cat broken.json | jq '.result.cli_path_checks' || cat broken.json
+          # It must NOT report ready, and the failure must name the PATH problem.
+          jq -e '.result.ready == false' broken.json
+          jq -e 'any(.result.cli_path_checks[]; .resolved == false)' broken.json
+          jq -e '(.result.failures | length) > 0' broken.json
+          test "$RC" -ne 0 || { echo "FAIL: a broken install must exit non-zero"; exit 1; }
+          # And it must not have advised re-running elevated (it already was). Read a FILE, never a pipe:
+          # under `pipefail` a matching `grep -qi` exits early, SIGPIPEs `jq`, the pipeline returns 141, the
+          # `if` is false — and the check is SKIPPED rather than failed. This PR introduced that; the same
+          # shape is fixed at the schtasks sites above.
+          jq -r '.result.failures[]' broken.json > broken-failures.txt
+          if grep -i 're-run elevated' broken-failures.txt > /dev/null; then
+            echo "FAIL: must not advise elevating an already-elevated install"; exit 1
+          fi
+
+  # #1748 WU3: the ROOT gate. `cargo test` on a normal runner cannot be it.
+  #
+  # 23 lib tests failed when the suite ran as root, and the one executable proof of the root-exec guard
+  # could not pass in the only environment where it runs — both because their fixtures sat under `/tmp`,
+  # which is mode 1777 and which the whole-chain install-root verify correctly condemns. The verify was
+  # right; the fixture LOCATION was wrong. This job runs the suite AS ROOT in a container that bakes a
+  # purpose-made non-sticky 0755 fixture root, so the proofs run and the verify keeps every tooth.
+  #
+  # It then does what six rounds of mode-bit assertions could not: an unprivileged account plants a binary
+  # where root would run it, root performs an ordinary install, and the job FAILS if root ever executed the
+  # planted code. Every attempt carries a falsifying control — the same attempt with the posture repaired
+  # must SUCCEED — so a build that simply refused everything could not pass.
+  root-gate:
+    name: "#1748 root gate: suite as root + an executed escalation attempt"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the gate image
+        run: docker build -f .github/docker/root-gate.Dockerfile -t dig-root-gate .
+
+      # AS ROOT, with fixtures on the clean baked-in root. Any failure here is a real one: the environment
+      # no longer contributes any.
+      - name: The whole lib suite, as root, with fixtures off /tmp
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            dig-root-gate \
+            bash -c 'set -o pipefail; cargo test --lib 2>&1 | tail -20'
+
+      # The escalation. Network is needed: it installs the real published binaries, because attacking a
+      # mock would prove something about the mock.
+      - name: An unprivileged account attempts to escalate through a real install
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            dig-root-gate \
+            bash -c 'cargo build --release --locked --bin dig-installer \
+              && cd /tmp \
+              && INSTALLER=/tmp/target/release/dig-installer \
+                 bash /work/.github/scripts/root-gate-escalation.sh'

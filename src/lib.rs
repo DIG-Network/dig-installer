@@ -52,15 +52,18 @@ pub mod autostart;
 pub mod beacon;
 pub mod browsers;
 pub mod daemon_dir;
+pub mod dirfd;
 pub mod dns;
 pub mod download;
 pub mod elevation;
 pub mod error;
 pub mod firewall;
 pub mod forcelist;
+pub mod guardedcmd;
 pub mod hardening;
 pub mod health;
 pub mod hosts;
+pub mod invoker;
 pub mod manifest;
 pub mod migrate;
 pub mod pathcheck;
@@ -68,13 +71,16 @@ pub mod paths;
 pub mod proc;
 pub mod regaudit;
 pub mod release;
+pub mod rootchain;
 pub mod scheme;
 pub mod secure;
 pub mod service;
+pub mod sources;
 pub mod svc;
 pub mod target;
 pub mod uninstall;
 pub mod update;
+pub mod userwrite;
 
 use std::path::PathBuf;
 
@@ -497,6 +503,50 @@ pub struct InstallReport {
     /// when no privileged component was placed (nothing to verify). A definitive
     /// `checked && !secure` makes the install NOT ready ([`evaluate_readiness`]).
     pub install_root_security: Option<secure::InstallRootSecurity>,
+    /// The permission posture of the directory this run's binaries were placed in, when that differs
+    /// from [`Self::install_root_security`]'s privileged root — the `--bin-dir` override, or the
+    /// per-user root of an unelevated install (#1748).
+    ///
+    /// REPORTED, never fatal. It is not the no-LPE invariant: a user-writable directory holding
+    /// binaries only that same user runs is their own authority. But it is exactly the posture that
+    /// made `/usr/local/bin` the wrong install root, so an install must not be silent about it — before
+    /// this, the directory root wrote to and executed from was neither checked nor mentioned on any
+    /// elevated unix install.
+    pub bin_dir_security: Option<secure::InstallRootSecurity>,
+    /// The permission posture of the `/usr/local/bin` PATH VENEER, when this run planted links there.
+    ///
+    /// FATAL under elevation, for the same reason as [`Self::bin_dir_security`] and found the same way —
+    /// by an executed escalation rather than by review. The veneer is the directory root's own login `PATH`
+    /// resolves DIG commands from, so an account that can write there replaces a link this installer
+    /// planted and root runs whatever it points at on the next `sudo dign …`. Refusing the PATH-WIRING step
+    /// was not enough: that step is non-fatal by design (a binary is placed; only wiring failed), so an
+    /// install onto an attacker-owned veneer still reported `ok: true`.
+    ///
+    /// `None` when no links were planted — an unelevated or `--bin-dir` install, or Windows.
+    pub veneer_security: Option<secure::InstallRootSecurity>,
+    /// HOW this run made its CLIs reachable by bare name — symlinks in the `/usr/local/bin` veneer, or the
+    /// install directory placed on `PATH` directly ([`paths::Reachability`]).
+    ///
+    /// Reported because it is a real fork with a security meaning, not an implementation detail: the second
+    /// value on an ELEVATED unix install means the veneer was measured UNSAFE and this run deliberately
+    /// declined to plant a link there. Read it together with [`Self::veneer_security`], which carries the
+    /// verdict that caused the fork. `None` on a dry run.
+    pub reachability: Option<paths::Reachability>,
+    /// Any DIG symlink this run REMOVED from an unsafe veneer.
+    ///
+    /// A link an earlier, safe-at-the-time run planted is a live escalation vector once that directory
+    /// becomes writable — an unprivileged process replaces it and root runs whatever it points at. So the
+    /// fallback removes them, and says which, rather than leaving them for somebody to find.
+    pub veneer_links_removed: Vec<String>,
+    /// Any directory that PRECEDES the wired install dir on root's login `PATH` and is not established safe.
+    ///
+    /// Reported because position decides which binary a bare name reaches, and the existing shadow check can
+    /// only see a file that is already there (#1748 F2). A `PATH` where a writable directory merely comes
+    /// first is a loaded gun: the attacker creates the name whenever she likes and root runs it, having
+    /// touched nothing this installer placed. Prepending is the fix; this is the backstop for the cases
+    /// prepending cannot win — a user's own `.bashrc`, or `/etc/paths` ordering on macOS, where
+    /// `path_helper` reads `/etc/paths` before `/etc/paths.d/*`.
+    pub preceding_unsafe_path_dirs: Vec<String>,
     /// The record of migrating an existing install off the legacy user-writable
     /// root onto the protected root (#565): services deregistered/re-pointed,
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
@@ -653,7 +703,19 @@ fn apply_update_decision(
     force_reinstall: bool,
     log: &mut dyn FnMut(&str),
 ) -> update::UpdateDecision {
-    let detected = update::detect_installed_version(std::path::Path::new(&c.dest));
+    let dest = std::path::Path::new(&c.dest);
+    // The probe RUNS the installed binary, as root, before anything has been downloaded or written. If
+    // it sits where an unprivileged account could have replaced it, that is arbitrary root code
+    // execution, so the probe is SKIPPED rather than the install failed: an unknown version is
+    // unparseable, which `decide` already treats as "reinstall" — the safe answer, and a strictly better
+    // outcome than trusting a version string an attacker chose (#1748 F1).
+    let detected = match secure::root_exec_guard(dest) {
+        Ok(()) => update::detect_installed_version(dest),
+        Err(why) => {
+            log(&format!("    ! not probing the installed version — {why}"));
+            update::detect_installed_version_with(dest, |_| None)
+        }
+    };
     let decision = update::decide_with_force(&detected, &c.version, force_reinstall);
     log(&format!("    {}", decision.summary));
     c.update_action = decision.action;
@@ -784,6 +846,11 @@ fn run_report_gated(
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
         install_root_security: None,
+        bin_dir_security: None,
+        veneer_security: None,
+        reachability: None,
+        veneer_links_removed: Vec::new(),
+        preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
         registration_audit: Vec::new(),
         install_manifest: None,
@@ -886,12 +953,57 @@ fn run_report_gated(
             report.components.push(digs);
         }
 
+        // The veneer's posture is measured ONCE, here, before anything is wired or linked, and the same
+        // answer drives both steps (#1748). Measuring twice would let them disagree, and a run that links
+        // into one directory while wiring another leaves the CLIs unreachable — which is this whole issue.
+        //
+        // The verdict is recorded either way. It is FATAL only when the veneer is actually the mechanism in
+        // play (`evaluate_readiness`): when we fall back it is a recorded DOWNGRADE, not a failure, because
+        // the install is then reachable through a chain root owns end to end.
+        let veneer_verdict = if cfg!(unix) && !plan.dry_run {
+            Some(secure::verify_install_root(
+                target.os,
+                std::path::Path::new(paths::UNIX_MACHINE_BIN_DIR),
+            ))
+        } else {
+            None
+        };
+        let veneer_is_safe = veneer_verdict
+            .as_ref()
+            // Absent measurement (Windows, or a dry run) must not silently mean "unsafe" and re-route the
+            // whole install: on Windows there is no veneer, and a dry run wires nothing.
+            .map(|v| v.is_established_safe())
+            .unwrap_or(true);
+        let reachability = paths::reachability_for(target.os, &plan.bin_dir, veneer_is_safe);
+        if let Some(v) = &veneer_verdict {
+            if !v.is_established_safe() {
+                log(&format!(
+                    "    ! {} is not safe to resolve DIG commands from: {}",
+                    paths::UNIX_MACHINE_BIN_DIR,
+                    v.note
+                ));
+                log("    · falling back: the protected root goes on PATH directly, and no link is planted");
+            }
+        }
+        report.veneer_security = veneer_verdict;
+        report.reachability = Some(reachability);
+
         // 2. PATH (only meaningful if we placed a PATH binary).
         if plan.modify_path
             && (plan.with_digstore || plan.with_dig_node || plan.with_dig_app || plan.with_dig_dns)
         {
-            log(&format!("Adding {} to PATH:", plan.bin_dir.display()));
-            let dir = plan.bin_dir.to_string_lossy().into_owned();
+            // The dir REPORTED is the one that actually has to be searchable, which since the veneer
+            // is not the dir binaries are placed in (#1748): an elevated install wires (or finds
+            // already present) `/usr/local/bin` and links into it, never `/opt/dig/bin`. Reporting the
+            // install dir here said "Adding /opt/dig/bin to PATH" for a run that did no such thing, and
+            // put a directory that is deliberately never on PATH into `report.path.dir`, which is a
+            // machine-consumed field.
+            let wired = paths::reachable_dir(target.os, &plan.bin_dir, veneer_is_safe);
+            // "Checking", not "Adding": on the default elevated install the veneer is already on PATH and
+            // this step writes nothing, so announcing an addition described a run that did not happen
+            // (#1748, C3).
+            log(&format!("Ensuring {} is on PATH:", wired.display()));
+            let dir = wired.to_string_lossy().into_owned();
             if plan.dry_run {
                 log("    (would add to PATH)");
                 report.path = Some(PathResult {
@@ -900,13 +1012,15 @@ fn run_report_gated(
                     note: "would add to PATH".to_string(),
                 });
             } else {
-                match paths::add_to_path(&plan.bin_dir) {
-                    Ok(note) => {
-                        log(&format!("    ✓ {note}"));
+                match paths::add_to_path(&plan.bin_dir, veneer_is_safe) {
+                    Ok(wiring) => {
+                        log(&format!("    ✓ {}", wiring.note));
                         report.path = Some(PathResult {
-                            modified: true,
+                            // OBSERVED, never assumed: the wiring itself reports whether it changed
+                            // anything, like every other field in this struct.
+                            modified: wiring.changed,
                             dir,
-                            note,
+                            note: wiring.note,
                         });
                     }
                     Err(e) => {
@@ -1082,7 +1196,10 @@ fn run_report_gated(
                         let a = autostart::register(&dig_app_path, target.os, plan.dry_run);
                         log(&format!(
                             "    {} {}",
-                            if a.registered { "✓" } else { "·" },
+                            // `!`, never `·`: an install that silently produces no autostart is a
+                            // dig-app that never starts at login, which is the false-tick class this
+                            // verification exists to remove. The note carries the actionable reason.
+                            if a.registered { "✓" } else { "!" },
                             a.note
                         ));
                         if a.registered {
@@ -1375,7 +1492,13 @@ fn run_report_gated(
         // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
         // immediately. Non-dry-run only (dry-run installs nothing to resolve).
         if !plan.dry_run {
-            verify_clis_on_path(&target, report, log);
+            link_protected_clis(&target, report, veneer_is_safe, log);
+            verify_clis_on_path(&target, invoker::target_user(), report, log);
+            #[cfg(unix)]
+            {
+                let wired = paths::reachable_dir(target.os, &plan.bin_dir, veneer_is_safe);
+                report_preceding_unsafe_path_dirs(&wired, report, log);
+            }
         }
 
         // #565: VERIFY the dir every privileged/service-executed binary landed in
@@ -1393,11 +1516,7 @@ fn run_report_gated(
                 let verdict = secure::verify_install_root(target.os, &root);
                 log(&format!(
                     "    {} {}",
-                    if verdict.checked && !verdict.secure {
-                        "!"
-                    } else {
-                        "✓"
-                    },
+                    if verdict.is_blocking() { "!" } else { "✓" },
                     verdict.note
                 ));
                 report.install_root_security = Some(verdict);
@@ -1449,6 +1568,11 @@ fn run_report_gated(
                     ));
                 }
             }
+
+            // #1748 (F9): AFTER the privileged verify above, because the dedupe inside asks whether that
+            // verify actually produced a verdict. Called before it the guard could never fire, and the
+            // same directory was reported twice on the default install.
+            report_bin_dir_posture(plan, &target, report, log);
         }
 
         // Professional hardening (#573): register the Add/Remove Programs entry (its
@@ -1595,7 +1719,7 @@ fn apply_windows_hardening(
     // plants no such pointer, still proceeds below).
     let protected = paths::protected_bin_dir();
     let verdict = secure::verify_install_root(target.os, &protected);
-    if verdict.checked && !verdict.secure {
+    if verdict.is_blocking() {
         log(&format!(
             "    ! skipping the Add/Remove Programs entry — the protected install root is not \
              owner-secure ({})",
@@ -1670,43 +1794,343 @@ fn register_scheme_handler(
     r
 }
 
-/// The user-facing DIG CLIs that MUST be runnable by bare name after install
-/// (#496): the dig-store CLI + the two node/dns CLIs a user drives directly
-/// (e.g. `dig-node pair approve <id>`). dig-relay is a background service (no
-/// user CLI surface required); the DIG Browser is a GUI installer.
-const REQUIRED_CLIS: &[&str] = &["dig-store", "dig-node", "dig-dns"];
+/// The user-facing DIG binaries that MUST be runnable by bare name after install.
+///
+/// The original set (#496) was the dig-store CLI plus the two node/dns CLIs a user drives directly
+/// (e.g. `dig-node pair approve <id>`). #1748 adds the ALIAS binaries and `dig-app`, because a
+/// component that was downloaded but never EXECUTED was earning a `✓` for existing on disk: a
+/// `dig-app` that cannot load its shared libraries was reported as installed successfully. Anything
+/// this installer places and a user is expected to run belongs here.
+///
+/// dig-relay is a background service (no user CLI surface required); the DIG Browser is a GUI
+/// installer, not a CLI; the privileged `dig-updater`/`dig-updater-worker` binaries are invoked by
+/// the beacon, never by the user, and live outside PATH by design (#565).
+const REQUIRED_CLIS: &[&str] = &[
+    "dig-store",
+    "digs",
+    "dig-node",
+    "dign",
+    "dig-dns",
+    "digd",
+    "dig-app",
+];
 
-/// Verify each installed required CLI resolves by bare name on the post-install
-/// PATH (#496) and record the result into `report.cli_path_checks`. Only checks
-/// CLIs actually placed this run (present in `report.components`). Logs each
-/// check; a failure is folded into the readiness verdict by
-/// [`evaluate_readiness`].
-fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dyn FnMut(&str)) {
-    let installed_clis: Vec<String> = report
+/// The subset of [`REQUIRED_CLIS`] that is a GUI application rather than a command-line tool.
+///
+/// `dig-app` is the per-user tray agent, so it has no `--version` subcommand to answer. This is NOT a
+/// blanket exemption from executability, and must not become one: see [`answers_version`].
+const GUI_APPS: &[&str] = &["dig-app"];
+
+/// Does `component` answer `--version`, so its install can be proven by RUNNING it?
+///
+/// Every real CLI does. A GUI app does not, on any platform: `dig-app --version` never returns,
+/// because the binary enters its event loop instead of printing and exiting. The probe is then answered
+/// by the [`pathcheck::VERSION_PROBE_TIMEOUT`] kill rather than by the app, which costs a guaranteed
+/// 20-second stall and then FAILS the whole install (`✗ DIG is NOT ready`, exit 12) for a tray agent
+/// that is behaving normally.
+///
+/// # This exemption is a known GAP, not a clean bill of health
+///
+/// Narrowing it to macOS was tried and REVERTED, on evidence. The claim was that Linux and Windows
+/// `dig-app` does exit, so the probe would be meaningful there and would catch the real defect — on
+/// stock Ubuntu `dig-app` dies with `libxdo.so.3: cannot open shared object file`. On a headless
+/// ubuntu-latest runner it does NOT exit: the e2e install failed with
+/// `dig-app --version did not finish within 20s and was killed` (run 30400688672). So the probe cannot
+/// distinguish "cannot load" from "started fine" for this binary, and demanding it turns every headless
+/// Linux install red.
+///
+/// What remains for `dig-app` is therefore RESOLUTION only ([`pathcheck::verify_cli_resolves`]) — the
+/// #1748 property that the invoking user's login shell finds the copy this run placed — and the note it
+/// emits says so explicitly rather than printing a bare `✓`. Nothing else makes up the difference:
+/// [`autostart::register`] WRITES a unit file and never enables or starts it
+/// ([`autostart::enable_command`] only prints advice a human must run), so a written unit is fully
+/// consistent with a binary that cannot load.
+///
+/// Closing the gap needs a probe that does not require the process to EXIT — spawn it, observe briefly,
+/// and treat "still running" as loaded while treating a loader failure (exit 126/127, or
+/// `error while loading shared libraries` on stderr) as a hard failure. That is tracked separately
+/// because it must be verified against a real headless box before it can gate an install.
+fn answers_version(component: &str) -> bool {
+    !GUI_APPS.contains(&component)
+}
+
+/// Link every installed user-facing CLI that lives in the protected root into the machine bin dir, so
+/// it is reachable by bare name (#1748).
+///
+/// `dig-dns` must live in `/opt/dig/bin` because a machine-wide service executes it (#565), and that
+/// directory is on no shell's default `PATH` — so `dig-dns doctor`, a command the docs tell users to
+/// run, resolved for nobody. Both ends of the link are root-owned `0755`, so reachability is gained
+/// without making a service-executed binary replaceable by an unprivileged user.
+///
+/// Best-effort: a link failure is logged and folded into readiness by the PATH verification that
+/// follows (which will find the CLI unreachable), rather than aborting an otherwise-complete install.
+// Windows plants no veneer links at all (it wires HKCU\Environment\Path to the install root), so the
+// whole body is `#[cfg(unix)]` and every parameter but `report` is unused there. Kept in the signature
+// so the call site does not need its own `cfg`.
+#[cfg_attr(windows, allow(unused_variables))]
+fn link_protected_clis(
+    target: &Target,
+    report: &mut InstallReport,
+    veneer_is_safe: bool,
+    log: &mut dyn FnMut(&str),
+) {
+    #[cfg(unix)]
+    {
+        let to_link: Vec<(String, String)> = report
+            .components
+            .iter()
+            .filter(|c| {
+                // Keyed on where the binary actually landed, so a per-user or `--bin-dir` install
+                // plants no links (#1748).
+                let dir = std::path::Path::new(&c.dest)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""));
+                paths::needs_machine_bin_link(target.os, &c.component, dir, veneer_is_safe)
+            })
+            .map(|c| (c.component.clone(), c.dest.clone()))
+            .collect();
+        // REMOVAL FIRST, and outside the `to_link` guard (#1748 F1).
+        //
+        // This block used to sit BELOW an `if to_link.is_empty() { return; }` early return, which made it
+        // unreachable: `to_link` is built from `needs_machine_bin_link`, which is `reachability_for(..) ==
+        // VeneerLinks`, so it is empty by construction exactly when `!veneer_is_safe` — the only condition
+        // the removal runs under. A contradiction, and deleting the whole block left 685 tests passing,
+        // because the only test that covered it called the helper directly and never traversed this seam.
+        //
+        // Shipped, that meant: a safe install plants the link, Homebrew arrives, `/usr/local/bin` becomes
+        // `<user>:admin 0775`, root re-runs the installer and it reports ready with the stale link still
+        // there for an unprivileged account to re-point.
+        if !veneer_is_safe {
+            // A link an earlier, safe-at-the-time run planted is a live vector once the directory is
+            // writable, and only this installer can take it away. `/usr/local/bin` really does change
+            // posture under us, and this is where that gets noticed.
+            let names: Vec<String> = report
+                .components
+                .iter()
+                .map(|c| target.exe_name(&c.component))
+                .collect();
+            let removed = paths::remove_veneer_links(&names, target.os);
+            if removed.is_empty() {
+                log(&format!(
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the                      protected root is on PATH directly instead",
+                    paths::UNIX_MACHINE_BIN_DIR
+                ));
+            } else {
+                for link in &removed {
+                    log(&format!(
+                        "    ✓ removed {link} — a link in a directory a non-root account can write is one                          they can re-point, and root runs whatever it points at"
+                    ));
+                }
+            }
+            report.veneer_links_removed = removed;
+        }
+
+        if to_link.is_empty() {
+            return;
+        }
+        log(&format!(
+            "Linking the protected-root CLIs into {}:",
+            paths::UNIX_MACHINE_BIN_DIR
+        ));
+        for (component, dest) in to_link {
+            let exe = target.exe_name(&component);
+            match paths::link_into_machine_bin(std::path::Path::new(&dest), &exe) {
+                Ok(link) => log(&format!("    ✓ {} → {dest}", link.display())),
+                Err(e) => log(&format!("    ! could not link {component}: {e}")),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows installs the whole stack into one root, so there is nothing to link.
+        let _ = (target, report, log);
+    }
+}
+
+/// Record every directory that precedes the wired install directory on the target user's login `PATH` and
+/// is NOT established safe (#1748 F2).
+///
+/// Prepending the protected root is the primary fix, but it cannot always win: a user's own `.bashrc` runs
+/// after `/etc/profile.d`, and on macOS `path_helper` composes `/etc/paths` — which ships `/usr/local/bin` —
+/// before `/etc/paths.d/*`. So position is VERIFIED rather than assumed, and a losing `PATH` fails readiness
+/// instead of reporting a green install whose commands an attacker can claim at any time.
+///
+/// Only meaningful under elevation, and only for directories a non-root account can actually write: the
+/// ordinary `/usr/bin`/`/bin` entries precede us on every box and are root-owned, which is fine.
+#[cfg(unix)]
+fn report_preceding_unsafe_path_dirs(
+    wired: &std::path::Path,
+    report: &mut InstallReport,
+    log: &mut dyn FnMut(&str),
+) {
+    if !invoker::is_root() {
+        return;
+    }
+    // ROOT's login PATH, not the target user's. The threat this check exists for is "root executes a binary
+    // an unprivileged account planted", so root's own resolution order is the one that matters.
+    //
+    // Measuring the TARGET USER's PATH instead flags their own directories — `~/.local/bin`, `~/.cargo/bin`
+    // — which precede ours on any developer machine and are not an escalation at all: they are that user
+    // running their own binaries with their own authority. Doing so failed a clean CI install with six
+    // false positives, which is how the wrong principal was caught.
+    let root_account = invoker::TargetUser {
+        name: "root".to_string(),
+        home: std::path::PathBuf::from("/root"),
+        uid: Some(0),
+        gid: Some(0),
+        via_elevation: false,
+    };
+    let Ok(path) = pathcheck::login_shell_path(&root_account) else {
+        // The PATH itself could not be read; `verify_clis_on_path` already reports that failure, and
+        // guessing here would only duplicate it.
+        return;
+    };
+    let wired_str = wired.to_string_lossy().to_string();
+    let unsafe_before: Vec<String> = pathcheck::entries_before(&path, &wired_str, ':')
+        .into_iter()
+        .filter(|dir| {
+            // The entry is RESOLVED before it is judged, and that is correct for this question in a way it
+            // would not be for a write target.
+            //
+            // Asking "may root write or exec here?" must never follow a symlink — a planted link redirects
+            // the operation. But asking "can a non-root account put a binary that root will RESOLVE here?"
+            // is a question about the directory the name actually lands in. On any usrmerge distribution
+            // `/bin` and `/sbin` are symlinks into `/usr`, so judging them unresolved reports the
+            // distribution's own layout as unsafe — it failed a clean CI install on exactly that.
+            //
+            // Resolving is also strictly stronger against the attack: if an attacker makes a PATH entry a
+            // link to a directory she owns, the resolved target is hers and is still flagged.
+            let Ok(resolved) = std::path::Path::new(dir).canonicalize() else {
+                // An unresolvable entry cannot hold a binary root will run, so it cannot win a name.
+                return false;
+            };
+            // `non_root_can_write`, NOT the install-root verdict: this asks whether somebody unprivileged
+            // can put a binary here, which is weaker than "is this fit to install into". Using the stronger
+            // rule flagged three directories nobody unprivileged can write — `/bin` and `/sbin` on usrmerge
+            // Linux, and Apple's sealed `/System/Cryptexes/App/usr/bin` — and failed clean installs on both
+            // platforms. Prepending is the primary defence for ordering; this is the backstop.
+            rootchain::non_root_can_write(&resolved).unwrap_or(false)
+        })
+        .collect();
+    if unsafe_before.is_empty() {
+        return;
+    }
+    log(&format!(
+        "    ! these directories come BEFORE {wired_str} on ROOT's PATH and are not safe: {}",
+        unsafe_before.join(", ")
+    ));
+    log("    · a non-root account can create a DIG command name there and win the resolution");
+    report.preceding_unsafe_path_dirs = unsafe_before;
+}
+
+/// Report the permission posture of the directory this run's binaries were PLACED in, when that is not
+/// already covered by the privileged-root verify (#1748).
+///
+/// The #565 check is applied to [`InstallPlan::privileged_install_root`], which is the protected root —
+/// so on every elevated unix install before this, the directory root actually wrote to and executed from
+/// was neither checked nor mentioned. That is precisely how `/usr/local/bin`, user-writable under
+/// Homebrew, became the install root without anything noticing.
+///
+/// Always REPORTED; fatal only under ELEVATION ([`evaluate_readiness`]). Root wrote those binaries and
+/// root-side execs and services resolve them, so a writable directory is an escalation there — whereas
+/// unelevated it is the user's own authority, and refusing would turn away every ordinary per-user install
+/// and every Homebrew Mac. What must never happen either way is SILENCE: the posture is logged and lands
+/// in `install.json` as [`InstallReport::bin_dir_security`], so a reviewer or a script can see it.
+fn report_bin_dir_posture(
+    plan: &InstallPlan,
+    target: &Target,
+    report: &mut InstallReport,
+    log: &mut dyn FnMut(&str),
+) {
+    let bin_dir = &plan.bin_dir;
+    // Skip only when the privileged verify ACTUALLY RAN on this exact directory — one verdict per dir,
+    // no duplicated log line on the common default install.
+    //
+    // `report.install_root_security` rather than `privileged_install_root()`, because those two came
+    // apart (#1748). The #565 verify is gated on the plan selecting a PRIVILEGED component, while since
+    // the veneer every ELEVATED install places its binaries in the protected root. So a CLI-only sudo
+    // install wrote into `/opt/dig/bin`, linked `/usr/local/bin` at it, and nothing checked the
+    // directory's mode at all — which is how a world-writable protected root reached a green install.
+    if report.install_root_security.is_some()
+        && plan.privileged_install_root(target.os).as_ref() == Some(bin_dir)
+    {
+        return;
+    }
+    let verdict = secure::verify_install_root(target.os, bin_dir);
+    log(&format!(
+        "Install directory posture ({}):",
+        bin_dir.display()
+    ));
+    log(&format!(
+        "    {} {}",
+        if verdict.is_blocking() {
+            // `!` because it is worth a human's attention, but readiness is unaffected: see the doc above.
+            "!"
+        } else {
+            "✓"
+        },
+        verdict.note
+    ));
+    report.bin_dir_security = Some(verdict);
+}
+
+/// Verify each installed user-facing binary resolves by bare name **on the target user's own PATH**
+/// and actually RUNS (#496, corrected by #1748), recording the result into `report.cli_path_checks`.
+///
+/// Only binaries actually placed this run (present in `report.components`) are checked. A failure is
+/// folded into the readiness verdict by [`evaluate_readiness`].
+///
+/// # Why this no longer takes the install's bin dir
+///
+/// It used to: it read each component's install directory, prepended that directory to our own
+/// `PATH`, and checked the CLI resolved against the result — which is always true once the download
+/// succeeded, in every environment. The check therefore passed against a `sudo` install that had put
+/// the whole stack in `/root/.dig/bin`, where no user could reach it. The PATH is now READ from the
+/// target user's login shell and never modified, so the only way to pass is for the install to
+/// genuinely be reachable by the person who ran it. See [`pathcheck`].
+fn verify_clis_on_path(
+    target: &Target,
+    user: &invoker::TargetUser,
+    report: &mut InstallReport,
+    log: &mut dyn FnMut(&str),
+) {
+    // Each CLI is carried with the destination THIS run wrote it to, so the check can confirm the
+    // bare name resolves to that copy rather than to a stale one left on PATH by an earlier install.
+    let installed_clis: Vec<(String, String)> = report
         .components
         .iter()
-        .map(|c| c.component.clone())
-        .filter(|id| REQUIRED_CLIS.contains(&id.as_str()))
+        .filter(|c| REQUIRED_CLIS.contains(&c.component.as_str()))
+        .map(|c| (c.component.clone(), c.dest.clone()))
         .collect();
     if installed_clis.is_empty() {
         return;
     }
-    log("Verifying the DIG CLIs resolve on PATH:");
-    for cli in installed_clis {
+    log(&format!(
+        "Verifying the DIG CLIs resolve + run in {}'s login shell:",
+        user.name
+    ));
+    for (cli, dest) in installed_clis {
         let exe = target.exe_name(&cli);
-        let bin_dir = report
-            .components
-            .iter()
-            .find(|c| c.component == cli)
-            .and_then(|c| {
-                std::path::Path::new(&c.dest)
-                    .parent()
-                    .map(|p| p.to_path_buf())
+        let dest_path = std::path::Path::new(&dest);
+        let outcome = if answers_version(&cli) {
+            pathcheck::verify_cli(user, &exe, dest_path).map(|version| {
+                format!(
+                    "`{cli} --version` resolved + ran as {} ({version})",
+                    user.name
+                )
             })
-            .unwrap_or_else(paths::default_bin_dir);
-        let check = match pathcheck::cli_resolves(&bin_dir, &exe) {
-            Ok(version) => {
-                let note = format!("`{cli} --version` resolved on PATH ({version})");
+        } else {
+            pathcheck::verify_cli_resolves(user, &exe, dest_path).map(|resolved| {
+                format!(
+                    "`{cli}` resolves to {} on {}'s PATH — NOT verified to run (a GUI app with \
+                     no `--version`; on macOS the probe never returns)",
+                    resolved.display(),
+                    user.name
+                )
+            })
+        };
+        let check = match outcome {
+            Ok(note) => {
                 log(&format!("    ✓ {note}"));
                 pathcheck::CliPathCheck {
                     cli: cli.clone(),
@@ -1715,9 +2139,7 @@ fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dy
                 }
             }
             Err(e) => {
-                log(&format!(
-                    "    ! {cli} is NOT resolvable on PATH: {e} — open a NEW terminal, or re-run elevated so the PATH change takes effect."
-                ));
+                log(&format!("    ! {cli} is NOT usable by {}: {e}", user.name));
                 pathcheck::CliPathCheck {
                     cli: cli.clone(),
                     resolved: false,
@@ -1740,6 +2162,21 @@ fn verify_clis_on_path(target: &Target, report: &mut InstallReport, log: &mut dy
 /// ([`ServiceResult::health_ok`], set from [`svc::is_service_running`]); dig-dns
 /// on a live resolution path; dig-relay on a successful registration.
 fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String> {
+    evaluate_readiness_when(plan, report, invoker::is_root())
+}
+
+/// [`evaluate_readiness`] with the elevated-ness supplied instead of read from the ambient uid.
+///
+/// The last gate in the crate to get this seam, and it needed it for the same reason as the others: the
+/// `is_root()` branch below is only reachable when the test process really is root, so on an unprivileged
+/// runner replacing it with `false` changed nothing observable and the suite stayed green — including the
+/// test named `an_elevated_install_into_a_writable_directory_is_fatal`, whose own doc claimed both arms
+/// were covered (#1748 C3).
+fn evaluate_readiness_when(
+    plan: &InstallPlan,
+    report: &InstallReport,
+    elevated: bool,
+) -> Vec<String> {
     let mut failures = Vec::new();
     if plan.dry_run {
         return failures;
@@ -1749,11 +2186,11 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         match &report.service {
             None => failures.push("dig-node: the node service was not installed".to_string()),
             Some(s) if !s.installed => failures.push(format!(
-                "dig-node: the OS service did not register ({}); re-run elevated",
+                "dig-node: the OS service did not register ({})",
                 s.note
             )),
             Some(s) if plan.service.start && !s.health_ok => failures.push(format!(
-                "dig-node: the '{}' service is not running ({}); re-run elevated",
+                "dig-node: the '{}' service is not running ({})",
                 svc::DIG_NODE_SERVICE_ID,
                 s.health_note
             )),
@@ -1765,15 +2202,16 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         match &report.dns {
             None => failures.push("dig-dns: the resolver service was not installed".to_string()),
             Some(d) if !d.installed => failures.push(format!(
-                "dig-dns: the OS service did not register ({}); re-run elevated",
+                "dig-dns: the OS service did not register ({})",
                 d.note
             )),
             // F7: gate on the fail-loud service-manager RUNNING poll (mirror the
             // dig-node `health_ok` gate) — a live `paths_live` probe alone is NOT
             // sufficient (another process could satisfy it; #493 false-success).
             Some(d) if plan.dns_service.start && !d.service_running => failures.push(format!(
-                "dig-dns: installed but the '{}' service did not reach RUNNING ({}); re-run elevated",
-                svc::DIG_DNS_SERVICE_ID, d.note
+                "dig-dns: installed but the '{}' service did not reach RUNNING ({})",
+                svc::DIG_DNS_SERVICE_ID,
+                d.note
             )),
             Some(d) if plan.dns_service.start && d.paths_live.is_empty() => failures.push(format!(
                 "dig-dns: installed but no live resolution path — the service is not serving ({})",
@@ -1787,7 +2225,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         match &report.relay {
             None => failures.push("dig-relay: the relay service was not installed".to_string()),
             Some(r) if !r.installed => failures.push(format!(
-                "dig-relay: the OS service did not register ({}); re-run elevated",
+                "dig-relay: the OS service did not register ({})",
                 r.note
             )),
             Some(_) => {}
@@ -1800,11 +2238,11 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     // firewall rule/scheme handler.
     if plan.auto_update {
         match &report.beacon {
-            None => failures.push(
-                "dig-updater: the auto-update beacon was not installed".to_string(),
-            ),
+            None => {
+                failures.push("dig-updater: the auto-update beacon was not installed".to_string())
+            }
             Some(b) if !b.applied => failures.push(format!(
-                "dig-updater: the daily update-check scheduler did not register ({}); re-run elevated",
+                "dig-updater: the daily update-check scheduler did not register ({})",
                 b.note
             )),
             Some(_) => {}
@@ -1826,7 +2264,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
         };
         if selected && !dir.acl_applied {
             failures.push(format!(
-                "{}: the machine-wide state directory could not be hardened + verified ({}); re-run elevated",
+                "{}: the machine-wide state directory could not be hardened + verified ({})",
                 dir.daemon, dir.note
             ));
         }
@@ -1841,12 +2279,65 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     // inconclusive read (`checked == false`) is only a warning (logged above),
     // never a false failure: the admin-only LOCATION remains the primary guarantee.
     if let Some(sec) = &report.install_root_security {
-        if sec.checked && !sec.secure {
+        if sec.is_blocking() {
             failures.push(format!(
                 "install root {}: {} — a non-admin could replace a privileged service binary; \
-                 re-run elevated / repair the directory permissions",
+                 repair the directory permissions",
                 sec.root, sec.note
             ));
+        }
+    }
+
+    // #1748: the same rule for the directory this run's binaries were PLACED in, when the check above
+    // did not cover it — but FATAL only under elevation.
+    //
+    // Elevation is what makes a writable directory an escalation rather than a preference: root wrote
+    // the binaries, `/usr/local/bin` links point into them, and services and root-side execs resolve
+    // them. A CLI-only `sudo` install selects no privileged component, so the gate above never fired,
+    // and a world-writable protected root shipped as a fully green install.
+    //
+    // Unelevated it stays a REPORT: a directory holding binaries only that same user runs is their own
+    // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
+    // #1748 F2: a directory that PRECEDES our install dir on root's PATH and is not established safe means
+    // an attacker can create a DIG command name there and win the resolution — without touching anything
+    // this installer placed. The existing shadow check only sees a file that is already there, so position
+    // is its own failure.
+    if elevated && !report.preceding_unsafe_path_dirs.is_empty() {
+        failures.push(format!(
+            "PATH order: {} precede{} the DIG install directory on root's PATH and are not root-owned              without group/other write — a non-root account can create `dign`/`digs` there and root will              run it; repair those directories or remove them from root's PATH",
+            report.preceding_unsafe_path_dirs.join(", "),
+            if report.preceding_unsafe_path_dirs.len() == 1 { "s" } else { "" }
+        ));
+    }
+
+    // #1748: the veneer is fatal ONLY when it is the mechanism in play.
+    //
+    // When links are planted there, an account that can write the directory re-points one and root runs
+    // whatever it points at — a live escalation, so the install must not report ready. When the run FELL
+    // BACK (`Reachability::DirectPathEntry`), the same unsafe verdict is a recorded downgrade rather than a
+    // failure: no link was planted, any earlier one was removed, and reachability comes from a chain root
+    // owns end to end. Failing then would be a refusal — and a refusal is not a fix.
+    if elevated && report.reachability == Some(paths::Reachability::VeneerLinks) {
+        if let Some(sec) = &report.veneer_security {
+            if sec.is_blocking() {
+                failures.push(format!(
+                    "PATH directory {}: {} — this is where root's own shell resolves DIG commands, so an                      account that can write there replaces a link this installer planted and root runs it;                      repair the directory permissions",
+                    sec.root, sec.note
+                ));
+            }
+        }
+    }
+
+    if elevated {
+        if let Some(sec) = &report.bin_dir_security {
+            if sec.is_blocking() {
+                failures.push(format!(
+                    "install directory {}: {} — an elevated install wrote binaries there, so a \
+                     non-root account could replace one root or a service later executes; repair the \
+                     directory permissions",
+                    sec.root, sec.note
+                ));
+            }
         }
     }
 
@@ -1857,7 +2348,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     if let Some(m) = &report.migration {
         for f in &m.deregister_failures {
             failures.push(format!(
-                "migration: {f}; re-run elevated so the privileged registration is re-pointed \
+                "migration: {f}; the privileged registration must be re-pointed \
                  into the protected root"
             ));
         }
@@ -1870,15 +2361,18 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     // registration and a tolerated re-install that never re-pointed it.
     failures.extend(regaudit::audit_failures(&report.registration_audit));
 
-    // PATH resolution (#496): any required CLI that does not resolve by bare
-    // name from a fresh shell makes the install NOT ready — the user could not
-    // run `dig-node …` / `dig-dns …` otherwise.
+    // PATH resolution (#496): any required CLI the TARGET USER cannot resolve by bare name in a
+    // fresh login shell, or that resolves but does not run, makes the install NOT ready — the user
+    // could not run `dig-node …` / `dig-dns …` otherwise.
+    //
+    // The remediation is the check's own note and nothing more (#1748). It used to append "open a new
+    // terminal or re-run elevated", which was advice the reader could not act on: the check now runs
+    // in a *fresh* login shell, so opening another terminal changes nothing, and the failing install
+    // that prompted this was already elevated — being told to elevate it again sent people looking for
+    // a privilege problem that was never there.
     for check in &report.cli_path_checks {
         if !check.resolved {
-            failures.push(format!(
-                "{}: the CLI is not runnable from a fresh shell ({}); open a new terminal or re-run elevated",
-                check.cli, check.note
-            ));
+            failures.push(format!("{}: {}", check.cli, check.note));
         }
     }
 
@@ -1908,7 +2402,7 @@ fn log_readiness_verdict(report: &InstallReport, log: &mut dyn FnMut(&str)) {
         for f in &report.failures {
             log(&format!("    - {f}"));
         }
-        log("Fix the above (re-run as Administrator/root if elevation is the cause) and run the installer again.");
+        log("Fix the above and run the installer again.");
     }
 }
 
@@ -2077,7 +2571,7 @@ fn register_dig_dns(
             result.note.push_str("; service reached RUNNING");
         } else {
             log(&format!(
-                "    ! service health: {} — the resolver may not be serving; re-run elevated if it did not start.",
+                "    ! service health: {} — the resolver may not be serving.",
                 state.describe(svc::DIG_DNS_SERVICE_ID)
             ));
             result.note.push_str(&format!(
@@ -2368,9 +2862,7 @@ fn register_dig_node(
         if running {
             log(&format!("    ✓ health check: {note}"));
         } else {
-            log(&format!(
-                "    ! health check FAILED: {note} — re-run elevated so the service registers and starts."
-            ));
+            log(&format!("    ! health check FAILED: {note}"));
         }
         result.health_checked = true;
         result.health_ok = running;
@@ -2769,6 +3261,25 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
             }
         }
+        // The VENEER links go too (#1748 F4). They live in neither bin root, so the residue scan below never
+        // looked at them and an uninstall reported `residue: []` while `/usr/local/bin/digs` still pointed at
+        // a binary that no longer exists. That is a false machine-consumed claim on its own — `--uninstall`
+        // promises zero residue — and it hands the stale-link escalation its starting state: the next time
+        // `/usr/local/bin` becomes writable, there is a DIG-named link sitting there for the taking.
+        //
+        // Unconditional, and it does not care about the veneer's posture: on uninstall we are removing our
+        // own links either way. `remove_links_in`'s discrimination still applies, so a foreign entry of the
+        // same name is left alone.
+        #[cfg(unix)]
+        {
+            let names: Vec<String> = uninstall::COMPONENT_STEMS
+                .iter()
+                .filter(|stem| !skip.iter().any(|s| s == *stem))
+                .map(|stem| target.exe_name(stem))
+                .collect();
+            removed += paths::remove_veneer_links(&names, target.os).len();
+        }
+
         // Remove the Add/Remove Programs entry alongside the binaries (Windows).
         #[cfg(windows)]
         let note_extra = match hardening::remove_arp_entry() {
@@ -2808,6 +3319,36 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         }
     }
 
+    fn remove_login_path_fragment(&mut self) -> (bool, String) {
+        let fragments = paths::login_path_fragment_files();
+        if fragments.is_empty() {
+            return (true, "no system-wide PATH fragment on this platform".into());
+        }
+        if self.dry_run {
+            return (true, format!("would remove {}", fragments.join(", ")));
+        }
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        for f in fragments {
+            match std::fs::remove_file(f) {
+                Ok(()) => removed.push(f),
+                // Absent is the desired end-state, so an unelevated or repeat run is not a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => failed.push(format!("{f}: {e}")),
+            }
+        }
+        if failed.is_empty() {
+            let note = if removed.is_empty() {
+                "no system-wide PATH fragment to remove".to_string()
+            } else {
+                format!("removed {}", removed.join(", "))
+            };
+            (true, note)
+        } else {
+            (false, format!("PATH fragment: {}", failed.join(", ")))
+        }
+    }
+
     fn scan_residue(&mut self) -> Vec<String> {
         if self.dry_run {
             return Vec::new();
@@ -2817,23 +3358,60 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             Err(_) => return Vec::new(),
         };
         let current = std::env::current_exe().ok();
-        let roots = [self.bin_dir.clone(), paths::protected_bin_dir()];
-        let mut residue = Vec::new();
-        for stem in uninstall::COMPONENT_STEMS {
-            for root in &roots {
-                let path = root.join(target.exe_name(stem));
-                // The running installer image is exempt (self-delete is impossible
-                // while running; OS cleanup handles it).
-                if current.as_deref() == Some(path.as_path()) {
-                    continue;
-                }
-                if path.exists() {
-                    residue.push(path.display().to_string());
-                }
+        residue_in(&residue_roots(&self.bin_dir), &target, current.as_deref())
+    }
+}
+
+/// Every directory a completed uninstall must leave free of DIG-named entries.
+///
+/// # Why the veneer is a root of its own (#1748 F4)
+///
+/// `/usr/local/bin` holds symlinks, not binaries, so it is neither of the two bin roots and the residue scan
+/// never looked at it. An uninstall therefore reported `residue: []` with `/usr/local/bin/digs` still present
+/// and dangling — a false machine-consumed claim against a `--uninstall` that promises zero residue, and the
+/// exact starting state the stale-link escalation needs: the next time that directory becomes writable there
+/// is a DIG-named entry sitting in it for the taking.
+///
+/// Split out from [`Installer::scan_residue`] because the decision is the ROOT LIST, and dropping the veneer
+/// from it left the whole suite green — the scan was only ever exercised against directories the test owned.
+// The veneer is the only conditional root, and it is unix-only — so on Windows the list is complete at
+// construction and never mutated.
+#[cfg_attr(windows, allow(unused_mut))]
+fn residue_roots(bin_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![bin_dir.to_path_buf(), paths::protected_bin_dir()];
+    #[cfg(unix)]
+    roots.push(std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR));
+    roots
+}
+
+/// The DIG-named entries still present under `roots`, i.e. what an uninstall failed to take.
+///
+/// `current` is the running installer's own image, which is exempt: a process cannot delete itself on
+/// Windows, so OS cleanup handles it rather than the uninstall reporting a residue it cannot act on.
+///
+/// # `symlink_metadata`, never `exists` (#1748 F4)
+///
+/// A DANGLING symlink is the single most likely residue here — the binary it pointed at has just been
+/// deleted — and `exists()` FOLLOWS the link, finds nothing, and reports the directory clean. So the one
+/// entry this scan exists to catch is the one an existence check cannot see.
+fn residue_in(
+    roots: &[std::path::PathBuf],
+    target: &Target,
+    current: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut residue = Vec::new();
+    for stem in uninstall::COMPONENT_STEMS {
+        for root in roots {
+            let path = root.join(target.exe_name(stem));
+            if current == Some(path.as_path()) {
+                continue;
+            }
+            if std::fs::symlink_metadata(&path).is_ok() {
+                residue.push(path.display().to_string());
             }
         }
-        residue
     }
+    residue
 }
 
 /// Run the first-class whole-stack `uninstall` (#568): stop + deregister ALL
@@ -3236,7 +3814,7 @@ mod tests {
     /// given test needs.
     fn base_plan() -> InstallPlan {
         InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-test-bin"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-test-bin"),
             with_digstore: false,
             digstore_version: None,
             with_dig_node: false,
@@ -3280,7 +3858,8 @@ mod tests {
     /// and report a clean LIFO reversal — the concrete guarantee SPEC §3.11 makes.
     #[test]
     fn rollback_after_midinstall_failure_removes_written_binaries_573_544() {
-        let dir = std::env::temp_dir().join(format!("dig-rollback-573-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-rollback-573-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let first = dir.join("digstore.bin");
         let second = dir.join("dig-node.bin");
@@ -3328,7 +3907,7 @@ mod tests {
         // An already-absent binary reverses cleanly (idempotent undo).
         let mut guard = RollbackGuard::new();
         guard.record(InstallAction::FileCreated(
-            std::env::temp_dir()
+            crate::sources::fixture_root()
                 .join("dig-573-absent.bin")
                 .to_string_lossy()
                 .into_owned(),
@@ -3373,7 +3952,7 @@ mod tests {
     #[test]
     fn default_plan_resolves_all_three_core_components() {
         let plan = InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-test-default"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-test-default"),
             modify_path: false,
             dry_run: true,
             ..InstallPlan::default()
@@ -4337,7 +4916,7 @@ mod tests {
 
     #[test]
     fn uninstall_dig_node_dry_run_reports_intent_without_touching_the_system() {
-        let bin_dir = std::env::temp_dir().join("dig-installer-test-uninstall-bin");
+        let bin_dir = crate::sources::fixture_root().join("dig-installer-test-uninstall-bin");
         let mut lines: Vec<String> = Vec::new();
         let result = uninstall_dig_node(&bin_dir, true, &mut |l| lines.push(l.to_string()));
         assert!(!result.uninstalled);
@@ -4359,7 +4938,7 @@ mod tests {
         // No `--with-dig-node` was ever run against this bin_dir, so the
         // binary is missing — the failure must be recorded, not panic/abort,
         // and the note must be non-empty (never silent, task #140).
-        let bin_dir = std::env::temp_dir().join(format!(
+        let bin_dir = crate::sources::fixture_root().join(format!(
             "dig-installer-test-no-node-bin-{}",
             std::process::id()
         ));
@@ -4480,7 +5059,7 @@ mod tests {
     /// its own dedicated readiness tests below.
     fn dig_node_service_plan() -> InstallPlan {
         InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-readiness-test"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-readiness-test"),
             with_digstore: false,
             with_dig_node: true,
             with_dig_dns: false,
@@ -4492,6 +5071,9 @@ mod tests {
     }
 
     /// A report shell (non-dry-run) the readiness tests populate per case.
+    /// The Windows protected root, as a literal, so the backslashes live in exactly one place.
+    const PROGRAM_FILES_BIN: &str = r"C:\Program Files\DIGin";
+
     fn report_shell() -> InstallReport {
         InstallReport {
             schema_version: SCHEMA_VERSION,
@@ -4511,6 +5093,11 @@ mod tests {
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
             install_root_security: None,
+            bin_dir_security: None,
+            veneer_security: None,
+            reachability: None,
+            veneer_links_removed: Vec::new(),
+            preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
             registration_audit: Vec::new(),
             install_manifest: None,
@@ -4654,10 +5241,22 @@ mod tests {
                 cli_only.requires_elevation(host),
                 "a Windows CLI-only install writes into admin-only Program Files"
             ),
-            target::Os::Linux | target::Os::MacOs => assert!(
-                !cli_only.requires_elevation(host),
-                "a unix CLI-only install stays in ~/.dig/bin (no elevation)"
-            ),
+            // On unix the CLI-only install needs elevation exactly when it is ALREADY elevated, because
+            // that is when `default_bin_dir()` is the root-owned protected root (#1748). Asserted against
+            // the real uid rather than assumed, so this holds in the container root gate too.
+            target::Os::Linux | target::Os::MacOs => {
+                if invoker::is_root() {
+                    assert!(
+                        cli_only.requires_elevation(host),
+                        "an elevated unix install places even the CLI in the protected root"
+                    );
+                } else {
+                    assert!(
+                        !cli_only.requires_elevation(host),
+                        "an unelevated unix CLI-only install stays in ~/.dig/bin"
+                    );
+                }
+            }
         }
     }
 
@@ -4706,6 +5305,547 @@ mod tests {
         );
     }
 
+    /// #1748 + #565 together: an elevated unix install may put USER CLIs in `/usr/local/bin`, and MUST
+    /// NOT put a privileged/service-executed binary there.
+    ///
+    /// This is the invariant that reconciles the two things `SPEC.md` §1.5/§1.6 assert — that
+    /// `/usr/local/bin` is the right elevated user root, and that a Homebrew-style group-writable
+    /// prefix is the wrong home for a service binary. Both hold only because the two placements are
+    /// separate, so the separation is pinned here rather than left to prose.
+    ///
+    /// The fixture is the DEFAULT (un-overridden) plan, which is the only way to express "an elevated
+    /// install" without depending on the runner's uid. `has_custom_bin_dir()` compares `bin_dir`
+    /// against `default_bin_dir()`, and `default_bin_dir()` itself branches on the CURRENT process's
+    /// uid — so hardcoding `bin_dir = "/usr/local/bin"` would look like an OVERRIDE on a non-root test
+    /// runner and route the privileged set there, inverting the assertion. `InstallPlan::default()`
+    /// carries whatever the default is for the uid in play, so the routing under test is the real one
+    /// on a root and a non-root runner alike.
+    ///
+    /// Both classes of component are asked of the SAME plan, so a routing that collapsed them into one
+    /// dir — in either direction — is caught; a test that only asked about `dig-dns` would pass against
+    /// a build that also sent `dign` to the protected root, and vice versa.
+    #[cfg(unix)]
+    #[test]
+    fn an_elevated_unix_install_keeps_privileged_binaries_out_of_the_machine_bin_dir() {
+        use target::Os;
+        let machine = std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR);
+        let elevated_default = InstallPlan::default();
+        assert!(
+            !elevated_default.has_custom_bin_dir(),
+            "the default plan must not read as an override, or the routing under test is not \
+             exercised"
+        );
+        // The separation the SPEC's two claims both rest on, asserted directly: the machine-wide user
+        // root and the privileged root are different directories, so "user CLIs may sit in a
+        // possibly-group-writable /usr/local/bin" and "no service binary may" are both satisfiable.
+        assert_ne!(paths::protected_bin_dir(), machine);
+
+        // The privileged set stays in the root-owned protected root, which is the dir
+        // `secure::verify_install_root` then holds to the no-LPE bar.
+        // dig-node and dig-relay joined this set in #1748 F1: the installer EXECUTES them as root
+        // (their own `install` verb), so where they SIT is a root-exec surface regardless of the
+        // identity their service later runs under.
+        for privileged in [
+            "dig-dns",
+            "dig-updater",
+            "dig-updater-worker",
+            "dig-node",
+            "dig-relay",
+        ] {
+            assert!(
+                paths::is_privileged_component(Os::Linux, privileged),
+                "{privileged} must be classified privileged for this test to mean anything"
+            );
+            assert_eq!(
+                elevated_default.bin_dir_for(privileged, Os::Linux),
+                paths::protected_bin_dir(),
+                "{privileged} is service-executed and must never land in {}, which Homebrew leaves \
+                 group-writable on an Intel Mac",
+                paths::UNIX_MACHINE_BIN_DIR
+            );
+        }
+
+        // The user CLIs go to the user root instead — `/usr/local/bin` when this process is root, which
+        // is the #1748 fix. Without this half the test would also pass against a build that routed
+        // EVERYTHING to the protected root.
+        for user_cli in ["dig-store", "digs", "dign", "digd", "dig-app"] {
+            assert!(
+                !paths::is_privileged_component(Os::Linux, user_cli),
+                "{user_cli} is a user-run CLI"
+            );
+            assert_eq!(
+                elevated_default.bin_dir_for(user_cli, Os::Linux),
+                paths::default_bin_dir(),
+                "a user-run CLI belongs in the §1.6 user root, not the privileged root"
+            );
+        }
+        // THE VENEER (#1748): an ELEVATED install's own bin dir is the ROOT-OWNED protected root, never
+        // the machine-wide `/usr/local/bin`. That directory is user-writable under Homebrew on an Intel
+        // Mac, and making it the dir root writes to and execs from produced three separate root paths
+        // into it. Asserted against the real uid rather than assumed, both ways.
+        if invoker::is_root() {
+            assert_eq!(
+                paths::default_bin_dir(),
+                paths::protected_bin_dir(),
+                "an elevated install must place binaries where only root can write"
+            );
+            assert_ne!(
+                paths::default_bin_dir(),
+                machine,
+                "/usr/local/bin is a PATH veneer for symlinks, never an install root"
+            );
+        } else {
+            assert_eq!(
+                paths::default_bin_dir(),
+                invoker::target_user().dig_bin_dir(),
+                "unelevated, nothing runs as root, so the per-user root is correct"
+            );
+        }
+
+        // And the verify follows the privileged binaries, not the user CLIs: `/usr/local/bin` is never
+        // the dir handed to the ACL check on this plan, so a group-writable one cannot fail the
+        // install — while an override that genuinely routed a service binary there would be checked.
+        assert_eq!(
+            elevated_default.privileged_install_root(Os::Linux),
+            Some(paths::protected_bin_dir())
+        );
+        let overridden = InstallPlan {
+            bin_dir: std::path::PathBuf::from("/opt/somewhere-else"),
+            ..InstallPlan::default()
+        };
+        assert_eq!(
+            overridden.privileged_install_root(Os::Linux),
+            Some(std::path::PathBuf::from("/opt/somewhere-else")),
+            "an override redirects the privileged root, so the ACL verify must follow it there"
+        );
+    }
+
+    // -- #1748: the directory binaries LANDED in is verified and reported --------
+
+    /// The #565 verify only ever looked at the PRIVILEGED root, so the directory this run actually wrote
+    /// to and executed from went unchecked and unmentioned on every elevated unix install — which is how
+    /// a user-writable `/usr/local/bin` became the install root with nothing noticing.
+    ///
+    /// The verdict must appear in `install.json`, and UNELEVATED it must not sink the install. Asserted on
+    /// a world-writable directory, the posture that matters, with the untouched-readiness half asserted too
+    /// so this cannot be "fixed" into a blanket refusal. The elevated arm, where the same posture IS fatal,
+    /// is `an_elevated_install_into_a_writable_directory_is_fatal`.
+    ///
+    /// unix-only because on Windows EVERY component is privileged (`is_privileged_component`), so the
+    /// privileged root always equals the bin dir and the verdict would be a duplicate — the case the
+    /// companion test below pins.
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_binaries_landed_in_is_verified_and_reported() {
+        let target = Target::current().expect("host target");
+        let dir = crate::sources::fixture_root()
+            .join(format!("dig-bindir-posture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        // A CLI-only plan, so there is no privileged root to shadow this directory's verdict.
+        let plan = InstallPlan {
+            bin_dir: dir.clone(),
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            with_dig_app: false,
+            auto_update: false,
+            with_relay: false,
+            ..InstallPlan::default()
+        };
+        assert_eq!(
+            plan.privileged_install_root(target.os),
+            None,
+            "the fixture must have no privileged root, or the posture report is skipped as duplicate"
+        );
+
+        let mut report = report_shell();
+        report_bin_dir_posture(&plan, &target, &mut report, &mut |_| {});
+        let verdict = report
+            .bin_dir_security
+            .as_ref()
+            .expect("the directory this run wrote to must be reported, never silently skipped");
+        assert_eq!(verdict.root, dir.to_string_lossy());
+        #[cfg(unix)]
+        {
+            assert!(verdict.is_blocking(), "got: {}", verdict.note);
+        }
+        // UNELEVATED it does not sink the install: a user-writable dir holding binaries only that user
+        // runs is their own authority, so refusing would break every ordinary per-user install. Injected
+        // rather than read from the runner's uid, so both arms hold in the container root gate as well.
+        assert!(
+            evaluate_readiness_when(&plan, &report, false).is_empty(),
+            "unelevated, the bin-dir posture is reported and never fatal"
+        );
+        // ELEVATED the same posture IS fatal — the arm asserted in full by
+        // `an_elevated_install_into_a_writable_directory_is_fatal`.
+        assert!(
+            !evaluate_readiness_when(&plan, &report, true).is_empty(),
+            "an elevated install must not proceed over a writable install directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One verdict per directory — but ONLY when the privileged verify actually PRODUCED one.
+    ///
+    /// The dedupe used to key on `privileged_install_root()`, i.e. on where privileged binaries WOULD
+    /// go, and those came apart from where the verify actually ran (#1748): the #565 check is gated on
+    /// the plan selecting a privileged component, while since the veneer every ELEVATED install places
+    /// its binaries in the protected root. So a CLI-only `sudo` install wrote into `/opt/dig/bin`,
+    /// nothing verified it, and the dedupe suppressed the one check that would have. A world-writable
+    /// protected root reached a fully green install that way, measured at mode 0777 on a real run.
+    #[test]
+    fn the_bin_dir_posture_is_deduped_only_against_a_verify_that_really_ran() {
+        let target = Target::current().expect("host target");
+        let plan = InstallPlan {
+            bin_dir: paths::protected_bin_dir(),
+            with_dig_dns: true,
+            ..InstallPlan::default()
+        };
+        assert_eq!(
+            plan.privileged_install_root(target.os).as_ref(),
+            Some(&plan.bin_dir),
+            "the fixture must be the same-directory case"
+        );
+
+        // The genuine duplicate: a verdict for this directory already exists, so no second one.
+        let mut covered = report_shell();
+        covered.install_root_security = Some(secure::InstallRootSecurity::established_safe(
+            plan.bin_dir.to_string_lossy().to_string(),
+            "already verified".to_string(),
+        ));
+        report_bin_dir_posture(&plan, &target, &mut covered, &mut |_| {});
+        assert!(
+            covered.bin_dir_security.is_none(),
+            "the privileged-root verify already covers this directory"
+        );
+
+        // The case the old dedupe got wrong: NO verify ran, so the directory root wrote into must still
+        // be checked rather than silently skipped as a "duplicate" of a verdict that does not exist.
+        let mut unchecked = report_shell();
+        assert!(unchecked.install_root_security.is_none());
+        report_bin_dir_posture(&plan, &target, &mut unchecked, &mut |_| {});
+        assert!(
+            unchecked.bin_dir_security.is_some(),
+            "nothing verified the directory this run wrote binaries into (#1748)"
+        );
+    }
+
+    /// The removal must be REACHED, not merely implemented — this test goes through `link_protected_clis`.
+    ///
+    /// # Why this test exists (#1748 F1)
+    ///
+    /// The removal block sat below an `if to_link.is_empty() { return; }` early return, and `to_link` is
+    /// empty by construction exactly when the veneer is unsafe — the only condition the removal runs under.
+    /// So it was provably dead code, and **deleting it left 685 tests passing**: the one test covering the
+    /// behaviour called `paths::remove_links_in` directly and never traversed this call site. The container
+    /// gate missed it too, because its fixture deleted the link before the run.
+    ///
+    /// The lesson is the fixture, not the assertion: a helper that works proves nothing about a caller that
+    /// never calls it. This drives the real seam, with the veneer redirected to a temp directory so it can
+    /// run unprivileged.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_veneer_reaches_the_removal_through_link_protected_clis() {
+        let target = Target::current().expect("host target");
+        if matches!(target.os, target::Os::Windows) {
+            return; // The veneer is a unix concept; Windows keeps one root and links nothing.
+        }
+
+        let mut report = report_shell();
+        report.components.push(ComponentResult {
+            component: "digs".to_string(),
+            version: "0.19.3".to_string(),
+            tag: "v0.19.3".to_string(),
+            asset: "digs".to_string(),
+            url: String::new(),
+            dest: paths::protected_bin_dir()
+                .join("digs")
+                .to_string_lossy()
+                .into_owned(),
+            previous_version: None,
+            update_action: update::UpdateAction::Install,
+        });
+
+        // UNSAFE veneer: nothing may be linked, and the removal must be REACHED. `to_link` is empty here,
+        // which is precisely the state in which the early return used to skip the removal entirely.
+        let mut lines = Vec::new();
+        link_protected_clis(&target, &mut report, false, &mut |l| {
+            lines.push(l.to_string())
+        });
+        let log = lines.join("\n");
+        assert!(
+            log.contains(paths::UNIX_MACHINE_BIN_DIR),
+            "an unsafe veneer must SAY what it did about the veneer, and it said nothing: {log:?}"
+        );
+        assert!(
+            !log.contains("Linking the protected-root CLIs"),
+            "no link may be planted into an unsafe veneer: {log:?}"
+        );
+
+        // The control that makes the assertion above about the POSTURE rather than about this function
+        // being quiet in general: a SAFE veneer takes the linking path and announces it.
+        let mut linked = Vec::new();
+        link_protected_clis(&target, &mut report, true, &mut |l| {
+            linked.push(l.to_string())
+        });
+        let linked = linked.join("\n");
+        assert!(
+            linked.contains("Linking the protected-root CLIs"),
+            "a safe veneer must still plant links — otherwise the fallback is just an abandonment: {linked:?}"
+        );
+    }
+
+    /// An unsafe veneer FAILS the install when links are planted there, and does NOT when the run fell back.
+    ///
+    /// This is the round-7 decision in one assertion, and both arms are load-bearing in opposite directions:
+    ///
+    /// * fatal when `VeneerLinks` — an account that can write the veneer re-points a link this run planted
+    ///   and root executes whatever it points at. Unprivileged CODE running as that user cannot type their
+    ///   password but can write that directory, so "they could `sudo` anyway" does not make it benign.
+    /// * NOT fatal when `DirectPathEntry` — the run declined to plant a link, removed any earlier one, and
+    ///   put the root-owned protected root on `PATH` instead. Failing then would refuse every
+    ///   Homebrew-on-Intel Mac, and a refusal is not a fix.
+    ///
+    /// Without the second arm, making the verdict fatal unconditionally passes every other test in the
+    /// suite — which is exactly what it did before this test existed.
+    #[test]
+    fn an_unsafe_veneer_is_fatal_only_when_it_is_the_mechanism_in_play() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            ..InstallPlan::default()
+        };
+        let unsafe_veneer = || {
+            Some(secure::InstallRootSecurity::detected_unsafe(
+                paths::UNIX_MACHINE_BIN_DIR,
+                "mode 775 allows group or other to write",
+            ))
+        };
+
+        // Links planted into a directory a non-root account can write: fatal.
+        let mut linking = report_shell();
+        linking.veneer_security = unsafe_veneer();
+        linking.reachability = Some(paths::Reachability::VeneerLinks);
+        let failures = evaluate_readiness_when(&plan, &linking, true);
+        assert!(
+            failures.iter().any(|f| f.contains(paths::UNIX_MACHINE_BIN_DIR)),
+            "a link planted in a writable veneer is a live escalation and must fail readiness: {failures:?}"
+        );
+
+        // Fell back: same verdict, no link planted, protected root on PATH instead. A recorded downgrade.
+        let mut fell_back = report_shell();
+        fell_back.veneer_security = unsafe_veneer();
+        fell_back.reachability = Some(paths::Reachability::DirectPathEntry);
+        let failures = evaluate_readiness_when(&plan, &fell_back, true);
+        assert!(
+            !failures.iter().any(|f| f.contains(paths::UNIX_MACHINE_BIN_DIR)),
+            "the fallback must INSTALL, not refuse - a refusal on every Homebrew Mac is the failure mode \
+             this design exists to avoid: {failures:?}"
+        );
+
+        // And unelevated it is never fatal either way, because nothing runs as root.
+        for mechanism in [
+            paths::Reachability::VeneerLinks,
+            paths::Reachability::DirectPathEntry,
+        ] {
+            let mut unelevated = report_shell();
+            unelevated.veneer_security = unsafe_veneer();
+            unelevated.reachability = Some(mechanism);
+            assert!(
+                !evaluate_readiness_when(&plan, &unelevated, false)
+                    .iter()
+                    .any(|f| f.contains(paths::UNIX_MACHINE_BIN_DIR)),
+                "unelevated, the veneer's posture is the user's own authority"
+            );
+        }
+    }
+
+    /// A DANGLING veneer link is residue, and the veneer is one of the directories scanned (#1748 F4).
+    ///
+    /// # Two decisions, each of which was green when deleted
+    ///
+    /// `--uninstall` promises "leaving ZERO residue", and the scan reported `residue: []` with
+    /// `/usr/local/bin/digs` still sitting there. Two separate things had to be true to fix that, and
+    /// removing either one left all 692 tests passing:
+    ///
+    /// 1. the **veneer must be in the root list** — it holds symlinks rather than binaries, so it is neither
+    ///    bin root and was simply never looked at;
+    /// 2. the check must be **`symlink_metadata`, not `exists`** — the likeliest residue here is a link whose
+    ///    target this uninstall just deleted, and `exists()` follows it, finds nothing, and calls the
+    ///    directory clean.
+    ///
+    /// So the fixture is a link that points at a path which does NOT exist. That input is what distinguishes
+    /// the two implementations: against a link with a live target, both agree, which is why every earlier
+    /// fixture here proved nothing. The controls pin it from the other side — a clean directory yields
+    /// nothing (so this is not "always reports something"), and the running image is exempt.
+    #[test]
+    fn a_dangling_link_is_residue_and_the_veneer_is_scanned() {
+        let target = Target::current().expect("host target");
+        let tmp = tempfile::tempdir().unwrap();
+        let veneer = tmp.path().join("usr-local-bin");
+        std::fs::create_dir_all(&veneer).unwrap();
+
+        // THE fixture: the target is deliberately absent, which is the state an uninstall leaves behind
+        // after deleting the binary the link pointed at.
+        let digs = veneer.join(target.exe_name("digs"));
+        let vanished = tmp.path().join("opt-dig-bin").join(target.exe_name("digs"));
+        assert!(
+            std::fs::symlink_metadata(&vanished).is_err(),
+            "the link's target must be ABSENT, or this fixture cannot tell the two checks apart"
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&vanished, &digs).unwrap();
+        #[cfg(windows)]
+        std::fs::write(&digs, b"stale").unwrap();
+
+        let found = residue_in(std::slice::from_ref(&veneer), &target, None);
+        assert_eq!(
+            found,
+            vec![digs.display().to_string()],
+            "a stale DIG entry in the veneer is residue - `--uninstall` promises zero, and this one is also \
+             the starting state the stale-link escalation needs"
+        );
+
+        // CONTROL — an empty directory yields nothing, so the assertion above is about the entry and not
+        // about this scan reporting a path per root regardless.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        assert!(
+            residue_in(std::slice::from_ref(&clean), &target, None).is_empty(),
+            "a directory with no DIG entries has no residue"
+        );
+
+        // CONTROL — the running installer's own image is exempt: it cannot delete itself while running.
+        assert!(
+            residue_in(std::slice::from_ref(&veneer), &target, Some(&digs)).is_empty(),
+            "the running image must not be reported as residue it could have taken"
+        );
+
+        // The ROOT LIST decision, which the scan above cannot see because it is handed its roots. On unix
+        // the veneer must be one of them; dropping that push left the whole suite green.
+        let roots = residue_roots(std::path::Path::new("/tmp/some-bin-dir"));
+        assert!(
+            roots.contains(&std::path::PathBuf::from("/tmp/some-bin-dir")),
+            "the run's own bin dir must be scanned: {roots:?}"
+        );
+        assert!(
+            roots.contains(&paths::protected_bin_dir()),
+            "the protected root must be scanned: {roots:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            roots.contains(&std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR)),
+            "the veneer holds links rather than binaries, so it is neither bin root and must be scanned \
+             explicitly or its stale entries are invisible: {roots:?}"
+        );
+    }
+
+    /// A directory that merely PRECEDES ours on root's `PATH` fails an elevated install (#1748 F2).
+    ///
+    /// # The fixture is the point: position with nothing planted yet
+    ///
+    /// The nearest wrong implementation is the one that shipped — the `same_binary` shadow check
+    /// (`pathcheck.rs`), which compares what root resolves against what we installed. That check only fires
+    /// once the attacker's file is ALREADY THERE, so a clean-but-losing `PATH` reported a fully green,
+    /// ready install: every DIG command was ours today and hers the moment she chose to create the name.
+    ///
+    /// So this report carries **no shadow, no unsafe veneer and no writable bin dir** — nothing an
+    /// existence-based check could catch. The only defect present is the ORDER, which is what makes the
+    /// assertion attributable to the positional rule rather than to any of the checks that surround it.
+    ///
+    /// Both controls are load-bearing in opposite directions, because two trivially wrong implementations
+    /// would otherwise satisfy the first assertion: an empty list must NOT fail (or "elevated always fails"
+    /// passes), and the same non-empty list unelevated must NOT fail (or "any non-empty list fails" passes,
+    /// which would refuse every developer box whose `~/.local/bin` comes first — the false-positive that
+    /// failed a clean CI install six times over).
+    #[test]
+    fn a_directory_preceding_ours_on_roots_path_is_fatal_when_elevated() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            ..InstallPlan::default()
+        };
+        // A name that could not plausibly appear in any other failure message, so `contains` cannot pass on
+        // a message some unrelated gate produced.
+        const LOSING: &str = "/opt/attacker-owned-and-earlier";
+
+        let mut losing = report_shell();
+        losing.preceding_unsafe_path_dirs = vec![LOSING.to_string()];
+        let elevated = evaluate_readiness_when(&plan, &losing, true);
+        assert!(
+            elevated.iter().any(|f| f.contains(LOSING)),
+            "a directory a non-root account can write that comes BEFORE ours on root's PATH means she can \
+             claim any DIG command name at will; the install must not report ready: {elevated:?}"
+        );
+
+        // CONTROL 1 — the same report unelevated must pass. Unprivileged, a directory earlier on the user's
+        // own PATH is the user running their own binaries with their own authority.
+        let unelevated = evaluate_readiness_when(&plan, &losing, false);
+        assert!(
+            !unelevated.iter().any(|f| f.contains(LOSING)),
+            "unelevated, PATH order is the user's own authority and must not fail: {unelevated:?}"
+        );
+
+        // CONTROL 2 — an elevated install with a WINNING order must pass. Without this, a rule that failed
+        // every elevated install would satisfy the assertion above.
+        let winning = report_shell();
+        assert!(
+            winning.preceding_unsafe_path_dirs.is_empty(),
+            "the control must start from a clean PATH order"
+        );
+        let clean = evaluate_readiness_when(&plan, &winning, true);
+        assert!(
+            !clean.iter().any(|f| f.contains("PATH order")),
+            "an elevated install that wins the resolution must report ready: {clean:?}"
+        );
+    }
+
+    /// An ELEVATED install into a group/world-writable directory is FATAL, not a note.
+    ///
+    /// Elevation is what makes the posture an escalation rather than a preference: root wrote the
+    /// binaries, `/usr/local/bin` links resolve into them, and root-side execs and services run them.
+    /// The unelevated half — the same posture reported and NOT fatal — is asserted by
+    /// `the_directory_binaries_landed_in_is_verified_and_reported`, so both arms are covered.
+    #[test]
+    fn an_elevated_install_into_a_writable_directory_is_fatal() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            ..InstallPlan::default()
+        };
+        let mut report = report_shell();
+        report.bin_dir_security = Some(secure::InstallRootSecurity::detected_unsafe(
+            "/opt/dig/bin".to_string(),
+            "mode 0777: group and other can write".to_string(),
+        ));
+
+        // BOTH arms, stated explicitly rather than branched on the runner's own uid. Branching on
+        // `is_root()` meant CI only ever ran the unelevated arm, so replacing the production
+        // `if invoker::is_root()` with `if false` changed nothing observable and this test stayed green
+        // while claiming to cover both (#1748 C3).
+        let elevated = evaluate_readiness_when(&plan, &report, true);
+        assert!(
+            elevated.iter().any(|f| f.contains("/opt/dig/bin")),
+            "an elevated install must NOT report ready over a writable install directory: {elevated:?}"
+        );
+
+        let unelevated = evaluate_readiness_when(&plan, &report, false);
+        assert!(
+            !unelevated.iter().any(|f| f.contains("/opt/dig/bin")),
+            "unelevated it is the user's own authority, never a failure: {unelevated:?}"
+        );
+
+        // And the ambient entry point agrees with the injected one on this runner, so the two cannot
+        // drift apart.
+        assert_eq!(
+            evaluate_readiness(&plan, &report),
+            evaluate_readiness_when(&plan, &report, invoker::is_root())
+        );
+    }
+
     /// #565: a definitive install-root ACL breach (an unprivileged principal
     /// CAN write where a privileged service binary lives) makes the install NOT
     /// ready; an inconclusive read is only a warning, never a false failure.
@@ -4722,29 +5862,43 @@ mod tests {
         };
         // Definitive breach → NOT ready, with a clear reason.
         let mut report = report_shell();
-        report.install_root_security = Some(secure::InstallRootSecurity {
-            root: r"C:\Program Files\DIG\bin".to_string(),
-            checked: true,
-            secure: false,
-            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
-        });
+        report.install_root_security = Some(secure::InstallRootSecurity::detected_unsafe(
+            r"C:\Program Files\DIG\bin".to_string(),
+            "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        ));
         let failures = evaluate_readiness(&plan, &report);
         assert!(
             failures.iter().any(|f| f.contains("install root")),
             "a definitive write breach must fail readiness: {failures:?}"
         );
-        // Inconclusive read → NOT a failure (the admin-only location still holds).
+        // An INDETERMINATE read also fails readiness (#1748 WU1). This assertion is inverted from what
+        // it used to be, deliberately: "indeterminate -> proceed" was the fail-open policy that seven
+        // call sites re-derived independently, and every round of this release found another site where
+        // it turned a REFUSAL into a tick. A posture nobody could establish is not evidence of safety,
+        // and the note always names the level that could not be verified.
         let mut report = report_shell();
-        report.install_root_security = Some(secure::InstallRootSecurity {
-            root: r"C:\Program Files\DIG\bin".to_string(),
-            checked: false,
-            secure: false,
-            note: "could not read the ACL back".to_string(),
-        });
+        report.install_root_security = Some(secure::InstallRootSecurity::indeterminate(
+            PROGRAM_FILES_BIN.to_string(),
+            "could not read the ACL back".to_string(),
+        ));
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("install root")),
+            "an unverifiable install root must not report ready: {failures:?}"
+        );
+
+        // The control that keeps the policy from collapsing into "always block": an ESTABLISHED-safe root
+        // passes. Without it, an `is_blocking()` that returned `true` unconditionally would satisfy both
+        // assertions above.
+        let mut report = report_shell();
+        report.install_root_security = Some(secure::InstallRootSecurity::established_safe(
+            PROGRAM_FILES_BIN.to_string(),
+            "admin-only, no unprivileged write ACE".to_string(),
+        ));
         let failures = evaluate_readiness(&plan, &report);
         assert!(
             !failures.iter().any(|f| f.contains("install root")),
-            "an inconclusive ACL read must not fail readiness: {failures:?}"
+            "a verified-safe install root must not fail readiness: {failures:?}"
         );
     }
 
@@ -4883,12 +6037,10 @@ mod tests {
         // A definitive write breach on that custom dir refuses ready.
         let mut report = report_shell();
         report.service = Some(running_service());
-        report.install_root_security = Some(secure::InstallRootSecurity {
-            root: custom.to_string_lossy().into_owned(),
-            checked: true,
-            secure: false,
-            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
-        });
+        report.install_root_security = Some(secure::InstallRootSecurity::detected_unsafe(
+            custom.to_string_lossy().into_owned(),
+            "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        ));
         let failures = evaluate_readiness(&plan, &report);
         assert!(
             failures.iter().any(|f| f.contains("install root")),
@@ -5195,12 +6347,81 @@ mod tests {
         report.cli_path_checks.push(pathcheck::CliPathCheck {
             cli: "dig-node".to_string(),
             resolved: false,
-            note: "`dig-node` did not resolve on PATH".to_string(),
+            note:
+                "`dig-node` is not on ubuntu's PATH (a fresh login shell searches: /usr/bin:/bin)"
+                    .to_string(),
         });
         let failures = evaluate_readiness(&plan, &report);
         assert_eq!(failures.len(), 1, "got: {failures:?}");
         assert!(failures[0].contains("dig-node"));
-        assert!(failures[0].contains("fresh shell"));
+        // The check's own note IS the remediation — it names the user and the PATH actually searched.
+        assert!(failures[0].contains("ubuntu"));
+        assert!(failures[0].contains("/usr/bin:/bin"));
+    }
+
+    /// #1748: the readiness failure must NOT tell the reader to re-run elevated.
+    ///
+    /// The install that prompted this WAS elevated — that was the cause, not the cure — and "open a
+    /// new terminal" is equally useless now the check already uses a fresh login shell. Both phrases
+    /// sent a real reader hunting a privilege problem that did not exist, so their absence is asserted
+    /// rather than left to review.
+    ///
+    /// The `libxdo.so.3` loader failure used as the fixture is a real state — it is what `dig-app`
+    /// does on stock Ubuntu — but note that `dig-app` itself is exempt from the version probe
+    /// ([`answers_version`]), so production does not currently SURFACE it for that component. The
+    /// fixture drives `evaluate_readiness`'s formatting directly, which is the code under test here,
+    /// and the message shape is what any real CLI's loader failure produces.
+    #[test]
+    fn a_path_failure_does_not_advise_re_running_elevated() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.cli_path_checks.push(pathcheck::CliPathCheck {
+            cli: "dig-app".to_string(),
+            resolved: false,
+            note: "`/usr/local/bin/dig-app --version` resolved on PATH but did NOT run: \
+                   libxdo.so.3: cannot open shared object file"
+                .to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        let joined = failures.join(" ");
+        assert!(
+            !joined.contains("re-run elevated"),
+            "must not advise elevating an already-elevated install: {joined}"
+        );
+        assert!(
+            !joined.contains("open a new terminal"),
+            "the check already used a fresh login shell: {joined}"
+        );
+        // The actionable detail — the loader error — must survive into the verdict.
+        assert!(joined.contains("libxdo.so.3"), "got: {joined}");
+    }
+
+    /// #1748: the SERVICE readiness branch must not advise elevating either.
+    ///
+    /// This is a separate code path from the PATH branch above, and it is the one a real run hit:
+    /// `dig-node start` failed with `Failed to connect to bus: No medium found` — root having no
+    /// session bus — and the verdict said "re-run elevated" for an install that was already root.
+    /// The missing thing was a user SESSION, not privilege, so the advice sent the reader after the
+    /// wrong cause. A second actor (the failing service) is required to exercise this branch, which is
+    /// why the PATH-branch test above cannot stand in for it.
+    #[test]
+    fn a_service_failure_does_not_advise_re_running_elevated_either() {
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        let mut svc = running_service();
+        svc.health_ok = false;
+        svc.health_note = "dig-node start exited with 6: error: Failed to connect to bus: \
+                           No medium found"
+            .to_string();
+        report.service = Some(svc);
+        let joined = evaluate_readiness(&plan, &report).join(" ");
+        assert!(
+            !joined.contains("re-run elevated"),
+            "the failing install was already root: {joined}"
+        );
+        // The real cause must still reach the reader verbatim.
+        assert!(joined.contains("Failed to connect to bus"), "got: {joined}");
     }
 
     /// #514: an `auto_update`-only plan (the beacon is a privileged OS-scheduler
@@ -5208,7 +6429,7 @@ mod tests {
     /// registration — never best-effort like the firewall rule/scheme handler).
     fn beacon_only_plan() -> InstallPlan {
         InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-readiness-beacon-test"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-readiness-beacon-test"),
             with_digstore: false,
             with_dig_node: false,
             with_dig_dns: false,
@@ -5306,7 +6527,7 @@ mod tests {
     }
 
     fn wiring_test_bin_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::sources::fixture_root().join(format!(
             "dig-installer-update-wiring-{tag}-{}",
             std::process::id()
         ))
@@ -5681,5 +6902,41 @@ mod tests {
     #[test]
     fn uninstall_covers_the_dig_app_binary_912() {
         assert!(uninstall::COMPONENT_STEMS.contains(&"dig-app"));
+    }
+
+    // -- #1748: a GUI app is proven by resolution, a CLI by running ---------------
+
+    /// `dig-app` must NOT be probed with `--version`: it is a tray app with no command-line surface,
+    /// and on macOS the probe never returns, which hung an entire install. Real CLIs must still be
+    /// RUN, so both arms are asserted — an implementation that exempted everything would be a
+    /// regression of #496 and cannot pass this.
+    #[test]
+    fn only_the_gui_app_is_exempt_from_the_version_probe() {
+        // The exemption is unconditional, and is a KNOWN GAP rather than a claim that dig-app is fine
+        // (see `answers_version`). Narrowing it to macOS was tried and reverted on evidence: on a
+        // headless ubuntu runner `dig-app --version` does not exit either, so the probe stalls 20s and
+        // then fails the whole install (run 30400688672).
+        assert!(
+            !answers_version("dig-app"),
+            "dig-app has no --version to answer on any platform"
+        );
+        for cli in ["dig-node", "dign", "dig-dns", "digd", "dig-store", "digs"] {
+            assert!(
+                answers_version(cli),
+                "{cli} is a real CLI and must be RUN, not just resolved"
+            );
+        }
+    }
+
+    /// Every GUI app must still be a REQUIRED CLI — the exemption changes HOW it is proven, never
+    /// whether it is checked at all. A typo here would silently drop dig-app from the verdict.
+    #[test]
+    fn the_gui_app_is_still_a_required_cli() {
+        for app in GUI_APPS {
+            assert!(
+                REQUIRED_CLIS.contains(app),
+                "{app} is exempt from the version probe but is not checked at all"
+            );
+        }
     }
 }

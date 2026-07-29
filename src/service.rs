@@ -12,9 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
-use crate::proc::HideConsole;
 use crate::svc;
 
 /// Configuration for the dig-node service the installer will register.
@@ -337,13 +335,17 @@ pub(crate) fn run_capturing(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(bin);
-    cmd.args(args);
+    // The single choke point for every privileged delegation this crate performs — dig-node's and
+    // dig-relay's own `install`/`start` verbs and dig-updater's `schedule` verbs (`crate::beacon`) — so
+    // the no-root-exec-of-a-user-writable-binary invariant is enforced once, here, for all of them
+    // rather than per call site. Unlike the version probe this cannot degrade: a service that must be
+    // registered by running a binary we do not trust has no safe fallback, so it fails LOUDLY (#1748 F1).
+    let mut guarded = crate::guardedcmd::GuardedCommand::for_installed_binary(bin)?;
+    guarded.args(args);
     for (k, v) in env {
-        cmd.env(k, v);
+        guarded.command_mut().env(k, v);
     }
-    let output = cmd
-        .hide_console()
+    let output = guarded
         .output()
         .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
     if !output.status.success() {
@@ -465,23 +467,35 @@ mod tests {
 
     /// See the Windows variant above. On unix we return a pre-existing system
     /// binary (`true`/`false`) to dodge the `ETXTBSY` write-then-exec race.
+    /// See the Windows variant above.
+    ///
+    /// `/usr/bin` is tried FIRST, not second. On any usrmerge distribution (every current Debian/Ubuntu)
+    /// `/bin` is a SYMLINK to `usr/bin`, and the root-exec guard refuses a symlinked level rather than
+    /// following it — correctly, because an inode walk cannot verify what it cannot traverse. So as ROOT a
+    /// `/bin/true` stub is refused before it ever runs, for a reason that has nothing to do with the
+    /// property under test. Found by running the suite as root in a container (#1748 WU3); in production
+    /// DIG's own roots are real directories, so the guard's strictness costs nothing there.
     #[cfg(not(windows))]
     fn stub_exit(_dir: &std::path::Path, success: bool) -> std::path::PathBuf {
         let base = if success { "true" } else { "false" };
-        for cand in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
+        for cand in [format!("/usr/bin/{base}"), format!("/bin/{base}")] {
             let p = std::path::PathBuf::from(&cand);
-            if p.exists() {
+            // The PARENT must not be a symlink, or the guard refuses the exec as root.
+            let parent_is_real = p
+                .parent()
+                .and_then(|d| std::fs::symlink_metadata(d).ok())
+                .is_some_and(|m| !m.is_symlink());
+            if p.exists() && parent_is_real {
                 return p;
             }
         }
-        // Fallback to the conventional path; every CI runner / POSIX system
-        // ships `/bin/true` and `/bin/false`.
+        // Fallback to the conventional path; every CI runner / POSIX system ships `/bin/true`.
         std::path::PathBuf::from(format!("/bin/{base}"))
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("dig-installer-svc-{tag}-{}", std::process::id()));
+        let d = crate::sources::fixture_root()
+            .join(format!("dig-installer-svc-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -559,7 +573,12 @@ mod tests {
 
     #[test]
     fn install_service_errors_when_binary_is_missing() {
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-xyz");
+        // A dedicated subdirectory, not bare `temp_dir()`: `/tmp` is mode 01777, so running the suite
+        // as root the `root_exec_guard` (correctly) refuses a world-writable dir before the
+        // missing-binary path under test is ever reached. The subdir is owned by whoever runs the test
+        // and is not group/other-writable, so the guard passes and EXECUTION is what fails.
+        let missing =
+            tmp_subdir("node-install-missing").join("definitely-not-a-real-dig-node-binary-xyz");
         let err = install_service(&missing, &ServiceConfig::default()).unwrap_err();
         // start:true (the default) is still attempted (and still fails) against
         // the same missing binary, so the surfaced error is the start failure.
@@ -585,7 +604,10 @@ mod tests {
 
     #[test]
     fn uninstall_service_errors_when_binary_is_missing() {
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-node-binary-abc");
+        // See `install_service_errors_when_binary_is_missing`: a dedicated subdir, so the guard is not
+        // what fails.
+        let missing =
+            tmp_subdir("node-uninstall-missing").join("definitely-not-a-real-dig-node-binary-abc");
         let err = uninstall_service(&missing).unwrap_err();
         assert!(err.contains("dig-node uninstall failed"), "got: {err}");
         assert!(err.contains("could not run"), "got: {err}");
@@ -671,8 +693,8 @@ mod tests {
         // First install: no prior binary, so nothing to stop — a skip (not an
         // error), even if the (injected) service state claims RUNNING; and the
         // stop action must NEVER be invoked.
-        let missing =
-            std::env::temp_dir().join(format!("dig-installer-stop-absent-{}", std::process::id()));
+        let missing = crate::sources::fixture_root()
+            .join(format!("dig-installer-stop-absent-{}", std::process::id()));
         let outcome = stop_running_service_by_id_with(
             &missing,
             "dig-node",
@@ -746,8 +768,8 @@ mod tests {
         // The public entrypoints (real svc probes) must at least handle the
         // first-install case cleanly on any host — the branch that never
         // consults the service manager or a binary.
-        let missing =
-            std::env::temp_dir().join(format!("dig-installer-stop-pub-{}", std::process::id()));
+        let missing = crate::sources::fixture_root()
+            .join(format!("dig-installer-stop-pub-{}", std::process::id()));
         assert!(!stop_running_dig_node(&missing).unwrap().attempted);
         assert!(!stop_running_dig_relay(&missing).unwrap().attempted);
     }
@@ -763,12 +785,29 @@ mod tests {
     // file — dodges the `ETXTBSY` write-then-exec race `stub_exit`'s own doc
     // comment already flags) so these are exec-race-free on every CI runner.
 
+    /// A shell to run `inline` with, at a path whose whole chain the root-exec guard can verify.
+    ///
+    /// NOT `/bin/sh`: on any usrmerge distribution (every current Debian/Ubuntu) `/bin` is a SYMLINK to
+    /// `usr/bin`, and the guard refuses a symlinked level rather than following it — correctly, since an
+    /// inode walk cannot verify what it cannot traverse. That refusal is right in production (DIG's own
+    /// roots are real directories) but it made these tests fail as root for a reason unrelated to what
+    /// they assert. Found by running the suite as root in a container, which is precisely why that gate
+    /// exists (#1748 WU3).
+    ///
+    /// `/usr/bin/sh` is the real path on those systems and resolves through no link.
     #[cfg(unix)]
     fn shell_stub(inline: &str) -> (std::path::PathBuf, Vec<String>) {
-        (
-            std::path::PathBuf::from("/bin/sh"),
-            vec!["-c".to_string(), inline.to_string()],
-        )
+        let real_sh = ["/usr/bin/sh", "/bin/sh"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| {
+                p.exists()
+                    && p.parent()
+                        .and_then(|d| std::fs::symlink_metadata(d).ok())
+                        .is_some_and(|m| !m.is_symlink())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
+        (real_sh, vec!["-c".to_string(), inline.to_string()])
     }
     #[cfg(windows)]
     fn shell_stub(inline: &str) -> (std::path::PathBuf, Vec<String>) {

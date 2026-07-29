@@ -35,6 +35,12 @@
 //! and unit-tested; the spawns/plist read are the thin per-OS I/O layer,
 //! exercised end-to-end by the 3-OS installer-e2e job.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 
 use crate::paths;
@@ -866,7 +872,8 @@ mod tests {
         // Defence-in-depth (#619): the read-back binary is canonicalized before
         // the prefix test, and an unverifiable path fails CLOSED.
         let os = crate::target::Target::current().expect("supported host").os;
-        let base = std::env::temp_dir().join(format!("dig-regaudit-{}", std::process::id()));
+        let base =
+            crate::sources::fixture_root().join(format!("dig-regaudit-{}", std::process::id()));
         let inside_dir = base.join("bin");
         std::fs::create_dir_all(&inside_dir).expect("create the trusted root");
         let exe = inside_dir.join(if os == Os::Windows { "dig.exe" } else { "dig" });

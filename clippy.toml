@@ -1,0 +1,17 @@
+# An unguarded spawn of an installer-placed binary must fail the BUILD, not a test (#1748 WU4).
+#
+# Root executing a binary out of a directory an unprivileged account can write is a complete privilege
+# escalation. Enforcing "every such spawn checks the directory first" was tried as a written-down list
+# (it said four sites, a fifth existed and was proved to root code execution) and then as a derived
+# source scan (better, but a heuristic: 8 of 17 evasion forms caught). Neither can cover the case
+# nobody thought of.
+#
+# So `crate::guardedcmd::GuardedCommand::for_installed_binary` is the only way to spawn an installed
+# binary, and it cannot be constructed without running `secure::root_exec_guard`. This rule makes the
+# compiler enforce that: `Command::new` is denied crate-wide, and the modules that legitimately spawn a
+# TRUSTED SYSTEM TOOL (`su`, `sh`, `id`, `launchctl`, …, resolved from a fixed directory list per
+# SPEC 7.6 — a different invariant with its own tests) carry a local
+# `#[allow(clippy::disallowed_methods)]` naming that reason.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "spawn an installed binary through guardedcmd::GuardedCommand::for_installed_binary, which cannot exist without secure::root_exec_guard having passed (#1748). For a trusted SYSTEM tool resolved via elevation::resolve_system_tool, add a local #[allow(clippy::disallowed_methods)] stating that." },
+]

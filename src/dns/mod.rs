@@ -28,6 +28,12 @@
 //! residue (only artifacts carrying [`plan::MARKER`] are ever touched/removed;
 //! a pre-existing org policy or `.dig` DNS rule is never clobbered).
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 pub mod doctor;
 pub mod linux;
 pub mod macos;
@@ -430,7 +436,7 @@ mod tests {
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::sources::fixture_root().join(format!(
             "dig-installer-dns-mod-{tag}-{}",
             std::process::id()
         ))
@@ -462,7 +468,8 @@ mod tests {
         // A binary that can't even be spawned (never installed, or removed
         // out from under us) must not panic — it reports honestly that
         // nothing was confirmed live, not a synthetic success.
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-dns-verify-xyz");
+        let missing =
+            crate::sources::fixture_root().join("definitely-not-a-real-dig-dns-verify-xyz");
         let result = verify_existing(&missing);
         assert!(result.installed);
         assert!(!result.started);
@@ -489,7 +496,7 @@ mod tests {
     fn stop_before_replace_skips_when_the_binary_is_absent() {
         // First install: no prior binary, so nothing to stop even if the probe
         // (nonsensically) claims RUNNING — must be a skip, never an attempt.
-        let missing = std::env::temp_dir().join(format!(
+        let missing = crate::sources::fixture_root().join(format!(
             "dig-installer-dns-stop-absent-{}",
             std::process::id()
         ));

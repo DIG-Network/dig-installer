@@ -87,6 +87,11 @@ fn bundled_version(app: &AppHandle) -> Option<String> {
             .join("bin")
             .join(install::bin_name())
     };
+    // The STAGED RESOURCE binary inside the app bundle, read for a version string to display — not an
+    // installed binary, and this path runs unelevated in the WebView process (the privileged install is a
+    // separate child, §4.1b/§4.1c). So there is no install root to verify and the root-exec guard has
+    // nothing to say here (`clippy.toml`, #1748 WU4).
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new(&bin)
         .arg("--version")
         .hide_console()

@@ -25,6 +25,12 @@
 //! operation — the same elevation `dig-node`/`dig-dns`/`dig-relay` service
 //! registration already requires (`InstallPlan::requires_elevation`).
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 use crate::service::run_capturing;
@@ -115,12 +121,18 @@ mod tests {
         p
     }
 
+    /// `/usr/bin` FIRST: on a usrmerge distribution `/bin` is a symlink, and the root-exec guard refuses a
+    /// symlinked level, so a `/bin/true` stub never runs as root (#1748 WU3, see `service::tests`).
     #[cfg(not(windows))]
     fn stub_exit(_dir: &std::path::Path, success: bool) -> std::path::PathBuf {
         let base = if success { "true" } else { "false" };
-        for cand in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
+        for cand in [format!("/usr/bin/{base}"), format!("/bin/{base}")] {
             let p = std::path::PathBuf::from(&cand);
-            if p.exists() {
+            let parent_is_real = p
+                .parent()
+                .and_then(|d| std::fs::symlink_metadata(d).ok())
+                .is_some_and(|m| !m.is_symlink());
+            if p.exists() && parent_is_real {
                 return p;
             }
         }
@@ -128,8 +140,8 @@ mod tests {
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("dig-installer-beacon-{tag}-{}", std::process::id()));
+        let d = crate::sources::fixture_root()
+            .join(format!("dig-installer-beacon-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -194,7 +206,8 @@ mod tests {
 
     #[test]
     fn register_errors_when_the_binary_is_missing() {
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-updater-binary-xyz");
+        let missing =
+            crate::sources::fixture_root().join("definitely-not-a-real-dig-updater-binary-xyz");
         let r = register(&missing, false);
         assert!(!r.applied);
         assert!(r.note.contains("could not run"), "got: {}", r.note);

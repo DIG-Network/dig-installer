@@ -17,6 +17,12 @@
 //! `detect`. Only the pure layer carries logic, so every mapping and match is
 //! unit-tested without a real registry, filesystem, or `Info.plist`.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use serde::Serialize;
 
 use crate::target::Os;

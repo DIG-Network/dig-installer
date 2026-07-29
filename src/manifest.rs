@@ -196,7 +196,8 @@ mod tests {
         // Exercise the real write + (unix) chmod against a temp dir, so the file
         // shape + permission posture is verified without touching the real
         // admin-only install home.
-        let dir = std::env::temp_dir().join(format!("dig-manifest-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-manifest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("install.json");
         let host = crate::target::Target::current().expect("host").os;

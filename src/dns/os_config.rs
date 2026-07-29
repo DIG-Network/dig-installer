@@ -20,11 +20,8 @@
 //! (`powershell`, `resolvectl`, `dscacheutil`, …) by absolute path.
 
 use std::path::Path;
-use std::process::Command;
 
 use serde::Deserialize;
-
-use crate::proc::HideConsole;
 
 /// The subset of `dig-dns`'s `OsConfigReport` (`configure-os`/`unconfigure-os`
 /// `--json`) the installer consumes. Deserialized permissively — unknown fields
@@ -127,9 +124,13 @@ pub fn unconfigure_removed(dig_dns_bin: Option<&Path>) -> Vec<String> {
 /// Spawn `<dig_dns_bin> <args>`, capturing stdout regardless of exit code, and
 /// parse the report. The shared body of [`configure_os`]/[`unconfigure_os`].
 fn run_os_config(dig_dns_bin: &Path, args: &[&str]) -> Result<OsConfigSummary, String> {
-    let output = Command::new(dig_dns_bin)
+    // Root runs this on EVERY platform, on install and on uninstall, and `dig-dns` is a DEFAULT
+    // component — so this was the most reachable root-side exec in the crate and the only one carrying
+    // no guard (#1748). It was proved to root code execution: with `/opt` group-writable, uid 1001
+    // planted a binary that `dns::doctor` refused to run and this call executed as uid 0. Placement does
+    // not cover it, because a `--bin-dir` override redirects the whole stack. Inert unelevated.
+    let output = crate::guardedcmd::GuardedCommand::for_installed_binary(dig_dns_bin)?
         .args(args)
-        .hide_console()
         .output()
         .map_err(|e| {
             format!(

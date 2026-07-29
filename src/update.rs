@@ -24,9 +24,7 @@
 //! types from here rather than duplicating the logic.
 
 use std::path::Path;
-use std::process::Command;
 
-use crate::proc::HideConsole;
 use crate::release::Repo;
 
 /// What a version probe found at a component's install destination.
@@ -231,9 +229,14 @@ pub fn decide_with_force(
 /// probe instead of spawning a real process (mirrors
 /// `service::stop_running_dig_node_with`'s injectable "is serving" pattern).
 fn spawn_version_probe(bin_path: &Path) -> Option<String> {
-    let out = Command::new(bin_path)
+    // Spawned through `GuardedCommand`, which cannot be constructed without the root-exec guard having
+    // passed — so the check is structural rather than remembered (#1748 WU4). `detect_installed_version`
+    // ALSO checks first, purely so it can report WHY it skipped the probe. A refusal here is `None`, which
+    // §7.1 already resolves to "version undetectable" → reinstall, so the install proceeds safely.
+    // The guard runs INSIDE the constructor, so this cannot spawn without it having passed.
+    let out = crate::guardedcmd::GuardedCommand::for_installed_binary(bin_path)
+        .ok()?
         .arg("--version")
-        .hide_console()
         .output()
         .ok()?;
     if !out.status.success() {
@@ -255,7 +258,7 @@ pub fn detect_installed_version(bin_path: &Path) -> DetectedVersion {
 /// [`detect_installed_version`] with an injectable version probe — production
 /// passes [`spawn_version_probe`]; tests pass a fixed answer so detection is
 /// exercised without a real spawnable binary.
-fn detect_installed_version_with(
+pub(crate) fn detect_installed_version_with(
     bin_path: &Path,
     probe: impl Fn(&Path) -> Option<String>,
 ) -> DetectedVersion {
@@ -505,15 +508,16 @@ mod tests {
 
     #[test]
     fn detects_absent_when_the_path_does_not_exist() {
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-cli-update-test");
+        let missing =
+            crate::sources::fixture_root().join("definitely-not-a-real-dig-cli-update-test");
         let detected = detect_installed_version_with(&missing, |_| panic!("must not spawn"));
         assert_eq!(detected, DetectedVersion::Absent);
     }
 
     #[test]
     fn detects_present_with_the_probes_output_when_the_path_exists() {
-        let dir =
-            std::env::temp_dir().join(format!("dig-installer-update-test-{}", std::process::id()));
+        let dir = crate::sources::fixture_root()
+            .join(format!("dig-installer-update-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake_bin = dir.join("fake-dig-node");
         std::fs::write(&fake_bin, b"not a real binary, just needs to exist").unwrap();
@@ -539,7 +543,7 @@ mod tests {
             os: crate::target::Os::Linux,
             arch: crate::target::Arch::X64,
         };
-        let bin_dir = std::env::temp_dir().join("dig-installer-check-updates-test");
+        let bin_dir = crate::sources::fixture_root().join("dig-installer-check-updates-test");
         let resolve_latest = |_: &Repo| -> Result<String, String> { Ok("1.0.0".to_string()) };
         let statuses = check_updates(&bin_dir, &target, &resolve_latest);
         let ids: Vec<&str> = statuses.iter().map(|s| s.component.as_str()).collect();
@@ -560,7 +564,7 @@ mod tests {
             os: crate::target::Os::Linux,
             arch: crate::target::Arch::X64,
         };
-        let bin_dir = std::env::temp_dir().join("dig-installer-check-updates-error-test");
+        let bin_dir = crate::sources::fixture_root().join("dig-installer-check-updates-error-test");
         let resolve_latest = |_: &Repo| -> Result<String, String> { Err("offline".to_string()) };
         let statuses = check_updates(&bin_dir, &target, &resolve_latest);
         for s in &statuses {

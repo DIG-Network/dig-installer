@@ -13,6 +13,12 @@
 //! runtime probe. The one-line elevation reason + per-OS remedy live in
 //! [`reason`]/[`remedy`] so both the CLI and the GUI surface identical copy.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -81,18 +87,44 @@ fn is_elevated_unix() -> bool {
 /// `$PATH` under (or on the way to) elevation is a root-`PATH`-hijack /
 /// pwnkit-class surface. Every tool the elevation path spawns — `id`, `pkexec`
 /// — is looked up here instead.
+///
+/// `/usr/local/bin` is deliberately ABSENT (#1748 F2). It is a system directory only by convention: on
+/// an Intel Mac, Homebrew owns it as `<user>:admin 0775`, so including it meant the "trusted" list
+/// itself named a user-writable directory — a planted `/usr/local/bin/<tool>` was resolved and run by
+/// root, and no `$PATH` hardening could help, because the hole was in the list. No supported platform
+/// ships `id`, `su`, `sh`, `getent`, `osascript` or `pkexec` there; they live in `/usr/bin` or `/bin`.
 #[cfg(unix)]
-const TRUSTED_SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"];
+const TRUSTED_SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// Resolve a well-known system tool to an ABSOLUTE path from [`TRUSTED_SYSTEM_DIRS`],
 /// NEVER via `$PATH`. Returns `None` (fail-closed) when the tool is absent from
-/// every trusted directory.
+/// every trusted directory, or when the file found there is not one only root could have placed.
+///
+/// The ownership check is belt-and-braces behind the list itself: a trusted directory is expected to be
+/// root-owned and not group/other-writable, so a tool inside it that is NOT — because the directory was
+/// re-owned, or the file was dropped by a package that widened it — is refused rather than executed as
+/// root. Fail-closed in both directions: an unreadable candidate is skipped, never assumed good.
 #[cfg(unix)]
 pub fn resolve_system_tool(name: &str) -> Option<PathBuf> {
     TRUSTED_SYSTEM_DIRS
         .iter()
         .map(|dir| Path::new(dir).join(name))
-        .find(|path| path.is_file())
+        .find(|path| path.is_file() && is_root_owned_and_not_group_writable(path))
+}
+
+/// Is `path` owned by uid 0 with no group/other write bit — i.e. could only root have put it there?
+///
+/// Follows symlinks deliberately: `/usr/bin/<tool>` is legitimately a symlink on several distributions,
+/// and it is the TARGET that gets executed, so the target's ownership is the property that matters.
+#[cfg(unix)]
+fn is_root_owned_and_not_group_writable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(md) => md.uid() == 0 && md.permissions().mode() & 0o022 == 0,
+        // Unreadable metadata is not a pass: root must not execute what it cannot vet.
+        Err(_) => false,
+    }
 }
 
 /// The fixed subcommand token the bundled installer recognises to run ONLY the
@@ -764,6 +796,158 @@ mod tests {
         );
     }
 
+    /// No root-side spawn anywhere in the crate may name its program by BARE NAME, because a bare name
+    /// is resolved through `$PATH` — and macOS's stock sudoers sets no `secure_path`, so under `sudo`
+    /// the inherited `$PATH` can begin with a user-writable Homebrew prefix. An attacker who can write
+    /// there supplies the very `su`/`sh`/`getent` that root is about to execute.
+    ///
+    /// [`resolve_system_tool_is_absolute_and_trusted_or_none`] proves the RESOLVER ignores `$PATH`, but
+    /// nothing proved the CALL SITES use it — reverting one to `Command::new("su")` left the whole
+    /// suite green. This asserts the property over the CLASS (no bare-name spawn of a privileged
+    /// helper, anywhere) rather than over the three call sites that exist today, so a fourth added
+    /// later is caught too.
+    ///
+    /// A source-level assertion is the honest tool here: the alternative is mutating the process-global
+    /// `$PATH`, which races every other test in the binary. The repo already uses this shape for the
+    /// release-workflow contract.
+    #[test]
+    fn no_privileged_spawn_resolves_its_program_through_the_path() {
+        // Each module that spawns a helper as root. `include_str!` binds at COMPILE time, so a renamed
+        // or deleted file breaks the build rather than silently vacating the check.
+        let sources: &[(&str, &str)] = &[
+            ("userwrite.rs", include_str!("userwrite.rs")),
+            ("pathcheck.rs", include_str!("pathcheck.rs")),
+            ("paths.rs", include_str!("paths.rs")),
+            ("invoker.rs", include_str!("invoker.rs")),
+            ("scheme.rs", include_str!("scheme.rs")),
+            ("autostart.rs", include_str!("autostart.rs")),
+        ];
+        // The helpers a root-side spawn must never name bare. `sh`/`su` are the shells root would be
+        // tricked into running; `getent`/`chown`/`chmod`/`id` are the rest of the privileged surface.
+        let helpers = ["su", "sh", "getent", "chown", "chmod", "id", "osascript"];
+        for (name, src) in sources {
+            // Only PRODUCTION code is in scope: a test helper spawning `sh` to sleep is not a root-side
+            // spawn, and flagging it would push the check toward being disabled rather than obeyed. The
+            // split is on the `mod tests` marker, and the assertion below fails loudly if a file's
+            // production half ever comes back empty, so the narrowing cannot silently vacate the check.
+            let production = src.split("\nmod tests {").next().unwrap_or("");
+            assert!(
+                production.len() > 200,
+                "{name}: the production half came back empty — the mod-tests split has drifted and \
+                 this check would pass vacuously"
+            );
+            for helper in helpers {
+                let bare = format!("Command::new(\"{helper}\")");
+                assert!(
+                    !production.contains(&bare),
+                    "{name} spawns `{helper}` by bare name, which resolves through $PATH — root must \
+                     resolve it with elevation::resolve_system_tool instead"
+                );
+            }
+        }
+        // A truthful control: the pattern being searched for is one that WOULD be found if present, so
+        // the assertions above cannot be passing merely because the needle can never match.
+        let planted = "fn demo() { Command::new(\"su\").arg(\"-\"); }";
+        assert!(planted.contains("Command::new(\"su\")"));
+    }
+
+    // -- #1748 F2: the TRUSTED list must not itself name a user-writable directory ----
+
+    /// `/usr/local/bin` must never be a trusted source for a tool root executes. On an Intel Mac
+    /// Homebrew owns it as `<user>:admin 0775`, so its presence in this list meant a planted
+    /// `/usr/local/bin/<tool>` was resolved and run by root — a hole no amount of `$PATH` hardening
+    /// could close, because the resolver never consulted `$PATH` in the first place.
+    ///
+    /// Gates in CI on every platform, unprivileged, because it is a property of the list itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_trusted_dirs_exclude_every_user_writable_prefix() {
+        for banned in [
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/opt/homebrew/bin",
+            "/home",
+            "/tmp",
+        ] {
+            assert!(
+                !TRUSTED_SYSTEM_DIRS.contains(&banned),
+                "{banned} is writable by a non-root account on at least one supported platform and \
+                 must not be a source for a tool root executes"
+            );
+        }
+        // The control: the list is not merely empty, it still contains the real system dirs, so the
+        // assertions above are about exclusion rather than about a vacuous list.
+        assert!(TRUSTED_SYSTEM_DIRS.contains(&"/usr/bin"));
+        assert!(TRUSTED_SYSTEM_DIRS.contains(&"/bin"));
+    }
+
+    /// A tool PLANTED in `/usr/local/bin` must not be resolved — the exploit, executed rather than
+    /// argued. Root-gated only because writing there requires it; the property is the resolver's.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_planted_in_usr_local_bin_is_not_resolved() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to plant a binary in /usr/local/bin");
+            return;
+        }
+        let name = format!("dig-planted-probe-{}", std::process::id());
+        let planted = Path::new("/usr/local/bin").join(&name);
+        if std::fs::create_dir_all("/usr/local/bin").is_err() {
+            return;
+        }
+        std::fs::write(&planted, b"#!/bin/sh\necho pwned\n").unwrap();
+        let resolved = resolve_system_tool(&name);
+        let _ = std::fs::remove_file(&planted);
+        assert_eq!(
+            resolved, None,
+            "a binary in /usr/local/bin must never be handed back as a trusted system tool"
+        );
+    }
+
+    /// Belt-and-braces behind the list: a file sitting in a genuinely trusted directory but NOT owned by
+    /// root — or group/other-writable — is refused too, because it is not one only root could have put
+    /// there. Root-gated for the same reason (writing to `/usr/bin`).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_root_owned_tool_in_a_trusted_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to place a file in /usr/bin");
+            return;
+        }
+        let name = format!("dig-owned-probe-{}", std::process::id());
+        let path = Path::new("/usr/bin").join(&name);
+        std::fs::write(&path, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root-owned 0755 in a trusted dir: the legitimate case, and the control that proves the
+        // fixture is capable of resolving at all.
+        assert_eq!(
+            resolve_system_tool(&name).as_deref(),
+            Some(path.as_path()),
+            "a root-owned 0755 tool in a trusted dir is exactly what may be resolved"
+        );
+
+        // Same path, same directory — only the OWNER changes, and it must now be refused.
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; test-only fixture setup.
+        assert_eq!(unsafe { libc::lchown(c.as_ptr(), 1000, 1000) }, 0);
+        let after_chown = resolve_system_tool(&name);
+
+        // And with root ownership restored but the group-write bit set.
+        assert_eq!(unsafe { libc::lchown(c.as_ptr(), 0, 0) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let after_widen = resolve_system_tool(&name);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(after_chown, None, "a non-root-owned tool must be refused");
+        assert_eq!(
+            after_widen, None,
+            "a group-writable tool must be refused — the group could replace it"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_system_tool_is_absolute_and_trusted_or_none() {
@@ -862,7 +1046,16 @@ mod tests {
             resolve_system_tool("id").is_some(),
             "the elevation probe depends on a trusted absolute `id`"
         );
-        // And the public probe stays panic-free + honest (CI is not root).
-        assert!(!is_elevated_unix(), "CI runs unprivileged");
+        // And the public probe stays panic-free + AGREES with the real uid, asserted both ways rather
+        // than assuming the runner is unprivileged. `assert!(!is_elevated_unix())` was an assertion
+        // about the TEST ENVIRONMENT dressed as one about the code, and it made the suite unrunnable as
+        // root — which the #1748 root-owned-ancestor tests need in order to exercise their branch at all.
+        // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
+        let really_root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(
+            is_elevated_unix(),
+            really_root,
+            "the probe must report the privilege this process actually has"
+        );
     }
 }

@@ -199,13 +199,21 @@ Default install location (override with `--bin-dir <DIR>`):
   admin-only directory, so a non-admin cannot replace a binary a LocalSystem service or the
   auto-update beacon runs as SYSTEM (a local privilege escalation; #565). Installing there needs
   elevation (the installer prompts / re-run as Administrator).
-- **macOS / Linux:** the user CLIs (`digstore`/`digs`/`digd`) stay in the elevation-free
-  `~/.dig/bin`; the machine-wide service binaries (`dig-dns`, the `dig-updater` beacon) install
-  into the root-owned `/opt/dig/bin`.
+- **macOS / Linux, run with `sudo`** (the documented `curl -fsSL https://dig.net/install.sh | sudo sh`):
+  the WHOLE stack — user CLIs included — installs into the root-owned `/opt/dig/bin`, and the CLIs a user
+  runs by name are symlinked into `/usr/local/bin`, which is already on every login shell's `PATH`. Root
+  never writes to, or runs anything from, a directory a non-root account can modify.
+- **macOS / Linux, run WITHOUT `sudo`:** the user CLIs (`digstore`/`digs`/`digd`) go in the
+  elevation-free `~/.dig/bin`, which is wired onto your own `PATH`. Nothing runs as root, so no
+  machine-wide directory is involved.
 
-An explicit `--bin-dir <DIR>` overrides both for the whole stack. Upgrading an install that predates
-this (binaries in `%LOCALAPPDATA%\Programs\...` / `~/.dig/bin`) migrates them to the protected root
-automatically and re-points the services — no manual steps.
+An explicit `--bin-dir <DIR>` overrides both for the whole stack.
+
+Upgrading an install that predates this migrates every PRIVILEGED binary — the ones a service or the
+installer itself runs as root — out of the old user-writable location into the protected root, and
+re-points the services at it, with no manual steps. On unix a leftover *user* CLI in `~/.dig/bin` is
+deliberately left alone: nothing runs it as root, so removing a binary out of somebody's home would be a
+liberty rather than a fix. It is shadowed by the newer copy on `PATH` and can be deleted at leisure.
 
 ---
 

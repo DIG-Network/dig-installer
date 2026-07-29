@@ -129,6 +129,13 @@ pub trait UninstallActions {
     fn delete_binaries(&mut self, skip: &[String]) -> (bool, String);
     /// Ask the GUI backend to unconfigure the extension forcelist (#612/#648).
     fn unconfigure_forcelist(&mut self) -> (bool, String);
+    /// Remove the SYSTEM-WIDE login-`PATH` fragment an elevated install writes
+    /// (`/etc/profile.d/dig-path.sh` on Linux, `/etc/paths.d/dig` on macOS).
+    ///
+    /// Its own step because it is machine-wide state that outlives every binary: left behind, it keeps
+    /// a now-empty — or worse, re-created by somebody else — directory on every account's login `PATH`,
+    /// root's included (#1748).
+    fn remove_login_path_fragment(&mut self) -> (bool, String);
     /// Re-scan for anything still present; the returned strings are the residue.
     fn scan_residue(&mut self) -> Vec<String>;
 }
@@ -170,6 +177,12 @@ pub fn orchestrate(actions: &mut dyn UninstallActions, dry_run: bool) -> Uninsta
 
     let (ok, note) = actions.remove_network_config();
     report.record("network", ok, note);
+
+    // Before the binaries: while they still exist the fragment is at least pointing at something this
+    // installer placed, so removing it first never widens the window in which it names a directory
+    // somebody else could re-create.
+    let (ok, note) = actions.remove_login_path_fragment();
+    report.record("login-path", ok, note);
 
     // Binaries are deleted only AFTER their services/schedulers are gone, so a
     // live service never points at a deleted binary mid-teardown. Crucially, a
@@ -250,6 +263,9 @@ mod tests {
         fn unconfigure_forcelist(&mut self) -> (bool, String) {
             self.outcome("forcelist")
         }
+        fn remove_login_path_fragment(&mut self) -> (bool, String) {
+            self.outcome("login-path")
+        }
         fn scan_residue(&mut self) -> Vec<String> {
             self.calls.push("scan".to_string());
             self.residue.clone()
@@ -268,6 +284,43 @@ mod tests {
         );
     }
 
+    /// The machine-wide login-`PATH` fragment MUST be removed by an uninstall.
+    ///
+    /// It was not, and nothing else would ever notice: it is a file in `/etc`, not a binary in a bin
+    /// root, so the residue scan does not look at it. Left behind it keeps a directory on every
+    /// account's login `PATH` — root's included — after the install that justified it is gone (#1748).
+    #[test]
+    fn the_machine_wide_login_path_fragment_is_removed() {
+        let mut a = FakeActions::default();
+        let r = orchestrate(&mut a, false);
+        assert!(
+            a.calls.iter().any(|c| c == "login-path"),
+            "uninstall never removed the system-wide PATH fragment: {:?}",
+            a.calls
+        );
+        let step = r
+            .steps
+            .iter()
+            .find(|s| s.id == "login-path")
+            .expect("the step must be reported, not silent");
+        assert!(step.ok);
+        // Before the binaries, so the fragment never outlives them.
+        let frag = a.calls.iter().position(|c| c == "login-path").unwrap();
+        let bins = a.calls.iter().position(|c| c == "binaries").unwrap();
+        assert!(frag < bins);
+    }
+
+    /// A failure to remove it fails the whole uninstall rather than being swallowed.
+    #[test]
+    fn a_failed_login_path_removal_makes_the_run_incomplete() {
+        let mut a = FakeActions {
+            fail_step: Some("login-path".to_string()),
+            ..Default::default()
+        };
+        let r = orchestrate(&mut a, false);
+        assert!(!r.complete());
+    }
+
     #[test]
     fn scans_for_residue_last() {
         let mut a = FakeActions::default();
@@ -281,7 +334,7 @@ mod tests {
         let r = orchestrate(&mut a, false);
         assert!(r.complete());
         assert!(r.residue.is_empty());
-        assert_eq!(r.steps.len(), 6);
+        assert_eq!(r.steps.len(), 7);
         assert!(r.steps.iter().all(|s| s.ok));
     }
 

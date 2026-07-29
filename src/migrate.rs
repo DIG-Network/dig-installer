@@ -42,6 +42,12 @@
 //! registration's binPath to decide what to vacate ([`crate::regaudit`]) — is
 //! the thin imperative layer.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 
 use crate::paths;
@@ -290,16 +296,28 @@ mod tests {
         }
     }
 
+    /// The unix migration vacates exactly the binaries that must not live in a user-writable root.
+    ///
+    /// `dig-node` and `dig-relay` are now in that set (#1748 F1): the installer executes them as root, so
+    /// a copy left behind in `~/.dig/bin` by an older installer is a root-exec surface and MUST be
+    /// vacated on upgrade, not left in place. That is a deliberate behaviour change — before this, an
+    /// upgrade would leave the old user-writable dig-node exactly where root would later run it from.
     #[test]
-    fn unix_removes_only_the_privileged_binaries_leaving_the_user_clis() {
+    fn unix_removes_the_privileged_and_root_executed_binaries_leaving_the_user_clis() {
         for os in [Os::Linux, Os::MacOs] {
             let stems = legacy_removable_stems(os);
             // Privileged (moving) binaries are removed …
-            for s in ["dig-dns", "dig-updater", "dig-updater-worker"] {
+            for s in [
+                "dig-dns",
+                "dig-updater",
+                "dig-updater-worker",
+                "dig-node",
+                "dig-relay",
+            ] {
                 assert!(stems.contains(&s), "{s} must be removed on {os:?}");
             }
-            // … the user CLIs are left in ~/.dig/bin (they do not move).
-            for s in ["digstore", "digs", "dig-node", "dign", "digd", "dig-relay"] {
+            // … the CLIs root never executes are left in ~/.dig/bin (they do not move).
+            for s in ["digstore", "digs", "dign", "digd"] {
                 assert!(
                     !stems.contains(&s),
                     "{s} is a user CLI on {os:?} — must NOT be removed from ~/.dig/bin"

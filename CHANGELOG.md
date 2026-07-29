@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [Unreleased]
+
+### Bug Fixes
+- **install:** Resolve the invoking user under `sudo`, so an elevated install no
+  longer lands in `/root` (#1748). `HOME=/root` made every `dirs::home_dir()`
+  call answer with root's home: the CLIs went to `/root/.dig/bin`, the `export
+  PATH` to `/root/.bashrc`, the dig-app autostart unit to
+  `/root/.config/systemd/user/`, and the `chia://` handler to
+  `/root/.local/share/applications/` — none of which the actual user can reach
+  (`/root` is mode `0700`).
+- **install:** An elevated unix install now places the user-facing CLIs in
+  `/usr/local/bin`, which is already on every login shell's `PATH`, and links
+  the protected-root `dig-dns` there too (`/opt/dig/bin` is on no default
+  `PATH`, so `dig-dns doctor` previously resolved for nobody). PATH wiring
+  falls back to `/etc/profile.d/dig-path.sh` only when a re-read of the target
+  user's login shell shows the directory is still unreachable.
+- **pathcheck:** The PATH verification no longer injects the install directory
+  into the PATH it verifies against (#1748). It prepended the bin dir and then
+  looked the CLI up in the result, which is true by construction after any
+  successful download — so it reported `✓ 'dig-node --version' resolved on
+  PATH` against an install no user could reach. The PATH is now read from the
+  target user's login shell (unix) or the persisted `Environment` values
+  (Windows) and used unmodified.
+- **pathcheck:** A component is no longer reported ready without its binary
+  having been EXECUTED, and the alias binaries plus `dig-app` join the verified
+  set. `dig-app` was earning a `✓` for existing on disk while being unable to
+  load `libxdo.so.3`.
+- **autostart:** The dig-app login registration targets the invoking user, is
+  `chown`ed back to them, ignores root's `$XDG_CONFIG_HOME`, and prints an
+  enable command that is runnable in a scope where the unit exists.
+
 ## [0.30.0] - 2026-07-28
 
 ### Features
