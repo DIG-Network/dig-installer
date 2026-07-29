@@ -211,4 +211,75 @@ if sudo -u "$ATTACKER" sh -c 'mv /opt/dig/bin /opt/dig/bin.stolen' 2>/dev/null; 
   fail "$ATTACKER renamed the protected root - the parent is writable"
 fi
 
+note "UNINSTALL (F4): a full uninstall must take the veneer links, not leave them and claim zero residue"
+# CONTROL 2 above left the veneer root-owned 0755 with our link in it, which is the ordinary end state of a
+# healthy install — so this is the uninstall a real user runs.
+#
+# Why this is a GATE assertion and not a unit test: the removal call site is reached only through the real
+# uninstall, and the helper it calls was already tested directly. Deleting the CALL left all 692 lib tests
+# passing — the same shape as F1, where the removal was provably dead code and the suite could not see it.
+#
+# Two things are wrong when the links are left behind, and both are asserted:
+#   1. `--uninstall` promises "leaving ZERO residue" and reported `residue: []` with the link still there,
+#      which is a false claim in a machine-consumed report;
+#   2. a DIG-named entry left in the veneer is the STARTING STATE of ATTEMPT 0 — the next time that
+#      directory becomes writable, an unprivileged account inherits a link root resolves.
+test -L /usr/local/bin/digs || fail "the uninstall scenario needs a planted link to be meaningful"
+echo "before uninstall:"; ls -l /usr/local/bin/digs
+
+# A FOREIGN entry of the same shape, planted beside ours: a regular file, which another package manager's
+# `digs` would be. It must SURVIVE — deleting somebody else's binary is not this installer's call — and it
+# must be REPORTED rather than silently ignored, so the two outcomes cannot be confused with each other.
+printf '#!/bin/sh\necho not-ours\n' > /usr/local/bin/dign
+chmod 0755 /usr/local/bin/dign
+
+# The installer's EXIT CODE is deliberately not what decides this, and `set +e` is load-bearing rather than
+# defensive. An uninstall that reports residue exits non-zero, so under `set -e` the script died here and the
+# assertions below never ran: the gate then "caught" the regression by exit code alone, which means the
+# variant that leaves the link AND drops the veneer from the residue scan — exit 0, `residue: []`, link still
+# present — would have sailed through. The filesystem and the report are the evidence.
+set +e
+"$INSTALLER" --uninstall --json > uninstall.json 2> uninstall.err
+RC=$?
+set -e
+cat uninstall.err
+echo "uninstall exit: $RC"
+jq -e '.result.steps | length > 0' uninstall.json || fail "the uninstall did nothing"
+
+if [ -e /usr/local/bin/digs ] || [ -L /usr/local/bin/digs ]; then
+  fail "the uninstall LEFT our veneer link behind - it is residue, and it is ATTEMPT 0's starting state (F4)"
+fi
+echo "our link was taken"
+
+# The foreign file is untouched, and named in the residue rather than quietly dropped from the report.
+test -f /usr/local/bin/dign \
+  || fail "the uninstall deleted a regular file that is not ours - possibly another package manager's dign (F4)"
+jq -e '[.result.residue[] | select(contains("/usr/local/bin/dign"))] | length == 1' uninstall.json \
+  || fail "a foreign entry we decline to delete must still be REPORTED as residue, not omitted: $(jq -c '.result.residue' uninstall.json)"
+# ...and that is the only thing left, so the report is precise rather than merely non-empty.
+jq -e '.result.residue | length == 1' uninstall.json \
+  || fail "residue must name exactly what survived: $(jq -c '.result.residue' uninstall.json)"
+echo "foreign entry left in place and reported: $(jq -c '.result.residue' uninstall.json)"
+
+note "CONTROL 3: with nothing foreign in the way, the same uninstall reports ZERO residue"
+# Without this, an uninstall that reported residue unconditionally would satisfy the assertions above.
+rm -f /usr/local/bin/dign
+"$INSTALLER" "${CLI_ONLY[@]}" --json > reinstall.json
+jq -e '.result.ready == true' reinstall.json || fail "the reinstall before the clean uninstall must be ready"
+test -L /usr/local/bin/digs   || fail "the reinstall planted no veneer link"
+set +e
+# stderr to its OWN file: the human log goes there, and merging it into the report made `jq` fail to parse a
+# file whose JSON was perfectly good.
+"$INSTALLER" --uninstall --json > uninstall-clean.json 2> uninstall-clean.err
+set -e
+cat uninstall-clean.err
+# RESIDUE, not `complete`. `complete` is `residue.is_empty() && every step ok`, and in this container the
+# service-teardown steps legitimately fail — the node/relay launcher binaries were never installed, so their
+# services cannot be deregistered. Asserting `complete` here would be asserting an outcome the correct design
+# cannot produce in this environment, which is how a fixture ends up measuring the container.
+jq -e '.result.residue | length == 0' uninstall-clean.json \
+  || fail "a clean uninstall must report zero residue: $(jq -c '.result.residue' uninstall-clean.json)"
+test ! -e /usr/local/bin/digs || fail "the clean uninstall left the veneer link"
+echo "clean-uninstall control verified: zero residue, link gone"
+
 note "All escalation attempts refused, and every control succeeded"
