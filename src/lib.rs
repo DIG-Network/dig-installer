@@ -924,7 +924,10 @@ fn run_report_gated(
             // put a directory that is deliberately never on PATH into `report.path.dir`, which is a
             // machine-consumed field.
             let wired = paths::reachable_dir(target.os, &plan.bin_dir);
-            log(&format!("Adding {} to PATH:", wired.display()));
+            // "Checking", not "Adding": on the default elevated install the veneer is already on PATH and
+            // this step writes nothing, so announcing an addition described a run that did not happen
+            // (#1748, C3).
+            log(&format!("Ensuring {} is on PATH:", wired.display()));
             let dir = wired.to_string_lossy().into_owned();
             if plan.dry_run {
                 log("    (would add to PATH)");
@@ -935,12 +938,14 @@ fn run_report_gated(
                 });
             } else {
                 match paths::add_to_path(&plan.bin_dir) {
-                    Ok(note) => {
-                        log(&format!("    ✓ {note}"));
+                    Ok(wiring) => {
+                        log(&format!("    ✓ {}", wiring.note));
                         report.path = Some(PathResult {
-                            modified: true,
+                            // OBSERVED, never assumed: the wiring itself reports whether it changed
+                            // anything, like every other field in this struct.
+                            modified: wiring.changed,
                             dir,
-                            note,
+                            note: wiring.note,
                         });
                     }
                     Err(e) => {

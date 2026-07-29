@@ -387,12 +387,44 @@ fn user_can_enter(dir: &str, user: &crate::invoker::TargetUser) -> bool {
     out.map(|s| s.success()).unwrap_or(false)
 }
 
+/// What a `PATH`-wiring attempt actually DID, as distinct from whether it succeeded.
+///
+/// `changed` exists because "we made no change" and "we changed something" are different facts and the
+/// `--json` report is consumed by machines (#1748). `InstallReport::path.modified` was hardcoded `true`
+/// on the success arm, so the DEFAULT elevated install — whose whole point is that the veneer is already
+/// on `PATH` and nothing needs wiring — reported a modification it never made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathWiring {
+    /// Did this run actually modify any `PATH` state (a registry value, a profile, a system fragment)?
+    pub changed: bool,
+    /// Human-readable detail, always populated.
+    pub note: String,
+}
+
+impl PathWiring {
+    /// A run that had nothing to do because the directory was already reachable.
+    fn unchanged(note: impl Into<String>) -> Self {
+        Self {
+            changed: false,
+            note: note.into(),
+        }
+    }
+
+    /// A run that wrote something.
+    fn changed(note: impl Into<String>) -> Self {
+        Self {
+            changed: true,
+            note: note.into(),
+        }
+    }
+}
+
 /// Add `bin_dir` to the user's PATH.
 ///   Windows: append to HKCU\Environment\Path (REG_EXPAND_SZ, no truncation),
 ///            then broadcast WM_SETTINGCHANGE. No elevation.
 ///   macOS/Linux: append an `export PATH` line to the user's shell profile(s)
 ///            (idempotent), so new shells see it. Returns a human note.
-pub fn add_to_path(bin_dir: &Path) -> Result<String, String> {
+pub fn add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
     #[cfg(windows)]
     {
         windows_add_to_path(bin_dir)
@@ -404,7 +436,7 @@ pub fn add_to_path(bin_dir: &Path) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn windows_add_to_path(bin_dir: &Path) -> Result<String, String> {
+fn windows_add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ};
     use winreg::{RegKey, RegValue};
 
@@ -416,7 +448,11 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<String, String> {
 
     let current: String = env.get_value("Path").unwrap_or_default();
     let new_path = match path_append(&current, &dir, ';') {
-        None => return Ok(format!("user PATH (already present): {dir}")),
+        None => {
+            return Ok(PathWiring::unchanged(format!(
+                "user PATH (already present): {dir}"
+            )))
+        }
         Some(p) => p,
     };
 
@@ -430,7 +466,7 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<String, String> {
     )
     .map_err(|e| format!("write HKCU\\Environment\\Path: {e}"))?;
     broadcast_environment_change();
-    Ok(format!("user PATH: {dir}"))
+    Ok(PathWiring::changed(format!("user PATH: {dir}")))
 }
 
 /// Does `component`, having landed in `bin_dir`, need a symlink from [`UNIX_MACHINE_BIN_DIR`] so a user
@@ -574,7 +610,7 @@ fn login_path_fragment(dir: &str) -> (&'static str, String) {
 }
 
 #[cfg(not(windows))]
-fn unix_add_to_path(bin_dir: &Path) -> Result<String, String> {
+fn unix_add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
     let user = crate::invoker::target_user();
     if crate::invoker::is_root() {
         return root_add_to_path(bin_dir, user);
@@ -606,7 +642,10 @@ fn unix_add_to_path(bin_dir: &Path) -> Result<String, String> {
 /// The install dir is still required to be one the user can ENTER: the veneer only holds symlinks, so
 /// an unreadable target directory leaves them reachable by name and unusable in fact.
 #[cfg(not(windows))]
-fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result<String, String> {
+fn root_add_to_path(
+    bin_dir: &Path,
+    user: &crate::invoker::TargetUser,
+) -> Result<PathWiring, String> {
     use crate::pathcheck;
 
     // This function is unix-only by `cfg`, and `reachable_dir` distinguishes only Windows from not, so
@@ -645,7 +684,9 @@ fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result
     }
 
     if let Some(note) = reachable(" already — no PATH wiring needed") {
-        return Ok(note);
+        // Nothing was written, and the report must not claim otherwise: this is the DEFAULT elevated
+        // install, whose whole design is that the veneer is already on PATH (#1748, C3).
+        return Ok(PathWiring::unchanged(note));
     }
 
     // Reached only on a platform whose login PATH lacks the veneer, or under a `--bin-dir` override.
@@ -697,7 +738,7 @@ fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result
         .map_err(|e| format!("write {fragment_file}: {e}"))?;
 
     if let Some(note) = reachable(&format!(" (wired via {fragment_file})")) {
-        return Ok(note);
+        return Ok(PathWiring::changed(note));
     }
     let observed =
         pathcheck::login_shell_path(user).unwrap_or_else(|e| format!("<unreadable: {e}>"));
@@ -765,7 +806,7 @@ pub fn ensure_bin_dir(bin_dir: &Path) -> Result<(), String> {
 /// profile-append logic (which `.zshrc`/`.bashrc`/`.profile` to touch, the
 /// re-run guard) is exercised without writing the developer's real dotfiles.
 #[cfg(not(windows))]
-fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<String, String> {
+fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<PathWiring, String> {
     use std::fs;
     use std::io::Write;
 
@@ -775,6 +816,8 @@ fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<String, String> {
     let line = format!("\n{marker}\nexport PATH=\"{dir}:$PATH\"\n");
 
     let mut touched = Vec::new();
+    // Distinguish "already had it" from "we appended it" — `touched` alone records both.
+    let mut wrote = false;
     // Write to whichever profiles exist (plus .profile as the POSIX fallback).
     for name in [".zshrc", ".bashrc", ".profile"] {
         let p = home.join(name);
@@ -787,6 +830,7 @@ fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<String, String> {
             touched.push(name);
             continue;
         }
+        wrote = true;
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -801,11 +845,18 @@ fn unix_add_to_path_in(bin_dir: &Path, home: &Path) -> Result<String, String> {
         let p = home.join(".profile");
         fs::write(&p, line.trim_start()).map_err(|e| format!("write {}: {e}", p.display()))?;
         touched.push(".profile");
+        wrote = true;
     }
-    Ok(format!(
+    if !wrote {
+        return Ok(PathWiring::unchanged(format!(
+            "{dir} is already on PATH in {}",
+            touched.join(", ")
+        )));
+    }
+    Ok(PathWiring::changed(format!(
         "added {dir} to PATH in {} (open a new shell to pick it up)",
         touched.join(", ")
-    ))
+    )))
 }
 
 #[cfg(windows)]
@@ -1285,6 +1336,40 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o777,
             "a --bin-dir the user chose is theirs; its posture is REPORTED, not rewritten"
+        );
+    }
+
+    /// A wiring attempt reports whether it CHANGED anything, not merely whether it succeeded.
+    ///
+    /// `InstallReport::path.modified` was hardcoded `true` on the success arm, so the default elevated
+    /// install — whose entire design is that the veneer is already on `PATH` and nothing needs writing —
+    /// claimed a modification it never made, in a field machines consume. Both arms are asserted, because
+    /// a `changed` that was always `false` would satisfy the interesting one on its own.
+    #[cfg(not(windows))]
+    #[test]
+    fn path_wiring_reports_whether_it_actually_changed_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(
+            home.join(".bashrc"),
+            "# existing
+",
+        )
+        .unwrap();
+
+        let first = unix_add_to_path_in(Path::new("/opt/somewhere/bin"), home).unwrap();
+        assert!(
+            first.changed,
+            "the first run appends the export, so it DID change PATH state: {}",
+            first.note
+        );
+
+        // Idempotent re-run: the entry is already there, so nothing is written and nothing is claimed.
+        let second = unix_add_to_path_in(Path::new("/opt/somewhere/bin"), home).unwrap();
+        assert!(
+            !second.changed,
+            "a re-run that writes nothing must not report a modification: {}",
+            second.note
         );
     }
 
