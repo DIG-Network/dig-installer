@@ -82,6 +82,10 @@ pub fn dig_owned_levels(root: &Path) -> Vec<PathBuf> {
 ///
 /// A directory with no DIG-owned levels (an operator's `--bin-dir`) is created if absent and otherwise
 /// left entirely alone — its posture is reported by [`verify`], not rewritten.
+///
+/// Ownership is repaired only when this process is root, since only root can give a directory away;
+/// otherwise a wrong owner is left for [`verify`] to report. The MODE is always repaired, because that
+/// is within the authority of whoever owns the level.
 pub fn ensure(root: &Path) -> Result<(), String> {
     let levels = dig_owned_levels(root);
     if levels.is_empty() {
@@ -111,10 +115,13 @@ fn ensure_levels(levels: &[PathBuf]) -> Result<(), String> {
         // Through the descriptor, so the inode re-moded is the one just opened. The mode is asserted
         // unconditionally: this is the repair path for a level an earlier run left group/world-writable.
         dirfd::fchmod(&fd, PRIVILEGED_DIR_MODE, level)?;
+        // Ownership can only be GIVEN by root, so it is repaired when we have the authority to do so
+        // and merely VERIFIED otherwise. An unprivileged run that finds a non-root level does not fail
+        // here — it fails at `verify`, whose ownership arm reports it and which readiness treats as
+        // fatal under elevation. Attempting the `fchown` regardless turned "this level has the wrong
+        // owner" into "chown: operation not permitted", which is a worse message for the same fact.
         let (owner, _) = dirfd::stat_of(&fd, level)?;
-        if owner != ROOT_UID {
-            // Only meaningful when we are root; unelevated the `fchown` fails and is reported, which is
-            // correct — an unprivileged run has no business owning the privileged root.
+        if owner != ROOT_UID && crate::invoker::is_root() {
             dirfd::fchown(&fd, ROOT_UID, ROOT_UID, level)?;
         }
     }
