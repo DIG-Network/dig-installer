@@ -154,29 +154,79 @@ fn cancel_install(state: State<'_, InstallState>) {
     state.cancelled.store(true, Ordering::SeqCst);
 }
 
-/// Point WebView2 at a writable, app-owned user-data folder BEFORE the webview
-/// initializes (#715).
+/// Where WebView2's user-data folder must live for THIS process (#1819).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebviewDataDir {
+    /// WebView2's own default, `%LOCALAPPDATA%\<bundle-id>\EBWebView`. Writable by definition for the
+    /// account that owns it, and the correct scope for a browser profile.
+    OwnProfile,
+    /// The hardened machine-wide root under `%ProgramData%`, for a token whose own `%LOCALAPPDATA%`
+    /// WebView2 cannot use.
+    MachineRoot,
+}
+
+/// Decide the folder from the token we are running under.
+///
+/// Pure and injected rather than reading the ambient token itself, so both arms are testable — the
+/// crate's own convention for an elevation-dependent decision (cf. `install::should_exec_verify`).
+///
+/// The direction is what matters: pinning to the machine root is what an ELEVATED or SYSTEM token
+/// needs, and it is exactly wrong for an unelevated one, whose `Administrators` group is deny-only.
+#[cfg(windows)]
+fn webview_data_dir_for(elevated: bool, system: bool) -> WebviewDataDir {
+    if elevated || system {
+        WebviewDataDir::MachineRoot
+    } else {
+        WebviewDataDir::OwnProfile
+    }
+}
+
+/// Point WebView2 at a writable user-data folder BEFORE the webview initializes (#715, #1819).
 ///
 /// On Windows the Tauri UI renders in WebView2, whose data folder defaults to
-/// `%LOCALAPPDATA%\<bundle-id>\EBWebView`. The installer GUI runs elevated, and
-/// when it runs as **LocalSystem** `%LOCALAPPDATA%` is
-/// `C:\Windows\system32\config\systemprofile\AppData\Local` — a dir WebView2
-/// cannot create, so it dies with "couldn't create the data directory" before
-/// the UI loads. WebView2 reads `WEBVIEW2_USER_DATA_FOLDER` at init, so setting
-/// it here (before `tauri::Builder::run`) makes the GUI launch under any account.
+/// `%LOCALAPPDATA%\<bundle-id>\EBWebView`. That default is right for an ordinary user token and
+/// WRONG for a privileged one: as **LocalSystem** `%LOCALAPPDATA%` is
+/// `C:\Windows\system32\config\systemprofile\AppData\Local`, which WebView2 cannot create, so it dies
+/// with "couldn't create the data directory" before the UI loads. WebView2 reads
+/// `WEBVIEW2_USER_DATA_FOLDER` at init, so setting it here (before `tauri::Builder::run`) fixes that.
 ///
-/// Because this process is elevated (admin, sometimes SYSTEM) and the target sits
-/// under the world-writable `%ProgramData%`, the dir is created through the
-/// HARDENED, fail-closed [`dig_installer::daemon_dir::ensure_webview_data_dir`]
-/// (SYSTEM-owned, protected `{SYSTEM:F, Administrators:F}` DACL, no reparse-point
-/// redirection) — never a bare `create_dir_all`, which a non-admin could
-/// pre-squat or junction into an attacker-controlled path a SYSTEM/admin WebView2
-/// would then write through. If hardening cannot be established + verified we
-/// FAIL CLOSED: surface a clear error and exit rather than pin WebView2 to an
-/// unverified dir (a controlled error beats a silent privileged write into an
-/// unsafe dir — or an opaque WebView2 crash). No-op off Windows.
+/// # Why this is CONDITIONAL, and why it was a defect that it wasn't (#1819)
+///
+/// This used to pin the machine root **unconditionally**. The machine root is deliberately
+/// `{SYSTEM:F, Administrators:F}`, protected and non-inheriting — load-bearing for #565, and NOT to be
+/// widened. So an **unelevated** GUI, whose `Administrators` group is deny-only in its token, could not
+/// create `…\installer\webview\EBWebView` and WebView2 refused to start:
+///
+/// > Microsoft Edge can't read and write to this data directory: `C:\ProgramData\DigNetwork\installer\webview\EBWebView`
+///
+/// That failure is worse than it first looks, because it happens *before any UI exists*. The GUI's own
+/// elevation gate and its #499 SYSTEM refusal (`install.rs`) are command handlers that run only after
+/// the WebView is up — so a process that cannot start its WebView cannot tell the user **anything**,
+/// including the one thing it wants to say ("re-launch and accept the UAC prompt"). The data folder
+/// must therefore never depend on a privilege the process might not have: an unelevated run gets its
+/// own profile and a working window, and the elevation gate then speaks for itself.
+///
+/// Elevated and SYSTEM still take the hardened root through the fail-closed
+/// [`dig_installer::daemon_dir::ensure_webview_data_dir`] (SYSTEM-owned, protected DACL, no
+/// reparse-point redirection) — never a bare `create_dir_all`, which a non-admin could pre-squat or
+/// junction into a path a privileged WebView2 would then write through. If that hardening cannot be
+/// established and verified we FAIL CLOSED rather than pin WebView2 to an unverified dir.
+///
+/// `is_system` is consulted as well as `is_elevated` because it fails CLOSED to "is SYSTEM", which
+/// pushes to the machine root — the safe direction: a SYSTEM token sent to its own profile is the
+/// original #715 crash. No-op off Windows.
 #[cfg(windows)]
 fn pin_webview_data_dir() {
+    // Ambient reads at the edge; the decision is the pure function above.
+    let target = webview_data_dir_for(
+        dig_installer::elevation::is_elevated(),
+        dig_installer::elevation::is_system(),
+    );
+    if target == WebviewDataDir::OwnProfile {
+        // Leave WEBVIEW2_USER_DATA_FOLDER unset: WebView2's default is already correct and writable.
+        return;
+    }
     match dig_installer::daemon_dir::ensure_webview_data_dir() {
         Ok(dir) => std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir),
         Err(e) => {
@@ -212,4 +262,58 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running DIG Installer");
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The direction is the whole point: an unelevated token must get its OWN profile.
+    ///
+    /// This is the #1819 regression. Pinning the machine root unconditionally meant an unelevated GUI
+    /// could not create `EBWebView` under a `{SYSTEM:F, Administrators:F}` directory, so WebView2
+    /// refused to start and the process died before it could render the very message telling the user
+    /// to re-launch elevated. Inverting this predicate reintroduces exactly that.
+    #[test]
+    fn an_unelevated_process_uses_its_own_profile() {
+        assert_eq!(
+            webview_data_dir_for(false, false),
+            WebviewDataDir::OwnProfile
+        );
+    }
+
+    /// ...and the control: a privileged token must NOT be sent to its own profile, because as SYSTEM
+    /// that is `…\systemprofile\AppData\Local`, which WebView2 cannot create (#715, the defect the
+    /// original pin existed to fix). Without this arm, "always use the own profile" would pass the
+    /// test above and regress #715.
+    #[test]
+    fn an_elevated_or_system_process_uses_the_hardened_machine_root() {
+        assert_eq!(
+            webview_data_dir_for(true, false),
+            WebviewDataDir::MachineRoot,
+            "elevated"
+        );
+        assert_eq!(
+            webview_data_dir_for(false, true),
+            WebviewDataDir::MachineRoot,
+            "SYSTEM"
+        );
+        assert_eq!(
+            webview_data_dir_for(true, true),
+            WebviewDataDir::MachineRoot,
+            "elevated AND SYSTEM"
+        );
+    }
+
+    /// `is_system` fails CLOSED to "is SYSTEM" when the identity cannot be determined, so a SYSTEM
+    /// result must be sufficient on its own — never require BOTH signals, or an indeterminate identity
+    /// would be routed to a profile WebView2 cannot use.
+    #[test]
+    fn a_system_result_alone_is_enough_to_take_the_machine_root() {
+        assert_ne!(
+            webview_data_dir_for(false, true),
+            WebviewDataDir::OwnProfile,
+            "SYSTEM alone must not fall through to the own-profile branch"
+        );
+    }
 }
