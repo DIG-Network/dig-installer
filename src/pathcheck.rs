@@ -150,7 +150,9 @@ fn unix_login_shell_path(user: &TargetUser) -> Result<String, String> {
     // `secure_path`, so a `$PATH` led by a user-writable Homebrew prefix would let an attacker supply
     // the very shell root spawns. Fail-closed: an unresolvable tool is an error, never a fallback to
     // a `$PATH` lookup.
-    let out = if user.via_elevation {
+    // `is_root()`, not the elevation hint: in the macOS GUI's root child there is no hint, and reading
+    // OUR OWN login shell there measures ROOT's PATH while reporting it as the user's (#1748).
+    let out = if crosses_user_boundary(crate::invoker::is_root(), user) {
         let su = crate::elevation::resolve_system_tool("su")
             .ok_or_else(|| "su not found in any trusted system directory".to_string())?;
         Command::new(su)
@@ -332,7 +334,12 @@ pub fn verify_cli_resolves(
             installed_at.display()
         ));
     }
-    Ok(resolved)
+    // The CANONICAL target, not the name that resolved to it (#1748, F5). On an elevated install the
+    // PATH hit is `/usr/local/bin/<exe>`, a symlink in a directory Homebrew leaves `<user>:admin 0775`
+    // on an Intel Mac — so returning it means the caller goes on to EXECUTE a path whose final
+    // component an unprivileged account may control. The canonical form is the placement inside the
+    // root-owned protected root, which is the copy whose properties were actually verified.
+    Ok(resolved.canonicalize().unwrap_or(resolved))
 }
 
 /// Are `a` and `b` the same binary, following symlinks?
@@ -397,6 +404,28 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
         .map_err(|e| format!("{what} output could not be read: {e}"))
 }
 
+/// Is there a privilege boundary to cross before executing something on this user's behalf?
+///
+/// Pure, and takes `euid_is_root` as an ARGUMENT rather than reading it, because the whole point of
+/// #1748 is which question is being asked — and a predicate that reads the ambient uid can only be
+/// tested in whichever state the test runner happens to be in. CI runs unprivileged, so a test that
+/// called the impure form could only ever exercise the `false` arm, which the DEFECTIVE
+/// `!user.via_elevation` form satisfies identically. That is not hypothetical: reverting the predicate
+/// to the defective form left the whole suite green.
+///
+/// The boundary exists exactly when we are root and the account we are acting for is somebody else.
+/// `via_elevation` is deliberately NOT consulted: it is only `true` when an elevation HINT
+/// (`SUDO_USER`/`DOAS_USER`/`PKEXEC_UID`) named another account, and the macOS GUI elevates through
+/// `osascript … with administrator privileges`, which inherits no environment — so in that root child
+/// there is no hint, `via_elevation` is `false`, and a hint-based predicate reports "not elevated"
+/// while running as uid 0.
+///
+/// Thin alias for [`TargetUser::acting_for_another_account`], which is the single shared decision — this
+/// module states it in its own vocabulary and adds nothing.
+fn crosses_user_boundary(euid_is_root: bool, user: &TargetUser) -> bool {
+    user.acting_for_another_account(euid_is_root)
+}
+
 /// The `su - <user> -c '<binary> --version'` form, when there is a user boundary to cross.
 ///
 /// `None` means "run it directly" (we genuinely are that user, or this is Windows). `Some(Err(..))` is
@@ -417,8 +446,7 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
 /// account is somebody else, which drops privilege for the probe wherever an account is known.
 #[cfg(unix)]
 fn as_user_command(binary: &Path, user: &TargetUser) -> Option<Result<Command, String>> {
-    let we_are_that_account = !crate::invoker::is_root() || user.name == "root";
-    if we_are_that_account {
+    if !crosses_user_boundary(crate::invoker::is_root(), user) {
         return None;
     }
     Some(
@@ -447,10 +475,22 @@ fn as_user_command(_binary: &Path, _user: &TargetUser) -> Option<Result<Command,
 /// execute it" is not the claim being made — the claim is that the user can. A binary that is
 /// present but unloadable surfaces its loader error here (for example a missing `libxdo.so.3`),
 /// which is the detail the failure note must carry.
+///
+/// When there is no account to drop to — a genuine root-shell install, or the macOS GUI's `osascript`
+/// child, where the resolved account IS root — root execs the binary itself, so that branch is gated on
+/// [`crate::secure::root_exec_guard`]: the containing directory must not be one an unprivileged account
+/// can write. Placement alone does not cover it, because a `--bin-dir` override can aim this call
+/// anywhere.
 pub(crate) fn run_version(binary: &Path, user: &TargetUser) -> Result<String, String> {
     let mut cmd = match as_user_command(binary, user) {
         Some(c) => c?,
         None => {
+            // No boundary to cross means either we are unelevated — executing a binary the user can
+            // already write is their own authority — or we are root acting AS root, which is the one
+            // case where root really does exec this binary itself. Guard it: with a `--bin-dir`
+            // override the directory can be one an unprivileged account writes, and neither placement
+            // nor the `su` drop protects this call then (#1748, F5).
+            crate::secure::root_exec_guard(binary)?;
             let mut c = Command::new(binary);
             c.arg("--version");
             c
@@ -819,52 +859,94 @@ mod tests {
 
     // -- #1748: "am I root?", not "was I sudo'd?" --------------------------------
 
-    /// The probe must drop privilege based on the EFFECTIVE UID, not on whether an elevation hint
-    /// happens to exist.
+    /// The predicate must answer "am I root, acting for somebody else?" — and it is asserted over its
+    /// three INPUTS directly, not through the ambient uid.
     ///
-    /// `via_elevation` is only `true` when `SUDO_USER`/`DOAS_USER`/`PKEXEC_UID` named another account.
-    /// The macOS GUI elevates via `osascript … with administrator privileges`, which inherits neither
-    /// environment nor stdin, so the root child has NO hint: the old predicate reported "not elevated"
-    /// while running as uid 0 and ran the binary directly as root.
+    /// This replaces a test that could not fail. It called `as_user_command`, which reads the real uid,
+    /// and CI runs unprivileged — so only the `is_none()` arm ever ran, and the DEFECTIVE
+    /// `!user.via_elevation` predicate satisfies that arm identically for a `via_elevation: false`
+    /// fixture. Reverting the fix left the suite GREEN 650/650. The property is now expressed against a
+    /// pure function so every combination is reachable on any runner.
     ///
-    /// The fixture is exactly that state — `via_elevation: false` with a NON-root account name — which is
-    /// what the old predicate got wrong and the new one gets right. Both arms are asserted against the
-    /// real uid, so the test is meaningful whichever way the suite is run.
-    #[cfg(unix)]
+    /// The decisive row is the second: root, no elevation hint, acting for a non-root account — the
+    /// macOS `osascript` child. `!via_elevation` says "no boundary" there and execs as root;
+    /// `euid_is_root && name != "root"` says "cross it".
     #[test]
-    fn the_probe_drops_privilege_based_on_the_uid_not_on_an_elevation_hint() {
-        let no_hint_but_root = TargetUser {
+    fn the_boundary_is_decided_by_the_uid_and_the_account_never_by_an_elevation_hint() {
+        let alice = |via_elevation| TargetUser {
             name: "alice".to_string(),
             home: std::path::PathBuf::from("/home/alice"),
-            uid: None,
-            gid: None,
-            // The osascript root child: no hint was available, so this is false even though euid == 0.
-            via_elevation: false,
+            uid: Some(1000),
+            gid: Some(1000),
+            via_elevation,
         };
-        let crossing = as_user_command(Path::new("/opt/dig/bin/dign"), &no_hint_but_root);
-        if crate::invoker::is_root() {
-            assert!(
-                crossing.is_some(),
-                "running as root for another account, the probe MUST cross the boundary even with no \
-                 elevation hint — otherwise it execs as root"
-            );
-        } else {
-            assert!(
-                crossing.is_none(),
-                "unelevated we already ARE the account, so there is no boundary to cross"
-            );
-        }
-
-        // The control, in both cases: when the resolved account IS root, there is no other account to
-        // drop to, so no `su` is attempted. A predicate that simply returned `Some` whenever we are root
-        // would fail here.
-        let root_itself = TargetUser {
+        let root = |via_elevation| TargetUser {
             name: "root".to_string(),
             home: std::path::PathBuf::from("/root"),
             uid: Some(0),
             gid: Some(0),
-            via_elevation: false,
+            via_elevation,
         };
-        assert!(as_user_command(Path::new("/opt/dig/bin/dign"), &root_itself).is_none());
+
+        // (euid_is_root, user, must_cross, why)
+        let cases: [(bool, TargetUser, bool, &str); 6] = [
+            (
+                true,
+                alice(true),
+                true,
+                "sudo: root acting for alice — drop privilege",
+            ),
+            (
+                true,
+                alice(false),
+                true,
+                "the osascript GUI child: root, NO hint, acting for alice — the defective predicate                  execs as root here",
+            ),
+            (
+                true,
+                root(false),
+                false,
+                "a genuine root install: no other account to drop to",
+            ),
+            (
+                true,
+                root(true),
+                false,
+                "root named as the target by a hint is still root",
+            ),
+            (
+                false,
+                alice(false),
+                false,
+                "unelevated: we already ARE alice",
+            ),
+            (
+                false,
+                alice(true),
+                false,
+                "unelevated with a stale hint in the environment is still not root",
+            ),
+        ];
+
+        for (euid_is_root, user, must_cross, why) in cases {
+            assert_eq!(
+                crosses_user_boundary(euid_is_root, &user),
+                must_cross,
+                "euid_is_root={euid_is_root} name={} via_elevation={}: {why}",
+                user.name,
+                user.via_elevation
+            );
+        }
+
+        // And the impure wrapper agrees with the pure predicate on this runner, so the two cannot drift
+        // apart. unix only: the Windows `as_user_command` is a `None` stub with no boundary to cross.
+        #[cfg(unix)]
+        {
+            let subject = alice(false);
+            assert_eq!(
+                as_user_command(Path::new("/opt/dig/bin/dign"), &subject).is_some(),
+                crosses_user_boundary(crate::invoker::is_root(), &subject)
+            );
+        }
     }
 }

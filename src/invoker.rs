@@ -52,7 +52,38 @@ impl TargetUser {
     pub fn dig_bin_dir(&self) -> PathBuf {
         self.home.join(".dig").join("bin")
     }
+
+    /// Are we ACTING FOR an account that is not the one we are running as — the question every
+    /// privilege-boundary decision must ask?
+    ///
+    /// # Why not [`Self::via_elevation`] (#1748)
+    ///
+    /// `via_elevation` answers "did an elevation HINT name another account?", which is a NARROWER
+    /// question and false in a state that really does occur: the macOS GUI elevates through
+    /// `osascript … with administrator privileges`, which inherits neither environment nor stdin, so
+    /// its root child has no `SUDO_USER`/`DOAS_USER`/`PKEXEC_UID` at all. There, `via_elevation` is
+    /// `false` while `geteuid() == 0` — and every decision keyed on it then behaves as though it were
+    /// unprivileged while holding root's authority. That mistake was a root-side exec of a
+    /// user-writable binary in one place and a root-authored write into a user's home in another.
+    ///
+    /// Being root is what makes an operation dangerous; how root was reached is irrelevant. So the
+    /// boundary exists exactly when the effective uid is root and the account being acted for is
+    /// somebody else.
+    ///
+    /// `euid_is_root` is a PARAMETER rather than an ambient read so the decision is pure and every
+    /// combination is testable on any runner — a test that reads the real uid can only exercise the
+    /// arm the test runner happens to be in, which is how the defective form stayed green.
+    ///
+    /// Callers that must NOT regress to the hint: [`crate::userwrite::write_bytes_as_user`],
+    /// [`crate::pathcheck`]'s login-shell probe and `--version` probe, [`crate::autostart`]'s XDG
+    /// resolution and enable-command, and [`crate::paths`]' PATH wiring.
+    pub fn acting_for_another_account(&self, euid_is_root: bool) -> bool {
+        euid_is_root && self.name != ROOT_ACCOUNT
+    }
 }
+
+/// The one account name for which there is never another account to drop to.
+const ROOT_ACCOUNT: &str = "root";
 
 /// One parsed passwd-database record — the fields this module needs.
 #[derive(Debug, Clone, PartialEq, Eq)]

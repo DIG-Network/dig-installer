@@ -353,7 +353,7 @@ fn user_can_enter(dir: &str, user: &crate::invoker::TargetUser) -> bool {
     // environment, so `via_elevation` is `false` in a root child and this would otherwise have asked
     // ROOT's own shell whether it can enter the directory — the wrong principal, and root can enter
     // almost anything (`crate::pathcheck::as_user_command`, SPEC §7.5).
-    let cross_to_user = crate::invoker::is_root() && user.name != "root";
+    let cross_to_user = user.acting_for_another_account(crate::invoker::is_root());
     let out = if cross_to_user {
         let Some(su) = crate::elevation::resolve_system_tool("su") else {
             return false;

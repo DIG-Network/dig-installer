@@ -55,7 +55,11 @@ pub fn write_as_user(path: &Path, contents: &str, user: &TargetUser) -> Result<(
 
 /// [`write_as_user`] for a binary artifact (an icon, a cache) — same authority rules.
 pub fn write_bytes_as_user(path: &Path, contents: &[u8], user: &TargetUser) -> Result<(), String> {
-    if !user.via_elevation {
+    // `is_root()`, never the elevation hint. In the macOS GUI's `osascript` root child there is no hint,
+    // so this took `write_directly` — root `create_dir_all` + `fs::write` inside a NON-ROOT user's home,
+    // following any symlink planted on the way. That is the root-authored-write escalation this module
+    // exists to remove, reappearing through the wrong predicate (#1748).
+    if !user.acting_for_another_account(crate::invoker::is_root()) {
         return write_directly(path, contents);
     }
     #[cfg(unix)]

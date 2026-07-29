@@ -282,7 +282,8 @@ fn replace_binary_with(
 ) -> Result<WriteOutcome, String> {
     match write_without_following_a_symlink(dest, bytes) {
         Ok(()) => {
-            set_executable(dest);
+            // Executability is set INSIDE the write, on the descriptor it holds — never by path
+            // afterwards (#1748, F4).
             Ok(WriteOutcome::Replaced)
         }
         Err(e) if is_sharing_violation(&e) => {
@@ -300,8 +301,8 @@ fn replace_binary_with(
 /// `std::fs::write` opens with `O_CREAT|O_TRUNC` and FOLLOWS an existing symlink, so a link planted at
 /// the destination redirects the write to its target. Under an elevated install that is a root
 /// arbitrary-file-create-and-overwrite primitive: `ln -s /etc/ld.so.preload /usr/local/bin/dign` and the
-/// next `sudo` install has root create and populate that file — and [`set_executable`] then marks the
-/// TARGET `0755`. No race is required, because the destination filenames are deterministic and
+/// next `sudo` install has root create and populate that file — and the `0755` that follows marks the
+/// TARGET executable. No race is required, because the destination filenames are deterministic and
 /// published. `same_binary` cannot catch it either: it canonicalises both sides, so a link and its
 /// target compare equal.
 ///
@@ -309,6 +310,14 @@ fn replace_binary_with(
 /// anything: after the unlink there is no symlink left to follow, and `O_EXCL` refuses to open a path
 /// that reappeared in between — so a concurrent re-plant loses rather than wins. `O_NOFOLLOW` is set as
 /// well, making the refusal explicit rather than incidental.
+///
+/// # The mode is set on the DESCRIPTOR, not on the path afterwards (#1748)
+///
+/// Creating the file safely and then calling `metadata` + `set_permissions` on `dest` re-resolves the
+/// path twice more, and both calls follow symlinks — a TOCTOU pair that was WON in practice: 9 hijacks
+/// in 6000 iterations turned a root-owned `0600` victim into `mode=755 uid=0`, aimed at `/etc/shadow`.
+/// So `fchmod` is applied to the descriptor this function already holds, which names the inode it just
+/// created and cannot be redirected to another one.
 ///
 /// Removing the destination first is what an upgrade does anyway (the old binary is being replaced), and
 /// it does not change the Windows behaviour this function exists to preserve: `remove_file` on a running
@@ -335,8 +344,20 @@ fn write_without_following_a_symlink(dest: &Path, bytes: &[u8]) -> std::io::Resu
     }
     let mut file = options.open(dest)?;
     file.write_all(bytes)?;
-    file.flush()
+    file.flush()?;
+    // Executable, through the descriptor. On Windows executability is by extension, so there is no mode
+    // to set and nothing to race.
+    #[cfg(unix)]
+    {
+        crate::dirfd::fchmod_file(&file, EXECUTABLE_MODE, dest)
+            .map_err(|e| std::io::Error::other(e))?;
+    }
+    Ok(())
 }
+
+/// The mode an installed binary is created with: owner writes, everybody executes.
+#[cfg(unix)]
+const EXECUTABLE_MODE: u32 = 0o755;
 
 /// Does this write error mean the destination is a RUNNING executable that
 /// could not be opened for writing — the one recoverable case (#544)?
@@ -363,24 +384,6 @@ fn is_sharing_violation(e: &std::io::Error) -> bool {
     {
         let _ = e;
         false
-    }
-}
-
-/// Mark `dest` executable (owner/group/other) on unix; a no-op on Windows,
-/// where executability is by extension, not a permission bit.
-fn set_executable(dest: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(dest) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o755);
-            let _ = std::fs::set_permissions(dest, perms);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dest;
     }
 }
 
@@ -466,7 +469,7 @@ mod tests {
     ///
     /// The install filenames are deterministic and published, and the destination directory was (before
     /// this release) user-writable on a Homebrew Mac — so `ln -s /etc/ld.so.preload <bin_dir>/dign` and
-    /// the next `sudo` install had root create and populate that file, then `set_executable` mark it
+    /// the next `sudo` install had root create and populate that file, then the mode change mark it
     /// `0755`. No race is required.
     ///
     /// Runs UNPRIVILEGED, which is the point: the fix is a property of how the file is opened, not of
@@ -496,6 +499,29 @@ mod tests {
         assert!(
             !std::fs::symlink_metadata(&dest).unwrap().is_symlink(),
             "the destination must be a real file afterwards, not the attacker's link"
+        );
+    }
+
+    /// The installed binary is made executable by the SAME call that wrote it, so there is no window in
+    /// which the mode is applied to a path rather than to the descriptor.
+    ///
+    /// A `metadata` + `set_permissions` pair after the write re-resolves `dest` twice, and both follow
+    /// symlinks: the race was won 9 times in 6000 iterations, turning a root-owned `0600` victim into
+    /// `mode=755 uid=0`. This asserts the observable consequence — the write alone leaves the file
+    /// executable — which a fix that merely reordered the two path calls would NOT satisfy, because the
+    /// separate `set_executable` step no longer exists to be called.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_itself_leaves_the_binary_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dig-node");
+        write_without_following_a_symlink(&dest, b"ELF").expect("the write must succeed");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the binary must be executable when the write returns — no separate chmod-by-path step"
         );
     }
 

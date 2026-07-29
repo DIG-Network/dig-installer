@@ -203,7 +203,24 @@ pub fn register_for(
 /// would put the unit back in root's scope — the #1748 inversion in a second guise. The XDG spec's
 /// own default, `<home>/.config`, is the correct answer for another account.
 fn target_xdg_config_home(user: &crate::invoker::TargetUser) -> PathBuf {
-    let env = if user.via_elevation {
+    // `is_root()`, not the hint: the macOS GUI's root child carries no hint, and honouring root's own
+    // `XDG_CONFIG_HOME` there is the #1748 inversion again.
+    target_xdg_config_home_when(
+        user,
+        user.acting_for_another_account(crate::invoker::is_root()),
+    )
+}
+
+/// [`target_xdg_config_home`] with the boundary decision supplied rather than read from the ambient uid.
+///
+/// Split out for the same reason the decision itself takes a parameter: a test that depends on the
+/// runner's real uid can only ever exercise one arm, and the arm CI reaches is the one the defective
+/// predicate also satisfies (#1748).
+fn target_xdg_config_home_when(
+    user: &crate::invoker::TargetUser,
+    acting_for_another_account: bool,
+) -> PathBuf {
+    let env = if acting_for_another_account {
         None
     } else {
         std::env::var("XDG_CONFIG_HOME").ok()
@@ -262,8 +279,20 @@ fn apply(dig_app_bin: &Path, os: Os, user: &crate::invoker::TargetUser) -> Resul
 /// non-privileged stand-in `sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user`, which
 /// works from the same root shell the installer was launched from.
 fn enable_command(user: &crate::invoker::TargetUser) -> String {
+    enable_command_when(
+        user,
+        user.acting_for_another_account(crate::invoker::is_root()),
+    )
+}
+
+/// [`enable_command`] with the boundary decision supplied rather than read from the ambient uid — see
+/// [`target_xdg_config_home_when`] for why.
+fn enable_command_when(
+    user: &crate::invoker::TargetUser,
+    acting_for_another_account: bool,
+) -> String {
     const ENABLE: &str = "systemctl --user enable --now dig-app.service";
-    match (user.via_elevation, user.uid) {
+    match (acting_for_another_account, user.uid) {
         (true, Some(uid)) => format!(
             "sudo -u {} XDG_RUNTIME_DIR=/run/user/{uid} {ENABLE}",
             user.name
@@ -646,7 +675,7 @@ WantedBy=default.target
         // A value only root could have.
         std::env::set_var("XDG_CONFIG_HOME", "/root/.config");
 
-        let elevated = target_xdg_config_home(&sudoing_ubuntu());
+        let elevated = target_xdg_config_home_when(&sudoing_ubuntu(), true);
         assert_eq!(
             elevated,
             Path::new("/home/ubuntu/.config"),
@@ -661,7 +690,7 @@ WantedBy=default.target
             via_elevation: false,
         };
         assert_eq!(
-            target_xdg_config_home(&self_run),
+            target_xdg_config_home_when(&self_run, false),
             Path::new("/root/.config"),
             "when we ARE the user, their XDG_CONFIG_HOME is authoritative"
         );
@@ -677,7 +706,7 @@ WantedBy=default.target
     /// their runtime dir.
     #[test]
     fn the_enable_command_names_the_target_user_under_elevation() {
-        let cmd = enable_command(&sudoing_ubuntu());
+        let cmd = enable_command_when(&sudoing_ubuntu(), true);
         assert!(cmd.contains("-u ubuntu"), "got: {cmd}");
         assert!(
             cmd.contains("XDG_RUNTIME_DIR=/run/user/1000"),
@@ -698,7 +727,7 @@ WantedBy=default.target
             via_elevation: false,
         };
         assert_eq!(
-            enable_command(&alice),
+            enable_command_when(&alice, false),
             "systemctl --user enable --now dig-app.service"
         );
     }
@@ -714,7 +743,7 @@ WantedBy=default.target
             gid: None,
             via_elevation: true,
         };
-        let cmd = enable_command(&ghost);
+        let cmd = enable_command_when(&ghost, true);
         assert!(cmd.contains("log in as ghost"), "got: {cmd}");
         assert!(
             !cmd.contains("XDG_RUNTIME_DIR"),
