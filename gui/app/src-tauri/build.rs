@@ -12,6 +12,12 @@
 //! not emit the `embed_digstore` cfg and the runtime falls back to the Tauri
 //! resource directory. The crate therefore always compiles.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). This is a BUILD SCRIPT running on the developer's own machine at compile
+// time: it probes the staged `digstore` for its `--version` string. There is no elevated process, no
+// install root and no attacker in that picture, so the root-exec guard has nothing to say about it.
+#![allow(clippy::disallowed_methods)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

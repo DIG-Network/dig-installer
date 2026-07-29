@@ -138,6 +138,9 @@ jobs:
             # fix here; the installer deliberately does not re-mode a directory
             # the distribution owns.
             sudo chmod 755 /opt
+            # And the veneer: the runner image ships /usr/local/bin world-writable, which the install now
+            # refuses because it is where root's PATH resolves DIG commands from (#1748 WU3).
+            sudo chmod 755 /usr/local/bin && sudo chown 0:0 /usr/local/bin
             sudo mkdir -p /opt/dig-bin && sudo chmod 755 /opt/dig-bin
             echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
           else
@@ -656,11 +659,19 @@ jobs:
       # a directory the distribution owns, so the image's own `/opt` is repaired
       # here. Asserted, not assumed: if a future image ships it correctly this
       # still passes, and the check below proves the level really is safe.
-      - name: Normalise the runner image's world-writable /opt
+      - name: Normalise the runner image's world-writable /opt and /usr/local/bin
         run: |
-          stat -c '%n %U %a' /opt
-          sudo chmod 755 /opt
-          test -z "$(find /opt -maxdepth 0 \( -perm -0002 -o -perm -0020 \))"             || { echo "FAIL: /opt is still group- or world-writable"; exit 1; }
+          stat -c '%n %U %a' /opt /usr/local/bin
+          # BOTH are shipped permissive by the runner image, and both are directories the installer
+          # deliberately does not re-mode because the distribution owns them. /usr/local/bin matters as much
+          # as /opt now: it is where root's own login PATH resolves DIG commands from, so an account that can
+          # write it replaces a planted link and root runs whatever it points at. The image's own posture is
+          # repaired here, and asserted rather than assumed.
+          sudo chmod 755 /opt /usr/local/bin
+          sudo chown 0:0 /usr/local/bin
+          for level in /opt /usr/local/bin; do
+            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))"               || { echo "FAIL: $level is still group- or world-writable"; exit 1; }
+          done
 
       - name: Install as root with HOME=/root and the DEFAULT bin dir
         run: |
