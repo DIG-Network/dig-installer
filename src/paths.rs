@@ -1557,7 +1557,7 @@ mod tests {
         let bin = PathBuf::from("/opt/dig/bin");
         let note = unix_add_to_path_in(&bin, &home).expect("ok");
         // With no existing dotfiles, it creates ~/.profile.
-        assert!(note.contains(".profile"), "got: {note}");
+        assert!(note.note.contains(".profile"), "got: {}", note.note);
         let profile = std::fs::read_to_string(home.join(".profile")).unwrap();
         assert!(profile.contains("/opt/dig/bin"));
         assert!(profile.contains("export PATH"));
@@ -1572,7 +1572,7 @@ mod tests {
         std::fs::write(home.join(".bashrc"), "# my bashrc\n").unwrap();
         let bin = PathBuf::from("/home/u/.dig/bin");
         let note = unix_add_to_path_in(&bin, &home).expect("ok");
-        assert!(note.contains(".bashrc"), "got: {note}");
+        assert!(note.note.contains(".bashrc"), "got: {}", note.note);
         let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
         assert!(bashrc.contains("# my bashrc")); // preserved
         assert!(bashrc.contains("/home/u/.dig/bin")); // appended

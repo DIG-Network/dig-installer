@@ -152,7 +152,7 @@ fn unix_login_shell_path(user: &TargetUser) -> Result<String, String> {
     // a `$PATH` lookup.
     // `is_root()`, not the elevation hint: in the macOS GUI's root child there is no hint, and reading
     // OUR OWN login shell there measures ROOT's PATH while reporting it as the user's (#1748).
-    let out = if crosses_user_boundary(crate::invoker::is_root(), user) {
+    let out = if user.acting_for_another_account(crate::invoker::is_root()) {
         let su = crate::elevation::resolve_system_tool("su")
             .ok_or_else(|| "su not found in any trusted system directory".to_string())?;
         Command::new(su)
@@ -404,28 +404,6 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
         .map_err(|e| format!("{what} output could not be read: {e}"))
 }
 
-/// Is there a privilege boundary to cross before executing something on this user's behalf?
-///
-/// Pure, and takes `euid_is_root` as an ARGUMENT rather than reading it, because the whole point of
-/// #1748 is which question is being asked — and a predicate that reads the ambient uid can only be
-/// tested in whichever state the test runner happens to be in. CI runs unprivileged, so a test that
-/// called the impure form could only ever exercise the `false` arm, which the DEFECTIVE
-/// `!user.via_elevation` form satisfies identically. That is not hypothetical: reverting the predicate
-/// to the defective form left the whole suite green.
-///
-/// The boundary exists exactly when we are root and the account we are acting for is somebody else.
-/// `via_elevation` is deliberately NOT consulted: it is only `true` when an elevation HINT
-/// (`SUDO_USER`/`DOAS_USER`/`PKEXEC_UID`) named another account, and the macOS GUI elevates through
-/// `osascript … with administrator privileges`, which inherits no environment — so in that root child
-/// there is no hint, `via_elevation` is `false`, and a hint-based predicate reports "not elevated"
-/// while running as uid 0.
-///
-/// Thin alias for [`TargetUser::acting_for_another_account`], which is the single shared decision — this
-/// module states it in its own vocabulary and adds nothing.
-fn crosses_user_boundary(euid_is_root: bool, user: &TargetUser) -> bool {
-    user.acting_for_another_account(euid_is_root)
-}
-
 /// The `su - <user> -c '<binary> --version'` form, when there is a user boundary to cross.
 ///
 /// `None` means "run it directly" (we genuinely are that user, or this is Windows). `Some(Err(..))` is
@@ -446,7 +424,7 @@ fn crosses_user_boundary(euid_is_root: bool, user: &TargetUser) -> bool {
 /// account is somebody else, which drops privilege for the probe wherever an account is known.
 #[cfg(unix)]
 fn as_user_command(binary: &Path, user: &TargetUser) -> Option<Result<Command, String>> {
-    if !crosses_user_boundary(crate::invoker::is_root(), user) {
+    if !user.acting_for_another_account(crate::invoker::is_root()) {
         return None;
     }
     Some(
@@ -930,7 +908,7 @@ mod tests {
 
         for (euid_is_root, user, must_cross, why) in cases {
             assert_eq!(
-                crosses_user_boundary(euid_is_root, &user),
+                user.acting_for_another_account(euid_is_root),
                 must_cross,
                 "euid_is_root={euid_is_root} name={} via_elevation={}: {why}",
                 user.name,
@@ -945,7 +923,7 @@ mod tests {
             let subject = alice(false);
             assert_eq!(
                 as_user_command(Path::new("/opt/dig/bin/dign"), &subject).is_some(),
-                crosses_user_boundary(crate::invoker::is_root(), &subject)
+                subject.acting_for_another_account(crate::invoker::is_root())
             );
         }
     }

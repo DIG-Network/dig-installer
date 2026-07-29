@@ -28,6 +28,7 @@ use std::path::Path;
 pub const ROOT_UID: u32 = 0;
 
 /// An open directory descriptor, closed on drop.
+#[derive(Debug)]
 pub struct DirFd(std::os::fd::OwnedFd);
 
 impl DirFd {
@@ -93,7 +94,7 @@ pub fn stat_of(fd: &DirFd, path: &Path) -> Result<(u32, u32), String> {
             std::io::Error::last_os_error()
         ));
     }
-    Ok((st.st_uid as u32, u32::from(st.st_mode) & 0o7777))
+    Ok((st.st_uid as u32, st.st_mode as u32 & 0o7777))
 }
 
 /// The owning uid of the already-open directory `fd`.

@@ -349,8 +349,7 @@ fn write_without_following_a_symlink(dest: &Path, bytes: &[u8]) -> std::io::Resu
     // to set and nothing to race.
     #[cfg(unix)]
     {
-        crate::dirfd::fchmod_file(&file, EXECUTABLE_MODE, dest)
-            .map_err(|e| std::io::Error::other(e))?;
+        crate::dirfd::fchmod_file(&file, EXECUTABLE_MODE, dest).map_err(std::io::Error::other)?;
     }
     Ok(())
 }
