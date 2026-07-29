@@ -1505,11 +1505,37 @@ returns true for both detected-unsafe AND indeterminate. A directory whose postu
 therefore refuses the install and names the level; that is the conservative direction, and it is the whole
 of the fix.
 
-**The directory root's own login `PATH` resolves DIG commands from MUST be verified, and a blocking verdict
-there MUST fail readiness.** It is not enough to refuse the PATH-WIRING step: that step is non-fatal by
-design (a binary is placed; only wiring failed), so an install onto a veneer an unprivileged account owns
-otherwise reports success while that account can replace a planted link and have root run it
-(`InstallReport::veneer_security`).
+**The directory root's own login `PATH` resolves DIG commands from MUST be verified.** It is not enough to
+refuse the PATH-WIRING step: that step is non-fatal by design (a binary is placed; only wiring failed), so an
+install onto a veneer an unprivileged account owns otherwise reports success while that account can replace a
+planted link and have root run it (`InstallReport::veneer_security`).
+
+**An unsafe veneer MUST cause a FALLBACK, never a refusal.** The veneer is a convenience — its only purpose
+is reachability — so a reimplementation MUST choose its reachability mechanism from the MEASURED posture
+(`paths::Reachability`, `InstallReport::reachability`):
+
+| Veneer posture | Mechanism | Links | `PATH` entry |
+|---|---|---|---|
+| established safe | `veneer_links` | planted in `/usr/local/bin` | the veneer (already present; nothing written) |
+| not established safe | `direct_path_entry` | NONE planted, and any previously planted DIG link REMOVED | the protected root itself, via `/etc/paths.d` or `/etc/profile.d` |
+
+Requirements a reimplementation MUST satisfy:
+
+- **The detection MUST NOT be weakened to accommodate the common case.** Homebrew on an Intel Mac leaves
+  `/usr/local/bin` `<user>:admin 0775`, and that IS an escalation even though the account which can write it
+  can usually `sudo`: the threat is not the human's privilege but that unprivileged CODE running as them — a
+  malicious `npm` postinstall, a compromised editor extension — cannot type their password yet can write that
+  directory unprompted and own root at the next elevated run. It also lets one admin silently attack another
+  admin's `sudo`.
+- **Failing the install instead is equally forbidden.** A refusal is not a fix.
+- **The posture MUST be measured ONCE per run** and the same answer MUST drive both the linking and the
+  wiring. A run that links into one directory while putting another on `PATH` leaves the CLIs unreachable.
+- **`veneer_security` is fatal ONLY when the veneer is the mechanism in play.** Under the fallback the same
+  verdict is a recorded downgrade.
+- **Removal is part of the fallback**, and MUST be limited to symlinks pointing into the protected root: a
+  regular file or a foreign link in a shared system directory belongs to somebody else.
+- **If the fallback's `PATH` fragment cannot be written**, there is no safe reachability left. The install MAY
+  proceed — the binaries are correctly placed — but it MUST say so explicitly and MUST NOT report ready.
 Earlier revisions of this section claimed placement covered (3) and (4); it does not under an override,
 and a normative claim the code does not satisfy tells a reimplementation to reproduce the gap.
 

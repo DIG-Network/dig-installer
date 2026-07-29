@@ -565,3 +565,27 @@ Tier 3 automates a real Chrome policy-file write on Linux CI, with the in-browse
 auto-updates" step documented manual per `runbooks/cross-browser-ext-acceptance.md`. Force-install
 via managed policy + a live `update_url` needs a REAL browser reading enterprise policy off the
 network — not reliably CI-drivable headless for most brands, hence the honest auto-vs-manual split.
+
+## `/bin` is a SYMLINK on modern Linux, so an inode-walk permission check refuses `/bin/sh` (#1748)
+
+Every current Debian/Ubuntu (and most other distributions) ships **usrmerge**: `/bin`, `/sbin`, `/lib` are
+symlinks into `/usr`. This matters for any check that verifies a path *level by level through `O_NOFOLLOW`
+descriptors*, which is what `dig-installer`'s install-root verify does to avoid being redirected by a planted
+link: a symlinked level cannot be traversed without following it, so the honest answer is to REFUSE — and
+`/bin/anything` is therefore refused as an exec target when running as root.
+
+The behaviour is correct and must not be relaxed. DIG's own roots (`/opt/dig/bin`, `%ProgramFiles%\DIG\bin`)
+are real directories, so nothing in production is affected. What it breaks is **test fixtures**: stubs that
+point at `/bin/sh` or `/bin/true` pass unprivileged and fail as root, with an error about symlinks that has
+nothing to do with the property under test. Prefer `/usr/bin/...`, and check that the parent is not itself a
+symlink before using it.
+
+Two general lessons, both of which cost real time here:
+
+- **A permission model that reasons about path levels meets platform conventions that reasoning did not
+  anticipate.** `/var` → `private/var`, `/etc` → `private/etc` and `/tmp` → `private/tmp` on macOS are the
+  same shape.
+- **This is only discoverable by RUNNING as root on the target platform.** It surfaced the first time the
+  suite ran as root inside a container and was invisible to five rounds of unprivileged CI. `/tmp` being mode
+  `1777` bit the same way: 23 tests failed as root purely because their fixtures lived under a
+  world-writable ancestor the verify correctly condemned. Fix the fixture location, never the check.
