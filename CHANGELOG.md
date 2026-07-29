@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.31.1] - 2026-07-29
+
+### Bug Fixes
+- **gui:** Pin WebView2 to the machine root only when the token can write it (#46)
+
 ## [0.31.0] - 2026-07-29
 
 ### Bug Fixes
