@@ -399,12 +399,26 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
 
 /// The `su - <user> -c '<binary> --version'` form, when there is a user boundary to cross.
 ///
-/// `None` means "run it directly" (we are already that user, or this is Windows). `Some(Err(..))` is
+/// `None` means "run it directly" (we genuinely are that user, or this is Windows). `Some(Err(..))` is
 /// fail-closed: `su` is resolved from the trusted system directories, never `$PATH`
 /// ([`crate::elevation::resolve_system_tool`]), because this spawn happens as root.
+///
+/// # The question is "am I root?", not "was I sudo'd?" (#1748)
+///
+/// This used to branch on `user.via_elevation`, which is only `true` when an elevation HINT identified a
+/// different account — `SUDO_USER`, `DOAS_USER`, `PKEXEC_UID`. There is a live path where we are root and
+/// no hint exists: the macOS GUI elevates through `osascript … with administrator privileges`
+/// ([`crate::elevation::relaunch_elevated_macos`]), which inherits neither environment nor stdin, so the
+/// root child has no hint, `via_elevation` is `false`, and the probe ran the binary directly AS ROOT.
+///
+/// That is the same defect shape as the placement bug this release fixes — a predicate answering a
+/// narrower question than the one that matters. Being root is the condition that makes an exec dangerous;
+/// how we became root is irrelevant. So the boundary is crossed whenever `is_root()` and the resolved
+/// account is somebody else, which drops privilege for the probe wherever an account is known.
 #[cfg(unix)]
 fn as_user_command(binary: &Path, user: &TargetUser) -> Option<Result<Command, String>> {
-    if !user.via_elevation {
+    let we_are_that_account = !crate::invoker::is_root() || user.name == "root";
+    if we_are_that_account {
         return None;
     }
     Some(
@@ -801,5 +815,56 @@ mod tests {
         );
         // The un-wrapped form is what the bug used, so it must NOT be what the elevated probe sends.
         assert_ne!(PRINT_PATH_VIA_LOGIN_SH, PRINT_PATH);
+    }
+
+    // -- #1748: "am I root?", not "was I sudo'd?" --------------------------------
+
+    /// The probe must drop privilege based on the EFFECTIVE UID, not on whether an elevation hint
+    /// happens to exist.
+    ///
+    /// `via_elevation` is only `true` when `SUDO_USER`/`DOAS_USER`/`PKEXEC_UID` named another account.
+    /// The macOS GUI elevates via `osascript … with administrator privileges`, which inherits neither
+    /// environment nor stdin, so the root child has NO hint: the old predicate reported "not elevated"
+    /// while running as uid 0 and ran the binary directly as root.
+    ///
+    /// The fixture is exactly that state — `via_elevation: false` with a NON-root account name — which is
+    /// what the old predicate got wrong and the new one gets right. Both arms are asserted against the
+    /// real uid, so the test is meaningful whichever way the suite is run.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_drops_privilege_based_on_the_uid_not_on_an_elevation_hint() {
+        let no_hint_but_root = TargetUser {
+            name: "alice".to_string(),
+            home: std::path::PathBuf::from("/home/alice"),
+            uid: None,
+            gid: None,
+            // The osascript root child: no hint was available, so this is false even though euid == 0.
+            via_elevation: false,
+        };
+        let crossing = as_user_command(Path::new("/opt/dig/bin/dign"), &no_hint_but_root);
+        if crate::invoker::is_root() {
+            assert!(
+                crossing.is_some(),
+                "running as root for another account, the probe MUST cross the boundary even with no \
+                 elevation hint — otherwise it execs as root"
+            );
+        } else {
+            assert!(
+                crossing.is_none(),
+                "unelevated we already ARE the account, so there is no boundary to cross"
+            );
+        }
+
+        // The control, in both cases: when the resolved account IS root, there is no other account to
+        // drop to, so no `su` is attempted. A predicate that simply returned `Some` whenever we are root
+        // would fail here.
+        let root_itself = TargetUser {
+            name: "root".to_string(),
+            home: std::path::PathBuf::from("/root"),
+            uid: Some(0),
+            gid: Some(0),
+            via_elevation: false,
+        };
+        assert!(as_user_command(Path::new("/opt/dig/bin/dign"), &root_itself).is_none());
     }
 }

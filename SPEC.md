@@ -311,38 +311,71 @@ tool's own environment and the passwd database:
 - A named account takes precedence over a conflicting uid.
 - `TargetUser.via_elevation` is `true` exactly when we are root acting for a different account.
 
+**KNOWN LIMITATION — the macOS GUI elevation supplies no hint.** Every source in the table above is an
+ENVIRONMENT variable, and macOS's `osascript … with administrator privileges` (§4.1c) inherits neither
+environment nor stdin. So in that root child no hint exists, resolution falls back to the CALLING
+process's own account, and `via_elevation` is `false` while `geteuid() == 0`. Consequences, which a
+reimplementation MUST NOT assume are solved:
+
+- per-user artifacts (the LaunchAgent, §1.11) are written into ROOT's home (`/var/root`), so dig-app does
+  not start at the real user's login;
+- the PATH verification (§1.5) measures ROOT's login `PATH`, not the invoking user's.
+
+The home inversion this section exists to prevent is therefore fixed for the **sudo CLI** path and NOT
+for **macOS GUI** installs. The passwd/directory lookup (§7.6) cannot help: the problem is the absent
+hint, not the lookup. Closing it requires deriving the account from the console owner, or the GUI passing
+it explicitly across the elevation boundary — tracked separately. Predicates that must behave correctly
+in that child MUST test `geteuid()`, never the hint (§7.5).
+
 **Placement.** On unix:
 
-| Situation | User-facing CLIs | Mechanism |
+| Situation | Placement — where binaries are WRITTEN | Reachability — what is on the user's `PATH` |
 |---|---|---|
-| Elevated (`geteuid()==0`) | `/usr/local/bin` (`paths::UNIX_MACHINE_BIN_DIR`) | Already on every login shell's `PATH`, so there is no `PATH` wiring left to get wrong |
-| Unelevated | `<invoking user>/.dig/bin` | Per-user profile append, elevation-free |
+| Elevated (`geteuid()==0`) | `/opt/dig/bin` (`paths::protected_bin_dir`), root-owned | SYMLINKS in `/usr/local/bin` (`paths::UNIX_MACHINE_BIN_DIR`), already on every login shell's `PATH` |
+| Unelevated | `<invoking user>/.dig/bin` | That directory itself, via a per-user profile append |
 
 An elevated install MUST NOT place user-facing CLIs under any home directory: root's is unreachable
 (mode `0700`), and one user's would privilege a single account on a multi-user machine.
 
-This table governs **user-facing CLIs only**. No privileged/service-executed binary is placed here:
-those go to the protected root (`/opt/dig/bin`) by the §1.6 component→root map, whatever the elevation
-state. That separation — not the mode of `/usr/local/bin` — is what upholds the §1.6 no-LPE invariant,
-and the distinction is load-bearing rather than pedantic: `/usr/local/bin` is root-owned `0755` on a
-stock Debian/Ubuntu or macOS box, but Homebrew on an Intel Mac makes it `<user>:admin` mode `0775`. A
-group-writable directory is an acceptable home for a binary the user runs as themselves (it is the
-posture every Homebrew tool already has, and replacing one grants no privilege the group did not have)
-and is NOT an acceptable home for one a root service executes. `secure::verify_install_root` enforces
-exactly that line: it rejects a privileged root that is group/other-writable or not root-owned, and it
-is applied to whichever dir privileged binaries actually landed in — so an override that DID route them
-into a Homebrew-writable `/usr/local/bin` fails the install loudly instead of shipping an escalation.
+**`/usr/local/bin` is a PATH VENEER and MUST NOT be an install root.** Placement and reachability are
+SEPARATE concerns, and conflating them is a defect class rather than a single defect. `/usr/local/bin` is
+root-owned `0755` on a stock Debian/Ubuntu or macOS box, but Homebrew on an Intel Mac makes it
+`<user>:admin` mode `0775` — a system directory by convention only. An elevated install therefore writes
+every binary into the root-owned protected root and links the user-invoked ones outward, so that:
 
-`dig-dns` is additionally SYMLINKED from `/usr/local/bin` into the protected root
-(`paths::needs_machine_bin_link`) so its CLI surface is reachable by name. The symlink is a
-human convenience and MUST NOT become a privileged exec path: every service artifact names the
-protected target directly (`ExecStart=/opt/dig/bin/dig-dns serve`), so replacing the symlink cannot
-redirect anything root runs.
+- root never WRITES into a directory a non-root account can modify, and
+- root never EXECUTES a binary from one.
+
+The property `/usr/local/bin` is relied on for is that it is on the default login `PATH`; that is the only
+property claimed of it. Making it the elevated install root — which an earlier revision of this release
+did — produced a FAMILY of root-write and root-exec paths into it rather than one, each individually
+patchable. Under the veneer the class is not representable: the link lives in the possibly-writable
+directory, while the target and every root-side write and exec do not. Replacing a link changes what the
+USER's shell resolves — the user's own privilege level — and never what root runs, because every service
+artifact names the protected target directly (`ExecStart=/opt/dig/bin/dig-dns serve`).
+
+`paths::needs_machine_bin_link` decides which components are linked: everything placed in the protected
+root that a user invokes by name, excluding `dig-updater`/`dig-updater-worker` (the beacon invokes those,
+a user never does, so they stay off `PATH`). It is keyed on the directory the binary actually landed in,
+so an unelevated or `--bin-dir` install plants no links — that placement is wired onto `PATH` directly.
+
+`secure::verify_install_root` rejects a privileged root that is group/other-writable or not root-owned.
+The directory a run's binaries were PLACED in is additionally verified and REPORTED whenever it differs
+from the privileged root (`InstallReport::bin_dir_security`, §7.5) — a report, not a gate, because a
+user-writable directory holding binaries only that same user runs is their own authority.
 
 **PATH wiring is verified, not assumed.** An elevated install MUST NOT wire `PATH` through dotfiles
 (the only dotfiles it can see are root's). It instead:
 
-1. reads the target user's **login-shell** `PATH` and checks whether the bin dir is already present;
+The directory that MUST be searchable is the **reachable** dir of the placement (`paths::reachable_dir`),
+not the placement itself: for the protected root that is the `/usr/local/bin` veneer, so the default
+elevated install writes no fragment at all; for a `--bin-dir` override or an unelevated run it is the
+directory itself. The linking decision and the wiring decision MUST be the SAME decision — a run that
+links into one directory while wiring another reports success for CLIs the user cannot find. The
+directory binaries were PLACED in MUST additionally be one the target user can enter, because a link
+into an untraversable directory resolves by name and then fails to execute.
+
+1. reads the target user's **login-shell** `PATH` and checks whether that dir is already present;
 2. only if absent, creates the bin dir when it does not yet exist (root-owned `0755`; `PATH` is wired
    before any component is downloaded, so an absent directory MUST NOT be reported as one the user
    cannot enter) and writes the system-wide fragment its login shells actually read:
@@ -425,16 +458,19 @@ therefore places binaries into two roots, chosen per component:
     DIG deliberately roots PRIVILEGED binaries here, NOT under a Homebrew-style `/usr/local` prefix,
     which is group-writable on an Intel Mac (`<user>:admin`, mode `0775`) — a group-writable install
     root lets any member of that group replace a service binary, which `secure::verify_install_root`
-    (and dig-node's own check) correctly rejects. This argument is about the PRIVILEGED root only; it
-    does not bear on where user-run CLIs go, and MUST NOT be read as excluding `/usr/local/bin` from
-    the user root below (see §1.5 Placement).
+    (and dig-node's own check) correctly rejects. The same reasoning excludes `/usr/local/bin` from
+    being ANY install root under elevation, privileged or not: an elevated run also writes and execs
+    user-facing binaries, so the whole stack goes here and `/usr/local/bin` holds only links
+    (§1.5 Placement).
 - **User root** — the dir user-run binaries go in: those no privileged service executes
   (`digstore`/`digs`/`digd` and the user-level `dig-node`/`dig-relay`). On unix it depends on the
-  elevation state, per the §1.5 placement table: `/usr/local/bin` under elevation (machine-wide, and
-  already on every login shell's `PATH`), the elevation-free per-user `~/.dig/bin` when unelevated.
+  elevation state, per the §1.5 placement table: the protected root `/opt/dig/bin` under elevation
+  (machine-wide, root-owned, reached through the `/usr/local/bin` symlink veneer), the elevation-free
+  per-user `~/.dig/bin` when unelevated.
   `paths::default_bin_dir()` is the single resolver and MUST NOT be reimplemented as `~/.dig/bin`
   unconditionally — doing so is #1748: under `sudo` the per-user dir resolves to `/root/.dig/bin`,
-  which is mode `0700`, so the CLIs are unreachable by the person who ran the install.
+  which is mode `0700`, so the CLIs are unreachable by the person who ran the install. It MUST equally
+  not be reimplemented as `/usr/local/bin`, which trades that defect for a root-write/root-exec class.
   (On Windows there is no separate user root — everything is in the one protected root.)
 
 The component→root map is `paths::is_privileged_component`: on Windows every component is protected;
@@ -446,7 +482,7 @@ The membership test is **"is this binary ever EXECUTED BY ROOT?"** — NOT "does
 run under a privileged identity?". Those differ, and the difference was a root code-execution defect:
 `dig-node` and `dig-relay` register themselves by their own `install` verb, which this installer runs as
 root, and their services are user-level — so classifying them by the identity of the resulting service
-left them in the elevated user root (`/usr/local/bin`), which Homebrew on an Intel Mac leaves
+left them in what was then the elevated user root (`/usr/local/bin`), which Homebrew on an Intel Mac leaves
 `<user>:admin 0775`. Any unprivileged account able to write there could drop a binary and have root
 execute it on the next `sudo` install, with no race. A binary root executes MUST therefore be
 root-owned, whatever it later runs as.
@@ -461,8 +497,8 @@ Two consequences a reimplementation MUST reproduce:
 **Elevation.** Writing into the protected root requires elevation, so even a CLI-only install
 elevates on Windows (the CLI lands in Program Files); a CLI-only unix install into the user root does
 not (`InstallPlan::requires_elevation`, §4.1). An unelevated run is the case that matters here: it
-targets `~/.dig/bin` and needs no privilege to write it. A run that is ALREADY root targets
-`/usr/local/bin` instead, so there is no elevation left to require.
+targets `~/.dig/bin` and needs no privilege to write it. A run that is ALREADY root targets the
+protected root instead, so there is no elevation left to require.
 
 **Verification (fail-loud) — the ACL check runs on WHEREVER privileged binaries land.** After
 placement the installer reads the effective permissions of the dir every privileged/service-executed
@@ -1001,7 +1037,8 @@ foundation for the mac/linux GUI elevation #638/#639) is:
 - **The digstore write+exec dir comes SOLELY from the vetted #565 routing.** `run()` resolves the
   directory it unpacks AND runs digstore from via `digstore_write_exec_dir` → `InstallPlan::bin_dir_for`
   — the admin-only protected root on Windows (`%ProgramFiles%\DIG\bin`), the unix user root (§1.6,
-  i.e. `/usr/local/bin` elevated and `~/.dig/bin` not; digstore runs AS the user — not an escalation).
+  i.e. the root-owned `/opt/dig/bin` elevated and `~/.dig/bin` not; digstore runs AS the user — not an
+  escalation).
   NEVER an ad-hoc user-writable path. This routing is test-locked (a revert to a hardcoded user dir
   fails a unit test).
 - **The `digstore --version` verify (Phase 6) never execs a user-writable binary under elevation.**
@@ -1012,9 +1049,10 @@ foundation for the mac/linux GUI elevation #638/#639) is:
 
   The predicate is `bin_dir == protected_bin_dir()`, i.e. it turns on the DIRECTORY's privilege, not on
   its name — so it tracks the §1.6 user root wherever it currently points. That matters concretely: an
-  elevated unix GUI run routes digstore to `/usr/local/bin`, which Homebrew may have left
-  group-writable, and this deferral is what stops the high-integrity process from executing a binary
-  any `admin`-group member could have swapped.
+  elevated unix GUI run routes digstore to the protected root, so the exec-verify is PERMITTED there
+  rather than deferred. The deferral remains load-bearing for a `--bin-dir` override, and was what
+  stopped the high-integrity process from executing a binary any `admin`-group member could have swapped
+  while `/usr/local/bin` was briefly the elevated root (§1.5).
 - **Association cache-refresh tools resolve to ABSOLUTE paths.** `register_dig_association` (per-user,
   unelevated) runs `update-mime-database` / `gtk-update-icon-cache` from a fixed allowlist of trusted
   system directories (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` — NOT `/usr/local/bin`, §7.5) via
@@ -1037,7 +1075,9 @@ privileged step ONLY, keeping the WebView unelevated:
   from a read-only AppImage). The root child runs the headless privileged install
   (`run_elevated_privileged_install_from_stdin`) — `dig_installer::run_report`, routing every privileged
   binary to the protected root `/opt/dig/bin` — and exits; it NEVER starts the WebView (no GUI ever runs
-  as root) and NEVER execs a user-writable binary.
+  as root) and NEVER execs a user-writable binary. The latter holds BY PLACEMENT: the root child
+  installs into the root-owned protected root (§1.6, §7.5) and execs only from there. It is NOT a
+  per-exec check, and it would NOT hold if the root child were ever given a user-writable `--bin-dir`.
 - **The selection is streamed over the child's STDIN, never a plan file.** There is no shared-namespace
   file, so the plan-file TOCTOU class is ELIMINATED (a co-located local user has nothing to pre-seed,
   symlink-swap, or race). The payload is a small JSON `InstallOpts` (a component-id → bool map + the
@@ -1078,7 +1118,9 @@ ONLY, keeping the WebView unelevated:
   elevation is NOT gated on #536. The root child runs the headless privileged install
   (`run_elevated_privileged_install_from_file`) — `dig_installer::run_report`, routing every
   privileged binary to the protected root `/opt/dig/bin` — and exits; it NEVER starts the WebView (no
-  GUI ever runs as root) and NEVER execs a user-writable binary.
+  GUI ever runs as root) and NEVER execs a user-writable binary. The latter holds BY PLACEMENT: the root child
+  installs into the root-owned protected root (§1.6, §7.5) and execs only from there. It is NOT a
+  per-exec check, and it would NOT hold if the root child were ever given a user-writable `--bin-dir`.
 - **The selection is handed over a PRIVATE temp file, not stdin.** Authorization Services does NOT
   inherit the caller's stdin or environment, so the Linux stdin channel (§4.1b) is unavailable on
   macOS. The safest equivalent is used: the JSON `InstallOpts` is written to a `0600` file inside a
@@ -1263,7 +1305,7 @@ admin-only `protected_bin_dir()` (§1.6), re-arming the §5 migration + fail-lou
 audit on the GUI path exactly as on the CLI. The GUI-owned `digstore` CLI is routed the SAME way: the
 pipeline places AND executes it via `bin_dir_for("digstore", os)` — the admin-only
 `protected_bin_dir()` (`%ProgramFiles%\DIG\bin`) on Windows, the §1.6 user root on unix
-(`/usr/local/bin` under elevation, `~/.dig/bin` otherwise — `paths::default_bin_dir()`, never a
+(the root-owned `/opt/dig/bin` under elevation, `~/.dig/bin` otherwise — `paths::default_bin_dir()`, never a
 hardcoded home-relative path). Because the elevated GUI both WRITES and EXECUTES digstore
 (`digstore --version`, Phase 6),
 a user-writable location would be a write→exec local privilege escalation under the high-integrity
@@ -1400,12 +1442,19 @@ displayed.
 ### 7.5 Root MUST NOT execute a binary from a directory an unprivileged account can write
 
 An elevated run MUST NOT execute any binary whose containing directory is group/other-writable or not
-root-owned. This generalises §4.1a/§4.1c ("the privileged process never execs the user root's
-`digstore`", "NEVER execs a user-writable binary") from the GUI's `should_exec_verify` to EVERY root-side
-exec in the library, because the library is what the GUI's root child calls into and it execs earlier in
-the run.
+root-owned. This is §4.1a/§4.1c ("the privileged process never execs the user root's `digstore`", "NEVER
+execs a user-writable binary") stated for the library, because the library is what the GUI's root child
+calls into and it execs earlier in the run than the GUI's own `should_exec_verify`.
 
-`secure::root_exec_guard` is the single decision. It is applied at both root-side exec surfaces:
+**It is satisfied PRIMARILY BY PLACEMENT, not by a guard at each exec.** An elevated install places every
+binary in the root-owned protected root (§1.6), so the directory root execs from is not user-writable in
+the first place. This is the load-bearing property, and it is what makes the invariant hold at the exec
+sites no guard covers — `pathcheck::run_version` (the PATH probe) and `dns::doctor`'s two `dig-dns`
+invocations. A reimplementation MUST NOT read this section as "the guard covers every exec": there are at
+least four root-side exec sites, and `secure::root_exec_guard` is applied at two of them.
+
+The guard is defence in depth for the two surfaces where a `--bin-dir` override can still direct root at
+a directory the invoking user chose:
 
 1. **the version probe (§7.1).** `update::detect_installed_version` RUNS `<dest> --version`, as root,
    for every component, BEFORE anything is downloaded or written. When the guard refuses, the probe is
@@ -1420,6 +1469,25 @@ the run.
 Unelevated the guard is inert by construction: executing a binary the user can already write is their
 own authority, not an escalation. An INDETERMINATE permission read is also permitted, matching §1.6's
 posture that an unreadable directory is never a false refusal. Only a DEFINITIVE breach refuses.
+
+**Being root is the condition; how root was reached is irrelevant.** Any predicate deciding whether to
+drop privilege for an exec MUST test the effective uid, NOT whether an elevation HINT
+(`SUDO_USER`/`DOAS_USER`/`PKEXEC_UID`) is present. The macOS GUI elevates through `osascript … with
+administrator privileges`, which inherits neither environment nor stdin, so the root child has NO hint:
+a hint-based predicate reports "not elevated" while running as uid 0. `pathcheck::as_user_command`
+therefore tests `invoker::is_root()`.
+
+**Root MUST NOT write through a symlink it did not create.** A destination is unlinked and then created
+with `O_EXCL` (plus `O_NOFOLLOW`), never opened with a following `O_CREAT|O_TRUNC`
+(`download::write_without_following_a_symlink`). The install filenames are deterministic and published,
+so a link planted at one would otherwise redirect a root write — and the subsequent `chmod 0755` — to any
+path on the filesystem, with no race required. Comparing the resolved paths is NOT a substitute: a
+canonicalising comparison reports a link and its target as the same file.
+
+**The directory binaries were placed in MUST be verified and REPORTED** whenever it differs from the
+privileged root — the `--bin-dir` override, or an unelevated per-user root
+(`InstallReport::bin_dir_security`). This is a report, not a gate: a user-writable directory holding
+binaries only that same user runs is their own authority. Silence is what is forbidden.
 
 ### 7.6 Trusted system-tool resolution
 

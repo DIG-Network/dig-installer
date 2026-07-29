@@ -651,6 +651,46 @@ jobs:
               || { echo "FAIL: $cli does not RUN for $USER_NAME"; exit 1; }
           done
 
+      # THE PLACEMENT invariant, and the reason `/usr/local/bin` is a veneer:
+      # root must never write to, or execute from, a directory a non-root account
+      # can modify (Homebrew leaves `/usr/local/bin` group-writable). So every
+      # binary an elevated install places lives in the root-owned protected root,
+      # and `/usr/local/bin` holds only SYMLINKS. Asserted BOTH ways: a regression
+      # that installs into the veneer again keeps `command -v` green above, so the
+      # reachability assertion alone cannot see it.
+      - name: Every binary lives in the protected root; the veneer holds only links
+        run: |
+          jq -e '(.result.components | length) > 0' install.json
+          jq -e 'all(.result.components[]; .dest | startswith("/opt/dig/bin/"))' install.json \
+            || { echo "FAIL: an elevated install placed a binary outside the protected root"; exit 1; }
+          for cli in dig-store digs; do
+            test -L "/usr/local/bin/$cli" \
+              || { echo "FAIL: /usr/local/bin/$cli must be a symlink, not an installed binary"; exit 1; }
+            printf '%s -> %s\n' "$cli" "$(readlink -f "/usr/local/bin/$cli")"
+            case "$(readlink -f "/usr/local/bin/$cli")" in
+              /opt/dig/bin/*) ;;
+              *) echo "FAIL: $cli link does not resolve into the protected root"; exit 1 ;;
+            esac
+          done
+          # The protected root must not be user-writable, and must be traversable
+          # so the links above are usable.
+          stat -c '%U %a /opt/dig/bin' /opt/dig/bin
+          test "$(stat -c '%U' /opt/dig/bin)" = root
+          test -z "$(find /opt/dig/bin -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+            || { echo "FAIL: the protected root is group- or world-writable"; exit 1; }
+
+      # The DEFAULT selection — every component, dig-app included — must obey the
+      # same placement rule. Run as a dry-run so the full default set is covered
+      # without installing services or importing dig-app's own start-up defect
+      # (#1753) into this gate: placement is decided before anything is fetched.
+      - name: The DEFAULT component selection places everything in the protected root
+        run: |
+          sudo -H ./target/release/dig-installer --dry-run --json > planned.json
+          jq -r '.result.components[] | "\(.component) -> \(.dest)"' planned.json
+          jq -e '(.result.components | length) > 2' planned.json
+          jq -e 'all(.result.components[]; .dest | startswith("/opt/dig/bin/"))' planned.json \
+            || { echo "FAIL: the default plan places a binary outside the protected root"; exit 1; }
+
       # The installer's own verdict must AGREE with what we just observed
       # independently. Before #1748 it claimed every CLI resolved while the loop
       # above would have failed, so agreement is the property under test.

@@ -974,7 +974,9 @@ fn run_privileged_via_pkexec(app: &AppHandle, opts: &InstallOpts) -> Result<(), 
 /// it is genuinely running as root, and executes ONLY the privileged component
 /// orchestration ([`dig_installer::run_report`]) — routing every privileged binary
 /// to the protected root (`/opt/dig/bin`). It NEVER starts the Tauri WebView (so no
-/// GUI ever runs as root) and NEVER execs a user-writable binary. Progress is
+/// GUI ever runs as root) and NEVER execs a user-writable binary
+/// (BY PLACEMENT: it installs into the root-owned protected root and execs only from there, `SPEC.md`
+/// §7.5 — not via a per-exec check, and not if it were handed a user-writable `--bin-dir`). Progress is
 /// written to stdout for the parent/logs.
 ///
 /// Reading from stdin (rather than a path argument) is what eliminates the
@@ -1072,7 +1074,9 @@ fn run_privileged_via_osascript(app: &AppHandle, opts: &InstallOpts) -> Result<(
 /// ONLY the privileged component orchestration ([`dig_installer::run_report`]) +
 /// (when selected) the enterprise force-install, routing every privileged binary
 /// to the protected root (`/opt/dig/bin`). It NEVER starts the Tauri WebView (so
-/// no GUI ever runs as root) and NEVER execs a user-writable binary. Progress is
+/// no GUI ever runs as root) and NEVER execs a user-writable binary
+/// (BY PLACEMENT: it installs into the root-owned protected root and execs only from there, `SPEC.md`
+/// §7.5 — not via a per-exec check, and not if it were handed a user-writable `--bin-dir`). Progress is
 /// written to stdout for the parent/logs.
 #[cfg(target_os = "macos")]
 pub fn run_elevated_privileged_install_from_file(plan_path: &Path) -> Result<(), String> {

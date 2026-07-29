@@ -499,6 +499,16 @@ pub struct InstallReport {
     /// when no privileged component was placed (nothing to verify). A definitive
     /// `checked && !secure` makes the install NOT ready ([`evaluate_readiness`]).
     pub install_root_security: Option<secure::InstallRootSecurity>,
+    /// The permission posture of the directory this run's binaries were placed in, when that differs
+    /// from [`Self::install_root_security`]'s privileged root — the `--bin-dir` override, or the
+    /// per-user root of an unelevated install (#1748).
+    ///
+    /// REPORTED, never fatal. It is not the no-LPE invariant: a user-writable directory holding
+    /// binaries only that same user runs is their own authority. But it is exactly the posture that
+    /// made `/usr/local/bin` the wrong install root, so an install must not be silent about it — before
+    /// this, the directory root wrote to and executed from was neither checked nor mentioned on any
+    /// elevated unix install.
+    pub bin_dir_security: Option<secure::InstallRootSecurity>,
     /// The record of migrating an existing install off the legacy user-writable
     /// root onto the protected root (#565): services deregistered/re-pointed,
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
@@ -798,6 +808,7 @@ fn run_report_gated(
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
         install_root_security: None,
+        bin_dir_security: None,
         migration: None,
         registration_audit: Vec::new(),
         install_manifest: None,
@@ -1394,6 +1405,7 @@ fn run_report_gated(
         if !plan.dry_run {
             link_protected_clis(&target, report, log);
             verify_clis_on_path(&target, invoker::target_user(), report, log);
+            report_bin_dir_posture(plan, &target, report, log);
         }
 
         // #565: VERIFY the dir every privileged/service-executed binary landed in
@@ -1764,7 +1776,14 @@ fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dy
         let to_link: Vec<(String, String)> = report
             .components
             .iter()
-            .filter(|c| paths::needs_machine_bin_link(target.os, &c.component))
+            .filter(|c| {
+                // Keyed on where the binary actually landed, so a per-user or `--bin-dir` install
+                // plants no links (#1748).
+                let dir = std::path::Path::new(&c.dest)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""));
+                paths::needs_machine_bin_link(target.os, &c.component, dir)
+            })
             .map(|c| (c.component.clone(), c.dest.clone()))
             .collect();
         if to_link.is_empty() {
@@ -1787,6 +1806,48 @@ fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dy
         // Windows installs the whole stack into one root, so there is nothing to link.
         let _ = (target, report, log);
     }
+}
+
+/// Report the permission posture of the directory this run's binaries were PLACED in, when that is not
+/// already covered by the privileged-root verify (#1748).
+///
+/// The #565 check is applied to [`InstallPlan::privileged_install_root`], which is the protected root —
+/// so on every elevated unix install before this, the directory root actually wrote to and executed from
+/// was neither checked nor mentioned. That is precisely how `/usr/local/bin`, user-writable under
+/// Homebrew, became the install root without anything noticing.
+///
+/// Deliberately a REPORT, not a gate. A user-writable directory holding binaries only that same user
+/// runs is their own authority, so failing the install would refuse every ordinary unelevated install
+/// and every Homebrew Mac. What must not happen is SILENCE: the posture is logged and lands in
+/// `install.json` as [`InstallReport::bin_dir_security`], so a reviewer or a script can see it.
+fn report_bin_dir_posture(
+    plan: &InstallPlan,
+    target: &Target,
+    report: &mut InstallReport,
+    log: &mut dyn FnMut(&str),
+) {
+    let bin_dir = &plan.bin_dir;
+    // Skip when the privileged verify already covers this exact directory — one verdict per dir, and no
+    // duplicated log line for the common default install.
+    if plan.privileged_install_root(target.os).as_ref() == Some(bin_dir) {
+        return;
+    }
+    let verdict = secure::verify_install_root(target.os, bin_dir);
+    log(&format!(
+        "Install directory posture ({}):",
+        bin_dir.display()
+    ));
+    log(&format!(
+        "    {} {}",
+        if verdict.checked && !verdict.secure {
+            // `!` because it is worth a human's attention, but readiness is unaffected: see the doc above.
+            "!"
+        } else {
+            "✓"
+        },
+        verdict.note
+    ));
+    report.bin_dir_security = Some(verdict);
 }
 
 /// Verify each installed user-facing binary resolves by bare name **on the target user's own PATH**
@@ -4650,6 +4711,7 @@ mod tests {
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
             install_root_security: None,
+            bin_dir_security: None,
             migration: None,
             registration_audit: Vec::new(),
             install_manifest: None,
@@ -4919,14 +4981,26 @@ mod tests {
                 "a user-run CLI belongs in the §1.6 user root, not the privileged root"
             );
         }
-        // And that user root IS the machine-wide dir exactly when we are root — the elevation branch
-        // itself, asserted against the uid rather than assumed.
+        // THE VENEER (#1748): an ELEVATED install's own bin dir is the ROOT-OWNED protected root, never
+        // the machine-wide `/usr/local/bin`. That directory is user-writable under Homebrew on an Intel
+        // Mac, and making it the dir root writes to and execs from produced three separate root paths
+        // into it. Asserted against the real uid rather than assumed, both ways.
         if invoker::is_root() {
-            assert_eq!(paths::default_bin_dir(), machine);
+            assert_eq!(
+                paths::default_bin_dir(),
+                paths::protected_bin_dir(),
+                "an elevated install must place binaries where only root can write"
+            );
+            assert_ne!(
+                paths::default_bin_dir(),
+                machine,
+                "/usr/local/bin is a PATH veneer for symlinks, never an install root"
+            );
         } else {
             assert_eq!(
                 paths::default_bin_dir(),
-                invoker::target_user().dig_bin_dir()
+                invoker::target_user().dig_bin_dir(),
+                "unelevated, nothing runs as root, so the per-user root is correct"
             );
         }
 
@@ -4945,6 +5019,92 @@ mod tests {
             overridden.privileged_install_root(Os::Linux),
             Some(std::path::PathBuf::from("/opt/somewhere-else")),
             "an override redirects the privileged root, so the ACL verify must follow it there"
+        );
+    }
+
+    // -- #1748: the directory binaries LANDED in is verified and reported --------
+
+    /// The #565 verify only ever looked at the PRIVILEGED root, so the directory this run actually wrote
+    /// to and executed from went unchecked and unmentioned on every elevated unix install — which is how
+    /// a user-writable `/usr/local/bin` became the install root with nothing noticing.
+    ///
+    /// A REPORT, not a gate: the verdict must appear in `install.json` while readiness is untouched.
+    /// Asserted on a world-writable directory, the posture that matters, with the untouched-readiness
+    /// half asserted too so this cannot be "fixed" into a refusal.
+    ///
+    /// unix-only because on Windows EVERY component is privileged (`is_privileged_component`), so the
+    /// privileged root always equals the bin dir and the verdict would be a duplicate — the case the
+    /// companion test below pins.
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_binaries_landed_in_is_verified_and_reported() {
+        let target = Target::current().expect("host target");
+        let dir = std::env::temp_dir().join(format!("dig-bindir-posture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        // A CLI-only plan, so there is no privileged root to shadow this directory's verdict.
+        let plan = InstallPlan {
+            bin_dir: dir.clone(),
+            with_digstore: true,
+            with_dig_node: false,
+            with_dig_dns: false,
+            with_dig_app: false,
+            auto_update: false,
+            with_relay: false,
+            ..InstallPlan::default()
+        };
+        assert_eq!(
+            plan.privileged_install_root(target.os),
+            None,
+            "the fixture must have no privileged root, or the posture report is skipped as duplicate"
+        );
+
+        let mut report = report_shell();
+        report_bin_dir_posture(&plan, &target, &mut report, &mut |_| {});
+        let verdict = report
+            .bin_dir_security
+            .as_ref()
+            .expect("the directory this run wrote to must be reported, never silently skipped");
+        assert_eq!(verdict.root, dir.to_string_lossy());
+        #[cfg(unix)]
+        {
+            assert!(verdict.checked && !verdict.secure, "got: {}", verdict.note);
+        }
+        // And it does NOT sink the install: a user-writable dir holding binaries only that user runs is
+        // their own authority, so refusing would break every ordinary unelevated install.
+        assert!(
+            evaluate_readiness(&plan, &report).is_empty(),
+            "the bin-dir posture is reported, never fatal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One verdict per directory: when the privileged-root verify already covers this exact directory —
+    /// the ordinary default install, and every Windows install — no second, duplicate verdict is
+    /// produced. Otherwise the log would report the same directory twice on the most common path.
+    #[test]
+    fn the_bin_dir_posture_is_not_reported_twice_for_the_same_directory() {
+        let target = Target::current().expect("host target");
+        let plan = InstallPlan {
+            bin_dir: paths::protected_bin_dir(),
+            with_dig_dns: true,
+            ..InstallPlan::default()
+        };
+        assert_eq!(
+            plan.privileged_install_root(target.os).as_ref(),
+            Some(&plan.bin_dir),
+            "the fixture must be the duplicate case"
+        );
+        let mut report = report_shell();
+        report_bin_dir_posture(&plan, &target, &mut report, &mut |_| {});
+        assert!(
+            report.bin_dir_security.is_none(),
+            "the privileged-root verify already covers this directory"
         );
     }
 

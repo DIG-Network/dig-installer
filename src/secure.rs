@@ -152,8 +152,19 @@ pub fn parse_acl_write_grants(output: &str) -> Result<(), String> {
 ///
 /// `SPEC.md` already forbids exactly this (§4.1a "the privileged process never execs the user root's
 /// `digstore`", §4.1c "NEVER execs a user-writable binary"), and the GUI honours it via
-/// `should_exec_verify`. This is that same rule, enforced in the library the GUI's root child calls
-/// into, so the invariant holds on every path rather than one.
+/// `should_exec_verify`. This is that same rule, enforced in the library the GUI's root child calls into.
+///
+/// # This guard is NOT the primary defence, and does not cover every exec
+///
+/// The invariant is upheld first by PLACEMENT: an elevated install puts every binary in the root-owned
+/// [`crate::paths::protected_bin_dir`], so the directory root execs from is not user-writable at all
+/// (§7.5). That is what covers the exec sites this guard is NOT applied to —
+/// `crate::pathcheck::run_version` and `crate::dns::doctor`'s two `dig-dns` invocations.
+///
+/// This guard is defence in depth for the two surfaces a `--bin-dir` override can still aim at a
+/// directory the invoking user chose: the version probe and `crate::service::run_capturing`. Do not
+/// describe it as covering every root-side exec — it does not, and a claim the code fails to satisfy is
+/// worse than no claim.
 ///
 /// Unelevated it is always `Ok`: executing a binary the user themselves can write is not an escalation,
 /// it is their own authority. An INDETERMINATE permission read (`checked: false`) is also `Ok` — the

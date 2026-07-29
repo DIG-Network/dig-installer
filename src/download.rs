@@ -277,7 +277,7 @@ fn replace_binary_with(
     bytes: &[u8],
     schedule_on_reboot: impl Fn(&Path, &[u8]) -> Result<(), String>,
 ) -> Result<WriteOutcome, String> {
-    match std::fs::write(dest, bytes) {
+    match write_without_following_a_symlink(dest, bytes) {
         Ok(()) => {
             set_executable(dest);
             Ok(WriteOutcome::Replaced)
@@ -288,6 +288,51 @@ fn replace_binary_with(
         }
         Err(e) => Err(format!("write {}: {e}", dest.display())),
     }
+}
+
+/// Write `bytes` to `dest` without ever following a symlink that is already there.
+///
+/// # Why a plain `std::fs::write` is not safe here (#1748)
+///
+/// `std::fs::write` opens with `O_CREAT|O_TRUNC` and FOLLOWS an existing symlink, so a link planted at
+/// the destination redirects the write to its target. Under an elevated install that is a root
+/// arbitrary-file-create-and-overwrite primitive: `ln -s /etc/ld.so.preload /usr/local/bin/dign` and the
+/// next `sudo` install has root create and populate that file — and [`set_executable`] then marks the
+/// TARGET `0755`. No race is required, because the destination filenames are deterministic and
+/// published. `same_binary` cannot catch it either: it canonicalises both sides, so a link and its
+/// target compare equal.
+///
+/// The destination is therefore UNLINKED first and then created with `O_EXCL`, which cannot follow
+/// anything: after the unlink there is no symlink left to follow, and `O_EXCL` refuses to open a path
+/// that reappeared in between — so a concurrent re-plant loses rather than wins. `O_NOFOLLOW` is set as
+/// well, making the refusal explicit rather than incidental.
+///
+/// Removing the destination first is what an upgrade does anyway (the old binary is being replaced), and
+/// it does not change the Windows behaviour this function exists to preserve: `remove_file` on a running
+/// Windows executable fails, so the sharing-violation path in [`replace_binary_with`] still sees its
+/// error and still schedules the reboot-time replace.
+fn write_without_following_a_symlink(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // `remove_file` unlinks a symlink itself rather than its target, so this cannot damage whatever a
+    // planted link pointed at. A missing destination is the ordinary first-install case.
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Anything else (a running Windows executable, a permission problem) is surfaced unchanged, so
+        // the caller's sharing-violation handling still applies.
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(dest)?;
+    file.write_all(bytes)?;
+    file.flush()
 }
 
 /// Does this write error mean the destination is a RUNNING executable that
@@ -409,6 +454,69 @@ fn schedule_replace_on_reboot(dest: &Path, _bytes: &[u8]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #1748: the install write must never follow a planted symlink ------------
+
+    /// THE root arbitrary-file-write primitive: a symlink pre-planted at the destination must NOT be
+    /// followed, so the file it points at is left untouched and the binary lands at the destination
+    /// itself.
+    ///
+    /// The install filenames are deterministic and published, and the destination directory was (before
+    /// this release) user-writable on a Homebrew Mac — so `ln -s /etc/ld.so.preload <bin_dir>/dign` and
+    /// the next `sudo` install had root create and populate that file, then `set_executable` mark it
+    /// `0755`. No race is required.
+    ///
+    /// Runs UNPRIVILEGED, which is the point: the fix is a property of how the file is opened, not of
+    /// who opens it, so it gates in CI. The fixture points the link at a file with known contents rather
+    /// than at a missing path, so "did not follow" is observable as the victim being INTACT rather than
+    /// merely absent.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_write_does_not_follow_a_symlink_planted_at_the_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("etc-ld-so-preload");
+        std::fs::write(&victim, b"ORIGINAL").unwrap();
+        let dest = tmp.path().join("dign");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        write_without_following_a_symlink(&dest, b"NEW-BINARY").expect("the write must succeed");
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"ORIGINAL",
+            "the write followed a planted symlink — root would have overwritten the target and then \
+             chmod'ed it 0755 (#1748)"
+        );
+        // And the binary really landed at the destination, as a regular file rather than a link — a
+        // "fix" that merely refused to write anything would fail here.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW-BINARY");
+        assert!(
+            !std::fs::symlink_metadata(&dest).unwrap().is_symlink(),
+            "the destination must be a real file afterwards, not the attacker's link"
+        );
+    }
+
+    /// The ordinary upgrade path must still work: an existing REGULAR file at the destination is
+    /// replaced. Asserted so the symlink fix cannot be satisfied by refusing to overwrite anything.
+    #[test]
+    fn an_install_write_replaces_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dig-node");
+        std::fs::write(&dest, b"OLD").unwrap();
+        write_without_following_a_symlink(&dest, b"NEW").expect("an upgrade must overwrite");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+    }
+
+    /// A first install (nothing at the destination) is the common case and must not be treated as an
+    /// error by the unlink-first step.
+    #[test]
+    fn an_install_write_creates_a_missing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("nested").join("dig-dns");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        write_without_following_a_symlink(&dest, b"FRESH").expect("a first install must succeed");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"FRESH");
+    }
 
     #[test]
     fn extracts_tag_name() {
