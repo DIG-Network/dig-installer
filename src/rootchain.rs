@@ -694,8 +694,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_root_can_write_requires_positive_evidence_of_unprivileged_control() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
