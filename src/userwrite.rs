@@ -167,98 +167,11 @@ fn ensure_user_can_write_dir(dir: &Path, user: &TargetUser) -> Result<(), String
     Ok(())
 }
 
-/// uid 0 — the only foreign owner whose directories this installer will reclaim, because it is the
-/// only one they could have been created by on the privileged path.
+/// The descriptor-based directory primitives this walk is built on live in [`crate::dirfd`], shared with
+/// [`crate::rootchain`] so there is ONE implementation of "open this level without following a symlink,
+/// then act through the descriptor".
 #[cfg(unix)]
-const ROOT_UID: u32 = 0;
-
-/// An open directory descriptor, closed on drop.
-#[cfg(unix)]
-struct DirFd(std::os::fd::OwnedFd);
-
-/// `openat` `name` beneath `parent` (or open `name` absolutely when `parent` is `None`) as a
-/// directory, refusing to traverse a symlink.
-///
-/// `Ok(None)` distinguishes "does not exist yet" — the ordinary case, which the user's own `mkdir -p`
-/// handles — from an error. A symlink surfaces as `ELOOP` and is reported as the ancestor attack it is.
-#[cfg(unix)]
-fn open_dir_nofollow(parent: Option<&DirFd>, name: &Path) -> Result<Option<DirFd>, String> {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_name = std::ffi::CString::new(name.as_os_str().as_bytes())
-        .map_err(|_| format!("{} contains an interior NUL byte", name.display()))?;
-    // O_NOFOLLOW: a symlink at this component fails rather than being followed. O_DIRECTORY: a
-    // non-directory fails rather than being opened. O_CLOEXEC: never leaked into the `su` child.
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let raw = match parent {
-        // SAFETY: `c_name` is a valid NUL-terminated string; `parent`'s descriptor is owned and open
-        // for the duration of the call; the return value is checked before being adopted.
-        Some(p) => unsafe { libc::openat(p.raw(), c_name.as_ptr(), flags) },
-        // SAFETY: as above, with an absolute path and no directory descriptor.
-        None => unsafe { libc::open(c_name.as_ptr(), flags) },
-    };
-    if raw >= 0 {
-        // SAFETY: `raw` is a fresh, valid descriptor this call owns and nothing else holds.
-        return Ok(Some(DirFd(unsafe {
-            std::os::fd::OwnedFd::from_raw_fd(raw)
-        })));
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::ENOENT) => Ok(None),
-        // ELOOP is O_NOFOLLOW's report that the component IS a symlink; ENOTDIR means it is a
-        // non-directory standing where a directory must be. Both are refusals, never repairs.
-        Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(format!(
-            "{} is a symlink or not a directory — refusing to write a privileged install's per-user \
-             artifact through it, because a planted link is how a root-side write is redirected \
-             somewhere it must never reach",
-            name.display()
-        )),
-        _ => Err(format!("could not open {}: {err}", name.display())),
-    }
-}
-
-#[cfg(unix)]
-impl DirFd {
-    fn raw(&self) -> libc::c_int {
-        use std::os::fd::AsRawFd;
-        self.0.as_raw_fd()
-    }
-}
-
-/// The owning uid of the already-open directory `fd`, read via `fstat` so it describes the inode the
-/// descriptor holds rather than whatever `path` may resolve to by now (`path` is for the message only).
-#[cfg(unix)]
-fn owner_of(fd: &DirFd, path: &Path) -> Result<u32, String> {
-    // SAFETY: `stat` is a plain C struct that is fully written by a successful `fstat`; the descriptor
-    // is owned and open, and the result is checked before any field is read.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(fd.raw(), &mut st) };
-    if rc != 0 {
-        return Err(format!(
-            "could not read the ownership of {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(st.st_uid as u32)
-}
-
-/// `fchown` the open directory to `uid`:`gid`, through the descriptor — never by path.
-#[cfg(unix)]
-fn fchown(fd: &DirFd, uid: u32, gid: u32, path: &Path) -> Result<(), String> {
-    // SAFETY: the descriptor is owned and open; `fchown` takes it by value and touches no memory.
-    let rc = unsafe { libc::fchown(fd.raw(), uid as libc::uid_t, gid as libc::gid_t) };
-    if rc != 0 {
-        return Err(format!(
-            "{} was created by root and could not be handed back to uid {uid}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
+use crate::dirfd::{fchown, open_dir_nofollow, owner_of, ROOT_UID};
 
 /// The unelevated write: we are the user, so there is no privilege boundary to respect.
 fn write_directly(path: &Path, contents: &[u8]) -> Result<(), String> {

@@ -297,54 +297,48 @@ fn verify_windows(root_str: &str, root: &std::path::Path) -> InstallRootSecurity
     }
 }
 
+/// The unix verdict: EVERY level of `root`'s path must be root-owned with no group/other write, checked
+/// through `O_NOFOLLOW` descriptors ([`crate::rootchain::verify`]).
+///
+/// # Why not `std::fs::metadata` on the leaf (#1748)
+///
+/// It was, and both halves of that were exploitable:
+///
+/// * **the leaf alone is not enough.** Write permission on a PARENT is permission to rename the leaf
+///   aside and substitute an attacker-owned directory of the same name, whatever the leaf's own mode
+///   says. `create_dir_all` created `/opt/dig` at the process umask, so `umask 000` left it `0777` and
+///   this check — reading only `/opt/dig/bin` — printed "root-owned with no group/other write".
+/// * **`metadata` FOLLOWS symlinks.** With `--bin-dir /home/alice/bin` where `~/bin` is a symlink to
+///   `/etc`, it described `/etc` and reported the install root secure; root then created binaries in
+///   `/etc`.
+///
+/// A refusal to inspect a level — it is a symlink, a non-directory, or unreadable — is `checked: false`,
+/// an indeterminate warning, never a false `secure: true`.
 #[cfg(unix)]
 fn verify_unix(root_str: &str, root: &std::path::Path) -> InstallRootSecurity {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
-    match std::fs::metadata(root) {
-        Ok(md) => {
-            let mode = md.permissions().mode();
-            let group_or_other_write = mode & 0o022 != 0;
-            let root_owned = md.uid() == 0;
-            if group_or_other_write {
-                InstallRootSecurity {
-                    root: root_str.to_string(),
-                    checked: true,
-                    secure: false,
-                    note: format!(
-                        "the install root is group/other-writable (mode {:o}) — a non-root user \
-                         could replace a service binary",
-                        mode & 0o777
-                    ),
-                }
-            } else if !root_owned {
-                InstallRootSecurity {
-                    root: root_str.to_string(),
-                    checked: true,
-                    secure: false,
-                    note: format!(
-                        "the install root is owned by uid {} (not root) — its owner could replace \
-                         a service binary",
-                        md.uid()
-                    ),
-                }
-            } else {
-                InstallRootSecurity {
-                    root: root_str.to_string(),
-                    checked: true,
-                    secure: true,
-                    note: format!(
-                        "the install root is root-owned with no group/other write (mode {:o})",
-                        mode & 0o777
-                    ),
-                }
-            }
-        }
+    match crate::rootchain::verify(root) {
+        Ok(None) => InstallRootSecurity {
+            root: root_str.to_string(),
+            checked: true,
+            secure: true,
+            note: "every level of the install root is root-owned with no group/other write"
+                .to_string(),
+        },
+        Ok(Some(bad)) => InstallRootSecurity {
+            root: root_str.to_string(),
+            checked: true,
+            secure: false,
+            note: format!(
+                "{}: {} — a non-root account could replace a binary this installer places or executes",
+                bad.level.display(),
+                bad.reason
+            ),
+        },
         Err(e) => InstallRootSecurity {
             root: root_str.to_string(),
             checked: false,
             secure: false,
-            note: format!("could not stat the install root to verify its permissions: {e}"),
+            note: format!("could not verify every level of the install root: {e}"),
         },
     }
 }
@@ -420,15 +414,15 @@ pub fn windows_created_root_levels(
 /// authoritative gate.
 pub fn ensure_protected_dir(os: Os, root: &std::path::Path) -> Result<(), String> {
     let _ = os;
-    std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod 0755 {}: {e}", root.display()))?;
+        // EVERY DIG-owned level, created and re-moded explicitly — not `create_dir_all` plus a chmod of
+        // the leaf, which left `/opt/dig` at the process umask (#1748, `crate::rootchain`).
+        crate::rootchain::ensure(root)?;
     }
     #[cfg(windows)]
     {
+        std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
         force_system_ownership(root)?;
     }
     Ok(())
