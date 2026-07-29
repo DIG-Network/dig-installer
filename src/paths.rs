@@ -637,22 +637,57 @@ fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result
     ))
 }
 
-/// Create `bin_dir` if it is absent, root-owned and world-traversable (0755).
+/// Ensure `bin_dir` exists and, when it is the protected root, that its mode is `0755` — root writes,
+/// everyone else reads and traverses.
 ///
-/// Separate from the download path's own creation so PATH wiring — which runs first — can rely on the
-/// directory existing without depending on which components a given run happens to install.
+/// # The mode is ENFORCED, not just set at creation (#1748)
+///
+/// `create_dir_all` applies the process umask, so the mode of the directory root writes binaries into
+/// was inherited from whatever invoked the installer. Measured on a GitHub Actions runner under
+/// `sudo -H`, that produced `/opt/dig/bin` at mode **0777** — a WORLD-WRITABLE protected root, which
+/// hands every local account the ability to replace a binary root executes. That is the escalation the
+/// protected root exists to prevent, arriving through the umask instead of through the path.
+///
+/// So the mode is set explicitly, and set on an EXISTING directory too. An early return on
+/// `is_dir()` would adopt whatever mode a previous run (or anybody else) left behind, which is the
+/// same defect one run later.
+///
+/// Applied only to the protected root. A per-user `~/.dig/bin` or a `--bin-dir` the user chose is
+/// theirs, and silently re-moding a directory the caller nominated would be a surprise; its posture is
+/// reported instead (`InstallReport::bin_dir_security`).
 #[cfg(not(windows))]
-fn ensure_bin_dir(bin_dir: &Path) -> Result<(), String> {
+pub fn ensure_bin_dir(bin_dir: &Path) -> Result<(), String> {
+    // `links_out_of` is "is this the protected root?", the same single decision that drives linking and
+    // PATH wiring — so the directory whose mode is pinned is exactly the one root writes into.
+    ensure_bin_dir_in(bin_dir, links_out_of(bin_dir))
+}
+
+/// [`ensure_bin_dir`] with the "is this the protected root?" decision passed in, so the mode
+/// enforcement is exercisable against a temp directory instead of the real `/opt/dig/bin`.
+#[cfg(not(windows))]
+fn ensure_bin_dir_in(bin_dir: &Path, pin_mode: bool) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    if bin_dir.is_dir() {
+    if !bin_dir.is_dir() {
+        std::fs::create_dir_all(bin_dir)
+            .map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
+    }
+    if !pin_mode {
         return Ok(());
     }
-    std::fs::create_dir_all(bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
-    // Explicit rather than umask-dependent: every login shell on the box will search this directory,
-    // so it must be traversable by every account regardless of the umask the installer inherited.
     std::fs::set_permissions(bin_dir, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod 0755 {}: {e}", bin_dir.display()))
+}
+
+/// Windows has no mode bits to enforce; the protected root's guarantee there is its ACL, verified by
+/// [`crate::secure::verify_install_root`].
+#[cfg(windows)]
+pub fn ensure_bin_dir(bin_dir: &Path) -> Result<(), String> {
+    if !bin_dir.is_dir() {
+        std::fs::create_dir_all(bin_dir)
+            .map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
+    }
+    Ok(())
 }
 
 /// [`unix_add_to_path`] against an explicit `home` directory. The real call uses
@@ -1125,6 +1160,62 @@ mod tests {
                 other.display()
             );
         }
+    }
+
+    /// The protected root's mode MUST NOT depend on the umask the installer inherited, and MUST be
+    /// enforced on a directory that already exists.
+    ///
+    /// `create_dir_all` applies the process umask, and under `sudo -H` on a GitHub Actions runner that
+    /// produced `/opt/dig/bin` at mode **0777** on a real install — a world-writable directory holding
+    /// the binaries root wrote and that root-side execs and `/usr/local/bin` links resolve to. The
+    /// fixture starts the directory at 0777 EXISTING, because that is the case an early
+    /// `if is_dir() { return }` gets wrong: it adopts whatever mode was left behind.
+    ///
+    /// Runs unprivileged against a redirected protected root, so it gates in CI.
+    #[cfg(unix)]
+    #[test]
+    fn the_protected_root_mode_is_pinned_not_inherited_from_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opt-dig-bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // `ensure_bin_dir` pins the mode of the PROTECTED root specifically, which this temp dir is not
+        // — so assert on the shared helper that decides the mode, applied to an existing directory.
+        ensure_bin_dir_in(&dir, true).expect("re-moding an existing directory must succeed");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the protected root was left at {mode:o} — a group/world-writable directory holding \
+             binaries root wrote is the escalation the protected root exists to prevent (#1748)"
+        );
+    }
+
+    /// A directory the CALLER nominated is not silently re-moded — only the protected root is.
+    #[cfg(unix)]
+    #[test]
+    fn a_user_chosen_bin_dir_is_not_silently_re_moded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("my-own-bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        ensure_bin_dir_in(&dir, links_out_of(&dir)).expect("an existing directory is fine");
+        assert!(
+            !links_out_of(&dir),
+            "the fixture must not be the protected root, or nothing is being asserted"
+        );
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "a --bin-dir the user chose is theirs; its posture is REPORTED, not rewritten"
+        );
     }
 
     /// PATH wiring must target the dir the user RESOLVES from, which after #1748 is not the dir the

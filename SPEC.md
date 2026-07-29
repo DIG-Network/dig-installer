@@ -1484,10 +1484,24 @@ so a link planted at one would otherwise redirect a root write — and the subse
 path on the filesystem, with no race required. Comparing the resolved paths is NOT a substitute: a
 canonicalising comparison reports a link and its target as the same file.
 
-**The directory binaries were placed in MUST be verified and REPORTED** whenever it differs from the
-privileged root — the `--bin-dir` override, or an unelevated per-user root
-(`InstallReport::bin_dir_security`). This is a report, not a gate: a user-writable directory holding
-binaries only that same user runs is their own authority. Silence is what is forbidden.
+**The directory binaries were placed in MUST be verified**, and the dedupe against the privileged-root
+check MUST key on a verdict that was actually PRODUCED, never on where privileged binaries would have
+gone (`InstallReport::bin_dir_security`). Those two came apart: the privileged check is gated on the plan
+selecting a privileged component, while every elevated install places its binaries in the protected root
+— so a CLI-only elevated install wrote into a directory nothing checked.
+
+The verdict is **FATAL under elevation** and a REPORT otherwise. Root wrote the binaries, the veneer's
+links resolve into them, and root-side execs and services run them, so a group/other-writable directory
+is an escalation. Unelevated, a user-writable directory holding binaries only that same user runs is
+their own authority, and failing on it would refuse every ordinary per-user install and every Homebrew
+Mac.
+
+**The protected root's mode MUST be `0755` explicitly, and MUST be enforced on an existing directory.**
+`mkdir` applies the process umask, so an inherited `umask 000` yields a WORLD-WRITABLE protected root —
+measured at mode `0777` on a real elevated install — which hands every local account the ability to
+replace a binary root executes. Setting the mode only at creation is the same defect one run later,
+because the next run adopts whatever was left behind (`paths::ensure_bin_dir`). A directory the caller
+nominated (`--bin-dir`, a per-user root) is NOT re-moded; its posture is reported instead.
 
 ### 7.6 Trusted system-tool resolution
 

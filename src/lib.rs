@@ -1827,9 +1827,17 @@ fn report_bin_dir_posture(
     log: &mut dyn FnMut(&str),
 ) {
     let bin_dir = &plan.bin_dir;
-    // Skip when the privileged verify already covers this exact directory — one verdict per dir, and no
-    // duplicated log line for the common default install.
-    if plan.privileged_install_root(target.os).as_ref() == Some(bin_dir) {
+    // Skip only when the privileged verify ACTUALLY RAN on this exact directory — one verdict per dir,
+    // no duplicated log line on the common default install.
+    //
+    // `report.install_root_security` rather than `privileged_install_root()`, because those two came
+    // apart (#1748). The #565 verify is gated on the plan selecting a PRIVILEGED component, while since
+    // the veneer every ELEVATED install places its binaries in the protected root. So a CLI-only sudo
+    // install wrote into `/opt/dig/bin`, linked `/usr/local/bin` at it, and nothing checked the
+    // directory's mode at all — which is how a world-writable protected root reached a green install.
+    if report.install_root_security.is_some()
+        && plan.privileged_install_root(target.os).as_ref() == Some(bin_dir)
+    {
         return;
     }
     let verdict = secure::verify_install_root(target.os, bin_dir);
@@ -2046,6 +2054,29 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
                  repair the directory permissions",
                 sec.root, sec.note
             ));
+        }
+    }
+
+    // #1748: the same rule for the directory this run's binaries were PLACED in, when the check above
+    // did not cover it — but FATAL only under elevation.
+    //
+    // Elevation is what makes a writable directory an escalation rather than a preference: root wrote
+    // the binaries, `/usr/local/bin` links point into them, and services and root-side execs resolve
+    // them. A CLI-only `sudo` install selects no privileged component, so the gate above never fired,
+    // and a world-writable protected root shipped as a fully green install.
+    //
+    // Unelevated it stays a REPORT: a directory holding binaries only that same user runs is their own
+    // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
+    if invoker::is_root() {
+        if let Some(sec) = &report.bin_dir_security {
+            if sec.checked && !sec.secure {
+                failures.push(format!(
+                    "install directory {}: {} — an elevated install wrote binaries there, so a \
+                     non-root account could replace one root or a service later executes; repair the \
+                     directory permissions",
+                    sec.root, sec.note
+                ));
+            }
         }
     }
 
@@ -5084,11 +5115,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// One verdict per directory: when the privileged-root verify already covers this exact directory —
-    /// the ordinary default install, and every Windows install — no second, duplicate verdict is
-    /// produced. Otherwise the log would report the same directory twice on the most common path.
+    /// One verdict per directory — but ONLY when the privileged verify actually PRODUCED one.
+    ///
+    /// The dedupe used to key on `privileged_install_root()`, i.e. on where privileged binaries WOULD
+    /// go, and those came apart from where the verify actually ran (#1748): the #565 check is gated on
+    /// the plan selecting a privileged component, while since the veneer every ELEVATED install places
+    /// its binaries in the protected root. So a CLI-only `sudo` install wrote into `/opt/dig/bin`,
+    /// nothing verified it, and the dedupe suppressed the one check that would have. A world-writable
+    /// protected root reached a fully green install that way, measured at mode 0777 on a real run.
     #[test]
-    fn the_bin_dir_posture_is_not_reported_twice_for_the_same_directory() {
+    fn the_bin_dir_posture_is_deduped_only_against_a_verify_that_really_ran() {
         let target = Target::current().expect("host target");
         let plan = InstallPlan {
             bin_dir: paths::protected_bin_dir(),
@@ -5098,14 +5134,66 @@ mod tests {
         assert_eq!(
             plan.privileged_install_root(target.os).as_ref(),
             Some(&plan.bin_dir),
-            "the fixture must be the duplicate case"
+            "the fixture must be the same-directory case"
         );
-        let mut report = report_shell();
-        report_bin_dir_posture(&plan, &target, &mut report, &mut |_| {});
+
+        // The genuine duplicate: a verdict for this directory already exists, so no second one.
+        let mut covered = report_shell();
+        covered.install_root_security = Some(secure::InstallRootSecurity {
+            root: plan.bin_dir.to_string_lossy().to_string(),
+            checked: true,
+            secure: true,
+            note: "already verified".to_string(),
+        });
+        report_bin_dir_posture(&plan, &target, &mut covered, &mut |_| {});
         assert!(
-            report.bin_dir_security.is_none(),
+            covered.bin_dir_security.is_none(),
             "the privileged-root verify already covers this directory"
         );
+
+        // The case the old dedupe got wrong: NO verify ran, so the directory root wrote into must still
+        // be checked rather than silently skipped as a "duplicate" of a verdict that does not exist.
+        let mut unchecked = report_shell();
+        assert!(unchecked.install_root_security.is_none());
+        report_bin_dir_posture(&plan, &target, &mut unchecked, &mut |_| {});
+        assert!(
+            unchecked.bin_dir_security.is_some(),
+            "nothing verified the directory this run wrote binaries into (#1748)"
+        );
+    }
+
+    /// An ELEVATED install into a group/world-writable directory is FATAL, not a note.
+    ///
+    /// Elevation is what makes the posture an escalation rather than a preference: root wrote the
+    /// binaries, `/usr/local/bin` links resolve into them, and root-side execs and services run them.
+    /// The unelevated half — the same posture reported and NOT fatal — is asserted by
+    /// `the_directory_binaries_landed_in_is_verified_and_reported`, so both arms are covered.
+    #[test]
+    fn an_elevated_install_into_a_writable_directory_is_fatal() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            ..InstallPlan::default()
+        };
+        let mut report = report_shell();
+        report.bin_dir_security = Some(secure::InstallRootSecurity {
+            root: "/opt/dig/bin".to_string(),
+            checked: true,
+            secure: false,
+            note: "mode 0777: group and other can write".to_string(),
+        });
+
+        let failures = evaluate_readiness(&plan, &report);
+        if invoker::is_root() {
+            assert!(
+                failures.iter().any(|f| f.contains("/opt/dig/bin")),
+                "an elevated install must not report ready over a writable install directory: {failures:?}"
+            );
+        } else {
+            assert!(
+                !failures.iter().any(|f| f.contains("/opt/dig/bin")),
+                "unelevated it is the user's own authority, never a failure: {failures:?}"
+            );
+        }
     }
 
     /// #565: a definitive install-root ACL breach (an unprivileged principal

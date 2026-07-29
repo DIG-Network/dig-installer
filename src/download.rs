@@ -241,7 +241,10 @@ fn verify_and_write(
         }
     }
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        // NOT a bare `create_dir_all`: that applies the process umask, and an inherited `umask 000`
+        // produced a world-writable `/opt/dig/bin` — every local account able to replace a binary root
+        // executes (#1748). `ensure_bin_dir` pins the protected root's mode instead.
+        crate::paths::ensure_bin_dir(parent)?;
     }
     replace_binary(dest, bytes)
 }
