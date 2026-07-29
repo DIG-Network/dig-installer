@@ -1497,7 +1497,7 @@ fn run_report_gated(
             #[cfg(unix)]
             {
                 let wired = paths::reachable_dir(target.os, &plan.bin_dir, veneer_is_safe);
-                report_preceding_unsafe_path_dirs(&target, &wired, report, log);
+                report_preceding_unsafe_path_dirs(&wired, report, log);
             }
         }
 
@@ -1955,7 +1955,6 @@ fn link_protected_clis(
 /// ordinary `/usr/bin`/`/bin` entries precede us on every box and are root-owned, which is fine.
 #[cfg(unix)]
 fn report_preceding_unsafe_path_dirs(
-    target: &Target,
     wired: &std::path::Path,
     report: &mut InstallReport,
     log: &mut dyn FnMut(&str),
@@ -2001,7 +2000,12 @@ fn report_preceding_unsafe_path_dirs(
                 // An unresolvable entry cannot hold a binary root will run, so it cannot win a name.
                 return false;
             };
-            secure::verify_install_root(target.os, &resolved).is_blocking()
+            // `non_root_can_write`, NOT the install-root verdict: this asks whether somebody unprivileged
+            // can put a binary here, which is weaker than "is this fit to install into". Using the stronger
+            // rule flagged three directories nobody unprivileged can write — `/bin` and `/sbin` on usrmerge
+            // Linux, and Apple's sealed `/System/Cryptexes/App/usr/bin` — and failed clean installs on both
+            // platforms. Prepending is the primary defence for ordering; this is the backstop.
+            rootchain::non_root_can_write(&resolved).unwrap_or(false)
         })
         .collect();
     if unsafe_before.is_empty() {

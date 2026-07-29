@@ -313,6 +313,42 @@ fn verify_within(base: &Path, root: &Path) -> Result<Option<Unsafe>, String> {
     Ok(None)
 }
 
+/// Can a NON-ROOT account demonstrably write `dir`?
+///
+/// # Why this is narrower than [`verify`], deliberately (#1748 F2)
+///
+/// [`verify`] answers "is this fit to be an install root?", and for that question anything short of
+/// root-owned-with-no-group-or-other-write must fail — including a level it could not inspect, because we
+/// are about to WRITE and EXEC there and an unestablished posture is not evidence of safety.
+///
+/// The PATH-ORDER backstop asks something different and weaker: "can somebody who is not root put a binary
+/// here that root would resolve first?" Reusing the install-root rule for it produced three false positives
+/// on correctly configured machines, each from a directory nobody unprivileged can write:
+///
+/// * `/bin` and `/sbin` on any usrmerge Linux — symlinks, so the descriptor walk cannot traverse them;
+/// * `/System/Cryptexes/App/usr/bin` on macOS 13+ — an Apple-managed cryptex on a sealed, read-only volume.
+///
+/// So this looks for POSITIVE evidence of unprivileged control instead:
+///
+/// * a **non-root owner** — that account can always write its own directory; this is the Homebrew case
+///   (`<user>:admin`) and the attack case (`alice:alice`);
+/// * the **other-write** bit — anybody at all can write it.
+///
+/// Group-write with a root owner is deliberately NOT counted here. It IS a real concern for an install root
+/// and [`verify`] still fails it there, but on macOS the `admin`/`wheel` groups are effectively privileged
+/// and on a sealed system volume the bits do not mean what they say — so using it to fail PATH ORDER
+/// produced noise rather than signal. The primary defence for ordering is prepending, not this check.
+///
+/// `Err` when the directory cannot be inspected at all: the caller treats that as "cannot judge" and does
+/// not flag it, because an unresolvable or unreadable `PATH` entry cannot hold a binary root will run.
+pub fn non_root_can_write(dir: &Path) -> Result<bool, String> {
+    let fd = dirfd::open_dir_nofollow(None, dir)
+        .map_err(|e| e.note().to_string())?
+        .ok_or_else(|| format!("{} does not exist", dir.display()))?;
+    let (owner, mode) = dirfd::stat_of(&fd, dir)?;
+    Ok(owner != ROOT_UID || mode & 0o002 != 0)
+}
+
 /// A level of the install root that a non-root account can modify.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unsafe {
@@ -641,6 +677,67 @@ mod tests {
             0o755,
             "created at the umask instead of the requested mode — the racer's window"
         );
+    }
+
+    /// `non_root_can_write` looks for POSITIVE evidence of unprivileged control, and is deliberately
+    /// narrower than the install-root verdict.
+    ///
+    /// The PATH-order backstop asks "can somebody who is not root put a binary here that root would resolve
+    /// first?", which is a weaker question than "is this fit to install into". Reusing the stronger rule
+    /// flagged three directories nobody unprivileged can write and failed clean installs on both platforms:
+    /// `/bin` and `/sbin` on usrmerge Linux (symlinks the descriptor walk cannot traverse) and Apple's sealed
+    /// `/System/Cryptexes/App/usr/bin`.
+    ///
+    /// Every arm is asserted, because the interesting one — root-owned but group-writable being NOT counted —
+    /// is a deliberate narrowing that a "flag everything suspicious" implementation would get wrong in the
+    /// opposite direction.
+    #[cfg(unix)]
+    #[test]
+    fn non_root_can_write_requires_positive_evidence_of_unprivileged_control() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+
+        // Owned by this (unprivileged) test user: they can always write their own directory. Under the root
+        // gate this is the root-owned case instead, so both environments exercise a real answer.
+        set_mode(&dir, 0o755);
+        let owned_by_non_root = !running_as_root(&dir);
+        assert_eq!(
+            non_root_can_write(&dir).unwrap(),
+            owned_by_non_root,
+            "a non-root OWNER can always write; a root-owned 0755 directory cannot be written by anyone else"
+        );
+
+        // World-writable: anybody at all, whoever owns it.
+        set_mode(&dir, 0o777);
+        assert!(
+            non_root_can_write(&dir).unwrap(),
+            "the other-write bit means anyone can put a binary here"
+        );
+
+        // Root-owned + GROUP-writable is deliberately NOT counted for this question. It is a real concern for
+        // an install root and `verify` still fails it there — but on macOS `admin`/`wheel` are effectively
+        // privileged, and using it to fail PATH ORDER produced noise rather than signal.
+        set_mode(&dir, 0o775);
+        if running_as_root(&dir) {
+            assert!(
+                !non_root_can_write(&dir).unwrap(),
+                "group-write with a root owner must not fail PATH order — that is what flagged Apple's \
+                 sealed cryptex directory and the distribution's own /bin"
+            );
+            // The control, in the same environment: the install-root rule DOES still reject it, so the
+            // narrowing is scoped to this question and has not weakened the install-root gate.
+            assert!(
+                verify(&dir).unwrap().is_some(),
+                "the install-root verdict must still refuse a group-writable root"
+            );
+        }
+
+        // A directory that cannot be inspected at all is an error, which the caller treats as "cannot judge"
+        // rather than as a finding — an unresolvable PATH entry cannot hold a binary root will run.
+        assert!(non_root_can_write(&tmp.path().join("absent")).is_err());
     }
 
     fn set_mode(p: &Path, mode: u32) {
