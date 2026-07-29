@@ -31,6 +31,12 @@
 //! Resolution against that PATH is a pure function ([`resolve_in_path`]); only [`login_shell_path`]
 //! and [`verify_cli`] touch the machine.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -466,13 +472,13 @@ pub(crate) fn run_version(binary: &Path, user: &TargetUser) -> Result<String, St
         None => {
             // No boundary to cross means either we are unelevated — executing a binary the user can
             // already write is their own authority — or we are root acting AS root, which is the one
-            // case where root really does exec this binary itself. Guard it: with a `--bin-dir`
-            // override the directory can be one an unprivileged account writes, and neither placement
-            // nor the `su` drop protects this call then (#1748, F5).
-            crate::secure::root_exec_guard(binary)?;
-            let mut c = Command::new(binary);
-            c.arg("--version");
-            c
+            // case where root really does exec this binary itself. Spawned through `GuardedCommand`,
+            // which cannot exist without the root-exec guard having passed: with a `--bin-dir` override
+            // the directory can be one an unprivileged account writes, and neither placement nor the
+            // `su` drop protects this call then (#1748 F5/WU4).
+            let mut guarded = crate::guardedcmd::GuardedCommand::for_installed_binary(binary)?;
+            guarded.arg("--version");
+            guarded.into_command()
         }
     };
     cmd.hide_console();

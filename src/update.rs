@@ -23,10 +23,14 @@
 //! `dig-installer` along. When that extraction happens, re-export the moved
 //! types from here rather than duplicating the logic.
 
-use std::path::Path;
-use std::process::Command;
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
 
-use crate::proc::HideConsole;
+use std::path::Path;
+
 use crate::release::Repo;
 
 /// What a version probe found at a component's install destination.
@@ -231,17 +235,14 @@ pub fn decide_with_force(
 /// probe instead of spawning a real process (mirrors
 /// `service::stop_running_dig_node_with`'s injectable "is serving" pattern).
 fn spawn_version_probe(bin_path: &Path) -> Option<String> {
-    // Guarded AT THE SPAWN, not only in the caller. `detect_installed_version` checks first so it can
-    // report WHY it skipped the probe, and that message is worth keeping — but a guard one call frame
-    // away from the exec is a guard the next caller of this helper will not inherit. Refusal here is
-    // `None`, which §7.1 already resolves to "version undetectable" → reinstall, so the install proceeds
-    // safely (#1748).
-    if crate::secure::root_exec_guard(bin_path).is_err() {
-        return None;
-    }
-    let out = Command::new(bin_path)
+    // Spawned through `GuardedCommand`, which cannot be constructed without the root-exec guard having
+    // passed — so the check is structural rather than remembered (#1748 WU4). `detect_installed_version`
+    // ALSO checks first, purely so it can report WHY it skipped the probe. A refusal here is `None`, which
+    // §7.1 already resolves to "version undetectable" → reinstall, so the install proceeds safely.
+    // The guard runs INSIDE the constructor, so this cannot spawn without it having passed.
+    let out = crate::guardedcmd::GuardedCommand::for_installed_binary(bin_path)
+        .ok()?
         .arg("--version")
-        .hide_console()
         .output()
         .ok()?;
     if !out.status.success() {

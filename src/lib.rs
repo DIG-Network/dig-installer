@@ -59,6 +59,7 @@ pub mod elevation;
 pub mod error;
 pub mod firewall;
 pub mod forcelist;
+pub mod guardedcmd;
 pub mod hardening;
 pub mod health;
 pub mod hosts;

@@ -6,12 +6,16 @@
 //! spawn + a short poll (giving a freshly-started service a moment to bind
 //! its sockets) + the human summary text.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use super::plan::{self, DoctorSummary, PacInfo};
-use crate::proc::HideConsole;
 
 /// Run `<dig_dns_bin> doctor --json`, capturing stdout regardless of the
 /// child's exit code (a non-zero exit is dig-dns's OWN "not fully live"
@@ -22,11 +26,8 @@ pub fn run_doctor(dig_dns_bin: &Path) -> Result<DoctorSummary, String> {
     // (#1748). Placement normally guarantees it — dig-dns is pinned to the protected root — but a
     // `--bin-dir` override redirects the whole stack, and then only this guard stands between root and
     // an attacker-supplied binary. Inert unelevated.
-    crate::secure::root_exec_guard(dig_dns_bin)?;
-    let output = Command::new(dig_dns_bin)
-        .arg("doctor")
-        .arg("--json")
-        .hide_console()
+    let output = crate::guardedcmd::GuardedCommand::for_installed_binary(dig_dns_bin)?
+        .args(["doctor", "--json"])
         .output()
         .map_err(|e| format!("could not run {} doctor: {e}", dig_dns_bin.display()))?;
     plan::parse_doctor_json(&String::from_utf8_lossy(&output.stdout))
@@ -36,11 +37,8 @@ pub fn run_doctor(dig_dns_bin: &Path) -> Result<DoctorSummary, String> {
 /// gateway for its actual bound port) and return the parsed PAC info.
 pub fn run_pac(dig_dns_bin: &Path) -> Result<PacInfo, String> {
     // As in `run_doctor`: root execs this binary, so the directory it lives in is verified first (#1748).
-    crate::secure::root_exec_guard(dig_dns_bin)?;
-    let output = Command::new(dig_dns_bin)
-        .arg("pac")
-        .arg("--json")
-        .hide_console()
+    let output = crate::guardedcmd::GuardedCommand::for_installed_binary(dig_dns_bin)?
+        .args(["pac", "--json"])
         .output()
         .map_err(|e| format!("could not run {} pac: {e}", dig_dns_bin.display()))?;
     plan::parse_pac_json(&String::from_utf8_lossy(&output.stdout))

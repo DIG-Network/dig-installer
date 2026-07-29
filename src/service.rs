@@ -10,11 +10,15 @@
 //! the configured endpoint. This module builds those invocations; the pure
 //! arg/env construction is unit-tested without spawning anything.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
-use crate::proc::HideConsole;
 use crate::svc;
 
 /// Configuration for the dig-node service the installer will register.
@@ -342,14 +346,12 @@ pub(crate) fn run_capturing(
     // the no-root-exec-of-a-user-writable-binary invariant is enforced once, here, for all of them
     // rather than per call site. Unlike the version probe this cannot degrade: a service that must be
     // registered by running a binary we do not trust has no safe fallback, so it fails LOUDLY (#1748 F1).
-    crate::secure::root_exec_guard(bin)?;
-    let mut cmd = Command::new(bin);
-    cmd.args(args);
+    let mut guarded = crate::guardedcmd::GuardedCommand::for_installed_binary(bin)?;
+    guarded.args(args);
     for (k, v) in env {
-        cmd.env(k, v);
+        guarded.command_mut().env(k, v);
     }
-    let output = cmd
-        .hide_console()
+    let output = guarded
         .output()
         .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
     if !output.status.success() {

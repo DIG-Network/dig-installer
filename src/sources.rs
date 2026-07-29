@@ -44,6 +44,7 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
         ("forcelist/macos.rs", include_str!("forcelist/macos.rs")),
         ("forcelist/mod.rs", include_str!("forcelist/mod.rs")),
         ("forcelist/windows.rs", include_str!("forcelist/windows.rs")),
+        ("guardedcmd.rs", include_str!("guardedcmd.rs")),
         ("hardening.rs", include_str!("hardening.rs")),
         ("health.rs", include_str!("health.rs")),
         ("hosts.rs", include_str!("hosts.rs")),

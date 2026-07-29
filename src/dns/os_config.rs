@@ -19,12 +19,15 @@
 //! hijack for an elevated install. dig-dns itself spawns the OS resolver tools
 //! (`powershell`, `resolvectl`, `dscacheutil`, …) by absolute path.
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
-use std::process::Command;
 
 use serde::Deserialize;
-
-use crate::proc::HideConsole;
 
 /// The subset of `dig-dns`'s `OsConfigReport` (`configure-os`/`unconfigure-os`
 /// `--json`) the installer consumes. Deserialized permissively — unknown fields
@@ -132,10 +135,8 @@ fn run_os_config(dig_dns_bin: &Path, args: &[&str]) -> Result<OsConfigSummary, S
     // no guard (#1748). It was proved to root code execution: with `/opt` group-writable, uid 1001
     // planted a binary that `dns::doctor` refused to run and this call executed as uid 0. Placement does
     // not cover it, because a `--bin-dir` override redirects the whole stack. Inert unelevated.
-    crate::secure::root_exec_guard(dig_dns_bin)?;
-    let output = Command::new(dig_dns_bin)
+    let output = crate::guardedcmd::GuardedCommand::for_installed_binary(dig_dns_bin)?
         .args(args)
-        .hide_console()
         .output()
         .map_err(|e| {
             format!(

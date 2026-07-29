@@ -23,6 +23,12 @@
 //! The pure edit logic here is unit-tested; the elevated file I/O is in
 //! [`write_dig_local`] / [`remove_dig_local`].
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 

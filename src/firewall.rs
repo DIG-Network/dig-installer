@@ -37,6 +37,12 @@
 //! the thin imperative layer that actually shells out (skipped entirely on
 //! `dry_run`, so they never touch a real system in tests).
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
+// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
+// fixtures, or the guarded wrapper itself.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 /// dig-node's peer-RPC listen port (its own `peer::DEFAULT_P2P_PORT`) — the
