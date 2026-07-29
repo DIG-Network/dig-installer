@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.31.2] - 2026-07-29
+
+### Bug Fixes
+- **gui:** Key the WebView2 pin on SYSTEM, not elevation — the real #1819 cause (#47)
+
 ## [0.31.1] - 2026-07-29
 
 ### Bug Fixes
