@@ -200,6 +200,39 @@ fn ensure_levels(levels: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+/// Create `dir` and every ABSENT level above it at [`PRIVILEGED_DIR_MODE`], for a directory this
+/// installer does not own but may have to bring into existence — the `/usr/local/bin` PATH veneer.
+///
+/// # Why this is not just `create_dir_all` (#1748 S4)
+///
+/// `create_dir_all` creates the intermediate levels at the process umask, so on a minimal image where
+/// `/usr/local` does not exist, `umask 000` produced a WORLD-WRITABLE `/usr/local` — a directory on
+/// root's `PATH` on every platform. That is the same one-line defect as the protected root, one level up.
+///
+/// Unlike [`ensure`] this REPAIRS NOTHING: a level that already exists is left exactly as the
+/// distribution set it up, because `/usr/local` and `/usr/local/bin` are the system's to configure and
+/// silently re-moding them would be overreach. Only what this installer itself brings into existence is
+/// given a mode, and it is given one that cannot be widened by the umask.
+pub fn ensure_veneer(dir: &Path) -> Result<(), String> {
+    require_normalized_absolute(dir)?;
+    let mut walked = PathBuf::from("/");
+    let mut parent = dirfd::open_dir_nofollow(None, &walked)
+        .map_err(|e| e.note().to_string())?
+        .ok_or_else(|| "/ could not be opened".to_string())?;
+    for component in dir.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        walked.push(name);
+        let name = Path::new(name);
+        dirfd::mkdirat(&parent, name, PRIVILEGED_DIR_MODE, &walked)?;
+        parent = dirfd::open_dir_nofollow(Some(&parent), name)
+            .map_err(|e| e.note().to_string())?
+            .ok_or_else(|| format!("{} vanished while being created", walked.display()))?;
+    }
+    Ok(())
+}
+
 /// The verdict for `root`: is every level of its path, from `/` down, safe from modification by a
 /// non-root account?
 ///

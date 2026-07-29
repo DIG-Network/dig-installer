@@ -410,18 +410,19 @@ fn output_within(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Out
 /// fail-closed: `su` is resolved from the trusted system directories, never `$PATH`
 /// ([`crate::elevation::resolve_system_tool`]), because this spawn happens as root.
 ///
-/// # The question is "am I root?", not "was I sudo'd?" (#1748)
+/// # The question is "am I root, acting for somebody else?" (#1748)
 ///
-/// This used to branch on `user.via_elevation`, which is only `true` when an elevation HINT identified a
-/// different account — `SUDO_USER`, `DOAS_USER`, `PKEXEC_UID`. There is a live path where we are root and
-/// no hint exists: the macOS GUI elevates through `osascript … with administrator privileges`
-/// ([`crate::elevation::relaunch_elevated_macos`]), which inherits neither environment nor stdin, so the
-/// root child has no hint, `via_elevation` is `false`, and the probe ran the binary directly AS ROOT.
+/// This used to branch on `user.via_elevation`, which is `true` only when an elevation HINT identified a
+/// different account (`SUDO_USER`, `DOAS_USER`, `PKEXEC_UID`) — so it answers how root was REACHED rather
+/// than whether root's authority is being held on another account's behalf. The condition that makes this
+/// exec dangerous is the latter, so the predicate is
+/// [`TargetUser::acting_for_another_account`](crate::invoker::TargetUser::acting_for_another_account).
 ///
-/// That is the same defect shape as the placement bug this release fixes — a predicate answering a
-/// narrower question than the one that matters. Being root is the condition that makes an exec dangerous;
-/// how we became root is irrelevant. So the boundary is crossed whenever `is_root()` and the resolved
-/// account is somebody else, which drops privilege for the probe wherever an account is known.
+/// It is a real difference wherever a non-root account is resolved with no hint present — `su -m`/`su -p`
+/// preserve the environment, and this call then execs the probed binary AS ROOT under the old predicate.
+/// It is NOT a difference in the macOS GUI's `osascript` child: no environment is inherited there, so no
+/// other account is knowable and both predicates answer `false`. That gap is `SPEC.md` §1.5a /
+/// DIG-Network/dig_ecosystem#1779, not something this branch closes.
 #[cfg(unix)]
 fn as_user_command(binary: &Path, user: &TargetUser) -> Option<Result<Command, String>> {
     if !user.acting_for_another_account(crate::invoker::is_root()) {
@@ -846,9 +847,10 @@ mod tests {
     /// fixture. Reverting the fix left the suite GREEN 650/650. The property is now expressed against a
     /// pure function so every combination is reachable on any runner.
     ///
-    /// The decisive row is the second: root, no elevation hint, acting for a non-root account — the
-    /// macOS `osascript` child. `!via_elevation` says "no boundary" there and execs as root;
-    /// `euid_is_root && name != "root"` says "cross it".
+    /// The decisive row is the second: root, no elevation hint, acting for a NON-ROOT account. That state
+    /// is reached by `su -m`/`su -p`, which preserve the environment — not by the macOS `osascript` child,
+    /// where no account other than root is knowable at all (#1779). `!via_elevation` says "no boundary"
+    /// there and execs as root; asking whether we are root acting for another account says "cross it".
     #[test]
     fn the_boundary_is_decided_by_the_uid_and_the_account_never_by_an_elevation_hint() {
         let alice = |via_elevation| TargetUser {
@@ -867,7 +869,7 @@ mod tests {
         };
 
         // (euid_is_root, user, must_cross, why)
-        let cases: [(bool, TargetUser, bool, &str); 6] = [
+        let cases: [(bool, TargetUser, bool, &str); 7] = [
             (
                 true,
                 alice(true),
@@ -878,7 +880,7 @@ mod tests {
                 true,
                 alice(false),
                 true,
-                "the osascript GUI child: root, NO hint, acting for alice — the defective predicate                  execs as root here",
+                "root, NO hint, acting for a non-root account (`su -m` preserves the environment):                  the defective predicate reports \"not elevated\" and execs as root",
             ),
             (
                 true,
@@ -903,6 +905,18 @@ mod tests {
                 alice(true),
                 false,
                 "unelevated with a stale hint in the environment is still not root",
+            ),
+            (
+                true,
+                TargetUser {
+                    name: "toor".to_string(),
+                    home: std::path::PathBuf::from("/root"),
+                    uid: Some(0),
+                    gid: Some(0),
+                    via_elevation: false,
+                },
+                false,
+                "a uid-0 account not literally named `root` is still root - the UID decides, and a name                  comparison would try to `su - toor` and drop nothing",
             ),
         ];
 

@@ -328,11 +328,12 @@ pub fn link_into_machine_bin(target: &Path, name: &str) -> Result<PathBuf, Strin
     // the LINK it plants, not the system directory holding it, and its posture is reported instead.
     let veneer = Path::new(UNIX_MACHINE_BIN_DIR);
     if !veneer.is_dir() {
-        std::fs::create_dir_all(veneer)
-            .map_err(|e| format!("create {UNIX_MACHINE_BIN_DIR}: {e}"))?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(veneer, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod 0755 {UNIX_MACHINE_BIN_DIR}: {e}"))?;
+        // EVERY level, each created with its mode as a syscall argument (#1748 S4). `create_dir_all`
+        // creates `/usr/local` as well as `/usr/local/bin` and applies the umask to both, so on a minimal
+        // image under `umask 000` it produced a WORLD-WRITABLE `/usr/local` — a directory on root's PATH
+        // on every platform. Same one-line class as the protected root, one level up. An EXISTING level is
+        // left as the distribution configured it.
+        crate::rootchain::ensure_veneer(veneer)?;
     }
     // `symlink` fails on an existing path, and an upgrade legitimately re-points the link.
     match std::fs::remove_file(&link) {
@@ -362,10 +363,10 @@ fn user_can_enter(dir: &str, user: &crate::invoker::TargetUser) -> bool {
     // the shell root is about to spawn. Fail-closed: an unresolvable tool answers "cannot enter",
     // which only ever declines to wire PATH.
     // Cross the account boundary whenever we are ROOT acting for somebody else — the effective uid, not
-    // whether an elevation HINT exists. The macOS GUI elevates via `osascript`, which inherits no
-    // environment, so `via_elevation` is `false` in a root child and this would otherwise have asked
-    // ROOT's own shell whether it can enter the directory — the wrong principal, and root can enter
-    // almost anything (`crate::pathcheck::as_user_command`, SPEC §7.5).
+    // whether an elevation HINT exists (#1748). Under `su -m`/`su -p` a non-root account is resolved with
+    // no hint present, and the hint-based predicate then asked ROOT's own shell whether it could enter the
+    // directory — the wrong principal, and root can enter almost anything
+    // (`crate::pathcheck::as_user_command`, SPEC §7.5).
     let cross_to_user = user.acting_for_another_account(crate::invoker::is_root());
     let out = if cross_to_user {
         let Some(su) = crate::elevation::resolve_system_tool("su") else {

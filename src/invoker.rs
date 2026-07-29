@@ -58,17 +58,27 @@ impl TargetUser {
     ///
     /// # Why not [`Self::via_elevation`] (#1748)
     ///
-    /// `via_elevation` answers "did an elevation HINT name another account?", which is a NARROWER
-    /// question and false in a state that really does occur: the macOS GUI elevates through
-    /// `osascript … with administrator privileges`, which inherits neither environment nor stdin, so
-    /// its root child has no `SUDO_USER`/`DOAS_USER`/`PKEXEC_UID` at all. There, `via_elevation` is
-    /// `false` while `geteuid() == 0` — and every decision keyed on it then behaves as though it were
-    /// unprivileged while holding root's authority. That mistake was a root-side exec of a
-    /// user-writable binary in one place and a root-authored write into a user's home in another.
+    /// `via_elevation` answers "did an elevation HINT name another account?" — a narrower question than
+    /// the one that matters, and one whose answer depends on how root was reached rather than on the fact
+    /// of holding root's authority.
     ///
-    /// Being root is what makes an operation dangerous; how root was reached is irrelevant. So the
-    /// boundary exists exactly when the effective uid is root and the account being acted for is
-    /// somebody else.
+    /// **What this does NOT fix.** The macOS GUI's `osascript` root child inherits no environment, so it
+    /// has no hint AND no other account is knowable there: `resolve` falls back to this process's own
+    /// account, which is uid 0, so this predicate answers `false` exactly as `via_elevation` did. The home
+    /// inversion in that child is NOT closed by this change and is tracked as its own work (`SPEC.md`
+    /// §1.5a, DIG-Network/dig_ecosystem#1779). Claiming otherwise would be worse than the bug.
+    ///
+    /// **What it does fix**, and why it is still the right question:
+    ///
+    /// * a uid-0 context where a NON-ROOT account is genuinely resolved without an elevation hint —
+    ///   `su -m` / `su -p` preserve the environment, and any wrapper that resolves the target account by
+    ///   another route lands here too. `via_elevation` reports "not elevated" there while the process
+    ///   holds root, so every decision keyed on it writes root-owned files into that account's home and
+    ///   execs its binaries as root: a genuine local privilege escalation.
+    /// * a uid-0 account NOT literally named `root` (`toor` on BSD) — the uid comparison below answers
+    ///   correctly where a name comparison would try to drop privilege to root itself.
+    /// * when #1779 adds a hint source for the `osascript` child (the console owner), every one of the
+    ///   seven decision points inherits it with no further change, because they all ask this one question.
     ///
     /// `euid_is_root` is a PARAMETER rather than an ambient read so the decision is pure and every
     /// combination is testable on any runner — a test that reads the real uid can only exercise the
@@ -78,12 +88,26 @@ impl TargetUser {
     /// [`crate::pathcheck`]'s login-shell probe and `--version` probe, [`crate::autostart`]'s XDG
     /// resolution and enable-command, and [`crate::paths`]' PATH wiring.
     pub fn acting_for_another_account(&self, euid_is_root: bool) -> bool {
-        euid_is_root && self.name != ROOT_ACCOUNT
+        if !euid_is_root {
+            return false;
+        }
+        match self.uid {
+            // The UID is authoritative. Comparing the NAME to the literal `"root"` would answer wrongly
+            // on a system whose uid-0 account is called something else (`toor` on BSD): we would try to
+            // `su - toor` and drop nothing.
+            Some(uid) => uid != ROOT_UID,
+            // No uid resolved, so the name is all there is.
+            None => self.name != ROOT_ACCOUNT,
+        }
     }
 }
 
-/// The one account name for which there is never another account to drop to.
+/// The one account name for which there is never another account to drop to, used only when no uid
+/// resolved — [`TargetUser::acting_for_another_account`] prefers the uid, which is authoritative.
 const ROOT_ACCOUNT: &str = "root";
+
+/// uid 0.
+const ROOT_UID: u32 = 0;
 
 /// One parsed passwd-database record — the fields this module needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,13 +295,44 @@ pub fn target_user() -> &'static TargetUser {
     LIVE.get_or_init(resolve_live)
 }
 
+/// The name of the account this process is RUNNING AS, from the passwd database rather than the
+/// environment.
+///
+/// # Why not `$USER` (#1748 S6)
+///
+/// `$USER`/`$USERNAME` are caller-controlled: under `sudo`/`su -m` they are whatever the invoking
+/// environment left behind, and this value feeds [`TargetUser::acting_for_another_account`], the
+/// predicate every privilege-boundary decision consults. A security predicate must not take its input
+/// from a string the caller chose — `getpwuid_r(geteuid())` is authoritative, is already used elsewhere in
+/// this module, and cannot be influenced from outside the process.
+///
+/// The environment is consulted only as a LAST resort, for a euid with no passwd entry at all (a
+/// container with an empty passwd file), where a name is better than nothing and the uid — which is what
+/// the predicate actually compares — is unaffected either way.
+fn self_account_name() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let by_euid = ElevationHint {
+            name: None,
+            uid: Some(euid as u32),
+            gid: None,
+        };
+        if let Some(entry) = directory_lookup(&by_euid) {
+            return entry.name;
+        }
+    }
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "root".to_string())
+}
+
 /// Resolve the [`TargetUser`] for the live process — the real `geteuid()`, the real environment, and
 /// the real passwd database.
 fn resolve_live() -> TargetUser {
     let self_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
-    let self_name = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "root".to_string());
+    let self_name = self_account_name();
     #[cfg(unix)]
     {
         // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
@@ -422,6 +477,146 @@ unsafe fn entry_from_passwd(pwd: &libc::passwd) -> Option<PasswdEntry> {
 
 #[cfg(test)]
 mod tests {
+    /// The account this process runs as is read from the passwd database, never from `$USER` (#1748 S6).
+    ///
+    /// `$USER`/`$USERNAME` are caller-controlled — under `sudo`/`su -m` they are whatever the invoking
+    /// environment left behind — and they feed the predicate every privilege-boundary decision consults.
+    /// A structural check, because the alternative is asserting on whatever account the test runner
+    /// happens to be.
+    #[test]
+    fn the_running_account_is_not_taken_from_a_caller_controlled_variable() {
+        let src = include_str!("invoker.rs");
+        let production = src.split("
+mod tests {").next().unwrap_or("");
+        let resolver = production
+            .split("fn self_account_name()")
+            .nth(1)
+            .expect("self_account_name must exist — it is the authoritative lookup")
+            .split("
+fn ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            resolver.contains("geteuid()") && resolver.contains("directory_lookup"),
+            "the running account must come from getpwuid_r(geteuid()), not from the environment"
+        );
+        // The environment may appear only AFTER the authoritative lookup, as a last resort for a euid with
+        // no passwd entry at all.
+        let env_at = resolver.find("std::env::var");
+        let lookup_at = resolver.find("directory_lookup");
+        assert!(
+            env_at.is_none() || env_at > lookup_at,
+            "the environment must be the LAST resort, never consulted before the passwd database"
+        );
+    }
+
+    /// A uid-0 account that is not literally named `root` is still root.
+    ///
+    /// The predicate compares the UID because the NAME is not reliable: `toor` on BSD is uid 0, and a name
+    /// comparison would report "another account" and try to `su - toor`, dropping nothing while believing
+    /// it had.
+    #[test]
+    fn a_uid_zero_account_under_another_name_is_still_root() {
+        let toor = TargetUser {
+            name: "toor".to_string(),
+            home: PathBuf::from("/root"),
+            uid: Some(0),
+            gid: Some(0),
+            via_elevation: false,
+        };
+        assert!(!toor.acting_for_another_account(true));
+
+        // And the reverse: a non-root uid IS another account, whatever it is called.
+        let odd = TargetUser {
+            name: "root".to_string(),
+            home: PathBuf::from("/home/odd"),
+            uid: Some(1000),
+            gid: Some(1000),
+            via_elevation: false,
+        };
+        assert!(
+            odd.acting_for_another_account(true),
+            "uid 1000 is another account even when the name says otherwise — the uid decides"
+        );
+    }
+
+    // -- #1748 C1: the AMBIENT READ that feeds the predicate must exist at every site ----
+
+    /// Every production decision point must actually ASK the kernel for the effective uid.
+    ///
+    /// # Why a behavioural test cannot cover this
+    ///
+    /// Making [`TargetUser::acting_for_another_account`] pure was right — it made all six input
+    /// combinations testable on any runner — but it MOVED the untested part rather than removing it. The
+    /// predicate is now proven; the WIRING from the real uid into it is not, because exercising it needs
+    /// the process to actually be root, and CI runs unprivileged.
+    ///
+    /// That gap is not theoretical. Replacing all seven production `acting_for_another_account(is_root())`
+    /// arguments with the literal `false` leaves the entire suite green on both Windows and Linux — and
+    /// `false` at those sites IS the shipped defect, since it is what the old hint-based predicate
+    /// returned in the macOS GUI's root child. This very PR shipped exactly that mistake mid-flight: the
+    /// whole-chain fix was wired into one of its two creation sites and only an e2e caught it.
+    ///
+    /// So the wiring is pinned STRUCTURALLY: each site must pass the ambient read, never a literal, and
+    /// the expected set of sites is named. Delete the wiring anywhere and the named site disappears; add a
+    /// new decision point that hardcodes the answer and the literal check fires.
+    #[test]
+    fn every_decision_point_reads_the_effective_uid_rather_than_assuming_it() {
+        const AMBIENT: &str = "acting_for_another_account(";
+        let mut wired = Vec::new();
+
+        for (file, src) in crate::sources::all() {
+            let production = src
+                .split(
+                    "
+mod tests {",
+                )
+                .next()
+                .unwrap_or("");
+            assert!(
+                production.len() > 50,
+                "{file}: the production/test split has drifted and this scan would be vacuous"
+            );
+            for line in production.lines().filter(|l| {
+                let code = l.split("//").next().unwrap_or("");
+                // The DEFINITION mentions its own name, and a doc comment may too; only CALLS decide
+                // anything.
+                code.contains(AMBIENT) && !code.contains("fn acting_for_another_account")
+            }) {
+                // The argument is read from the CALL LINE rather than by matching brackets, because the
+                // ambient read `is_root()` closes a paren of its own.
+                let argument = line.split(AMBIENT).nth(1).unwrap_or_default();
+                assert!(
+                    argument.contains("is_root"),
+                    "{file} decides a privilege boundary with `{}` instead of reading the effective                      uid. A literal (or any value not derived from `is_root()`) hardcodes the answer,                      which is precisely the defect #1748 fixed - the old predicate returned `false` in                      the macOS GUI's root child while running as uid 0.",
+                    argument.trim()
+                );
+                wired.push(file);
+            }
+        }
+
+        // The sites that MUST be wired. Named, so removing the ambient read anywhere fails here rather
+        // than passing by finding one fewer call.
+        for (file, count) in [
+            ("autostart.rs", 3),
+            ("pathcheck.rs", 2),
+            ("paths.rs", 1),
+            ("userwrite.rs", 1),
+        ] {
+            let found = wired.iter().filter(|f| **f == file).count();
+            assert_eq!(
+                found, count,
+                "{file} should read the effective uid at {count} decision point(s), found {found}.                  Removing one silently reverts that site to assuming it is unelevated; adding one means                  this list needs updating deliberately."
+            );
+        }
+        assert_eq!(
+            wired.len(),
+            7,
+            "the crate has 7 privilege-boundary decision points; found {}: {wired:?}",
+            wired.len()
+        );
+    }
+
     use super::*;
 
     // -- #1748 F2: the account lookup no longer spawns a plantable tool ----------

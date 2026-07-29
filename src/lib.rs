@@ -1965,6 +1965,21 @@ fn verify_clis_on_path(
 /// ([`ServiceResult::health_ok`], set from [`svc::is_service_running`]); dig-dns
 /// on a live resolution path; dig-relay on a successful registration.
 fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String> {
+    evaluate_readiness_when(plan, report, invoker::is_root())
+}
+
+/// [`evaluate_readiness`] with the elevated-ness supplied instead of read from the ambient uid.
+///
+/// The last gate in the crate to get this seam, and it needed it for the same reason as the others: the
+/// `is_root()` branch below is only reachable when the test process really is root, so on an unprivileged
+/// runner replacing it with `false` changed nothing observable and the suite stayed green — including the
+/// test named `an_elevated_install_into_a_writable_directory_is_fatal`, whose own doc claimed both arms
+/// were covered (#1748 C3).
+fn evaluate_readiness_when(
+    plan: &InstallPlan,
+    report: &InstallReport,
+    elevated: bool,
+) -> Vec<String> {
     let mut failures = Vec::new();
     if plan.dry_run {
         return failures;
@@ -2086,7 +2101,7 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     //
     // Unelevated it stays a REPORT: a directory holding binaries only that same user runs is their own
     // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
-    if invoker::is_root() {
+    if elevated {
         if let Some(sec) = &report.bin_dir_security {
             if sec.checked && !sec.secure {
                 failures.push(format!(
@@ -5231,18 +5246,28 @@ mod tests {
             note: "mode 0777: group and other can write".to_string(),
         });
 
-        let failures = evaluate_readiness(&plan, &report);
-        if invoker::is_root() {
-            assert!(
-                failures.iter().any(|f| f.contains("/opt/dig/bin")),
-                "an elevated install must not report ready over a writable install directory: {failures:?}"
-            );
-        } else {
-            assert!(
-                !failures.iter().any(|f| f.contains("/opt/dig/bin")),
-                "unelevated it is the user's own authority, never a failure: {failures:?}"
-            );
-        }
+        // BOTH arms, stated explicitly rather than branched on the runner's own uid. Branching on
+        // `is_root()` meant CI only ever ran the unelevated arm, so replacing the production
+        // `if invoker::is_root()` with `if false` changed nothing observable and this test stayed green
+        // while claiming to cover both (#1748 C3).
+        let elevated = evaluate_readiness_when(&plan, &report, true);
+        assert!(
+            elevated.iter().any(|f| f.contains("/opt/dig/bin")),
+            "an elevated install must NOT report ready over a writable install directory: {elevated:?}"
+        );
+
+        let unelevated = evaluate_readiness_when(&plan, &report, false);
+        assert!(
+            !unelevated.iter().any(|f| f.contains("/opt/dig/bin")),
+            "unelevated it is the user's own authority, never a failure: {unelevated:?}"
+        );
+
+        // And the ambient entry point agrees with the injected one on this runner, so the two cannot
+        // drift apart.
+        assert_eq!(
+            evaluate_readiness(&plan, &report),
+            evaluate_readiness_when(&plan, &report, invoker::is_root())
+        );
     }
 
     /// #565: a definitive install-root ACL breach (an unprivileged principal

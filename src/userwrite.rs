@@ -70,10 +70,12 @@ pub fn write_as_user_when(
 
 /// [`write_as_user`] for a binary artifact (an icon, a cache) — same authority rules.
 pub fn write_bytes_as_user(path: &Path, contents: &[u8], user: &TargetUser) -> Result<(), String> {
-    // `is_root()`, never the elevation hint. In the macOS GUI's `osascript` root child there is no hint,
-    // so this took `write_directly` — root `create_dir_all` + `fs::write` inside a NON-ROOT user's home,
-    // following any symlink planted on the way. That is the root-authored-write escalation this module
-    // exists to remove, reappearing through the wrong predicate (#1748).
+    // `is_root()`, never the elevation hint (#1748). Whenever we hold root and a NON-ROOT account is
+    // resolved — `su -m`/`su -p` preserve the environment, so no hint is needed for that — the hint-based
+    // predicate took `write_directly`: root `create_dir_all` + `fs::write` inside that user's home,
+    // following any symlink planted on the way, which is the root-authored-write escalation this module
+    // exists to remove. (The macOS `osascript` child is NOT that case: no other account is knowable
+    // there, so both predicates delegate nothing — #1779.)
     write_bytes_as_user_when(
         path,
         contents,
