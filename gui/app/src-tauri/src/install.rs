@@ -29,6 +29,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+// Used ONLY by the Linux desktop-integration cache refresh below (`update-mime-database`,
+// `gtk-update-icon-cache`), so on Windows and macOS this import is dead. Gated rather than blanket
+// `#[allow(unused_imports)]` so it stays honest — and worth knowing CI could not see this: the
+// `gui clippy` job runs on ubuntu-latest ONLY, where the import IS used.
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
