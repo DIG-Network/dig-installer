@@ -70,6 +70,30 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The directory test fixtures build their trees in.
+///
+/// # Why not `std::env::temp_dir()` (#1748 WU3)
+///
+/// `/tmp` is mode `1777`, and since the install-root verify walks EVERY level of a path, anything built
+/// under it is correctly condemned as sitting beneath a world-writable ancestor. That is the verify being
+/// right — but it made 23 lib tests fail when the suite runs AS ROOT, and it meant the one executable proof
+/// of the root-exec guard could not pass in the only environment where it runs: skipped unprivileged,
+/// failing as root, for a reason that has nothing to do with the property under test.
+///
+/// So the root gate runs in a container that bakes a purpose-made fixture root — root-owned, `0755`, not
+/// sticky — and points `DIG_TEST_FIXTURE_ROOT` at it. Everywhere else this falls back to the system temp
+/// directory, which is correct for the unprivileged runs where a writable ancestor is not a finding.
+///
+/// Fixing the fixture LOCATION rather than relaxing the verify is the whole point: the verify keeps its
+/// teeth and the proofs become runnable.
+#[cfg(test)]
+pub fn fixture_root() -> std::path::PathBuf {
+    match std::env::var("DIG_TEST_FIXTURE_ROOT") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

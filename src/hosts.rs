@@ -574,8 +574,8 @@ mod tests {
     // -- File-I/O wrapper tests against a TEMP hosts file (never the real one). --
 
     fn tmp_hosts(tag: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("dig-installer-hosts-{tag}-{}", std::process::id()));
+        let d = crate::sources::fixture_root()
+            .join(format!("dig-installer-hosts-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d.join("hosts")
     }
@@ -617,7 +617,8 @@ mod tests {
 
     #[test]
     fn remove_dig_local_at_missing_file_is_ok_none() {
-        let path = std::env::temp_dir().join("dig-installer-hosts-does-not-exist-xyz/hosts");
+        let path =
+            crate::sources::fixture_root().join("dig-installer-hosts-does-not-exist-xyz/hosts");
         assert_eq!(remove_dig_local_at(&path).expect("missing file ok"), None);
     }
 

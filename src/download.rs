@@ -695,7 +695,8 @@ mod tests {
 
     #[test]
     fn verify_and_write_writes_bytes_when_no_checksum_given() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-nohash-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-nohash-{}", std::process::id()));
         let dest = dir.join("nested").join("artifact.bin");
         let outcome = verify_and_write(b"hello dig", &dest, None).expect("write ok");
         assert_eq!(outcome, WriteOutcome::Replaced);
@@ -705,7 +706,7 @@ mod tests {
 
     #[test]
     fn verify_and_write_accepts_a_matching_checksum() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-ok-{}", std::process::id()));
+        let dir = crate::sources::fixture_root().join(format!("dig-dl-ok-{}", std::process::id()));
         let dest = dir.join("artifact.bin");
         let data = b"verified payload";
         let sum = sha256_hex(data);
@@ -717,7 +718,7 @@ mod tests {
 
     #[test]
     fn verify_and_write_rejects_a_mismatched_checksum_and_writes_nothing() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-bad-{}", std::process::id()));
+        let dir = crate::sources::fixture_root().join(format!("dig-dl-bad-{}", std::process::id()));
         let dest = dir.join("artifact.bin");
         let err = verify_and_write(b"payload", &dest, Some("deadbeef")).unwrap_err();
         assert!(err.contains("checksum mismatch"), "got: {err}");
@@ -729,7 +730,8 @@ mod tests {
     #[test]
     fn verify_and_write_marks_the_file_executable_on_unix() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("dig-dl-exec-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-exec-{}", std::process::id()));
         let dest = dir.join("tool");
         verify_and_write(b"#!/bin/sh\n", &dest, None).expect("ok");
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
@@ -840,7 +842,8 @@ mod tests {
 
     #[test]
     fn replace_binary_writes_in_place_when_the_destination_is_free() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-free-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-free-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("dig-dns-free.bin");
         let outcome = replace_binary(&dest, b"NEW").expect("an unlocked write applies in place");
@@ -886,7 +889,8 @@ mod tests {
     /// write-time failure (ERROR_LOCK_VIOLATION 33 included).
     #[test]
     fn replace_binary_hard_errors_on_a_non_sharing_violation_write_failure() {
-        let dir = std::env::temp_dir().join(format!("dig-dl-harderr-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-harderr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let scheduled = std::cell::Cell::new(false);
         // `dir` is a directory → std::fs::write fails with a non-32 error.
@@ -917,7 +921,8 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
 
-        let dir = std::env::temp_dir().join(format!("dig-dl-locked-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-dl-locked-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("dig-dns.exe");
         std::fs::write(&dest, b"OLD BINARY").unwrap();

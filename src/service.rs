@@ -473,23 +473,35 @@ mod tests {
 
     /// See the Windows variant above. On unix we return a pre-existing system
     /// binary (`true`/`false`) to dodge the `ETXTBSY` write-then-exec race.
+    /// See the Windows variant above.
+    ///
+    /// `/usr/bin` is tried FIRST, not second. On any usrmerge distribution (every current Debian/Ubuntu)
+    /// `/bin` is a SYMLINK to `usr/bin`, and the root-exec guard refuses a symlinked level rather than
+    /// following it — correctly, because an inode walk cannot verify what it cannot traverse. So as ROOT a
+    /// `/bin/true` stub is refused before it ever runs, for a reason that has nothing to do with the
+    /// property under test. Found by running the suite as root in a container (#1748 WU3); in production
+    /// DIG's own roots are real directories, so the guard's strictness costs nothing there.
     #[cfg(not(windows))]
     fn stub_exit(_dir: &std::path::Path, success: bool) -> std::path::PathBuf {
         let base = if success { "true" } else { "false" };
-        for cand in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
+        for cand in [format!("/usr/bin/{base}"), format!("/bin/{base}")] {
             let p = std::path::PathBuf::from(&cand);
-            if p.exists() {
+            // The PARENT must not be a symlink, or the guard refuses the exec as root.
+            let parent_is_real = p
+                .parent()
+                .and_then(|d| std::fs::symlink_metadata(d).ok())
+                .is_some_and(|m| !m.is_symlink());
+            if p.exists() && parent_is_real {
                 return p;
             }
         }
-        // Fallback to the conventional path; every CI runner / POSIX system
-        // ships `/bin/true` and `/bin/false`.
+        // Fallback to the conventional path; every CI runner / POSIX system ships `/bin/true`.
         std::path::PathBuf::from(format!("/bin/{base}"))
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("dig-installer-svc-{tag}-{}", std::process::id()));
+        let d = crate::sources::fixture_root()
+            .join(format!("dig-installer-svc-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -687,8 +699,8 @@ mod tests {
         // First install: no prior binary, so nothing to stop — a skip (not an
         // error), even if the (injected) service state claims RUNNING; and the
         // stop action must NEVER be invoked.
-        let missing =
-            std::env::temp_dir().join(format!("dig-installer-stop-absent-{}", std::process::id()));
+        let missing = crate::sources::fixture_root()
+            .join(format!("dig-installer-stop-absent-{}", std::process::id()));
         let outcome = stop_running_service_by_id_with(
             &missing,
             "dig-node",
@@ -762,8 +774,8 @@ mod tests {
         // The public entrypoints (real svc probes) must at least handle the
         // first-install case cleanly on any host — the branch that never
         // consults the service manager or a binary.
-        let missing =
-            std::env::temp_dir().join(format!("dig-installer-stop-pub-{}", std::process::id()));
+        let missing = crate::sources::fixture_root()
+            .join(format!("dig-installer-stop-pub-{}", std::process::id()));
         assert!(!stop_running_dig_node(&missing).unwrap().attempted);
         assert!(!stop_running_dig_relay(&missing).unwrap().attempted);
     }
@@ -779,12 +791,29 @@ mod tests {
     // file — dodges the `ETXTBSY` write-then-exec race `stub_exit`'s own doc
     // comment already flags) so these are exec-race-free on every CI runner.
 
+    /// A shell to run `inline` with, at a path whose whole chain the root-exec guard can verify.
+    ///
+    /// NOT `/bin/sh`: on any usrmerge distribution (every current Debian/Ubuntu) `/bin` is a SYMLINK to
+    /// `usr/bin`, and the guard refuses a symlinked level rather than following it — correctly, since an
+    /// inode walk cannot verify what it cannot traverse. That refusal is right in production (DIG's own
+    /// roots are real directories) but it made these tests fail as root for a reason unrelated to what
+    /// they assert. Found by running the suite as root in a container, which is precisely why that gate
+    /// exists (#1748 WU3).
+    ///
+    /// `/usr/bin/sh` is the real path on those systems and resolves through no link.
     #[cfg(unix)]
     fn shell_stub(inline: &str) -> (std::path::PathBuf, Vec<String>) {
-        (
-            std::path::PathBuf::from("/bin/sh"),
-            vec!["-c".to_string(), inline.to_string()],
-        )
+        let real_sh = ["/usr/bin/sh", "/bin/sh"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| {
+                p.exists()
+                    && p.parent()
+                        .and_then(|d| std::fs::symlink_metadata(d).ok())
+                        .is_some_and(|m| !m.is_symlink())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
+        (real_sh, vec!["-c".to_string(), inline.to_string()])
     }
     #[cfg(windows)]
     fn shell_stub(inline: &str) -> (std::path::PathBuf, Vec<String>) {

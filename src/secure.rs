@@ -165,20 +165,17 @@ pub fn parse_acl_write_grants(output: &str) -> Result<(), String> {
 /// The invariant is upheld first by PLACEMENT: an elevated install puts every binary in the root-owned
 /// [`crate::paths::protected_bin_dir`], so the directory root execs from is not user-writable at all
 /// (`SPEC.md` §7.5). Placement alone is NOT sufficient, because an explicit `--bin-dir` override
-/// redirects the whole stack to a directory the invoking user chose — so every root-side exec in the
-/// library is gated on this guard as well:
+/// redirects the whole stack to a directory the invoking user chose.
 ///
-/// 1. `crate::update::detect_installed_version` — the `<dest> --version` probe, which runs before
-///    anything is downloaded;
-/// 2. `crate::service::run_capturing` — the `install`/`uninstall` verb delegation;
-/// 3. `crate::pathcheck::run_version`'s direct-exec branch — reached when there is no account to drop
-///    to (a root-shell install, or the macOS GUI's `osascript` child);
-/// 4. `crate::dns::doctor`'s two `dig-dns` invocations.
+/// **This comment deliberately does not enumerate the call sites.** Two earlier revisions did, and both
+/// were wrong — the first claimed placement covered sites it did not, the second listed four sites while a
+/// fifth existed and was proved to root code execution. An enumeration in a comment is a claim that rots
+/// the moment somebody adds a caller, and a claim the code fails to satisfy is worse than no claim.
 ///
-/// That list is the whole set, and it is asserted by
-/// `the_root_exec_guard_is_wired_into_every_root_side_exec`. An earlier revision of this comment claimed
-/// placement covered (3) and (4); it did not, and a claim the code fails to satisfy is worse than no
-/// claim.
+/// The set is instead closed by CONSTRUCTION: [`crate::guardedcmd::GuardedCommand::for_installed_binary`]
+/// is the only way to spawn an installed binary, it calls this guard before yielding a value, and
+/// `clippy.toml` denies `std::process::Command::new` outside the modules that spawn trusted system tools.
+/// An unguarded root-side exec does not compile, so there is no list to keep current.
 ///
 /// Unelevated it is always `Ok`: executing a binary the user themselves can write is not an escalation,
 /// it is their own authority. An INDETERMINATE permission read (`checked: false`) is also `Ok` — the
@@ -860,7 +857,8 @@ mod tests {
             eprintln!("skipped: the guard is deliberately inert unelevated");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("dig-rootexec-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-rootexec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("dig-node");
@@ -895,7 +893,8 @@ mod tests {
             eprintln!("skipped: asserts the UNELEVATED arm");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("dig-userexec-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-userexec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -912,7 +911,8 @@ mod tests {
     #[test]
     fn unix_verify_flags_a_group_or_other_writable_root() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("dig-secure-ug-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-secure-ug-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 0o777 → group + other write present → NOT secure.
@@ -986,31 +986,45 @@ mod tests {
     /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory
     /// under a WORLD-WRITABLE ancestor is NOT secure, and the verdict names the ANCESTOR.
     ///
-    /// `/tmp` is mode `1777` on every unix box, which makes it a truthful stand-in for the `0777`
-    /// `/opt/dig` this release fixes: write permission on the parent is permission to rename the leaf
-    /// aside and substitute an attacker-owned directory of the same name.
+    /// The fixture builds its OWN world-writable ancestor rather than borrowing `/tmp`'s `1777`: the root
+    /// gate runs with fixtures on a clean `0755` root precisely so a writable ancestor is a fact the test
+    /// STATES rather than one it inherits from the environment (#1748 WU3). Write permission on the parent
+    /// is permission to rename the leaf aside and substitute an attacker-owned directory of the same name.
     #[cfg(unix)]
     #[test]
     fn unix_verify_rejects_a_perfect_leaf_under_a_writable_ancestor() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("dig-secure-chain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let ancestor =
+            crate::sources::fixture_root().join(format!("dig-secure-chain-{}", std::process::id()));
+        let dir = ancestor.join("bin");
+        let _ = std::fs::remove_dir_all(&ancestor);
         std::fs::create_dir_all(&dir).unwrap();
+        // The leaf is beyond reproach; only the PARENT is writable. A leaf-only check passes this.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
 
         let v = verify_install_root(Os::Linux, &dir);
         assert!(v.is_blocking());
         assert!(
             !v.is_established_safe(),
-            "a 0755 leaf under a 1777 ancestor must NOT be reported secure: {}",
+            "a 0755 leaf under a world-writable ancestor must NOT be reported secure: {}",
+            v.note
+        );
+        // The named level is an ANCESTOR, never the innocent leaf. Stated as "not the leaf" rather than as
+        // a literal path because the first unsafe level depends on the fixture root: on the container gate
+        // it is the ancestor this test created, and on an ordinary runner `/tmp` (1777) is unsafe first.
+        // Either way the property under test — a perfect leaf does not save a writable ancestry — holds.
+        assert!(
+            !v.note.contains(&dir.display().to_string()),
+            "the verdict blamed the leaf, which is beyond reproach here: {}",
             v.note
         );
         assert!(
-            v.note.contains("/tmp") || v.note.contains(&dir.display().to_string()),
-            "the verdict must name the offending level: {}",
+            v.note.contains("write"),
+            "the verdict must say WHY the level is unsafe: {}",
             v.note
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ancestor);
     }
 
     // -- #732: privileged-owner classification + created-level computation ------

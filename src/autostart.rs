@@ -195,7 +195,7 @@ pub fn register_for(
             note: format!("would register dig-app to start at {}'s login", user.name),
         };
     }
-    match apply(dig_app_bin, os, user) {
+    match apply(dig_app_bin, os, user, acting_for_another_account) {
         Ok(note) => AutostartResult {
             registered: true,
             mechanism,
@@ -270,11 +270,17 @@ fn artifact_path(
 /// On unix the artifact is written BY the target user ([`crate::userwrite`]), so it is theirs to manage
 /// and `systemd --user` will load it — and so a privileged install never follows a symlink planted in
 /// the user-writable directories it has to write into (#1748).
-fn apply(dig_app_bin: &Path, os: Os, user: &crate::invoker::TargetUser) -> Result<String, String> {
+fn apply(
+    dig_app_bin: &Path,
+    os: Os,
+    user: &crate::invoker::TargetUser,
+    acting_for_another_account: bool,
+) -> Result<String, String> {
     match os {
         Os::Windows => register_windows(dig_app_bin),
         Os::MacOs => {
-            let path = install_launch_agent(&user.home, dig_app_bin, user)?;
+            let path =
+                install_launch_agent(&user.home, dig_app_bin, user, acting_for_another_account)?;
             Ok(format!(
                 "wrote the LaunchAgent {} — dig-app starts at {}'s next login",
                 path.display(),
@@ -283,7 +289,8 @@ fn apply(dig_app_bin: &Path, os: Os, user: &crate::invoker::TargetUser) -> Resul
         }
         Os::Linux => {
             let xdg = target_xdg_config_home(user);
-            let path = install_systemd_user_unit(&xdg, dig_app_bin, user)?;
+            let path =
+                install_systemd_user_unit(&xdg, dig_app_bin, user, acting_for_another_account)?;
             Ok(format!(
                 "wrote the systemd user unit {} — it starts at {}'s next login, or start it now \
                  with: {}",
@@ -336,12 +343,14 @@ pub fn install_launch_agent(
     home: &Path,
     dig_app_bin: &Path,
     user: &crate::invoker::TargetUser,
+    acting_for_another_account: bool,
 ) -> Result<PathBuf, String> {
     let path = launch_agent_path(home);
-    crate::userwrite::write_as_user(
+    crate::userwrite::write_as_user_when(
         &path,
         &launch_agent_plist(&dig_app_bin.to_string_lossy()),
         user,
+        acting_for_another_account,
     )?;
     Ok(path)
 }
@@ -354,12 +363,14 @@ pub fn install_systemd_user_unit(
     xdg: &Path,
     dig_app_bin: &Path,
     user: &crate::invoker::TargetUser,
+    acting_for_another_account: bool,
 ) -> Result<PathBuf, String> {
     let path = systemd_user_unit_path(xdg);
-    crate::userwrite::write_as_user(
+    crate::userwrite::write_as_user_when(
         &path,
         &systemd_user_unit(&dig_app_bin.to_string_lossy()),
         user,
+        acting_for_another_account,
     )?;
     Ok(path)
 }
@@ -558,20 +569,21 @@ WantedBy=default.target
         // Unelevated: we ARE the user, so the write is direct — the elevated path delegates to the
         // user's own shell instead (`crate::userwrite`), which is what closes the #1748 symlink LPE.
         let me = unelevated_alice();
-        let plist = install_launch_agent(tmp.path(), Path::new("/usr/local/bin/dig-app"), &me)
+        let plist = install_launch_agent(tmp.path(), Path::new("/opt/dig/bin/dig-app"), &me, false)
             .expect("launch agent written");
         assert_eq!(plist, launch_agent_path(tmp.path()));
         assert_eq!(
             std::fs::read_to_string(&plist).expect("readable"),
-            launch_agent_plist("/usr/local/bin/dig-app")
+            launch_agent_plist("/opt/dig/bin/dig-app")
         );
 
-        let unit = install_systemd_user_unit(tmp.path(), Path::new("/usr/bin/dig-app"), &me)
-            .expect("unit written");
+        let unit =
+            install_systemd_user_unit(tmp.path(), Path::new("/opt/dig/bin/dig-app"), &me, false)
+                .expect("unit written");
         assert_eq!(unit, systemd_user_unit_path(tmp.path()));
         assert_eq!(
             std::fs::read_to_string(&unit).expect("readable"),
-            systemd_user_unit("/usr/bin/dig-app")
+            systemd_user_unit("/opt/dig/bin/dig-app")
         );
     }
 

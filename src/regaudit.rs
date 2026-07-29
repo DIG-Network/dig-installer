@@ -872,7 +872,8 @@ mod tests {
         // Defence-in-depth (#619): the read-back binary is canonicalized before
         // the prefix test, and an unverifiable path fails CLOSED.
         let os = crate::target::Target::current().expect("supported host").os;
-        let base = std::env::temp_dir().join(format!("dig-regaudit-{}", std::process::id()));
+        let base =
+            crate::sources::fixture_root().join(format!("dig-regaudit-{}", std::process::id()));
         let inside_dir = base.join("bin");
         std::fs::create_dir_all(&inside_dir).expect("create the trusted root");
         let exe = inside_dir.join(if os == Os::Windows { "dig.exe" } else { "dig" });

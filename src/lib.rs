@@ -513,6 +513,17 @@ pub struct InstallReport {
     /// this, the directory root wrote to and executed from was neither checked nor mentioned on any
     /// elevated unix install.
     pub bin_dir_security: Option<secure::InstallRootSecurity>,
+    /// The permission posture of the `/usr/local/bin` PATH VENEER, when this run planted links there.
+    ///
+    /// FATAL under elevation, for the same reason as [`Self::bin_dir_security`] and found the same way —
+    /// by an executed escalation rather than by review. The veneer is the directory root's own login `PATH`
+    /// resolves DIG commands from, so an account that can write there replaces a link this installer
+    /// planted and root runs whatever it points at on the next `sudo dign …`. Refusing the PATH-WIRING step
+    /// was not enough: that step is non-fatal by design (a binary is placed; only wiring failed), so an
+    /// install onto an attacker-owned veneer still reported `ok: true`.
+    ///
+    /// `None` when no links were planted — an unelevated or `--bin-dir` install, or Windows.
+    pub veneer_security: Option<secure::InstallRootSecurity>,
     /// The record of migrating an existing install off the legacy user-writable
     /// root onto the protected root (#565): services deregistered/re-pointed,
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
@@ -813,6 +824,7 @@ fn run_report_gated(
         daemon_dirs: Vec::new(),
         install_root_security: None,
         bin_dir_security: None,
+        veneer_security: None,
         migration: None,
         registration_audit: Vec::new(),
         install_manifest: None,
@@ -1816,6 +1828,20 @@ fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dy
                 Err(e) => log(&format!("    ! could not link {component}: {e}")),
             }
         }
+
+        // The veneer's own posture, RECORDED and (under elevation) FATAL. This directory is what root's
+        // login PATH resolves DIG commands from, so an account that can write here replaces a link we just
+        // planted and root runs whatever it points at. Refusing the PATH-WIRING step alone was not enough:
+        // that step is non-fatal by design, so an install onto an attacker-owned veneer still reported
+        // `ok: true` — found by the container gate's executed escalation, not by review (#1748 WU3).
+        let veneer = std::path::Path::new(paths::UNIX_MACHINE_BIN_DIR);
+        let verdict = secure::verify_install_root(target.os, veneer);
+        log(&format!(
+            "    {} {}",
+            if verdict.is_blocking() { "!" } else { "✓" },
+            verdict.note
+        ));
+        report.veneer_security = Some(verdict);
     }
     #[cfg(not(unix))]
     {
@@ -2099,6 +2125,19 @@ fn evaluate_readiness_when(
     //
     // Unelevated it stays a REPORT: a directory holding binaries only that same user runs is their own
     // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
+    // #1748 WU3: the veneer is the directory root's PATH resolves DIG commands from, so an account that can
+    // write there can replace a link this installer planted and have root run it. Same rule, same reason.
+    if elevated {
+        if let Some(sec) = &report.veneer_security {
+            if sec.is_blocking() {
+                failures.push(format!(
+                    "PATH directory {}: {} — this is where root's own shell resolves DIG commands, so an                      account that can write there replaces a link this installer planted and root runs it;                      repair the directory permissions",
+                    sec.root, sec.note
+                ));
+            }
+        }
+    }
+
     if elevated {
         if let Some(sec) = &report.bin_dir_security {
             if sec.is_blocking() {
@@ -3529,7 +3568,7 @@ mod tests {
     /// given test needs.
     fn base_plan() -> InstallPlan {
         InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-test-bin"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-test-bin"),
             with_digstore: false,
             digstore_version: None,
             with_dig_node: false,
@@ -3573,7 +3612,8 @@ mod tests {
     /// and report a clean LIFO reversal — the concrete guarantee SPEC §3.11 makes.
     #[test]
     fn rollback_after_midinstall_failure_removes_written_binaries_573_544() {
-        let dir = std::env::temp_dir().join(format!("dig-rollback-573-{}", std::process::id()));
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-rollback-573-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let first = dir.join("digstore.bin");
         let second = dir.join("dig-node.bin");
@@ -3621,7 +3661,7 @@ mod tests {
         // An already-absent binary reverses cleanly (idempotent undo).
         let mut guard = RollbackGuard::new();
         guard.record(InstallAction::FileCreated(
-            std::env::temp_dir()
+            crate::sources::fixture_root()
                 .join("dig-573-absent.bin")
                 .to_string_lossy()
                 .into_owned(),
@@ -3666,7 +3706,7 @@ mod tests {
     #[test]
     fn default_plan_resolves_all_three_core_components() {
         let plan = InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-test-default"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-test-default"),
             modify_path: false,
             dry_run: true,
             ..InstallPlan::default()
@@ -4630,7 +4670,7 @@ mod tests {
 
     #[test]
     fn uninstall_dig_node_dry_run_reports_intent_without_touching_the_system() {
-        let bin_dir = std::env::temp_dir().join("dig-installer-test-uninstall-bin");
+        let bin_dir = crate::sources::fixture_root().join("dig-installer-test-uninstall-bin");
         let mut lines: Vec<String> = Vec::new();
         let result = uninstall_dig_node(&bin_dir, true, &mut |l| lines.push(l.to_string()));
         assert!(!result.uninstalled);
@@ -4652,7 +4692,7 @@ mod tests {
         // No `--with-dig-node` was ever run against this bin_dir, so the
         // binary is missing — the failure must be recorded, not panic/abort,
         // and the note must be non-empty (never silent, task #140).
-        let bin_dir = std::env::temp_dir().join(format!(
+        let bin_dir = crate::sources::fixture_root().join(format!(
             "dig-installer-test-no-node-bin-{}",
             std::process::id()
         ));
@@ -4773,7 +4813,7 @@ mod tests {
     /// its own dedicated readiness tests below.
     fn dig_node_service_plan() -> InstallPlan {
         InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-readiness-test"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-readiness-test"),
             with_digstore: false,
             with_dig_node: true,
             with_dig_dns: false,
@@ -4808,6 +4848,7 @@ mod tests {
             daemon_dirs: Vec::new(),
             install_root_security: None,
             bin_dir_security: None,
+            veneer_security: None,
             migration: None,
             registration_audit: Vec::new(),
             install_manifest: None,
@@ -4951,10 +4992,22 @@ mod tests {
                 cli_only.requires_elevation(host),
                 "a Windows CLI-only install writes into admin-only Program Files"
             ),
-            target::Os::Linux | target::Os::MacOs => assert!(
-                !cli_only.requires_elevation(host),
-                "a unix CLI-only install stays in ~/.dig/bin (no elevation)"
-            ),
+            // On unix the CLI-only install needs elevation exactly when it is ALREADY elevated, because
+            // that is when `default_bin_dir()` is the root-owned protected root (#1748). Asserted against
+            // the real uid rather than assumed, so this holds in the container root gate too.
+            target::Os::Linux | target::Os::MacOs => {
+                if invoker::is_root() {
+                    assert!(
+                        cli_only.requires_elevation(host),
+                        "an elevated unix install places even the CLI in the protected root"
+                    );
+                } else {
+                    assert!(
+                        !cli_only.requires_elevation(host),
+                        "an unelevated unix CLI-only install stays in ~/.dig/bin"
+                    );
+                }
+            }
         }
     }
 
@@ -5136,7 +5189,8 @@ mod tests {
     #[test]
     fn the_directory_binaries_landed_in_is_verified_and_reported() {
         let target = Target::current().expect("host target");
-        let dir = std::env::temp_dir().join(format!("dig-bindir-posture-{}", std::process::id()));
+        let dir = crate::sources::fixture_root()
+            .join(format!("dig-bindir-posture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
@@ -5172,11 +5226,18 @@ mod tests {
         {
             assert!(verdict.is_blocking(), "got: {}", verdict.note);
         }
-        // And it does NOT sink the install: a user-writable dir holding binaries only that user runs is
-        // their own authority, so refusing would break every ordinary unelevated install.
+        // UNELEVATED it does not sink the install: a user-writable dir holding binaries only that user
+        // runs is their own authority, so refusing would break every ordinary per-user install. Injected
+        // rather than read from the runner's uid, so both arms hold in the container root gate as well.
         assert!(
-            evaluate_readiness(&plan, &report).is_empty(),
-            "the bin-dir posture is reported, never fatal"
+            evaluate_readiness_when(&plan, &report, false).is_empty(),
+            "unelevated, the bin-dir posture is reported and never fatal"
+        );
+        // ELEVATED the same posture IS fatal — the arm asserted in full by
+        // `an_elevated_install_into_a_writable_directory_is_fatal`.
+        assert!(
+            !evaluate_readiness_when(&plan, &report, true).is_empty(),
+            "an elevated install must not proceed over a writable install directory"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5851,7 +5912,7 @@ mod tests {
     /// registration — never best-effort like the firewall rule/scheme handler).
     fn beacon_only_plan() -> InstallPlan {
         InstallPlan {
-            bin_dir: std::env::temp_dir().join("dig-installer-readiness-beacon-test"),
+            bin_dir: crate::sources::fixture_root().join("dig-installer-readiness-beacon-test"),
             with_digstore: false,
             with_dig_node: false,
             with_dig_dns: false,
@@ -5949,7 +6010,7 @@ mod tests {
     }
 
     fn wiring_test_bin_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::sources::fixture_root().join(format!(
             "dig-installer-update-wiring-{tag}-{}",
             std::process::id()
         ))

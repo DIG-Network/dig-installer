@@ -318,11 +318,15 @@ mod tests {
     }
 
     /// Unelevated we ARE the user, so the write is direct and must simply work, parents included.
+    ///
+    /// Uses the injected seam rather than the ambient uid: run AS ROOT this would take the elevated path
+    /// and delegate to `su alice`, which cannot write inside a root-owned temp dir — a failure about the
+    /// fixture, not about the property (#1748 WU3).
     #[test]
     fn an_unelevated_write_creates_the_file_and_its_parents() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a").join("b").join("unit.service");
-        write_as_user(&path, "BODY", &user("alice", false)).unwrap();
+        write_as_user_when(&path, "BODY", &user("alice", false), false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "BODY");
     }
 

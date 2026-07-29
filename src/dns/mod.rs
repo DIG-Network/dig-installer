@@ -436,7 +436,7 @@ mod tests {
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::sources::fixture_root().join(format!(
             "dig-installer-dns-mod-{tag}-{}",
             std::process::id()
         ))
@@ -468,7 +468,8 @@ mod tests {
         // A binary that can't even be spawned (never installed, or removed
         // out from under us) must not panic — it reports honestly that
         // nothing was confirmed live, not a synthetic success.
-        let missing = std::env::temp_dir().join("definitely-not-a-real-dig-dns-verify-xyz");
+        let missing =
+            crate::sources::fixture_root().join("definitely-not-a-real-dig-dns-verify-xyz");
         let result = verify_existing(&missing);
         assert!(result.installed);
         assert!(!result.started);
@@ -495,7 +496,7 @@ mod tests {
     fn stop_before_replace_skips_when_the_binary_is_absent() {
         // First install: no prior binary, so nothing to stop even if the probe
         // (nonsensically) claims RUNNING — must be a skip, never an attempt.
-        let missing = std::env::temp_dir().join(format!(
+        let missing = crate::sources::fixture_root().join(format!(
             "dig-installer-dns-stop-absent-{}",
             std::process::id()
         ));

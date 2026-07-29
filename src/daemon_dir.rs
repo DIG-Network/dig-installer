@@ -1282,7 +1282,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn reparse_point_on_a_component_is_detected() {
-        let base = std::env::temp_dir().join(format!("dig-webview-reparse-{}", std::process::id()));
+        let base = crate::sources::fixture_root()
+            .join(format!("dig-webview-reparse-{}", std::process::id()));
         let target = base.join("real-target");
         let link = base.join("junction");
         let _ = std::fs::remove_dir_all(&base);
@@ -1320,7 +1321,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ensure_does_not_clobber_the_shared_dignetwork_logs_sibling() {
-        let base = std::env::temp_dir().join(format!("dig-webview-shared-{}", std::process::id()));
+        let base = crate::sources::fixture_root()
+            .join(format!("dig-webview-shared-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let log = base
             .join("DigNetwork")

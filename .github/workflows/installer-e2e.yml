@@ -337,18 +337,21 @@ jobs:
       - name: Windows — verify the SCM display names via `sc qc` (#494)
         if: runner.os == 'Windows'
         run: |
+          # `grep` over a HERE-STRING rather than a pipe: a matching `grep -q` exits early and SIGPIPEs its
+          # producer, which under `pipefail` fails the step after the assertion has already passed.
           NODE_QC="$(sc.exe qc net.dignetwork.dig-node)"
           echo "$NODE_QC"
-          echo "$NODE_QC" | grep -q "DIG NETWORK: NODE"
+          grep -q "DIG NETWORK: NODE" <<< "$NODE_QC"
           DNS_QC="$(sc.exe qc net.dignetwork.dig-dns)"
           echo "$DNS_QC"
-          echo "$DNS_QC" | grep -q "DIG NETWORK: DNS"
+          grep -q "DIG NETWORK: DNS" <<< "$DNS_QC"
 
       - name: Windows — both services RUNNING per `sc query` (belt-and-braces)
         if: runner.os == 'Windows'
         run: |
-          sc.exe query net.dignetwork.dig-node | grep -q "RUNNING"
-          sc.exe query net.dignetwork.dig-dns | grep -q "RUNNING"
+          # Captured first, then matched: see the `sc qc` step above for why a pipe into `grep -q` is unsafe.
+          grep -q "RUNNING" <<< "$(sc.exe query net.dignetwork.dig-node)"
+          grep -q "RUNNING" <<< "$(sc.exe query net.dignetwork.dig-dns)"
 
       - name: Linux — both units active per `systemctl` (belt-and-braces)
         if: runner.os == 'Linux'
@@ -368,8 +371,10 @@ jobs:
       - name: macOS — both jobs running per `launchctl` (belt-and-braces)
         if: runner.os == 'macOS'
         run: |
-          sudo launchctl print system/net.dignetwork.dig-node | grep -q "state = running"
-          sudo launchctl print system/net.dignetwork.dig-dns | grep -q "state = running"
+          # `launchctl print` emits multi-KB output and the match is near the top, so a piped `grep -q`
+          # SIGPIPEs it almost every time — the most likely of these to fail after passing.
+          grep -q "state = running" <<< "$(sudo launchctl print system/net.dignetwork.dig-node)"
+          grep -q "state = running" <<< "$(sudo launchctl print system/net.dignetwork.dig-dns)"
 
       - name: Uninstall dig-node via the installer flag + assert deregistered
         run: |
@@ -790,7 +795,58 @@ jobs:
           jq -e 'any(.result.cli_path_checks[]; .resolved == false)' broken.json
           jq -e '(.result.failures | length) > 0' broken.json
           test "$RC" -ne 0 || { echo "FAIL: a broken install must exit non-zero"; exit 1; }
-          # And it must not have advised re-running elevated (it already was).
-          if jq -r '.result.failures[]' broken.json | grep -qi 're-run elevated'; then
+          # And it must not have advised re-running elevated (it already was). Read a FILE, never a pipe:
+          # under `pipefail` a matching `grep -qi` exits early, SIGPIPEs `jq`, the pipeline returns 141, the
+          # `if` is false — and the check is SKIPPED rather than failed. This PR introduced that; the same
+          # shape is fixed at the schtasks sites above.
+          jq -r '.result.failures[]' broken.json > broken-failures.txt
+          if grep -i 're-run elevated' broken-failures.txt > /dev/null; then
             echo "FAIL: must not advise elevating an already-elevated install"; exit 1
           fi
+
+  # #1748 WU3: the ROOT gate. `cargo test` on a normal runner cannot be it.
+  #
+  # 23 lib tests failed when the suite ran as root, and the one executable proof of the root-exec guard
+  # could not pass in the only environment where it runs — both because their fixtures sat under `/tmp`,
+  # which is mode 1777 and which the whole-chain install-root verify correctly condemns. The verify was
+  # right; the fixture LOCATION was wrong. This job runs the suite AS ROOT in a container that bakes a
+  # purpose-made non-sticky 0755 fixture root, so the proofs run and the verify keeps every tooth.
+  #
+  # It then does what six rounds of mode-bit assertions could not: an unprivileged account plants a binary
+  # where root would run it, root performs an ordinary install, and the job FAILS if root ever executed the
+  # planted code. Every attempt carries a falsifying control — the same attempt with the posture repaired
+  # must SUCCEED — so a build that simply refused everything could not pass.
+  root-gate:
+    name: "#1748 root gate: suite as root + an executed escalation attempt"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the gate image
+        run: docker build -f .github/docker/root-gate.Dockerfile -t dig-root-gate .
+
+      # AS ROOT, with fixtures on the clean baked-in root. Any failure here is a real one: the environment
+      # no longer contributes any.
+      - name: The whole lib suite, as root, with fixtures off /tmp
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            dig-root-gate \
+            bash -lc 'cargo test --lib 2>&1 | tail -20; exit ${PIPESTATUS[0]}'
+
+      # The escalation. Network is needed: it installs the real published binaries, because attacking a
+      # mock would prove something about the mock.
+      - name: An unprivileged account attempts to escalate through a real install
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            dig-root-gate \
+            bash -lc 'cargo build --release --locked --bin dig-installer \
+              && cd /tmp \
+              && INSTALLER=/tmp/target/release/dig-installer \
+                 bash /work/.github/scripts/root-gate-escalation.sh'

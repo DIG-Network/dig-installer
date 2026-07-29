@@ -414,7 +414,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp_subdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
+        let d = crate::sources::fixture_root().join(format!(
             "dig-installer-dns-linux-{tag}-{}",
             std::process::id()
         ));

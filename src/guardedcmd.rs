@@ -109,25 +109,43 @@ mod tests {
 
     /// The guard runs at construction, so a refusal means no process was ever spawned.
     ///
-    /// Asserted unprivileged by pointing at a directory whose posture cannot be established, which
-    /// `is_blocking` treats as blocking — the WU1 policy. Root-gated behavioural proofs live in the
-    /// container gate; this is the property that gates on every runner.
+    /// The fixture is a WORLD-WRITABLE directory holding a binary — the shape the guard exists to refuse.
+    /// Root-gated because the guard is deliberately inert unelevated (running a binary you can already
+    /// write is your own authority), and the control asserts exactly that, so neither arm is vacuous.
+    #[cfg(unix)]
     #[test]
     fn a_refused_directory_yields_no_command_at_all() {
-        // Unelevated the guard is inert by design, so this asserts the SHAPE that matters: the only way to
-        // obtain a `GuardedCommand` is a constructor that returns `Result`, so a caller cannot spawn
-        // without having handled a refusal.
-        let absent = Path::new("/nonexistent-dig-dir-for-tests/dig-dns");
-        let outcome = GuardedCommand::for_installed_binary(absent);
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-guardedcmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("dig-dns");
+        std::fs::write(
+            &bin,
+            b"#!/bin/sh
+exit 0
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let outcome = GuardedCommand::for_installed_binary(&bin);
         if crate::invoker::is_root() {
             assert!(
                 outcome.is_err(),
-                "root must not obtain a command for a binary whose directory could not be verified"
+                "root must not obtain a command for a binary in a world-writable directory - the whole                  point is that there is no way to spawn without the guard having passed"
             );
+            // The control, on the SAME binary: tighten only the directory and the guard permits it, so the
+            // refusal is about the posture rather than about refusing everything.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(GuardedCommand::for_installed_binary(&bin).is_ok());
         } else {
             // Their own authority: the guard is inert, and that is the documented contract.
             assert!(outcome.is_ok());
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The crate spawns installed binaries ONLY through this type.
