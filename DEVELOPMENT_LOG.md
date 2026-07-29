@@ -589,3 +589,23 @@ Two general lessons, both of which cost real time here:
   suite ran as root inside a container and was invisible to five rounds of unprivileged CI. `/tmp` being mode
   `1777` bit the same way: 23 tests failed as root purely because their fixtures lived under a
   world-writable ancestor the verify correctly condemned. Fix the fixture location, never the check.
+
+## GitHub Actions runner images have surprising filesystem ownership — never assert on ambient posture (#1748)
+
+Three fixtures in `dig-installer` broke on assumptions about directories the test did not create, each
+costing a CI round:
+
+- **`/tmp` is mode `1777`.** Any fixture built under it sits beneath a world-writable ancestor, which a
+  whole-chain install-root verify correctly condemns. 23 tests failed as root for this reason alone.
+- **`/bin` and `/sbin` are symlinks** on any usrmerge distribution, so a descriptor walk refuses them.
+- **`/usr` is owned by uid 1001 on the `ubuntu-latest` image**, and `/opt` and `/usr/local/bin` ship mode
+  `0777`. A test asserting "`/usr/bin` is root-owned on every supported platform" is simply false there —
+  and the *verify was right*: uid 1001 really can rename `/usr/bin` on that machine.
+
+The rule: **a security test must build the posture it asserts on, or assert a property that holds in either
+direction.** Anything else measures the CI image. When a fixture genuinely needs a clean chain, bake one into
+the image (`/dig-fixtures`, root-owned `0755`, not sticky) and point the tests at it through an env var —
+never at `/tmp`, and never at a system directory whose ownership the image may have changed.
+
+Corollary worth keeping: when a check flags a CI machine, check whether the machine is actually
+misconfigured before weakening the check. In all three cases here the check was correct.

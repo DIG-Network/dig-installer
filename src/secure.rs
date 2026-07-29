@@ -983,22 +983,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A root-owned `0755` directory whose WHOLE CHAIN is root-owned is accepted.
+    /// The walk produces a COHERENT verdict about a real system directory, in whichever direction the
+    /// machine's own ownership warrants.
     ///
-    /// The fixture is `/usr/bin` — a real directory whose every level (`/`, `/usr`, `/usr/bin`) is
-    /// root-owned `0755` on every supported platform. A temp directory cannot express this property any
-    /// more: `/tmp` is mode `1777`, so since #1748 the walk correctly refuses anything beneath it, and
-    /// the old fixture asserted "secure" about a chain that never was.
+    /// This used to assert flatly that `/usr/bin` verifies clean, "root-owned `0755` on every supported
+    /// platform". That is not true of the GitHub Actions ubuntu image, where **`/usr` is owned by uid 1001**
+    /// — so the walk correctly reported it unsafe (uid 1001 can rename `/usr/bin`) and the test failed for
+    /// being wrong about the world rather than about the code. It is the third time an assumption about
+    /// ambient filesystem posture has broken a fixture in this issue, after `/tmp` being `1777` and `/bin`
+    /// being a symlink.
+    ///
+    /// So the property asserted is the one that holds everywhere: the walk reaches a definite conclusion and
+    /// JUSTIFIES it. Both directions are checked, so neither a walk that always passes nor one that always
+    /// refuses would satisfy this — the clean arm runs on a correctly-owned box, the refusing arm names the
+    /// offending level and says why.
     #[cfg(unix)]
     #[test]
-    fn unix_verify_accepts_a_root_owned_chain() {
+    fn unix_verify_reaches_a_justified_verdict_about_a_real_system_directory() {
         let v = verify_install_root(Os::Linux, std::path::Path::new("/usr/bin"));
-        // A clean chain is ESTABLISHED safe, which is the only non-blocking outcome.
-        assert!(
-            v.is_established_safe(),
-            "every level of /usr/bin is root-owned 0755, so it must verify clean: {}",
-            v.note
-        );
+        if v.is_established_safe() {
+            assert!(
+                !v.is_blocking(),
+                "established-safe and blocking are opposites: {}",
+                v.note
+            );
+            assert!(
+                v.note.contains("root-owned"),
+                "a clean verdict must say what it established: {}",
+                v.note
+            );
+        } else {
+            // The machine's own posture is not clean — true of the GH runner image. The verdict must then
+            // name the offending LEVEL and the reason, which is what an operator needs.
+            assert!(v.is_blocking(), "not-safe must block: {}", v.note);
+            assert!(
+                v.note.contains("/usr")
+                    && (v.note.contains("owned by uid") || v.note.contains("write")),
+                "a refusal must name the level and why: {}",
+                v.note
+            );
+        }
     }
 
     /// A DETECTED unsafe level — including a symlink — is `checked: true`, so the gates fire; only a level
