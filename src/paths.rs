@@ -472,8 +472,12 @@ fn links_out_of(bin_dir: &Path) -> bool {
 ///   from.
 /// * **anything else** (a `--bin-dir` override, an unelevated per-user root) → itself. No links are
 ///   planted for those, so the directory holding the binaries is the one that has to be searchable.
-pub fn reachable_dir(bin_dir: &Path) -> PathBuf {
-    if links_out_of(bin_dir) {
+///
+/// Takes `os` for the same reason [`needs_machine_bin_link`] does: on Windows the protected root IS the
+/// one install root, nothing is linked, and there is no `/usr/local/bin` — so the answer there is always
+/// the directory itself.
+pub fn reachable_dir(os: Os, bin_dir: &Path) -> PathBuf {
+    if !matches!(os, Os::Windows) && links_out_of(bin_dir) {
         return PathBuf::from(UNIX_MACHINE_BIN_DIR);
     }
     bin_dir.to_path_buf()
@@ -564,7 +568,9 @@ fn unix_add_to_path(bin_dir: &Path) -> Result<String, String> {
 fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result<String, String> {
     use crate::pathcheck;
 
-    let wired = reachable_dir(bin_dir);
+    // This function is unix-only by `cfg`, and `reachable_dir` distinguishes only Windows from not, so
+    // either unix variant gives the same answer.
+    let wired = reachable_dir(Os::Linux, bin_dir);
     let dir = wired.to_string_lossy().to_string();
     let reachable = |note: &str| -> Option<String> {
         match pathcheck::login_shell_path(user) {
@@ -1228,12 +1234,12 @@ mod tests {
     #[test]
     fn the_dir_that_must_be_on_path_is_the_veneer_for_a_protected_root_install() {
         assert_eq!(
-            reachable_dir(&protected_bin_dir()),
+            reachable_dir(Os::Linux, &protected_bin_dir()),
             PathBuf::from(UNIX_MACHINE_BIN_DIR),
             "the protected root is reached through the veneer, never by being put on PATH"
         );
         assert_ne!(
-            reachable_dir(&protected_bin_dir()),
+            reachable_dir(Os::Linux, &protected_bin_dir()),
             protected_bin_dir(),
             "wiring /opt/dig/bin onto every login shell defeats the veneer"
         );
@@ -1244,8 +1250,17 @@ mod tests {
             PathBuf::from("/home/alice/.dig/bin"),
             PathBuf::from("/opt/somewhere-else"),
         ] {
-            assert_eq!(reachable_dir(&owned), owned);
+            assert_eq!(reachable_dir(Os::Linux, &owned), owned);
         }
+
+        // Windows has no veneer: the protected root IS the one install root, nothing is linked, and
+        // `/usr/local/bin` does not exist. Without the OS arm this would report a unix path as the
+        // directory a Windows install must have on PATH — and `report.path.dir` is machine-consumed.
+        assert_eq!(
+            reachable_dir(Os::Windows, &protected_bin_dir()),
+            protected_bin_dir(),
+            "on Windows the install root is what goes on PATH; there is nothing to link"
+        );
     }
 
     /// The linking decision and the wiring decision must be the SAME decision.
@@ -1262,7 +1277,7 @@ mod tests {
             PathBuf::from("/opt/somewhere-else"),
         ] {
             let links = needs_machine_bin_link(Os::Linux, "dig-node", &dir);
-            let wired_elsewhere = reachable_dir(&dir) != dir;
+            let wired_elsewhere = reachable_dir(Os::Linux, &dir) != dir;
             assert_eq!(
                 links,
                 wired_elsewhere,

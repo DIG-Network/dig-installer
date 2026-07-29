@@ -915,8 +915,15 @@ fn run_report_gated(
         if plan.modify_path
             && (plan.with_digstore || plan.with_dig_node || plan.with_dig_app || plan.with_dig_dns)
         {
-            log(&format!("Adding {} to PATH:", plan.bin_dir.display()));
-            let dir = plan.bin_dir.to_string_lossy().into_owned();
+            // The dir REPORTED is the one that actually has to be searchable, which since the veneer
+            // is not the dir binaries are placed in (#1748): an elevated install wires (or finds
+            // already present) `/usr/local/bin` and links into it, never `/opt/dig/bin`. Reporting the
+            // install dir here said "Adding /opt/dig/bin to PATH" for a run that did no such thing, and
+            // put a directory that is deliberately never on PATH into `report.path.dir`, which is a
+            // machine-consumed field.
+            let wired = paths::reachable_dir(target.os, &plan.bin_dir);
+            log(&format!("Adding {} to PATH:", wired.display()));
+            let dir = wired.to_string_lossy().into_owned();
             if plan.dry_run {
                 log("    (would add to PATH)");
                 report.path = Some(PathResult {

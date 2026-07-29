@@ -703,6 +703,10 @@ jobs:
           jq -e 'all(.result.cli_path_checks[]; .resolved == true)' install.json
           # No user-facing binary may live under root's home.
           jq -e 'all(.result.components[]; (.dest | startswith("/root")) | not)' install.json
+          # And the PATH result must name the dir that actually has to be searchable — the veneer, not
+          # the install dir, which is deliberately never on any PATH. This field is machine-consumed.
+          jq -e '.result.path.dir == "/usr/local/bin"' install.json \
+            || { echo "FAIL: report.path.dir names a directory that is not on the user's PATH"; exit 1; }
 
       # The other half of the bound: the check must be capable of going RED.
       # Point an install at a root-only directory (mode 0700, unreachable by any
