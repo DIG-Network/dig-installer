@@ -1481,13 +1481,35 @@ explicit `--bin-dir` override redirects the whole stack into a directory the inv
    root-shell install, or the macOS GUI's `osascript` child, §1.5a);
 4. `dns::doctor`'s two `dig-dns` invocations.
 
-The set is DERIVED from the source, not enumerated: every function that spawns an installer-placed binary
-MUST call the guard, and a check that walks the crate enforces it. A hardcoded list was tried and failed
-exactly as lists do — it named four sites and asserted a count of four while a FIFTH
-(`dns::os_config::run_os_config`, reached on the default plan, on every OS, on install AND uninstall) had no
-guard at all and was proved to root code execution. The guard MUST also be called in the function that
-performs the spawn, not merely in its caller: a guard one frame away is one the next caller does not
-inherit.
+The set MUST be closed by CONSTRUCTION, not by an inventory. A reimplementation MUST provide a single
+spawn seam that cannot be constructed without the guard having passed, and MUST make an unguarded spawn of an
+installed binary fail to BUILD rather than fail a test:
+
+* a written-down list was tried — it named four sites and asserted a count of four while a FIFTH
+  (`dns::os_config::run_os_config`, reached on the default plan, on every OS, on install AND uninstall) had
+  no guard at all and was proved to root code execution;
+* a derived source scan was tried — better, and it found a guard sitting one frame ABOVE its spawn, but it
+  is a heuristic pretending to be an enumeration: measured at 8 of 17 evasion forms caught, including two
+  ordinary accidents (a discarded verdict, and a `pub(super) fn` body attributed to a guarded sibling).
+
+This implementation uses `guardedcmd::GuardedCommand::for_installed_binary` plus a `clippy.toml`
+`disallowed-methods` entry on `std::process::Command::new`. The guard MUST be invoked in the function that
+performs the spawn, not merely in its caller: a guard one frame away is one the next caller does not inherit.
+
+**The verdict of a permission check MUST be a single decision, not two fields a caller combines.** Exposing
+"was it read?" and "is it safe?" separately let seven call sites each re-derive the policy as "block only on
+a definitive breach", which reads INDETERMINATE as a pass — and an unestablished posture is exactly what a
+REFUSAL looks like. The same class was consequently found and fixed five rounds running, one site at a time.
+So the fields are private, one predicate answers "must this stop what the caller was about to do?", and it
+returns true for both detected-unsafe AND indeterminate. A directory whose posture cannot be established
+therefore refuses the install and names the level; that is the conservative direction, and it is the whole
+of the fix.
+
+**The directory root's own login `PATH` resolves DIG commands from MUST be verified, and a blocking verdict
+there MUST fail readiness.** It is not enough to refuse the PATH-WIRING step: that step is non-fatal by
+design (a binary is placed; only wiring failed), so an install onto a veneer an unprivileged account owns
+otherwise reports success while that account can replace a planted link and have root run it
+(`InstallReport::veneer_security`).
 Earlier revisions of this section claimed placement covered (3) and (4); it does not under an override,
 and a normative claim the code does not satisfy tells a reimplementation to reproduce the gap.
 
