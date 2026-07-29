@@ -27,6 +27,48 @@ use std::path::Path;
 /// uid 0 — root.
 pub const ROOT_UID: u32 = 0;
 
+/// Why a level could not be opened as a directory - and crucially, WHICH KIND of answer that is.
+///
+/// # The distinction is load-bearing (#1748)
+///
+/// `O_NOFOLLOW` reporting `ELOOP` is not a failure to inspect the level: it IS the detection of a planted
+/// symlink, the exact condition the descriptor discipline exists to find. Both were previously collapsed
+/// into one `String`, and `secure::verify_install_root` mapped any error to
+/// `checked: false, secure: false` - "indeterminate". Every gate treats indeterminate as a pass
+/// (`if verdict.checked && !verdict.secure`), so the strongest available detection became a silent tick:
+/// with `/opt/dig-link -> /data/dig-bin` (alice-owned, `0777`) the guard returned `Ok`, the PATH write
+/// went ahead, and root's login `PATH` gained a directory alice controls.
+///
+/// So a symlink or non-directory is [`Self::NotADirectory`], a DEFINITIVE refusal, while a genuinely
+/// unreadable level is [`Self::Unreadable`], which may legitimately resolve to indeterminate.
+#[derive(Debug)]
+pub enum OpenRefusal {
+    /// The level is a symlink, or something that is not a directory. A positive detection.
+    NotADirectory(String),
+    /// The level could not be inspected at all (permissions, an I/O error, a malformed name).
+    Unreadable(String),
+}
+
+impl OpenRefusal {
+    /// The human-readable detail, whichever kind this is.
+    pub fn note(&self) -> &str {
+        match self {
+            Self::NotADirectory(n) | Self::Unreadable(n) => n,
+        }
+    }
+
+    /// Is this a positive detection of a symlink / non-directory, rather than a failure to look?
+    pub fn is_definitive(&self) -> bool {
+        matches!(self, Self::NotADirectory(_))
+    }
+}
+
+impl std::fmt::Display for OpenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.note())
+    }
+}
+
 /// An open directory descriptor, closed on drop.
 #[derive(Debug)]
 pub struct DirFd(std::os::fd::OwnedFd);
@@ -43,12 +85,16 @@ impl DirFd {
 ///
 /// `Ok(None)` distinguishes "does not exist yet" — an ordinary case for most callers — from an error. A
 /// symlink surfaces as `ELOOP` and is reported as the ancestor attack it is.
-pub fn open_dir_nofollow(parent: Option<&DirFd>, name: &Path) -> Result<Option<DirFd>, String> {
+pub fn open_dir_nofollow(
+    parent: Option<&DirFd>,
+    name: &Path,
+) -> Result<Option<DirFd>, OpenRefusal> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_name = std::ffi::CString::new(name.as_os_str().as_bytes())
-        .map_err(|_| format!("{} contains an interior NUL byte", name.display()))?;
+    let c_name = std::ffi::CString::new(name.as_os_str().as_bytes()).map_err(|_| {
+        OpenRefusal::Unreadable(format!("{} contains an interior NUL byte", name.display()))
+    })?;
     // O_NOFOLLOW: a symlink at this component fails rather than being followed. O_DIRECTORY: a
     // non-directory fails rather than being opened. O_CLOEXEC: never leaked into a child process.
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
@@ -69,13 +115,17 @@ pub fn open_dir_nofollow(parent: Option<&DirFd>, name: &Path) -> Result<Option<D
     match err.raw_os_error() {
         Some(libc::ENOENT) => Ok(None),
         // ELOOP is O_NOFOLLOW's report that the component IS a symlink; ENOTDIR means it is a
-        // non-directory standing where a directory must be. Both are refusals, never repairs.
-        Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(format!(
-            "{} is a symlink or not a directory — refusing to treat it as a directory, because a \
-             planted link is how a root-side operation is redirected somewhere it must never reach",
+        // non-directory standing where a directory must be. Both are POSITIVE DETECTIONS of what this
+        // module exists to catch, so they are reported as such - never as "could not read", which every
+        // caller treats as an inconclusive pass.
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(OpenRefusal::NotADirectory(format!(
+            "{} is a symlink or not a directory - refusing to treat it as a directory, because a              planted link is how a root-side operation is redirected somewhere it must never reach",
             name.display()
-        )),
-        _ => Err(format!("could not open {}: {err}", name.display())),
+        ))),
+        _ => Err(OpenRefusal::Unreadable(format!(
+            "could not open {}: {err}",
+            name.display()
+        ))),
     }
 }
 
@@ -114,6 +164,29 @@ pub fn fchown(fd: &DirFd, uid: u32, gid: u32, path: &Path) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+/// `mkdirat` `name` beneath `parent` with `mode`, reporting an already-existing directory as `Ok`.
+///
+/// The mode is passed to the SYSCALL rather than applied afterwards. `mkdir` masks it with the process
+/// umask, so the result can only ever be NARROWER than `mode`, never wider — which closes the window a
+/// create-then-`fchmod` pair leaves open. That window is real: an unprivileged racer won 12 of 3000
+/// iterations against it, entering the directory while it still carried the umask's permissions.
+pub fn mkdirat(parent: &DirFd, name: &Path, mode: u32, display: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_name = std::ffi::CString::new(name.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains an interior NUL byte", name.display()))?;
+    // SAFETY: `c_name` is a valid NUL-terminated string and `parent`'s descriptor is owned and open.
+    let rc = unsafe { libc::mkdirat(parent.raw(), c_name.as_ptr(), mode as libc::mode_t) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    Err(format!("could not create {}: {err}", display.display()))
 }
 
 /// `fchmod` the open directory to `mode`, through the descriptor — never by path.
@@ -165,7 +238,11 @@ mod tests {
 
         let err =
             open_dir_nofollow(None, &link).expect_err("a symlink must be refused, never traversed");
-        assert!(err.contains("symlink"), "got: {err}");
+        assert!(err.note().contains("symlink"), "got: {err}");
+        assert!(
+            err.is_definitive(),
+            "a symlink is a POSITIVE DETECTION, not a failure to look - classifying it as \n             indeterminate is what turned it into a silent pass at all three gates (#1748)"
+        );
 
         // The control: the real directory opens fine, so the refusal is about the LINK and not about
         // the call failing for everything.

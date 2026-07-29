@@ -157,13 +157,15 @@ fn ensure_user_can_write_dir(dir: &Path, user: &TargetUser) -> Result<(), String
         return Ok(());
     };
 
-    let home = open_dir_nofollow(None, &user.home)?.ok_or_else(|| {
-        format!(
-            "{} does not exist, so {}'s per-user artifacts have nowhere to live",
-            user.home.display(),
-            user.name
-        )
-    })?;
+    let home = open_dir_nofollow(None, &user.home)
+        .map_err(|e| e.note().to_string())?
+        .ok_or_else(|| {
+            format!(
+                "{} does not exist, so {}'s per-user artifacts have nowhere to live",
+                user.home.display(),
+                user.name
+            )
+        })?;
     let home_owner = owner_of(&home, &user.home)?;
     if home_owner != uid {
         return Err(format!(
@@ -178,7 +180,8 @@ fn ensure_user_can_write_dir(dir: &Path, user: &TargetUser) -> Result<(), String
     let mut walked = user.home.to_path_buf();
     for component in relative.components() {
         walked.push(component);
-        let Some(level) = open_dir_nofollow(Some(&parent), Path::new(component.as_os_str()))?
+        let Some(level) = open_dir_nofollow(Some(&parent), Path::new(component.as_os_str()))
+            .map_err(|e| e.note().to_string())?
         else {
             // Absent from here down: the user's own `mkdir -p` creates these, owned by them.
             return Ok(());

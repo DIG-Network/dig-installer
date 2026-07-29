@@ -324,7 +324,27 @@ fn verify_windows(root_str: &str, root: &std::path::Path) -> InstallRootSecurity
 /// an indeterminate warning, never a false `secure: true`.
 #[cfg(unix)]
 fn verify_unix(root_str: &str, root: &std::path::Path) -> InstallRootSecurity {
-    match crate::rootchain::verify(root) {
+    verdict_from_walk(root_str, crate::rootchain::verify(root))
+}
+
+/// Map a [`crate::rootchain::verify`] outcome onto the reported verdict.
+///
+/// Pure, and separate from the walk, because WHICH FIELD each outcome lands in is the whole of #1748's S3
+/// and it must be assertable without needing a root-owned directory tree to test against. The mapping:
+///
+/// * `Ok(None)` — every level checked and safe → `checked: true, secure: true`;
+/// * `Ok(Some(unsafe))` — a level was DETECTED unsafe (writable, wrong owner, **or a symlink**) →
+///   `checked: true, secure: false`. Definitive, so the three gates fire;
+/// * `Err(note)` — a level could not be inspected at all → `checked: false`, indeterminate.
+///
+/// A symlink used to take the `Err` arm, and every gate is written `if verdict.checked && !verdict.secure`,
+/// so indeterminate is a PASS at all of them: the strongest detection this code can make printed a tick.
+#[cfg(unix)]
+fn verdict_from_walk(
+    root_str: &str,
+    walk: Result<Option<crate::rootchain::Unsafe>, String>,
+) -> InstallRootSecurity {
+    match walk {
         Ok(None) => InstallRootSecurity {
             root: root_str.to_string(),
             checked: true,
@@ -942,7 +962,45 @@ mod tests {
         );
     }
 
-    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory
+    /// A DETECTED unsafe level — including a symlink — is `checked: true`, so the gates fire; only a level
+    /// that could not be inspected at all is indeterminate.
+    ///
+    /// This is the whole of S3, asserted on the pure mapping so it needs no root-owned fixture. A symlink
+    /// took the `Err` arm and landed in `checked: false`, and all three gates read
+    /// `if verdict.checked && !verdict.secure` — so the strongest detection this code can make was a PASS
+    /// at every one of them: `root_exec_guard` returned `Ok`, the `/etc/profile.d` write went ahead, and
+    /// readiness printed a tick. Proved with the ordinary sysadmin move of symlinking the install root
+    /// onto a data volume (`/opt/dig-link -> /data/dig-bin`, alice-owned `0777`).
+    ///
+    /// That a symlinked level really does produce `Ok(Some(_))` — the input this maps — is asserted by
+    /// `rootchain::tests::a_symlinked_level_is_definitively_unsafe_not_indeterminate`.
+    #[cfg(unix)]
+    #[test]
+    fn a_detected_unsafe_level_is_definitive_and_only_an_unreadable_one_is_indeterminate() {
+        let detected = verdict_from_walk(
+            "/opt/dig-link",
+            Ok(Some(crate::rootchain::Unsafe {
+                level: std::path::PathBuf::from("/opt/dig-link"),
+                reason: "it is a symlink or not a directory".to_string(),
+            })),
+        );
+        assert!(
+            detected.checked && !detected.secure,
+            "a DETECTION must be definitive, or every gate waves it through: {detected:?}"
+        );
+
+        // The other two arms, so the mapping cannot be satisfied by returning one verdict for everything.
+        let clean = verdict_from_walk("/opt/dig/bin", Ok(None));
+        assert!(clean.checked && clean.secure);
+
+        let unreadable = verdict_from_walk("/opt/dig/bin", Err("permission denied".to_string()));
+        assert!(
+            !unreadable.checked,
+            "a level that could not be READ is legitimately indeterminate: {unreadable:?}"
+        );
+    }
+
+    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory
     /// under a WORLD-WRITABLE ancestor is NOT secure, and the verdict names the ANCESTOR.
     ///
     /// `/tmp` is mode `1777` on every unix box, which makes it a truthful stand-in for the `0777`

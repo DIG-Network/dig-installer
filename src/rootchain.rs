@@ -47,6 +47,46 @@ pub const PRIVILEGED_DIR_MODE: u32 = 0o755;
 /// other write.
 const GROUP_OR_OTHER_WRITE: u32 = 0o022;
 
+/// Reject any install root that is not an ABSOLUTE, already-normalized path.
+///
+/// # Why refuse rather than resolve (#1748)
+///
+/// Every check here reasons about "the levels of this path", and `..` breaks that reasoning in both
+/// directions at once. Measured, from a single `--bin-dir` argument:
+///
+/// * [`verify`] skipped `..` components, so it verified `/opt/dig/bin` and reported `secure: true` while
+///   the path in USE was `/opt/dig/bin/../../../tmp/pwn` — a control that passes for a different
+///   directory than the one root then writes to;
+/// * [`dig_owned_levels`] emitted `..` as a LEVEL, so `ensure` walked outward and `fchmod 0755` +
+///   `chown root:root` an operator-chosen ancestor: `/home/alice/.ssh` went from `1001:700` to `0:755`
+///   (world-readable `authorized_keys`, the user locked out of their own directory), and `/tmp` lost its
+///   sticky bit.
+///
+/// Resolving `..` lexically is not a fix: `a/../b` is only equal to `b` when `a` is not a symlink, so a
+/// lexical normalizer would hand back a path the kernel resolves elsewhere — the very confusion this
+/// module uses descriptors to avoid. And `std::fs::canonicalize` FOLLOWS symlinks, which is the attack in
+/// F2. A legitimate install root never contains `..`, so the honest answer is to refuse it.
+fn require_normalized_absolute(root: &Path) -> Result<(), String> {
+    if !root.is_absolute() {
+        return Err(format!(
+            "{} is not an absolute path — an install root must be stated absolutely, because every              permission check here is a statement about its levels",
+            root.display()
+        ));
+    }
+    for component in root.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {}
+            Component::ParentDir | Component::CurDir => {
+                return Err(format!(
+                    "{} contains a `.` or `..` component — refusing, because a path that walks outward                      cannot be verified level by level, and resolving it would either follow a symlink                      or disagree with what the kernel does",
+                    root.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The levels of `root` that DIG itself introduces, outermost first — the ones this installer created
 /// and is therefore entitled to own and re-mode.
 ///
@@ -59,6 +99,12 @@ const GROUP_OR_OTHER_WRITE: u32 = 0o022;
 /// not ours to re-mode. It is still VERIFIED — see [`verify`] — because root writing into it is only
 /// safe if no non-root account can reach it.
 pub fn dig_owned_levels(root: &Path) -> Vec<PathBuf> {
+    // A path with `..` in it is not ours to interpret, let alone to re-mode — it once produced
+    // `/opt/dig/..` as a "DIG-owned level" and chowned the operator's home
+    // ([`require_normalized_absolute`]).
+    if require_normalized_absolute(root).is_err() {
+        return Vec::new();
+    }
     // `/opt/dig` is the prefix this installer owns; the DIG-owned levels are it and everything below.
     let owned_prefix = Path::new("/opt/dig");
     let Ok(below) = root.strip_prefix(owned_prefix) else {
@@ -87,6 +133,7 @@ pub fn dig_owned_levels(root: &Path) -> Vec<PathBuf> {
 /// otherwise a wrong owner is left for [`verify`] to report. The MODE is always repaired, because that
 /// is within the authority of whoever owns the level.
 pub fn ensure(root: &Path) -> Result<(), String> {
+    require_normalized_absolute(root)?;
     let levels = dig_owned_levels(root);
     if levels.is_empty() {
         if !root.is_dir() {
@@ -105,31 +152,50 @@ pub fn ensure_levels_for_test(levels: &[PathBuf]) -> Result<(), String> {
 
 /// [`ensure`] over an explicit level list, outermost first, so the create-and-repair behaviour is
 /// exercisable against a temporary tree instead of the real `/opt/dig`.
+///
+/// # It DESCENDS by descriptor, exactly as [`verify`] does
+///
+/// Each level used to be opened by its own FULL PATH, so the kernel re-resolved every component above it
+/// — the descriptor discipline protected only the last component, and a symlink planted at an
+/// intermediate level was followed. Now the outermost level's parent is opened once and every level below
+/// is created and opened RELATIVE to the descriptor above (`mkdirat`/`openat`), so the tree is pinned by
+/// inode from the first open onward and no path is resolved twice.
 fn ensure_levels(levels: &[PathBuf]) -> Result<(), String> {
+    let Some(outermost) = levels.first() else {
+        return Ok(());
+    };
+    // The outermost level's PARENT anchors the walk. It is a directory this installer does not own
+    // (`/opt`), so it is opened and descended FROM, never created or re-moded.
+    let anchor_path = outermost
+        .parent()
+        .ok_or_else(|| format!("{} has no parent to anchor the walk", outermost.display()))?;
+    let mut parent = dirfd::open_dir_nofollow(None, anchor_path)
+        .map_err(|e| e.note().to_string())?
+        .ok_or_else(|| format!("{} does not exist", anchor_path.display()))?;
+
     for level in levels {
-        if !level.is_dir() {
-            // `create_dir` (not `_all`) so each level is created by this loop and none is created
-            // implicitly at the umask by a deeper call.
-            match std::fs::create_dir(level) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("create {}: {e}", level.display())),
-            }
-        }
-        let fd = dirfd::open_dir_nofollow(None, level)?
+        let name = level
+            .file_name()
+            .ok_or_else(|| format!("{} has no final component", level.display()))?;
+        let name = Path::new(name);
+        // The mode is a SYSCALL argument, so the directory can never exist even briefly with permissions
+        // WIDER than 0755 under a permissive umask, and is then pinned exactly — which is also the repair
+        // path for a level an earlier run left group- or world-writable.
+        dirfd::mkdirat(&parent, name, PRIVILEGED_DIR_MODE, level)?;
+        let fd = dirfd::open_dir_nofollow(Some(&parent), name)
+            .map_err(|e| e.note().to_string())?
             .ok_or_else(|| format!("{} vanished while being created", level.display()))?;
-        // Through the descriptor, so the inode re-moded is the one just opened. The mode is asserted
-        // unconditionally: this is the repair path for a level an earlier run left group/world-writable.
         dirfd::fchmod(&fd, PRIVILEGED_DIR_MODE, level)?;
-        // Ownership can only be GIVEN by root, so it is repaired when we have the authority to do so
-        // and merely VERIFIED otherwise. An unprivileged run that finds a non-root level does not fail
-        // here — it fails at `verify`, whose ownership arm reports it and which readiness treats as
-        // fatal under elevation. Attempting the `fchown` regardless turned "this level has the wrong
-        // owner" into "chown: operation not permitted", which is a worse message for the same fact.
+        // Ownership can only be GIVEN by root, so it is repaired when we have the authority and merely
+        // VERIFIED otherwise. An unprivileged run that finds a non-root level does not fail here — it
+        // fails at `verify`, whose ownership arm reports it and which readiness treats as fatal under
+        // elevation. Attempting the `fchown` regardless turned "this level has the wrong owner" into
+        // "chown: operation not permitted", a worse message for the same fact.
         let (owner, _) = dirfd::stat_of(&fd, level)?;
         if owner != ROOT_UID && crate::invoker::is_root() {
             dirfd::fchown(&fd, ROOT_UID, ROOT_UID, level)?;
         }
+        parent = fd;
     }
     Ok(())
 }
@@ -153,6 +219,7 @@ fn ensure_levels(levels: &[PathBuf]) -> Result<(), String> {
 /// report "root-owned with no group/other write (mode 755)" while describing `/etc`, and root then
 /// created files there.
 pub fn verify(root: &Path) -> Result<Option<Unsafe>, String> {
+    require_normalized_absolute(root)?;
     verify_within(Path::new("/"), root)
 }
 
@@ -171,20 +238,41 @@ fn verify_within(base: &Path, root: &Path) -> Result<Option<Unsafe>, String> {
         ));
     };
     let mut walked = base.to_path_buf();
-    let mut fd: DirFd = dirfd::open_dir_nofollow(None, base)?
-        .ok_or_else(|| format!("{} could not be opened", base.display()))?;
+    let mut fd: DirFd = match dirfd::open_dir_nofollow(None, base) {
+        Ok(Some(fd)) => fd,
+        Ok(None) => return Err(format!("{} does not exist", base.display())),
+        // Even the anchor being a symlink is a positive detection, not a failure to look.
+        Err(e) if e.is_definitive() => {
+            return Ok(Some(Unsafe {
+                level: base.to_path_buf(),
+                reason: e.note().to_string(),
+            }))
+        }
+        Err(e) => return Err(e.note().to_string()),
+    };
     for component in below.components() {
-        // `CurDir`/`ParentDir` cannot appear in the absolute, normalised paths this is called with, and
-        // are skipped rather than guessed at.
+        // `CurDir`/`ParentDir` are refused by `require_normalized_absolute` before the walk starts;
+        // skipping them here is what let this verify a DIFFERENT path than the caller went on to use.
         let Component::Normal(name) = component else {
             continue;
         };
         walked.push(name);
-        let Some(next) = dirfd::open_dir_nofollow(Some(&fd), Path::new(name))? else {
+        fd = match dirfd::open_dir_nofollow(Some(&fd), Path::new(name)) {
+            Ok(Some(next)) => next,
             // Absent: nothing beneath it can be unsafe, and `ensure` is what creates it.
-            return Ok(None);
+            Ok(None) => return Ok(None),
+            // A SYMLINK or non-directory at this level is the attack, not an inability to inspect it —
+            // so it is a DEFINITIVE `Unsafe`, never an indeterminate `Err` that every gate waves through
+            // (#1748 S3). `/opt/dig-link -> /data/dig-bin` on an alice-owned `0777` volume reported
+            // "could not read" and root's PATH gained a directory alice controls.
+            Err(e) if e.is_definitive() => {
+                return Ok(Some(Unsafe {
+                    level: walked.clone(),
+                    reason: e.note().to_string(),
+                }))
+            }
+            Err(e) => return Err(e.note().to_string()),
         };
-        fd = next;
         if let Some(bad) = level_verdict(&fd, &walked)? {
             return Ok(Some(bad));
         }
@@ -305,10 +393,18 @@ mod tests {
         assert!(bad.reason.contains("write"), "got: {}", bad.reason);
     }
 
-    /// A symlink standing in for a level is REFUSED, never followed — the F2 shape. A path-based
-    /// `metadata` would have described the target and reported it secure.
+    /// A symlinked level is reported as DEFINITIVELY UNSAFE, not as an inability to inspect it.
+    ///
+    /// This previously returned `Err`, which `secure::verify_install_root` mapped to
+    /// `checked: false, secure: false` — "indeterminate" — and every gate treats indeterminate as a pass
+    /// (`if verdict.checked && !verdict.secure`). So the strongest detection this module can make became a
+    /// silent tick: `/opt/dig-link -> /data/dig-bin` on an alice-owned `0777` volume, the ordinary
+    /// sysadmin move of putting the install root on a data volume, produced `root_exec_guard -> Ok(())`
+    /// and root's login `PATH` gained a directory alice controls.
+    ///
+    /// `Ok(Some(_))` is the assertion that matters: it is the shape callers act on.
     #[test]
-    fn a_symlinked_level_is_refused_rather_than_followed() {
+    fn a_symlinked_level_is_definitively_unsafe_not_indeterminate() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real");
         std::fs::create_dir(&real).unwrap();
@@ -316,8 +412,11 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let err = verify_within(tmp.path(), &link).expect_err("a symlinked level must be refused");
-        assert!(err.contains("symlink"), "got: {err}");
+        let verdict = verify_within(tmp.path(), &link)
+            .expect("a symlink is a DETECTION, so the walk must not report it as unreadable");
+        let bad = verdict.expect("a symlinked level must be reported unsafe");
+        assert_eq!(bad.level, link);
+        assert!(bad.reason.contains("symlink"), "got: {}", bad.reason);
     }
 
     /// `ensure` REPAIRS an existing level rather than accepting it. A box that installed an earlier
@@ -344,6 +443,132 @@ mod tests {
                 level.display()
             );
         }
+    }
+
+    // -- #1748 S2: `..` must not be interpretable as a level ---------------------
+
+    /// A `..` in the install root is REFUSED, by both the verify and the create path.
+    ///
+    /// The three attacks this closes were each proved by execution from a single `--bin-dir` argument:
+    ///
+    /// * `verify("/opt/dig/bin/../../../tmp/pwn")` returned `checked: true, secure: true` — a security
+    ///   control passing for a DIFFERENT directory than the one root then used, because the walk skipped
+    ///   `..` components;
+    /// * `dig_owned_levels("/opt/dig/../../home/alice/.ssh")` emitted `..` as a LEVEL, so `ensure` walked
+    ///   OUTWARD and `chmod 0755` + `chown root:root` the operator's own `.ssh` (`1001:700` → `0:755`:
+    ///   world-readable `authorized_keys`, and alice locked out of her own directory);
+    /// * `ensure("/opt/dig/../../tmp/dignew")` stripped `/tmp` of its sticky bit and `fchmod`ed `/` and
+    ///   `/opt` — the levels this module's own contract says it verifies but never re-modes.
+    #[test]
+    fn a_dotdot_install_root_is_refused_by_every_entry_point() {
+        let evil = Path::new("/opt/dig/bin/../../../tmp/pwn");
+
+        let err = verify(evil)
+            .expect_err("verify must refuse a path it cannot reason about level by level");
+        assert!(
+            err.contains(".."),
+            "the refusal must name the reason: {err}"
+        );
+
+        assert!(
+            ensure(evil).is_err(),
+            "ensure must refuse: it would otherwise chmod and chown whatever the `..` walks out to"
+        );
+
+        // And no `..` is ever emitted as a level, which is what aimed the chown at `/home/alice/.ssh`.
+        for outward in [
+            "/opt/dig/../../home/alice/.ssh",
+            "/opt/dig/..",
+            "/opt/dig/bin/../../../tmp",
+        ] {
+            let levels = dig_owned_levels(Path::new(outward));
+            assert!(
+                levels.is_empty(),
+                "{outward} produced levels {levels:?} — a `..` level is an aimable root chmod/chown"
+            );
+        }
+
+        // The truthful control: the legitimate root is still accepted, so the refusal is about `..` and
+        // not about refusing everything.
+        assert_eq!(
+            dig_owned_levels(Path::new("/opt/dig/bin")),
+            vec![PathBuf::from("/opt/dig"), PathBuf::from("/opt/dig/bin")]
+        );
+        assert!(require_normalized_absolute(Path::new("/opt/dig/bin")).is_ok());
+    }
+
+    /// A relative root is refused too: every check here is a statement about absolute levels, and a
+    /// relative path silently makes it a statement about the process's working directory.
+    #[test]
+    fn a_relative_install_root_is_refused() {
+        assert!(require_normalized_absolute(Path::new("opt/dig/bin")).is_err());
+        assert!(require_normalized_absolute(Path::new("./opt/dig")).is_err());
+    }
+
+    /// `ensure` must not follow a symlink planted at the level ABOVE the ones it creates.
+    ///
+    /// Opening each level by its own full path means the kernel re-resolves every component above it, so
+    /// `O_NOFOLLOW` protects only the LAST one. The levels in the list defend themselves that way — the
+    /// loop reaches `/opt/dig` before `/opt/dig/bin` — but the ANCHOR does not: with `/opt` a symlink,
+    /// a path-based `open("/opt/dig")` follows it and the whole install root is created inside the
+    /// attacker's target. The descent opens the anchor `O_NOFOLLOW` first, so the tree is pinned by inode
+    /// before anything is created.
+    ///
+    /// The fixture is therefore a symlinked ANCHOR, which is the case a leaf-only refusal sails past.
+    #[test]
+    fn ensure_refuses_a_symlinked_anchor_above_the_levels_it_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let anchor = tmp.path().join("anchor");
+        std::os::unix::fs::symlink(&elsewhere, &anchor).unwrap();
+
+        let dig = anchor.join("dig");
+        let err = ensure_levels(&[dig.clone(), dig.join("bin")])
+            .expect_err("a symlinked anchor must be refused, never followed");
+        assert!(err.contains("symlink"), "got: {err}");
+        assert!(
+            !elsewhere.join("dig").exists(),
+            "the walk followed the symlinked anchor and created the install root inside its target"
+        );
+    }
+
+    /// A symlink AT one of the levels is refused too — the same refusal, one component in.
+    #[test]
+    fn ensure_refuses_a_symlink_at_a_level_it_would_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let dig = tmp.path().join("dig");
+        std::os::unix::fs::symlink(&elsewhere, &dig).unwrap();
+
+        let err = ensure_levels(&[dig.clone(), dig.join("bin")])
+            .expect_err("a symlinked level must be refused");
+        assert!(err.contains("symlink"), "got: {err}");
+        assert!(!elsewhere.join("bin").exists());
+    }
+
+    /// A newly created level is never even briefly wider than `0755`, whatever the umask.    /// A newly created level is never even briefly wider than `0755`, whatever the umask.
+    ///
+    /// `mkdir` masks the mode it is GIVEN, so passing `0755` to the syscall can only ever yield something
+    /// narrower — whereas creating at the umask and then `fchmod`ing leaves a window an unprivileged
+    /// racer won 12 times in 3000 iterations.
+    #[test]
+    fn a_created_level_is_never_wider_than_the_pinned_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dirfd::open_dir_nofollow(None, tmp.path()).unwrap().unwrap();
+        let level = tmp.path().join("fresh");
+
+        // A permissive umask is exactly the condition under which the old code produced 0777.
+        let previous = unsafe { libc::umask(0) };
+        dirfd::mkdirat(&base, Path::new("fresh"), PRIVILEGED_DIR_MODE, &level).unwrap();
+        unsafe { libc::umask(previous) };
+
+        assert_eq!(
+            mode_of(&level),
+            0o755,
+            "created at the umask instead of the requested mode — the racer's window"
+        );
     }
 
     fn set_mode(p: &Path, mode: u32) {
