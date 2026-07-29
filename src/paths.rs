@@ -748,46 +748,24 @@ fn root_add_to_path(
     ))
 }
 
-/// Ensure `bin_dir` exists and, when it is the protected root, that its mode is `0755` — root writes,
-/// everyone else reads and traverses.
+/// Ensure `bin_dir` exists, and that every DIG-owned level of it is root-owned `0755`.
 ///
-/// # The mode is ENFORCED, not just set at creation (#1748)
+/// # The whole CHAIN, not the leaf (#1748)
 ///
-/// `create_dir_all` applies the process umask, so the mode of the directory root writes binaries into
-/// was inherited from whatever invoked the installer. Measured on a GitHub Actions runner under
-/// `sudo -H`, that produced `/opt/dig/bin` at mode **0777** — a WORLD-WRITABLE protected root, which
-/// hands every local account the ability to replace a binary root executes. That is the escalation the
-/// protected root exists to prevent, arriving through the umask instead of through the path.
+/// This used to `create_dir_all` and then pin the mode of the leaf. `create_dir_all` creates the
+/// intermediate levels at the process umask, so `/opt/dig` was left at whatever the caller's umask
+/// implied — measured `0777` under `umask 000`, on an install that reported success. Write permission on
+/// `/opt/dig` is permission to rename `/opt/dig/bin` aside and substitute an attacker-owned directory of
+/// the same name, so every service `ExecStart`, every veneer symlink and the root-run beacon then resolve
+/// to planted binaries.
 ///
-/// So the mode is set explicitly, and set on an EXISTING directory too. An early return on
-/// `is_dir()` would adopt whatever mode a previous run (or anybody else) left behind, which is the
-/// same defect one run later.
-///
-/// Applied only to the protected root. A per-user `~/.dig/bin` or a `--bin-dir` the user chose is
-/// theirs, and silently re-moding a directory the caller nominated would be a surprise; its posture is
-/// reported instead (`InstallReport::bin_dir_security`).
+/// [`crate::rootchain::ensure`] creates each level individually and REPAIRS an existing one, through
+/// `O_NOFOLLOW` descriptors. A directory the caller nominated (`--bin-dir`, a per-user root) is created
+/// if absent and never re-moded — its posture is reported instead
+/// (`InstallReport::bin_dir_security`).
 #[cfg(not(windows))]
 pub fn ensure_bin_dir(bin_dir: &Path) -> Result<(), String> {
-    // `links_out_of` is "is this the protected root?", the same single decision that drives linking and
-    // PATH wiring — so the directory whose mode is pinned is exactly the one root writes into.
-    ensure_bin_dir_in(bin_dir, links_out_of(bin_dir))
-}
-
-/// [`ensure_bin_dir`] with the "is this the protected root?" decision passed in, so the mode
-/// enforcement is exercisable against a temp directory instead of the real `/opt/dig/bin`.
-#[cfg(not(windows))]
-fn ensure_bin_dir_in(bin_dir: &Path, pin_mode: bool) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if !bin_dir.is_dir() {
-        std::fs::create_dir_all(bin_dir)
-            .map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
-    }
-    if !pin_mode {
-        return Ok(());
-    }
-    std::fs::set_permissions(bin_dir, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod 0755 {}: {e}", bin_dir.display()))
+    crate::rootchain::ensure(bin_dir)
 }
 
 /// Windows has no mode bits to enforce; the protected root's guarantee there is its ACL, verified by
@@ -1303,9 +1281,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        // `ensure_bin_dir` pins the mode of the PROTECTED root specifically, which this temp dir is not
-        // — so assert on the shared helper that decides the mode, applied to an existing directory.
-        ensure_bin_dir_in(&dir, true).expect("re-moding an existing directory must succeed");
+        // The shared chain implementation, applied to an existing directory — `ensure_bin_dir` itself
+        // keys on the real `/opt/dig/bin`, which a test must not touch.
+        crate::rootchain::ensure_levels_for_test(&[dir.clone()])
+            .expect("re-moding an existing directory must succeed");
 
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -1326,11 +1305,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        ensure_bin_dir_in(&dir, links_out_of(&dir)).expect("an existing directory is fine");
         assert!(
             !links_out_of(&dir),
             "the fixture must not be the protected root, or nothing is being asserted"
         );
+        ensure_bin_dir(&dir).expect("an existing directory is fine");
 
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,

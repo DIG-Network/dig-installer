@@ -97,6 +97,12 @@ pub fn ensure(root: &Path) -> Result<(), String> {
     ensure_levels(&levels)
 }
 
+/// [`ensure_levels`] for tests in sibling modules, which must not touch the real `/opt/dig`.
+#[cfg(test)]
+pub fn ensure_levels_for_test(levels: &[PathBuf]) -> Result<(), String> {
+    ensure_levels(levels)
+}
+
 /// [`ensure`] over an explicit level list, outermost first, so the create-and-repair behaviour is
 /// exercisable against a temporary tree instead of the real `/opt/dig`.
 fn ensure_levels(levels: &[PathBuf]) -> Result<(), String> {
