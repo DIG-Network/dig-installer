@@ -53,13 +53,43 @@ pub fn write_as_user(path: &Path, contents: &str, user: &TargetUser) -> Result<(
     write_bytes_as_user(path, contents.as_bytes(), user)
 }
 
+/// [`write_as_user`] with the privilege-boundary decision supplied instead of read from the ambient uid.
+///
+/// Exists so the ELEVATED path — the one that must never follow a planted symlink — is exercisable on an
+/// unprivileged test runner. Without it those tests silently measured `write_directly` instead, which
+/// follows symlinks by design because unelevated we ARE the user and their own home is their own
+/// authority (#1748).
+pub fn write_as_user_when(
+    path: &Path,
+    contents: &str,
+    user: &TargetUser,
+    acting_for_another_account: bool,
+) -> Result<(), String> {
+    write_bytes_as_user_when(path, contents.as_bytes(), user, acting_for_another_account)
+}
+
 /// [`write_as_user`] for a binary artifact (an icon, a cache) — same authority rules.
 pub fn write_bytes_as_user(path: &Path, contents: &[u8], user: &TargetUser) -> Result<(), String> {
     // `is_root()`, never the elevation hint. In the macOS GUI's `osascript` root child there is no hint,
     // so this took `write_directly` — root `create_dir_all` + `fs::write` inside a NON-ROOT user's home,
     // following any symlink planted on the way. That is the root-authored-write escalation this module
     // exists to remove, reappearing through the wrong predicate (#1748).
-    if !user.acting_for_another_account(crate::invoker::is_root()) {
+    write_bytes_as_user_when(
+        path,
+        contents,
+        user,
+        user.acting_for_another_account(crate::invoker::is_root()),
+    )
+}
+
+/// [`write_bytes_as_user`] with the boundary decision supplied — see [`write_as_user_when`].
+pub fn write_bytes_as_user_when(
+    path: &Path,
+    contents: &[u8],
+    user: &TargetUser,
+    acting_for_another_account: bool,
+) -> Result<(), String> {
+    if !acting_for_another_account {
         return write_directly(path, contents);
     }
     #[cfg(unix)]
@@ -70,6 +100,7 @@ pub fn write_bytes_as_user(path: &Path, contents: &[u8], user: &TargetUser) -> R
     // user's own session, not files root places in a user-writable directory.
     #[cfg(not(unix))]
     {
+        let _ = user;
         write_directly(path, contents)
     }
 }
@@ -304,10 +335,13 @@ mod tests {
         let planted = tmp.path().join("dig-app.service");
         std::os::unix::fs::symlink(&victim, &planted).unwrap();
 
-        let result = write_as_user(
+        let result = write_as_user_when(
             &planted,
             "PAYLOAD",
             &user("definitely-not-a-real-account-xyz", true),
+            // Root, acting for another account: the arm that must never follow the link. Stated
+            // explicitly so it is exercised on an unprivileged runner.
+            true,
         );
 
         // Content first: it names the actual escalation, so a regression reports the LPE rather than
@@ -533,10 +567,11 @@ mod tests {
         let planted = tmp.path().join("dig-app.service");
         std::os::unix::fs::symlink(&absent, &planted).unwrap();
 
-        let _ = write_as_user(
+        let _ = write_as_user_when(
             &planted,
             "PAYLOAD",
             &user("definitely-not-a-real-account-xyz", true),
+            true,
         );
 
         assert!(
