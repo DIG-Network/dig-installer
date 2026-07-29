@@ -124,6 +124,12 @@ export const COMPONENTS = [
     name: componentMessages.digAppName,
     desc: componentMessages.digAppDesc,
     on: true,
+    // The app is a CONTROL PANE over the node: it has no engine of its own, so with no
+    // dig-node it can only ever report "no node". Selecting it therefore pins dig-node
+    // selected and locked — `Components.jsx` renders a component something selected
+    // requires exactly like a `req` one, and `plan_from_selection` enforces the same rule
+    // server-side so a hand-built selection cannot produce an app with no engine.
+    requires: "dig-node",
   },
   {
     id: "dig-dns",

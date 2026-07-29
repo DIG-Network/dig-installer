@@ -50,7 +50,14 @@ export function Components({ sel, toggle, path, onChange, status }) {
   const intl = useIntl();
   // A `hidden` component (e.g. the DIG Browser, #491) is never offered.
   const offered = COMPONENTS.filter((c) => !c.hidden);
-  const selectedCount = offered.filter((c) => c.req || sel[c.id]).length;
+  // A component another SELECTED component depends on cannot be unchecked while that dependent is
+  // checked — dig-app is a control pane over dig-node and can only ever report "no node" without
+  // it. Returns the dependent, so the pill can NAME why the box is locked rather than being an
+  // unexplained greyed row (dig_ecosystem#1800: a disabled control must say why).
+  const requiredBy = (id) =>
+    offered.find((other) => other.requires === id && (other.req || sel[other.id]));
+  const isLocked = (c) => Boolean(c.req) || Boolean(requiredBy(c.id));
+  const selectedCount = offered.filter((c) => c.req || sel[c.id] || requiredBy(c.id)).length;
   // An option only makes sense alongside the component it configures (#424 —
   // "open the firewall for dig-node" is meaningless without dig-node itself),
   // so it drops out of the list the moment that component is unchecked.
@@ -86,11 +93,19 @@ export function Components({ sel, toggle, path, onChange, status }) {
         <FormattedMessage id="components.components" defaultMessage="Components" />
       </p>
       {offered.map((c) => {
-        const on = c.req || sel[c.id];
+        const dependent = requiredBy(c.id);
+        const locked = isLocked(c);
+        // Locked means CHECKED as well as un-toggleable: a dependency that displayed as unchecked
+        // while being installed anyway would be a lie about what the install does.
+        const on = locked || sel[c.id];
         const st = statusFor(c.id);
         const tracked = UPDATE_TRACKED_IDS.includes(c.id);
         return (
-          <div className={"comp" + (c.req ? " req" : "")} key={c.id} onClick={() => !c.req && toggle(c.id)}>
+          <div
+            className={"comp" + (locked ? " req" : "")}
+            key={c.id}
+            onClick={() => !locked && toggle(c.id)}
+          >
             <div className={"check" + (on ? " on" : "")} style={{ width: 22, height: 22, flex: "0 0 22px" }}>
               {Ic.check}
             </div>
@@ -103,7 +118,16 @@ export function Components({ sel, toggle, path, onChange, status }) {
                 <FormattedMessage id="components.required" defaultMessage="REQUIRED" />
               </span>
             )}
-            {!c.req &&
+            {!c.req && dependent && (
+              <span className="pill-req">
+                <FormattedMessage
+                  id="components.requiredBy"
+                  defaultMessage="NEEDED BY {name}"
+                  values={{ name: intl.formatMessage(dependent.name) }}
+                />
+              </span>
+            )}
+            {!locked &&
               tracked &&
               (st ? (
                 <StatusPill status={st} />
