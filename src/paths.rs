@@ -54,10 +54,12 @@ use crate::target::Os;
 /// symlinks that make them reachable by name ([`needs_machine_bin_link`]). Root never writes to it and
 /// never executes from it, so the class does not need a guard per surface.
 ///
-/// A user-writable veneer is still worth REPORTING (an attacker who can replace a symlink here changes
-/// what the USER's shell resolves — their own privilege level, not root's), which is why
-/// [`crate::secure::verify_install_root`] is applied to it and the verdict is surfaced, without failing
-/// the install.
+/// A user-writable veneer is worth REPORTING — an attacker who can replace a symlink here changes what
+/// the USER's shell resolves, which is their own privilege level rather than root's — and it is
+/// reported wherever this directory is the one that must be on `PATH`
+/// ([`reachable_dir`], `InstallReport::bin_dir_security`). It is NOT independently verified on the
+/// default elevated install, where the directory that gets verified is the protected root the binaries
+/// live in; an earlier revision of this comment claimed otherwise, and the claim was false.
 pub const UNIX_MACHINE_BIN_DIR: &str = "/usr/local/bin";
 
 /// Default install directory for DIG tool binaries.
@@ -319,8 +321,19 @@ pub fn path_append(current: &str, dir: &str, sep: char) -> Option<String> {
 #[cfg(unix)]
 pub fn link_into_machine_bin(target: &Path, name: &str) -> Result<PathBuf, String> {
     let link = Path::new(UNIX_MACHINE_BIN_DIR).join(name);
-    std::fs::create_dir_all(UNIX_MACHINE_BIN_DIR)
-        .map_err(|e| format!("create {UNIX_MACHINE_BIN_DIR}: {e}"))?;
+    // NOT a bare `create_dir_all`: on a minimal image `/usr/local/bin` does not exist, and creating it
+    // at the process umask produced mode 777 under `umask 000` — a world-writable directory on every
+    // account's default PATH, which is the third instance of this same one-line omission (#1748, F6).
+    // A directory that already exists is left exactly as the distribution set it up: this installer owns
+    // the LINK it plants, not the system directory holding it, and its posture is reported instead.
+    let veneer = Path::new(UNIX_MACHINE_BIN_DIR);
+    if !veneer.is_dir() {
+        std::fs::create_dir_all(veneer)
+            .map_err(|e| format!("create {UNIX_MACHINE_BIN_DIR}: {e}"))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(veneer, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod 0755 {UNIX_MACHINE_BIN_DIR}: {e}"))?;
+    }
     // `symlink` fails on an existing path, and an upgrade legitimately re-points the link.
     match std::fs::remove_file(&link) {
         Ok(()) => {}
@@ -495,12 +508,25 @@ pub const PROFILE_D_SCRIPT: &str = "/etc/profile.d/dig-path.sh";
 /// bash-isms), and idempotent at SOURCE time as well as at write time: the `case` guard means a shell
 /// that already has `dir` on `PATH` — because it was inherited, or because the file got sourced twice —
 /// does not accumulate a duplicate entry.
+///
+/// # APPENDED, never prepended (#1748)
+///
+/// This file is read by every LOGIN shell of every account, root's included. Prepending put `dir` in
+/// FRONT of `/usr/bin` and `/bin` machine-wide, so whatever `dir` contained won the resolution of every
+/// bare command name - `ls`, `cp`, `sudo` - for root as well. Executed: with
+/// `--bin-dir /home/alice/digbin`, root's login `PATH` began with alice's directory and `sh -lc 'ls'`
+/// ran alice's `ls` as uid 0.
+///
+/// Appending gives the DIG CLIs the reachability they need (nothing else on the machine is called
+/// `dign` or `digs`) while making the fragment unable to shadow a system command. A name COLLISION is
+/// then resolved in the system's favour, which is the right direction for a fragment installed
+/// machine-wide.
 pub fn profile_d_script(dir: &str) -> String {
     format!(
         "# added by dig-installer: make the DIG CLIs resolvable in every login shell\n\
          case \":${{PATH}}:\" in\n\
          \x20 *\":{dir}:\"*) ;;\n\
-         \x20 *) PATH=\"{dir}:${{PATH}}\"; export PATH ;;\n\
+         \x20 *) PATH=\"${{PATH}}:{dir}\"; export PATH ;;\n\
          esac\n"
     )
 }
@@ -512,6 +538,21 @@ pub fn profile_d_script(dir: &str) -> String {
 /// invoked by both `/etc/profile` (bash) and `/etc/zprofile` (zsh), which composes the login `PATH`
 /// from `/etc/paths` plus one fragment file per entry in `/etc/paths.d` (#1748).
 pub const PATHS_D_FILE: &str = "/etc/paths.d/dig";
+
+/// Every system-wide login-`PATH` fragment file this installer may have written, so an uninstall can
+/// remove them without re-deriving the platform rules.
+///
+/// Both unix files are listed regardless of host, because a machine can have been installed by an
+/// earlier version, or have had its `/etc` copied between systems, and a stale fragment naming a
+/// directory that no longer exists is exactly the leftover an uninstall is for. Empty on Windows, whose
+/// `PATH` lives in the registry and is handled by the per-user PATH removal.
+pub fn login_path_fragment_files() -> Vec<&'static str> {
+    if cfg!(windows) {
+        Vec::new()
+    } else {
+        vec![PROFILE_D_SCRIPT, PATHS_D_FILE]
+    }
+}
 
 /// Render the `/etc/paths.d` fragment for `dir`.
 ///
@@ -611,6 +652,29 @@ fn root_add_to_path(bin_dir: &Path, user: &crate::invoker::TargetUser) -> Result
     // Either way the directory about to be wired must exist before the user's shell is asked whether it
     // can enter it.
     ensure_bin_dir(&wired)?;
+
+    // REFUSE BEFORE WRITING to put a directory a non-root account can write onto every login shell's
+    // PATH, root's included (#1748, F3).
+    //
+    // The readiness verdict already failed such an install, but only AFTERWARDS — the fragment was
+    // already on disk, was never rolled back, and no uninstall removed it. Executed: with
+    // `--bin-dir /home/alice/digbin`, `sh -lc 'ls'` as root ran alice's `ls`. So the check moves in
+    // front of the write, and the message names the real problem rather than the bin dir's mode.
+    //
+    // Only under elevation: an unelevated run writes the user's OWN dotfile, which is their authority.
+    if crate::invoker::is_root() {
+        let verdict = crate::secure::verify_install_root(
+            crate::target::Os::from_consts(std::env::consts::OS)
+                .unwrap_or(crate::target::Os::Linux),
+            &wired,
+        );
+        if verdict.checked && !verdict.secure {
+            return Err(format!(
+                "refusing to put {dir} on every login shell's PATH: {} — a directory a non-root                  account can write, placed on root's own PATH, lets that account shadow every system                  command for root",
+                verdict.note
+            ));
+        }
+    }
 
     // Refuse to wire a directory the target user cannot even enter. The fragment is read by EVERY
     // login shell on the machine, so putting an inaccessible dir on PATH would degrade every
@@ -1312,7 +1376,7 @@ mod tests {
     #[test]
     fn the_profile_d_snippet_is_posix_sh_and_guards_against_duplicating_the_entry() {
         let s = profile_d_script("/usr/local/bin");
-        assert!(s.contains(r#"PATH="/usr/local/bin:${PATH}""#), "got: {s}");
+        assert!(s.contains(r#"PATH="${PATH}:/usr/local/bin""#), "got: {s}");
         assert!(s.contains("export PATH"));
         // The source-time guard: a shell that already has the dir does nothing.
         assert!(s.contains(r#"case ":${PATH}:" in"#), "got: {s}");
@@ -1398,7 +1462,7 @@ mod tests {
     #[test]
     fn the_profile_d_snippet_keeps_the_dir_inside_quotes() {
         let s = profile_d_script("/opt/dig bin");
-        assert!(s.contains(r#"PATH="/opt/dig bin:${PATH}""#), "got: {s}");
+        assert!(s.contains(r#"PATH="${PATH}:/opt/dig bin""#), "got: {s}");
     }
 
     #[cfg(not(windows))]

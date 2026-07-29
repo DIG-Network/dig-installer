@@ -1414,7 +1414,6 @@ fn run_report_gated(
         if !plan.dry_run {
             link_protected_clis(&target, report, log);
             verify_clis_on_path(&target, invoker::target_user(), report, log);
-            report_bin_dir_posture(plan, &target, report, log);
         }
 
         // #565: VERIFY the dir every privileged/service-executed binary landed in
@@ -1488,6 +1487,11 @@ fn run_report_gated(
                     ));
                 }
             }
+
+            // #1748 (F9): AFTER the privileged verify above, because the dedupe inside asks whether that
+            // verify actually produced a verdict. Called before it the guard could never fire, and the
+            // same directory was reported twice on the default install.
+            report_bin_dir_posture(plan, &target, report, log);
         }
 
         // Professional hardening (#573): register the Add/Remove Programs entry (its
@@ -3045,6 +3049,36 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             )
         } else {
             (false, format!("forcelist: {}", failed.join(", ")))
+        }
+    }
+
+    fn remove_login_path_fragment(&mut self) -> (bool, String) {
+        let fragments = paths::login_path_fragment_files();
+        if fragments.is_empty() {
+            return (true, "no system-wide PATH fragment on this platform".into());
+        }
+        if self.dry_run {
+            return (true, format!("would remove {}", fragments.join(", ")));
+        }
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        for f in fragments {
+            match std::fs::remove_file(f) {
+                Ok(()) => removed.push(f),
+                // Absent is the desired end-state, so an unelevated or repeat run is not a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => failed.push(format!("{f}: {e}")),
+            }
+        }
+        if failed.is_empty() {
+            let note = if removed.is_empty() {
+                "no system-wide PATH fragment to remove".to_string()
+            } else {
+                format!("removed {}", removed.join(", "))
+            };
+            (true, note)
+        } else {
+            (false, format!("PATH fragment: {}", failed.join(", ")))
         }
     }
 
