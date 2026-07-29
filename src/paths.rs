@@ -1283,7 +1283,7 @@ mod tests {
 
         // The shared chain implementation, applied to an existing directory — `ensure_bin_dir` itself
         // keys on the real `/opt/dig/bin`, which a test must not touch.
-        crate::rootchain::ensure_levels_for_test(&[dir.clone()])
+        crate::rootchain::ensure_levels_for_test(std::slice::from_ref(&dir))
             .expect("re-moding an existing directory must succeed");
 
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
