@@ -1986,7 +1986,22 @@ fn report_preceding_unsafe_path_dirs(
     let unsafe_before: Vec<String> = pathcheck::entries_before(&path, &wired_str, ':')
         .into_iter()
         .filter(|dir| {
-            secure::verify_install_root(target.os, std::path::Path::new(dir)).is_blocking()
+            // The entry is RESOLVED before it is judged, and that is correct for this question in a way it
+            // would not be for a write target.
+            //
+            // Asking "may root write or exec here?" must never follow a symlink — a planted link redirects
+            // the operation. But asking "can a non-root account put a binary that root will RESOLVE here?"
+            // is a question about the directory the name actually lands in. On any usrmerge distribution
+            // `/bin` and `/sbin` are symlinks into `/usr`, so judging them unresolved reports the
+            // distribution's own layout as unsafe — it failed a clean CI install on exactly that.
+            //
+            // Resolving is also strictly stronger against the attack: if an attacker makes a PATH entry a
+            // link to a directory she owns, the resolved target is hers and is still flagged.
+            let Ok(resolved) = std::path::Path::new(dir).canonicalize() else {
+                // An unresolvable entry cannot hold a binary root will run, so it cannot win a name.
+                return false;
+            };
+            secure::verify_install_root(target.os, &resolved).is_blocking()
         })
         .collect();
     if unsafe_before.is_empty() {
