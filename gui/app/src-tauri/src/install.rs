@@ -19,6 +19,13 @@
 //!      the same release-resolution/download/service-lifecycle machinery the
 //!      CLI thin-shim uses (see [`plan_from_selection`]).
 
+// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
+// (`clippy.toml`, #1748 WU4). The remaining spawns in this module are trusted SYSTEM tools resolved to an
+// absolute path from a fixed trusted directory list (`elevation::resolve_system_tool`, SPEC 7.6 — a
+// different invariant with its own tests), plus the elevation relaunch itself. The one spawn of an
+// INSTALLED binary — the `digstore --version` verify — goes through `guardedcmd::GuardedCommand`.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -556,12 +563,19 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         dig_installer::elevation::is_elevated(),
         bin_in_protected_root,
     ) {
-        let out = Command::new(&dest_bin)
-            .arg("--version")
-            .hide_console()
-            .output()
+        // Through the library's guarded seam (#1748 WU4): a `GuardedCommand` cannot be constructed
+        // without `secure::root_exec_guard` having passed, so this exec is verified by CONSTRUCTION
+        // rather than by `should_exec_verify` alone. The two are complementary — that predicate decides
+        // whether to verify HERE or defer to the unelevated GUI, and this one decides whether the
+        // directory is fit to exec from at all.
+        let out = dig_installer::guardedcmd::GuardedCommand::for_installed_binary(&dest_bin)
+            .and_then(|mut c| {
+                c.arg("--version")
+                    .output()
+                    .map_err(|e| format!("could not run {}: {e}", dest_bin.display()))
+            })
             .map_err(|e| {
-                let msg = format!("verify failed: could not run {}: {e}", dest_bin.display());
+                let msg = format!("verify failed: {e}");
                 let _ = app.emit(
                     "install://error",
                     InstallError {

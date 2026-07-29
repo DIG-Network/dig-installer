@@ -847,8 +847,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/work" -w /work \
             -e CARGO_TARGET_DIR=/tmp/target \
+            -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             dig-root-gate \
-            bash -lc 'cargo test --lib 2>&1 | tail -20; exit ${PIPESTATUS[0]}'
+            bash -c 'set -o pipefail; cargo test --lib 2>&1 | tail -20'
 
       # The escalation. Network is needed: it installs the real published binaries, because attacking a
       # mock would prove something about the mock.
@@ -856,8 +857,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/work" -w /work \
             -e CARGO_TARGET_DIR=/tmp/target \
+            -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             dig-root-gate \
-            bash -lc 'cargo build --release --locked --bin dig-installer \
+            bash -c 'cargo build --release --locked --bin dig-installer \
               && cd /tmp \
               && INSTALLER=/tmp/target/release/dig-installer \
                  bash /work/.github/scripts/root-gate-escalation.sh'
