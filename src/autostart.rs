@@ -156,19 +156,32 @@ pub fn windows_run_command(binary_path: &Path) -> String {
 /// (`systemctl --user enable --now dig-app.service`) then failed for both accounts — for the user
 /// because no such unit existed, for root because there was no bus.
 pub fn register(dig_app_bin: &Path, os: Os, dry_run: bool) -> AutostartResult {
-    register_for(dig_app_bin, os, dry_run, crate::invoker::target_user())
+    let user = crate::invoker::target_user();
+    register_for(
+        dig_app_bin,
+        os,
+        dry_run,
+        user,
+        user.acting_for_another_account(crate::invoker::is_root()),
+    )
 }
 
-/// [`register`] against an explicit target user, so the elevated and unelevated paths are both
-/// testable.
+/// [`register`] against an explicit target user AND an explicit boundary decision, so the elevated and
+/// unelevated paths are both testable.
+///
+/// `acting_for_another_account` is passed in rather than derived from the ambient uid
+/// ([`crate::invoker::TargetUser::acting_for_another_account`]) because a test that reads the real uid
+/// can only exercise the arm the runner is in — the mistake that let a defective predicate stay green
+/// (#1748).
 pub fn register_for(
     dig_app_bin: &Path,
     os: Os,
     dry_run: bool,
     user: &crate::invoker::TargetUser,
+    acting_for_another_account: bool,
 ) -> AutostartResult {
     let mechanism = mechanism_for(os).to_string();
-    let artifact = artifact_path(user, os);
+    let artifact = artifact_path(user, os, acting_for_another_account);
     if dry_run {
         return AutostartResult {
             registered: false,
@@ -230,13 +243,20 @@ fn target_xdg_config_home_when(
 
 /// Where the autostart artifact lives for `os` — a registry path on Windows (so the `--json` record
 /// names something a user can actually inspect), a file path elsewhere.
-fn artifact_path(user: &crate::invoker::TargetUser, os: Os) -> String {
+fn artifact_path(
+    user: &crate::invoker::TargetUser,
+    os: Os,
+    acting_for_another_account: bool,
+) -> String {
     match os {
         Os::Windows => format!("HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"),
         Os::MacOs => launch_agent_path(&user.home).to_string_lossy().into_owned(),
-        Os::Linux => systemd_user_unit_path(&target_xdg_config_home(user))
-            .to_string_lossy()
-            .into_owned(),
+        Os::Linux => systemd_user_unit_path(&target_xdg_config_home_when(
+            user,
+            acting_for_another_account,
+        ))
+        .to_string_lossy()
+        .into_owned(),
     }
 }
 
@@ -600,10 +620,13 @@ WantedBy=default.target
     #[test]
     fn a_sudo_install_writes_the_unit_into_the_invoking_users_scope_not_roots() {
         let r = register_for(
-            Path::new("/usr/local/bin/dig-app"),
+            Path::new("/opt/dig/bin/dig-app"),
             Os::Linux,
             true,
             &sudoing_ubuntu(),
+            // Root, acting for ubuntu — stated explicitly so the elevated arm is exercised on an
+            // unprivileged CI runner.
+            true,
         );
         // Compared as paths, not strings: `join` uses the HOST separator, so a literal
         // forward-slash expectation would fail on a Windows CI runner for a reason that has
@@ -639,7 +662,13 @@ WantedBy=default.target
             gid: None,
             via_elevation: false,
         };
-        let r = register_for(Path::new("/usr/local/bin/dig-app"), Os::Linux, true, &alice);
+        let r = register_for(
+            Path::new("/opt/dig/bin/dig-app"),
+            Os::Linux,
+            true,
+            &alice,
+            false,
+        );
         assert_eq!(
             Path::new(&r.artifact),
             systemd_user_unit_path(Path::new("/home/alice/.config")),
@@ -651,10 +680,11 @@ WantedBy=default.target
     #[test]
     fn a_sudo_install_writes_the_launch_agent_into_the_invoking_users_library() {
         let r = register_for(
-            Path::new("/usr/local/bin/dig-app"),
+            Path::new("/opt/dig/bin/dig-app"),
             Os::MacOs,
             true,
             &sudoing_ubuntu(),
+            true,
         );
         assert_eq!(
             Path::new(&r.artifact),
