@@ -114,7 +114,7 @@ jobs:
           else
             echo "INSTALLER=$(pwd)/target/release/dig-installer" >> "$GITHUB_ENV"
           fi
-          if [ "${{ runner.os }}" = "Linux" ]; then
+          if [ "${{ runner.os }}" != "Windows" ]; then
             # dig-dns's Linux systemd unit runs as a DEDICATED, unprivileged
             # service account (CAP_NET_BIND_SERVICE only, dns/linux.rs) —
             # `${{ runner.temp }}` lives under `/home/runner`, whose default
@@ -123,9 +123,24 @@ jobs:
             # job). `/opt` is world-traversable, matching what a real Linux
             # package (`.deb`) would install into. Root-owned 0755 also satisfies
             # the #565 H3 install-root ACL verify (no group/other write).
+            #
+            # macOS uses the same directory (#1748): `${{ runner.temp }}` lives
+            # under `/Users/runner`, owned by uid 501, and an ELEVATED install
+            # into a directory a non-root account owns is now refused outright —
+            # correctly, since that account could replace a binary root executes.
+            #
+            # `/opt` itself is normalised to 755 FIRST. The GitHub runner image
+            # ships it mode 777, and since #1748 the install-root verify walks
+            # EVERY level: write permission on `/opt` is permission to rename
+            # `/opt/dig-bin` aside and substitute an attacker-owned directory of
+            # the same name, so a root-owned leaf under a world-writable parent is
+            # correctly refused. Repairing the image's own `/opt` is the honest
+            # fix here; the installer deliberately does not re-mode a directory
+            # the distribution owns.
+            sudo chmod 755 /opt
             sudo mkdir -p /opt/dig-bin && sudo chmod 755 /opt/dig-bin
             echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
-          elif [ "${{ runner.os }}" = "Windows" ]; then
+          else
             # #565 H3: a privileged (service-executed) install into a custom
             # --bin-dir is now ACL-verified fail-loud, exactly like the protected
             # root — a LocalSystem service must not run a binary from a
@@ -142,8 +157,6 @@ jobs:
               /grant:r '*S-1-5-32-544:(OI)(CI)F' \
               /grant:r '*S-1-5-32-545:(OI)(CI)RX'
             echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
-          else
-            echo "BIN_DIR=${{ runner.temp }}/dig-bin" >> "$GITHUB_ENV"
           fi
 
       # The installer registers OS services and writes the hosts file — the
@@ -624,6 +637,20 @@ jobs:
       # `sudo -H` sets HOME=/root, which is what sudo does for the documented
       # `curl -fsSL https://dig.net/install.sh | sudo sh`. No `--bin-dir`, so the
       # real `default_bin_dir()` decision is exercised.
+      # The runner image ships `/opt` mode 777, and since #1748 the install-root
+      # verify walks EVERY level of the chain: write permission on `/opt` is
+      # permission to rename `/opt/dig` aside and substitute an attacker-owned
+      # directory of the same name, so a root-owned `/opt/dig/bin` beneath a
+      # world-writable `/opt` is correctly refused. The installer does not re-mode
+      # a directory the distribution owns, so the image's own `/opt` is repaired
+      # here. Asserted, not assumed: if a future image ships it correctly this
+      # still passes, and the check below proves the level really is safe.
+      - name: Normalise the runner image's world-writable /opt
+        run: |
+          stat -c '%n %U %a' /opt
+          sudo chmod 755 /opt
+          test -z "$(find /opt -maxdepth 0 \( -perm -0002 -o -perm -0020 \))"             || { echo "FAIL: /opt is still group- or world-writable"; exit 1; }
+
       - name: Install as root with HOME=/root and the DEFAULT bin dir
         run: |
           sudo -H ./target/release/dig-installer \
