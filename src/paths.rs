@@ -637,24 +637,32 @@ pub fn remove_veneer_links(components: &[String], os: Os) -> Vec<String> {
 /// exercisable without touching the real `/usr/local/bin`.
 #[cfg(unix)]
 fn remove_links_in(veneer: &Path, protected: &Path, components: &[String]) -> Vec<String> {
+    // The veneer is opened ONCE, `O_NOFOLLOW|O_DIRECTORY`, and every read and unlink below is relative to
+    // that descriptor (#1748 F5). Path-based `read_link`/`remove_file` re-resolve every component, so an
+    // account owning `/usr/local` could replace `/usr/local/bin` with a symlink to a directory of her
+    // choosing and have root unlink entries there — and the read-then-remove pair was a TOCTOU window that
+    // made the "is it a link into the protected root?" check advisory rather than binding.
+    //
+    // A SYMLINKED veneer is refused outright, consistent with this crate's own rule that a symlinked level
+    // is a definitive detection rather than an inconvenience: `open_dir_nofollow` returns
+    // `OpenRefusal::NotADirectory` and we remove nothing.
+    let Ok(Some(dir)) = crate::dirfd::open_dir_nofollow(None, veneer) else {
+        return Vec::new();
+    };
     let mut removed = Vec::new();
     for component in components {
-        let link = veneer.join(component);
-        // `symlink_metadata`, never `metadata`: the question is what the ENTRY is, not what it points at.
-        let Ok(meta) = std::fs::symlink_metadata(&link) else {
-            continue;
-        };
-        if !meta.is_symlink() {
-            continue;
-        }
-        let Ok(points_at) = std::fs::read_link(&link) else {
+        let name = Path::new(component);
+        // `readlinkat` answers "is this entry a symlink, and where does it point?" in one syscall against the
+        // descriptor. `Ok(None)` is a regular file or an absent entry — neither is ours.
+        let Ok(Some(points_at)) = crate::dirfd::readlinkat(&dir, name) else {
             continue;
         };
         if !points_at.starts_with(protected) {
+            // Somebody else's link. Possibly another package manager's `digs`; not ours to remove.
             continue;
         }
-        if std::fs::remove_file(&link).is_ok() {
-            removed.push(link.to_string_lossy().into_owned());
+        if crate::dirfd::unlinkat(&dir, name).is_ok() {
+            removed.push(veneer.join(component).to_string_lossy().into_owned());
         }
     }
     removed
@@ -665,6 +673,51 @@ fn remove_links_in(veneer: &Path, protected: &Path, components: &[String]) -> Ve
 /// every account — which is the scope an elevated install is entitled to and the scope a per-user
 /// dotfile edit cannot reach (#1748).
 pub const PROFILE_D_SCRIPT: &str = "/etc/profile.d/dig-path.sh";
+
+/// Where the wired directory goes relative to what is already on `PATH`.
+///
+/// # This is a POSITIONAL security property, not a style choice (#1748 F2)
+///
+/// Round 4 established APPEND, and for the case it was found in that is right: the directory being wired
+/// was a user-chosen `--bin-dir`, and putting a directory an attacker might own in FRONT of `/usr/bin`
+/// machine-wide let her shadow `ls` for root. Appending makes a name collision resolve in the system's
+/// favour.
+///
+/// Round 8's fallback then wired the ROOT-OWNED protected root — and inherited the append, which is the
+/// wrong answer for it. Appending puts `/opt/dig/bin` behind `/usr/local/bin`, so on a Homebrew Mac the
+/// attacker does not need to touch anything DIG planted: she creates `/usr/local/bin/digs` herself and wins
+/// the resolution, because her directory is simply earlier. On macOS it is structural — `/etc/paths` ships
+/// `/usr/local/bin` and `path_helper` reads it BEFORE `/etc/paths.d/*`, so an appended fragment can never
+/// win, and macOS is the actual Homebrew platform.
+///
+/// The two cases are genuinely different and must not share a rule:
+///
+/// * a **user-chosen directory** may be attacker-owned → APPEND, so it cannot shadow the system;
+/// * the **protected root** is root-owned `0755`, whole-chain verified, and holds only DIG's own binaries
+///   → PREPEND, because the only thing it can shadow is a name an attacker planted somewhere earlier.
+///
+/// Treating those as one class is the over-generalisation this issue keeps producing: a guard justified by
+/// one attacker behaviour, applied to a case that behaves differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPosition {
+    /// In FRONT of the existing `PATH`. Only for a directory this installer owns end to end.
+    Prepend,
+    /// BEHIND the existing `PATH`, so a collision resolves in the system's favour.
+    Append,
+}
+
+/// Which end of `PATH` the wired directory belongs on.
+///
+/// Pure, so both arms are testable without touching a real `PATH`.
+pub fn path_position(wired: &Path, veneer_is_safe: bool) -> PathPosition {
+    // The protected root is ours: root-owned 0755, verified level by level, and containing nothing but the
+    // binaries this installer placed. It goes first — otherwise the fallback loses to whatever directory
+    // happens to precede it, which is exactly the directory it was chosen to avoid.
+    if wired == protected_bin_dir() && !veneer_is_safe {
+        return PathPosition::Prepend;
+    }
+    PathPosition::Append
+}
 
 /// Render the `/etc/profile.d` snippet that puts `dir` on the login `PATH`.
 ///
@@ -685,12 +738,18 @@ pub const PROFILE_D_SCRIPT: &str = "/etc/profile.d/dig-path.sh";
 /// `dign` or `digs`) while making the fragment unable to shadow a system command. A name COLLISION is
 /// then resolved in the system's favour, which is the right direction for a fragment installed
 /// machine-wide.
-pub fn profile_d_script(dir: &str) -> String {
+pub fn profile_d_script(dir: &str, position: PathPosition) -> String {
+    let assignment = match position {
+        // In FRONT: the only name this can shadow is one an attacker planted in a directory that
+        // precedes us, which is the entire point of prepending it (#1748 F2).
+        PathPosition::Prepend => format!("PATH=\"{dir}:${{PATH}}\""),
+        PathPosition::Append => format!("PATH=\"${{PATH}}:{dir}\""),
+    };
     format!(
         "# added by dig-installer: make the DIG CLIs resolvable in every login shell\n\
          case \":${{PATH}}:\" in\n\
          \x20 *\":{dir}:\"*) ;;\n\
-         \x20 *) PATH=\"${{PATH}}:{dir}\"; export PATH ;;\n\
+         \x20 *) {assignment}; export PATH ;;\n\
          esac\n"
     )
 }
@@ -729,11 +788,11 @@ pub fn paths_d_fragment(dir: &str) -> String {
 /// The file an elevated install writes to put `dir` on every login shell's `PATH`, and its contents,
 /// chosen for the platform whose login shells will actually read it.
 #[cfg(not(windows))]
-fn login_path_fragment(dir: &str) -> (&'static str, String) {
+fn login_path_fragment(dir: &str, position: PathPosition) -> (&'static str, String) {
     if cfg!(target_os = "macos") {
         (PATHS_D_FILE, paths_d_fragment(dir))
     } else {
-        (PROFILE_D_SCRIPT, profile_d_script(dir))
+        (PROFILE_D_SCRIPT, profile_d_script(dir, position))
     }
 }
 
@@ -865,12 +924,12 @@ fn root_add_to_path(
         ));
     }
 
-    let (fragment_file, fragment_body) = login_path_fragment(&dir);
-    if let Some(parent) = Path::new(fragment_file).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(fragment_file, fragment_body)
-        .map_err(|e| format!("write {fragment_file}: {e}"))?;
+    // Position is a security property here, not cosmetics: the protected root must PRECEDE whatever
+    // directory made the veneer unsafe, or the attacker simply creates the name earlier on PATH and wins
+    // without touching anything this installer planted (#1748 F2).
+    let position = path_position(&wired, veneer_is_safe);
+    let (fragment_file, fragment_body) = login_path_fragment(&dir, position);
+    write_login_path_fragment(fragment_file, &fragment_body)?;
 
     if let Some(note) = reachable(&format!(" (wired via {fragment_file})")) {
         return Ok(PathWiring::changed(note));
@@ -894,6 +953,60 @@ fn root_add_to_path(
         "wrote {fragment_file} but {dir} is STILL not on {}'s login PATH (it searches:          {observed}){no_alternative}",
         user.name
     ))
+}
+
+/// Write `body` to `file` with its mode pinned by the SYSCALL, creating any missing parent at `0755`.
+///
+/// # Why the mode cannot be left to the umask (#1748 F3)
+///
+/// This was `create_dir_all` + `std::fs::write`, neither of which pins a mode, so both inherited the process
+/// umask. Measured as root at `umask 000`: the fragment landed `-rw-rw-rw- root:root`, and with
+/// `/etc/profile.d` absent the parent landed `drwxrwxrwx root:root`. An unprivileged account can then append
+/// arbitrary shell to a file `/etc/profile` sources for EVERY login shell, root's included — which is a
+/// better escalation than anything else in this issue, because it needs no install to be running.
+///
+/// `sudo` clamps the umask to at least `0022`, so `sudo dig-installer` was safe; a root shell, `su -`, a
+/// container entrypoint or a cron invocation is not. Round 8 is what made this write common: before it, an
+/// unsafe veneer meant the fragment was never reached at all.
+///
+/// This crate had already learned the lesson one round earlier — `/opt/dig` was measured `0777` under
+/// `umask 000` "on an install that reported success" — and the `/etc` fragment simply did not get the
+/// treatment. So the mode is a `mode()` argument on the open, and the destination is unlinked first so an
+/// existing file cannot contribute its own permissions or redirect the write through a symlink.
+#[cfg(not(windows))]
+fn write_login_path_fragment(file: &str, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let path = Path::new(file);
+    if let Some(parent) = path.parent() {
+        if !parent.is_dir() {
+            // `mode()` on the builder, so the directory can never exist even briefly wider than 0755.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+    }
+    // Unlink first: an existing file keeps its own mode through a plain `write`, and a symlink planted at
+    // this path would redirect a root write. `O_NOFOLLOW` makes the refusal explicit; `create_new` means a
+    // concurrent re-plant loses rather than wins. This is the same shape as `download`'s binary write.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("replace {file}: {e}")),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("write {file}: {e}"))?;
+    f.write_all(body.as_bytes())
+        .map_err(|e| format!("write {file}: {e}"))?;
+    f.flush().map_err(|e| format!("write {file}: {e}"))
 }
 
 /// Ensure `bin_dir` exists, and that every DIG-owned level of it is root-owned `0755`.
@@ -1594,6 +1707,124 @@ mod tests {",
         );
     }
 
+    /// The `/etc` fragment and any parent it creates are `0644`/`0755` WHATEVER the umask (#1748 F3).
+    ///
+    /// Measured before this fix, as root at `umask 000`: the fragment landed `-rw-rw-rw-` and a created
+    /// `/etc/profile.d` landed `drwxrwxrwx`. An unprivileged account can then append arbitrary shell to a file
+    /// `/etc/profile` sources for every login shell including root's — no install even has to be running.
+    /// `sudo` clamps the umask so `sudo dig-installer` was safe; a root shell, `su -`, a container entrypoint
+    /// or cron is not.
+    ///
+    /// The fixture sets `umask 000` explicitly, which is the condition that produced it. Asserted on both the
+    /// file and the created parent, because the parent was the wider of the two.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_login_path_fragment_pins_its_mode_regardless_of_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("profile.d");
+        let file = parent.join("dig-path.sh");
+
+        let previous = unsafe { libc::umask(0) };
+        let outcome = write_login_path_fragment(file.to_str().unwrap(), "export PATH=x\n");
+        unsafe { libc::umask(previous) };
+        outcome.expect("the write must succeed");
+
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o644,
+            "the fragment is {file_mode:o}: a group/other-writable file that /etc/profile sources is a root \
+             shell for anyone who can write it"
+        );
+        let parent_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            parent_mode, 0o755,
+            "the created parent is {parent_mode:o} - a writable directory lets the fragment be replaced \
+             wholesale"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "export PATH=x\n");
+    }
+
+    /// A symlink planted at the fragment path is REFUSED, not followed, and the victim is untouched.
+    ///
+    /// The fragment path is fixed and published, so a link planted there would redirect a root write to any
+    /// file on the system. Same discipline as the binary write in `download`.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_login_path_fragment_never_writes_through_a_planted_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        let planted = tmp.path().join("dig-path.sh");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        write_login_path_fragment(planted.to_str().unwrap(), "export PATH=x\n")
+            .expect("the write must still succeed at the intended path");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "root wrote THROUGH a planted symlink"
+        );
+        assert!(!std::fs::symlink_metadata(&planted).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&planted).unwrap(),
+            "export PATH=x\n"
+        );
+    }
+
+    // -- #1748 F2: reachability is POSITIONAL, not merely presence ----------------
+
+    /// The protected root is PREPENDED under the fallback; everything else is appended.
+    ///
+    /// Round 4's append rule was found on a user-chosen `--bin-dir` — a directory an attacker might own, which
+    /// must not be able to shadow `/usr/bin` for root. Round 8's fallback then wired the ROOT-OWNED protected
+    /// root and inherited that rule, which is the wrong answer for it: appended, `/opt/dig/bin` sits behind
+    /// `/usr/local/bin`, so the attacker never needs the link this installer planted — she creates
+    /// `/usr/local/bin/digs` herself and wins because her directory is simply earlier.
+    ///
+    /// Both arms are asserted, because a constant satisfies either one alone: always-prepend re-opens round
+    /// 4's finding for `--bin-dir`, always-append leaves the fallback losing.
+    #[test]
+    fn the_protected_root_is_prepended_under_the_fallback_and_others_are_appended() {
+        // The fallback: ours end to end (root-owned 0755, whole-chain verified, only DIG's binaries), so it
+        // goes first. The only name it can shadow is one an attacker planted earlier on PATH.
+        assert_eq!(
+            path_position(&protected_bin_dir(), VENEER_UNSAFE),
+            PathPosition::Prepend
+        );
+
+        // A user-chosen directory is NEVER prepended, whatever the veneer's posture — that is round 4's
+        // finding, and it is a different case.
+        for dir in [
+            PathBuf::from("/home/alice/digbin"),
+            PathBuf::from("/opt/somewhere-else"),
+            PathBuf::from(UNIX_MACHINE_BIN_DIR),
+        ] {
+            for safe in [VENEER_SAFE, VENEER_UNSAFE] {
+                assert_eq!(
+                    path_position(&dir, safe),
+                    PathPosition::Append,
+                    "{} must never be put in front of the system directories",
+                    dir.display()
+                );
+            }
+        }
+
+        // And the rendered fragment really differs, so the decision reaches the file.
+        let front = profile_d_script("/opt/dig/bin", PathPosition::Prepend);
+        assert!(
+            front.contains(r#"PATH="/opt/dig/bin:${PATH}""#),
+            "got: {front}"
+        );
+        let back = profile_d_script("/opt/dig/bin", PathPosition::Append);
+        assert!(
+            back.contains(r#"PATH="${PATH}:/opt/dig/bin""#),
+            "got: {back}"
+        );
+    }
+
     // -- #1748: an unsafe veneer FALLS BACK, it does not refuse -------------------
 
     /// The whole fallback, both ways, on the one decision that drives it.
@@ -1676,6 +1907,55 @@ mod tests {",
         }
     }
 
+    /// A SYMLINKED veneer is refused outright — nothing is removed through it (#1748 F5).
+    ///
+    /// With the removal reachable, a path-based delete became aimable: an account owning `/usr/local` replaces
+    /// `/usr/local/bin` with a symlink to a directory she chose, fills it with decoys pointing into
+    /// `/opt/dig/bin`, and root unlinks entries at a path she controls. A denial primitive rather than an
+    /// escalation — `unlink(2)` never follows the final component and the basenames are constrained to DIG's
+    /// own — but the `read_link`→`remove_file` pair made the type check advisory.
+    ///
+    /// Opening the veneer `O_NOFOLLOW|O_DIRECTORY` refuses the whole operation, which is the same answer this
+    /// crate gives a symlinked level anywhere else. The fixture is the exact shape: the veneer is a link, and
+    /// the decoys inside its target DO point into the protected root, so a removal that resolved the path
+    /// would delete them.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_veneer_is_refused_and_nothing_is_removed_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join("opt-dig-bin");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("digs"), b"real").unwrap();
+
+        // Where the attacker aims: decoys that WOULD satisfy the "points into the protected root" test.
+        let aimed = tmp.path().join("aimed");
+        std::fs::create_dir_all(&aimed).unwrap();
+        std::os::unix::fs::symlink(protected.join("digs"), aimed.join("digs")).unwrap();
+
+        // The veneer itself is a symlink to that directory.
+        let veneer = tmp.path().join("usr-local-bin");
+        std::os::unix::fs::symlink(&aimed, &veneer).unwrap();
+
+        let removed = remove_links_in(&veneer, &protected, &["digs".to_string()]);
+
+        assert!(
+            removed.is_empty(),
+            "a symlinked veneer must be refused, not traversed: {removed:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(aimed.join("digs")).is_ok(),
+            "root unlinked an entry at a path the attacker chose"
+        );
+
+        // The control: with the veneer a REAL directory, the same link IS removed — so the refusal above is
+        // about the symlinked veneer and not about this function declining to do its job.
+        let real_veneer = tmp.path().join("real-veneer");
+        std::fs::create_dir_all(&real_veneer).unwrap();
+        std::os::unix::fs::symlink(protected.join("digs"), real_veneer.join("digs")).unwrap();
+        let removed = remove_links_in(&real_veneer, &protected, &["digs".to_string()]);
+        assert_eq!(removed.len(), 1, "a real veneer must still be cleaned");
+    }
+
     /// A DIG link left in a veneer that has BECOME unsafe is removed; anything else there is left alone.
     ///
     /// Removal is part of the fallback rather than a nicety: a link an earlier, safe-at-the-time run planted
@@ -1749,7 +2029,7 @@ mod tests {",
     /// twice.
     #[test]
     fn the_profile_d_snippet_is_posix_sh_and_guards_against_duplicating_the_entry() {
-        let s = profile_d_script("/usr/local/bin");
+        let s = profile_d_script("/usr/local/bin", PathPosition::Append);
         assert!(s.contains(r#"PATH="${PATH}:/usr/local/bin""#), "got: {s}");
         assert!(s.contains("export PATH"));
         // The source-time guard: a shell that already has the dir does nothing.
@@ -1820,7 +2100,7 @@ mod tests {",
     #[cfg(not(windows))]
     #[test]
     fn the_login_path_fragment_target_follows_the_platform() {
-        let (file, body) = login_path_fragment("/opt/dig-bin");
+        let (file, body) = login_path_fragment("/opt/dig-bin", PathPosition::Append);
         if cfg!(target_os = "macos") {
             assert_eq!(file, PATHS_D_FILE);
             assert_eq!(body, "/opt/dig-bin\n");
@@ -1835,7 +2115,7 @@ mod tests {",
     /// the machine — a far worse outcome than the bug being fixed.
     #[test]
     fn the_profile_d_snippet_keeps_the_dir_inside_quotes() {
-        let s = profile_d_script("/opt/dig bin");
+        let s = profile_d_script("/opt/dig bin", PathPosition::Append);
         assert!(s.contains(r#"PATH="${PATH}:/opt/dig bin""#), "got: {s}");
     }
 

@@ -538,6 +538,15 @@ pub struct InstallReport {
     /// becomes writable — an unprivileged process replaces it and root runs whatever it points at. So the
     /// fallback removes them, and says which, rather than leaving them for somebody to find.
     pub veneer_links_removed: Vec<String>,
+    /// Any directory that PRECEDES the wired install dir on root's login `PATH` and is not established safe.
+    ///
+    /// Reported because position decides which binary a bare name reaches, and the existing shadow check can
+    /// only see a file that is already there (#1748 F2). A `PATH` where a writable directory merely comes
+    /// first is a loaded gun: the attacker creates the name whenever she likes and root runs it, having
+    /// touched nothing this installer placed. Prepending is the fix; this is the backstop for the cases
+    /// prepending cannot win — a user's own `.bashrc`, or `/etc/paths` ordering on macOS, where
+    /// `path_helper` reads `/etc/paths` before `/etc/paths.d/*`.
+    pub preceding_unsafe_path_dirs: Vec<String>,
     /// The record of migrating an existing install off the legacy user-writable
     /// root onto the protected root (#565): services deregistered/re-pointed,
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
@@ -841,6 +850,7 @@ fn run_report_gated(
         veneer_security: None,
         reachability: None,
         veneer_links_removed: Vec::new(),
+        preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
         registration_audit: Vec::new(),
         install_manifest: None,
@@ -1484,6 +1494,11 @@ fn run_report_gated(
         if !plan.dry_run {
             link_protected_clis(&target, report, veneer_is_safe, log);
             verify_clis_on_path(&target, invoker::target_user(), report, log);
+            #[cfg(unix)]
+            {
+                let wired = paths::reachable_dir(target.os, &plan.bin_dir, veneer_is_safe);
+                report_preceding_unsafe_path_dirs(&target, &wired, report, log);
+            }
         }
 
         // #565: VERIFY the dir every privileged/service-executed binary landed in
@@ -1870,6 +1885,42 @@ fn link_protected_clis(
             })
             .map(|c| (c.component.clone(), c.dest.clone()))
             .collect();
+        // REMOVAL FIRST, and outside the `to_link` guard (#1748 F1).
+        //
+        // This block used to sit BELOW an `if to_link.is_empty() { return; }` early return, which made it
+        // unreachable: `to_link` is built from `needs_machine_bin_link`, which is `reachability_for(..) ==
+        // VeneerLinks`, so it is empty by construction exactly when `!veneer_is_safe` — the only condition
+        // the removal runs under. A contradiction, and deleting the whole block left 685 tests passing,
+        // because the only test that covered it called the helper directly and never traversed this seam.
+        //
+        // Shipped, that meant: a safe install plants the link, Homebrew arrives, `/usr/local/bin` becomes
+        // `<user>:admin 0775`, root re-runs the installer and it reports ready with the stale link still
+        // there for an unprivileged account to re-point.
+        if !veneer_is_safe {
+            // A link an earlier, safe-at-the-time run planted is a live vector once the directory is
+            // writable, and only this installer can take it away. `/usr/local/bin` really does change
+            // posture under us, and this is where that gets noticed.
+            let names: Vec<String> = report
+                .components
+                .iter()
+                .map(|c| target.exe_name(&c.component))
+                .collect();
+            let removed = paths::remove_veneer_links(&names, target.os);
+            if removed.is_empty() {
+                log(&format!(
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the                      protected root is on PATH directly instead",
+                    paths::UNIX_MACHINE_BIN_DIR
+                ));
+            } else {
+                for link in &removed {
+                    log(&format!(
+                        "    ✓ removed {link} — a link in a directory a non-root account can write is one                          they can re-point, and root runs whatever it points at"
+                    ));
+                }
+            }
+            report.veneer_links_removed = removed;
+        }
+
         if to_link.is_empty() {
             return;
         }
@@ -1884,41 +1935,57 @@ fn link_protected_clis(
                 Err(e) => log(&format!("    ! could not link {component}: {e}")),
             }
         }
-
-        // The veneer's posture was measured once, before anything was wired (see `run_report_gated`), and
-        // this step acts on that same answer rather than re-reading it.
-        if !veneer_is_safe {
-            // Not merely "decline to plant new links": a link an earlier, safe-at-the-time run left here is
-            // a live escalation vector now, so it goes. `/usr/local/bin` really does change posture under
-            // us — Homebrew gets installed, an admin re-modes it — and this is where that is noticed.
-            let names: Vec<String> = report
-                .components
-                .iter()
-                .map(|c| target.exe_name(&c.component))
-                .collect();
-            let removed = paths::remove_veneer_links(&names, target.os);
-            if removed.is_empty() {
-                log(&format!(
-                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the \
-                     protected root is on PATH directly instead",
-                    paths::UNIX_MACHINE_BIN_DIR
-                ));
-            } else {
-                for link in &removed {
-                    log(&format!(
-                        "    ✓ removed {link} — a link in a directory a non-root account can write is one \
-                         they can re-point, and root runs whatever it points at"
-                    ));
-                }
-            }
-            report.veneer_links_removed = removed;
-        }
     }
     #[cfg(not(unix))]
     {
         // Windows installs the whole stack into one root, so there is nothing to link.
         let _ = (target, report, log);
     }
+}
+
+/// Record every directory that precedes the wired install directory on the target user's login `PATH` and
+/// is NOT established safe (#1748 F2).
+///
+/// Prepending the protected root is the primary fix, but it cannot always win: a user's own `.bashrc` runs
+/// after `/etc/profile.d`, and on macOS `path_helper` composes `/etc/paths` — which ships `/usr/local/bin` —
+/// before `/etc/paths.d/*`. So position is VERIFIED rather than assumed, and a losing `PATH` fails readiness
+/// instead of reporting a green install whose commands an attacker can claim at any time.
+///
+/// Only meaningful under elevation, and only for directories a non-root account can actually write: the
+/// ordinary `/usr/bin`/`/bin` entries precede us on every box and are root-owned, which is fine.
+#[cfg(unix)]
+fn report_preceding_unsafe_path_dirs(
+    target: &Target,
+    wired: &std::path::Path,
+    report: &mut InstallReport,
+    log: &mut dyn FnMut(&str),
+) {
+    if !invoker::is_root() {
+        return;
+    }
+    let user = invoker::target_user();
+    let Ok(path) = pathcheck::login_shell_path(user) else {
+        // The PATH itself could not be read; `verify_clis_on_path` already reports that failure, and
+        // guessing here would only duplicate it.
+        return;
+    };
+    let wired_str = wired.to_string_lossy().to_string();
+    let unsafe_before: Vec<String> = pathcheck::entries_before(&path, &wired_str, ':')
+        .into_iter()
+        .filter(|dir| {
+            secure::verify_install_root(target.os, std::path::Path::new(dir)).is_blocking()
+        })
+        .collect();
+    if unsafe_before.is_empty() {
+        return;
+    }
+    log(&format!(
+        "    ! these directories come BEFORE {wired_str} on {}'s PATH and are not safe: {}",
+        user.name,
+        unsafe_before.join(", ")
+    ));
+    log("    · a non-root account can create a DIG command name there and win the resolution");
+    report.preceding_unsafe_path_dirs = unsafe_before;
 }
 
 /// Report the permission posture of the directory this run's binaries were PLACED in, when that is not
@@ -2196,6 +2263,18 @@ fn evaluate_readiness_when(
     //
     // Unelevated it stays a REPORT: a directory holding binaries only that same user runs is their own
     // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
+    // #1748 F2: a directory that PRECEDES our install dir on root's PATH and is not established safe means
+    // an attacker can create a DIG command name there and win the resolution — without touching anything
+    // this installer placed. The existing shadow check only sees a file that is already there, so position
+    // is its own failure.
+    if elevated && !report.preceding_unsafe_path_dirs.is_empty() {
+        failures.push(format!(
+            "PATH order: {} precede{} the DIG install directory on root's PATH and are not root-owned              without group/other write — a non-root account can create `dign`/`digs` there and root will              run it; repair those directories or remove them from root's PATH",
+            report.preceding_unsafe_path_dirs.join(", "),
+            if report.preceding_unsafe_path_dirs.len() == 1 { "s" } else { "" }
+        ));
+    }
+
     // #1748: the veneer is fatal ONLY when it is the mechanism in play.
     //
     // When links are planted there, an account that can write the directory re-points one and root runs
@@ -3147,6 +3226,25 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
             }
         }
+        // The VENEER links go too (#1748 F4). They live in neither bin root, so the residue scan below never
+        // looked at them and an uninstall reported `residue: []` while `/usr/local/bin/digs` still pointed at
+        // a binary that no longer exists. That is a false machine-consumed claim on its own — `--uninstall`
+        // promises zero residue — and it hands the stale-link escalation its starting state: the next time
+        // `/usr/local/bin` becomes writable, there is a DIG-named link sitting there for the taking.
+        //
+        // Unconditional, and it does not care about the veneer's posture: on uninstall we are removing our
+        // own links either way. `remove_links_in`'s discrimination still applies, so a foreign entry of the
+        // same name is left alone.
+        #[cfg(unix)]
+        {
+            let names: Vec<String> = uninstall::COMPONENT_STEMS
+                .iter()
+                .filter(|stem| !skip.iter().any(|s| s == *stem))
+                .map(|stem| target.exe_name(stem))
+                .collect();
+            removed += paths::remove_veneer_links(&names, target.os).len();
+        }
+
         // Remove the Add/Remove Programs entry alongside the binaries (Windows).
         #[cfg(windows)]
         let note_extra = match hardening::remove_arp_entry() {
@@ -3225,7 +3323,13 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             Err(_) => return Vec::new(),
         };
         let current = std::env::current_exe().ok();
-        let roots = [self.bin_dir.clone(), paths::protected_bin_dir()];
+        // The VENEER is scanned as a root of its own (#1748 F4): its links live in neither bin dir, so an
+        // uninstall used to report `residue: []` with `/usr/local/bin/digs` still present and dangling.
+        // `--uninstall` promises zero residue, and a stale DIG-named entry is also the starting state the
+        // stale-link escalation needs.
+        let mut roots = vec![self.bin_dir.clone(), paths::protected_bin_dir()];
+        #[cfg(unix)]
+        roots.push(std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR));
         let mut residue = Vec::new();
         for stem in uninstall::COMPONENT_STEMS {
             for root in &roots {
@@ -3235,7 +3339,9 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 if current.as_deref() == Some(path.as_path()) {
                     continue;
                 }
-                if path.exists() {
+                // `symlink_metadata`, not `exists()`: a DANGLING symlink left in the veneer is exactly the
+                // residue this scan exists to find, and `exists()` follows the link and reports nothing.
+                if std::fs::symlink_metadata(&path).is_ok() {
                     residue.push(path.display().to_string());
                 }
             }
@@ -4927,6 +5033,7 @@ mod tests {
             veneer_security: None,
             reachability: None,
             veneer_links_removed: Vec::new(),
+            preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
             registration_audit: Vec::new(),
             install_manifest: None,
@@ -5362,6 +5469,71 @@ mod tests {
         assert!(
             unchecked.bin_dir_security.is_some(),
             "nothing verified the directory this run wrote binaries into (#1748)"
+        );
+    }
+
+    /// The removal must be REACHED, not merely implemented — this test goes through `link_protected_clis`.
+    ///
+    /// # Why this test exists (#1748 F1)
+    ///
+    /// The removal block sat below an `if to_link.is_empty() { return; }` early return, and `to_link` is
+    /// empty by construction exactly when the veneer is unsafe — the only condition the removal runs under.
+    /// So it was provably dead code, and **deleting it left 685 tests passing**: the one test covering the
+    /// behaviour called `paths::remove_links_in` directly and never traversed this call site. The container
+    /// gate missed it too, because its fixture deleted the link before the run.
+    ///
+    /// The lesson is the fixture, not the assertion: a helper that works proves nothing about a caller that
+    /// never calls it. This drives the real seam, with the veneer redirected to a temp directory so it can
+    /// run unprivileged.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_veneer_reaches_the_removal_through_link_protected_clis() {
+        let target = Target::current().expect("host target");
+        if matches!(target.os, target::Os::Windows) {
+            return; // The veneer is a unix concept; Windows keeps one root and links nothing.
+        }
+
+        let mut report = report_shell();
+        report.components.push(ComponentResult {
+            component: "digs".to_string(),
+            version: "0.19.3".to_string(),
+            tag: "v0.19.3".to_string(),
+            asset: "digs".to_string(),
+            url: String::new(),
+            dest: paths::protected_bin_dir()
+                .join("digs")
+                .to_string_lossy()
+                .into_owned(),
+            previous_version: None,
+            update_action: update::UpdateAction::Install,
+        });
+
+        // UNSAFE veneer: nothing may be linked, and the removal must be REACHED. `to_link` is empty here,
+        // which is precisely the state in which the early return used to skip the removal entirely.
+        let mut lines = Vec::new();
+        link_protected_clis(&target, &mut report, false, &mut |l| {
+            lines.push(l.to_string())
+        });
+        let log = lines.join("\n");
+        assert!(
+            log.contains(paths::UNIX_MACHINE_BIN_DIR),
+            "an unsafe veneer must SAY what it did about the veneer, and it said nothing: {log:?}"
+        );
+        assert!(
+            !log.contains("Linking the protected-root CLIs"),
+            "no link may be planted into an unsafe veneer: {log:?}"
+        );
+
+        // The control that makes the assertion above about the POSTURE rather than about this function
+        // being quiet in general: a SAFE veneer takes the linking path and announces it.
+        let mut linked = Vec::new();
+        link_protected_clis(&target, &mut report, true, &mut |l| {
+            linked.push(l.to_string())
+        });
+        let linked = linked.join("\n");
+        assert!(
+            linked.contains("Linking the protected-root CLIs"),
+            "a safe veneer must still plant links — otherwise the fallback is just an abandonment: {linked:?}"
         );
     }
 

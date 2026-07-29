@@ -89,6 +89,42 @@ pub fn resolve_in_path(
         .find(|candidate| exists(candidate))
 }
 
+/// Which directories on `path` come BEFORE `wanted`, in order?
+///
+/// # Why position and not existence (#1748 F2)
+///
+/// `verify_cli_resolves` already refuses when a bare name resolves to something other than the copy this
+/// install placed — but that only fires when the shadowing file is ALREADY there. A `PATH` on which an
+/// unsafe directory merely PRECEDES the protected root is reported ready, and the attacker then creates the
+/// name at her leisure: she never has to touch anything DIG planted, she just gets there first.
+///
+/// So reachability has to be checked positionally. This returns the directories that would win a name
+/// against `wanted`, so a caller can ask whether any of them is a directory a non-root account can write.
+/// Pure, and separate from the verdict, so both halves are testable without a real `PATH`.
+///
+/// `wanted` absent from `path` yields every entry: nothing about it wins, because it cannot be reached at
+/// all — a caller distinguishes that with [`path_contains`].
+pub fn entries_before(path: &str, wanted: &str, sep: char) -> Vec<String> {
+    let trail = if sep == ';' { '\\' } else { '/' };
+    let normalise = |e: &str| {
+        let e = e.trim().trim_end_matches(trail).to_string();
+        if sep == ';' {
+            e.to_ascii_lowercase()
+        } else {
+            e
+        }
+    };
+    let want = normalise(wanted);
+    let mut before = Vec::new();
+    for entry in path.split(sep).map(str::trim).filter(|e| !e.is_empty()) {
+        if normalise(entry) == want {
+            return before;
+        }
+        before.push(entry.to_string());
+    }
+    before
+}
+
 /// Is `dir` present on `path`? Case-insensitive and trailing-separator-insensitive on Windows,
 /// matching [`crate::paths::path_append`]'s comparison so "did the append take effect?" has one
 /// answer. Pure.
@@ -842,7 +878,36 @@ mod tests {
         assert_ne!(PRINT_PATH_VIA_LOGIN_SH, PRINT_PATH);
     }
 
-    // -- #1748: "am I root?", not "was I sudo'd?" --------------------------------
+    /// `entries_before` answers WHICH directories win a name against ours, in order.
+    ///
+    /// The property the shadow check cannot see: a `PATH` on which a writable directory merely PRECEDES the
+    /// install dir is reported ready, and the attacker creates the name afterwards. So the ordering itself
+    /// has to be inspectable.
+    #[test]
+    fn entries_before_returns_only_what_precedes_the_wanted_directory() {
+        let path = "/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/dig/bin:/sbin";
+        assert_eq!(
+            entries_before(path, "/opt/dig/bin", ':'),
+            vec!["/usr/local/sbin", "/usr/local/bin", "/usr/bin"],
+            "everything up to but not including the wanted dir, in PATH order"
+        );
+
+        // First on PATH: nothing wins against it. This is what prepending buys.
+        assert!(entries_before("/opt/dig/bin:/usr/bin", "/opt/dig/bin", ':').is_empty());
+
+        // Absent: nothing about it wins because it cannot be reached at all, so every entry is returned and
+        // the caller distinguishes the case with `path_contains`.
+        assert_eq!(
+            entries_before("/usr/bin:/bin", "/opt/dig/bin", ':').len(),
+            2
+        );
+
+        // Trailing separators and duplicates must not defeat the match, or a losing PATH would be reported
+        // as winning.
+        assert!(entries_before("/usr/bin:/opt/dig/bin/", "/opt/dig/bin", ':').len() == 1);
+    }
+
+    // -- #1748: "am I root?", not "was I sudo'd?" --------------------------------    // -- #1748: "am I root?", not "was I sudo'd?" --------------------------------
 
     /// The predicate must answer "am I root, acting for somebody else?" — and it is asserted over its
     /// three INPUTS directly, not through the ambient uid.

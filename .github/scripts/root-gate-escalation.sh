@@ -40,6 +40,54 @@ jq -e '.result.ready == true'  baseline.json || fail "a clean install must be re
 test -x /opt/dig/bin/digs      || fail "the baseline install placed no binary"
 test -L /usr/local/bin/digs    || fail "the baseline install planted no veneer link"
 
+note "ATTEMPT 0 (F1): a link this installer planted is LEFT IN PLACE and the veneer becomes unsafe under it"
+# THE scenario the removal exists for, and the one the gate used to skip: the baseline install above planted
+# `/usr/local/bin/digs -> /opt/dig/bin/digs` while the veneer was safe, then Homebrew arrives (or an admin
+# re-modes the directory) and it is no longer safe. The link is NOT removed by the attacker here — that is
+# the point. It is a live vector she can re-point at will, and only the installer can take it away.
+#
+# The previous version of this gate deleted the link before the run, so no link existed to remove and every
+# assertion about removal was trivially satisfied.
+test -L /usr/local/bin/digs || fail "the baseline must have planted a link for this scenario to mean anything"
+chown "$ATTACKER:$ATTACKER" /usr/local/bin
+chmod 0775 /usr/local/bin
+stat -c '%n %U %a' /usr/local/bin
+echo "the stale link, still present and now inside a directory $ATTACKER owns:"
+ls -l /usr/local/bin/digs
+
+set +e
+"$INSTALLER" "${CLI_ONLY[@]}" --json > attempt0.json 2> attempt0.err
+RC=$?
+set -e
+cat attempt0.err
+echo "installer exit: $RC"
+
+# The removal must actually have happened. This is the assertion that was dead code away from failing.
+if [ -e /usr/local/bin/digs ] || [ -L /usr/local/bin/digs ]; then
+  fail "the stale link SURVIVED a run that measured the veneer unsafe - $ATTACKER re-points it and root runs her binary (F1)"
+fi
+jq -e '(.result.veneer_links_removed | length) > 0' attempt0.json \
+  || fail "the run did not REPORT removing the stale link, so nothing tells an operator it was there (F1)"
+jq -r '.result.veneer_links_removed[]' attempt0.json
+jq -e '.result.reachability == "direct_path_entry"' attempt0.json \
+  || fail "an unsafe veneer must fall back to putting the protected root on PATH"
+if grep -q 'uid=0(root)' attempt0.json attempt0.err; then
+  fail "root EXECUTED something out of the unsafe veneer"
+fi
+echo "stale-link removal verified: the link is gone and the run reported taking it"
+
+note "CONTROL 0: with the veneer repaired, the link comes BACK — removal is posture-driven, not unconditional"
+chown 0:0 /usr/local/bin
+chmod 0755 /usr/local/bin
+"$INSTALLER" "${CLI_ONLY[@]}" --json > control0.json
+test -L /usr/local/bin/digs \
+  || fail "a safe veneer must get the link back - otherwise the removal is just deletion, not a mechanism switch"
+jq -e '.result.reachability == "veneer_links"' control0.json || fail "a safe veneer must use the veneer"
+jq -e '(.result.veneer_links_removed | length) == 0' control0.json \
+  || fail "nothing should be removed when the veneer is safe"
+jq -e '.result.ready == true' control0.json || fail "the repaired install must be ready"
+echo "control verified: safe veneer -> link restored, nothing removed"
+
 note "ATTEMPT 1 (G1): the attacker owns the veneer, replaces the link, and waits for the next install"
 # The documented Homebrew-on-Intel posture: /usr/local/bin owned by a non-root account, group-writable.
 chown "$ATTACKER:$ATTACKER" /usr/local/bin
@@ -71,16 +119,27 @@ fi
 if [ -L /usr/local/bin/digs ] && readlink /usr/local/bin/digs | grep -q '^/opt/dig/bin/'; then
   fail "a DIG link was planted in an attacker-owned veneer - she re-points it and root runs her binary (G1)"
 fi
-# It must report NOT READY, because her file still SHADOWS the install on PATH and we deliberately do not
-# delete it: a regular file in /usr/local/bin may be another package manager's, and vandalising a shared
-# system directory is not this installer's to do. So the operator has to be told, precisely.
-jq -e '.result.ready == false' attempt1.json   || fail "an install shadowed by a file in an unsafe veneer reported READY, so nothing tells the operator"
-jq -r '.result.failures[]' attempt1.json > a1-failures.txt
-grep -qi 'shadow' a1-failures.txt   || fail "the failure must name the SHADOWING, which is what an operator has to repair: $(cat a1-failures.txt)"
-# And it must have chosen the fallback mechanism rather than the veneer.
+# It must have chosen the fallback mechanism rather than the veneer.
 jq -e '.result.reachability == "direct_path_entry"' attempt1.json   || fail "an unsafe veneer must fall back to putting the protected root on PATH directly"
-# The escalation itself never completed: root did not run her code, which the marker checks above prove.
-echo "fallback verified: no DIG link planted, mechanism=direct_path_entry, install reported NOT ready"
+
+# THE property, and the one the append-vs-prepend fix makes achievable: root's own login shell must resolve
+# DIG commands to OUR binary, not to the one she planted earlier on PATH. Her file is deliberately NOT
+# deleted (a regular file in /usr/local/bin may be another package manager's), so the only way to win is to
+# come FIRST. This is checked in a real login shell, which is what reads the fragment.
+resolved="$(su - root -c 'command -v digs' 2>/dev/null || true)"
+echo "root resolves digs to: ${resolved:-nothing}"
+case "$resolved" in
+  /opt/dig/bin/*) ;;
+  *) fail "root resolves digs to [${resolved:-nothing}] - the attacker planted the name earlier on PATH and won (F2)" ;;
+esac
+# And it really is our binary that runs, not merely our path that is printed.
+if ! su - root -c 'digs --version' 2>&1 | grep -q '0\.19\.3'; then
+  fail "root ran something other than the installed digs"
+fi
+# The unsafe veneer is still REPORTED, so an operator is told about a directory they must repair even though
+# the install is usable.
+jq -e '.result.veneer_security.secure == false' attempt1.json   || fail "the unsafe veneer must be reported even when the fallback makes the install usable"
+echo "fallback verified: no DIG link planted, mechanism=direct_path_entry, root resolves digs into the protected root, veneer reported unsafe"
 
 note "CONTROL 1: repair ONLY the veneer's ownership and the same install must succeed"
 chown 0:0 /usr/local/bin

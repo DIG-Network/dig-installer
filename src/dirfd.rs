@@ -189,6 +189,65 @@ pub fn mkdirat(parent: &DirFd, name: &Path, mode: u32, display: &Path) -> Result
     Err(format!("could not create {}: {err}", display.display()))
 }
 
+/// Read the target of the symlink `name` beneath `parent`, relative to that descriptor.
+///
+/// `Ok(None)` means the entry is not a symlink (or does not exist) — an ordinary answer, not an error.
+///
+/// Relative to a DIRECTORY DESCRIPTOR rather than a path, because the caller has already established what
+/// that directory is: a path-based `read_link` re-resolves every component, so an attacker who controls an
+/// ancestor can point the operation at a directory of her choosing between the check and the act (#1748 F5).
+pub fn readlinkat(parent: &DirFd, name: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let c_name = std::ffi::CString::new(name.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains an interior NUL byte", name.display()))?;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `c_name` is NUL-terminated, `parent`'s descriptor is owned and open, and `buf` is sized by
+    // `PATH_MAX` with its length passed explicitly. The return value is checked before `buf` is read.
+    let len = unsafe {
+        libc::readlinkat(
+            parent.raw(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    if len < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            // Not a symlink, or simply absent: both are "nothing for us to remove".
+            Some(libc::EINVAL) | Some(libc::ENOENT) => Ok(None),
+            _ => Err(format!("could not read the link {}: {err}", name.display())),
+        };
+    }
+    buf.truncate(len as usize);
+    Ok(Some(std::path::PathBuf::from(
+        std::ffi::OsString::from_vec(buf),
+    )))
+}
+
+/// Unlink the entry `name` beneath `parent`, relative to that descriptor.
+///
+/// `unlink(2)` never follows a symlink at the final component, so this removes the LINK and never its target
+/// — but the DIRECTORY is still resolved from the descriptor rather than a path, so the entry removed is
+/// provably inside the directory the caller verified.
+pub fn unlinkat(parent: &DirFd, name: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_name = std::ffi::CString::new(name.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains an interior NUL byte", name.display()))?;
+    // SAFETY: as above; `unlinkat` touches no memory beyond the path it is given.
+    let rc = unsafe { libc::unlinkat(parent.raw(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(format!(
+            "could not remove {}: {}",
+            name.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// `fchmod` the open directory to `mode`, through the descriptor — never by path.
 pub fn fchmod(fd: &DirFd, mode: u32, path: &Path) -> Result<(), String> {
     // SAFETY: the descriptor is owned and open; `fchmod` takes it by value and touches no memory.

@@ -19,12 +19,6 @@
 //! hijack for an elevated install. dig-dns itself spawns the OS resolver tools
 //! (`powershell`, `resolvectl`, `dscacheutil`, …) by absolute path.
 
-// `Command::new` is denied crate-wide so an unguarded spawn of an INSTALLED binary cannot compile
-// (`clippy.toml`, #1748 WU4). The spawns in this module are either trusted SYSTEM tools resolved from a
-// fixed directory list (`SPEC.md` §7.6 — a different invariant with its own tests in `elevation`), test
-// fixtures, or the guarded wrapper itself.
-#![allow(clippy::disallowed_methods)]
-
 use std::path::Path;
 
 use serde::Deserialize;
