@@ -32,15 +32,22 @@ fail=0
 # awk also lets each extractor say what it did NOT find, instead of silently yielding an empty string
 # that would then be compared as if it were a version.
 
+# Every extractor strips a trailing CR first, because BOTH `Cargo.lock`s in this repo are stored with
+# CRLF line endings. The old `grep -m1 | sed` pipeline tolerated that by accident — `grep` matched a
+# prefix and `sed` captured between quotes, so the stray `\r` fell outside the capture. An extractor
+# that compares a WHOLE line does not get that for free, and the first version of this rewrite failed
+# in CI with "no [[package]] 'dig-installer'" for exactly that reason. `sub(/\r$/, "")` as a leading
+# rule is portable to mawk (Ubuntu's default awk), unlike a regex `RS`.
+
 # Print the first `version = "X"` line (TOML).
 toml_version() {
-  awk -F'"' '/^version = / { print $2; found=1; exit } END { if (!found) exit 3 }' "$1" \
+  awk -F'"' '{ sub(/\r$/, "") } /^version = / { print $2; found=1; exit } END { if (!found) exit 3 }' "$1" \
     || { echo "check-version-agreement: no top-level 'version =' in $1" >&2; return 1; }
 }
 
 # Print the first top-level `"version": "X"` (JSON, 2-space indent).
 json_top_version() {
-  awk -F'"' '/^  "version": / { print $4; found=1; exit } END { if (!found) exit 3 }' "$1" \
+  awk -F'"' '{ sub(/\r$/, "") } /^  "version": / { print $4; found=1; exit } END { if (!found) exit 3 }' "$1" \
     || { echo "check-version-agreement: no top-level '\"version\":' in $1" >&2; return 1; }
 }
 
@@ -48,6 +55,7 @@ json_top_version() {
 # follows the crate's `name = "..."` line in its [[package]] block). ---
 locked_crate_version() { # $1=Cargo.lock  $2=crate-name
   awk -v want="name = \"$2\"" -F'"' '
+      { sub(/\r$/, "") }
       $0 == want { in_pkg = 1; next }
       in_pkg && /^version = / { print $2; found = 1; exit }
       END { if (!found) exit 3 }
