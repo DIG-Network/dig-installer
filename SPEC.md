@@ -359,10 +359,20 @@ root that a user invokes by name, excluding `dig-updater`/`dig-updater-worker` (
 a user never does, so they stay off `PATH`). It is keyed on the directory the binary actually landed in,
 so an unelevated or `--bin-dir` install plants no links — that placement is wired onto `PATH` directly.
 
-`secure::verify_install_root` rejects a privileged root that is group/other-writable or not root-owned.
-The directory a run's binaries were PLACED in is additionally verified and REPORTED whenever it differs
-from the privileged root (`InstallReport::bin_dir_security`, §7.5) — a report, not a gate, because a
-user-writable directory holding binaries only that same user runs is their own authority.
+`secure::verify_install_root` rejects a privileged root that is group/other-writable or not root-owned,
+checking EVERY level of its path (§7.5). The directory a run's binaries were PLACED in is additionally
+verified and reported (`InstallReport::bin_dir_security`): **FATAL under elevation**, because root wrote
+those binaries and root-side execs and services resolve them, and a REPORT otherwise, because a
+directory holding binaries only that same user runs is their own authority.
+
+**A system-wide `PATH` fragment MUST append, MUST be refused for an unsafe directory, and MUST be
+removed on uninstall.** `/etc/profile.d/dig-path.sh` and `/etc/paths.d/dig` are read by every LOGIN shell
+of every account, root's included. A PREPEND therefore lets whatever the directory contains win the
+resolution of every bare command name machine-wide — executed: `--bin-dir /home/alice/digbin` put alice's
+directory in front of root's `PATH`, and `sh -lc 'ls'` ran alice's `ls` as uid 0. So the entry is
+APPENDED; an elevated run verifies the directory (§7.5) and REFUSES to write the fragment at all when it
+is group/other-writable, before writing rather than after; and uninstall removes the fragment as its own
+reported step, since it is machine-wide state in `/etc` that no binary residue scan would ever find.
 
 **PATH wiring is verified, not assumed.** An elevated install MUST NOT wire `PATH` through dotfiles
 (the only dotfiles it can see are root's). It instead:
@@ -390,9 +400,17 @@ into an untraversable directory resolves by name and then fails to execute.
 Every required CLI MUST be verified to resolve, by bare name, on the target user's own login `PATH`,
 to the copy the run placed. A binary with a command-line surface MUST additionally be RUN
 (`--version`). A **GUI application** (`dig-app`) MUST NOT be probed with `--version` — it has no
-command-line surface and on macOS the probe never returns — so resolution alone proves it; its ability
-to start is proven by the autostart registration. Every `--version` probe MUST be bounded by a
-deadline and the child killed on overrun: no single binary may hang an install.
+command-line surface and on macOS the probe never returns — so resolution alone is all that is proven of
+it.
+
+**Its ability to START is NOT proven, and MUST NOT be claimed.** Nothing in this installer enables or
+starts `dig-app`: the autostart step WRITES a unit/agent file and the enable command is printed as advice,
+so a successful registration is entirely consistent with a binary that cannot load. Resolution therefore
+establishes the §1.5 reachability property and nothing more, and a reimplementation MUST NOT treat a
+`resolved` verdict for a GUI application as an executability guarantee.
+
+Every `--version` probe MUST be bounded by a deadline and the child killed on overrun: no single binary
+may hang an install.
 
 The login-shell probe MUST enter a real **login** shell. `su - <user> -c CMD` does not do so on
 BSD/macOS — `su`'s own `-c` takes a login CLASS there, so the command is handed to the shell verbatim
@@ -400,8 +418,13 @@ and no profile is read — therefore the probed command is itself wrapped in `sh
 
 **Protected-root CLIs are linked back onto PATH.** `/opt/dig/bin` is on no shell's default `PATH`, so a
 privileged binary a user is expected to invoke by name (`dig-dns doctor`) MUST be symlinked into
-`UNIX_MACHINE_BIN_DIR` (`paths::needs_machine_bin_link`). Both ends are root-owned `0755`, so
-reachability is added without making a service-executed binary unprivileged-writable.
+`UNIX_MACHINE_BIN_DIR` (`paths::needs_machine_bin_link`). The TARGET is root-owned `0755` by
+construction; the directory holding the LINK is not guaranteed to be (Homebrew on an Intel Mac leaves
+`/usr/local/bin` `<user>:admin 0775` — §1.5), and it does not need to be: replacing a link there changes
+what a USER's shell resolves, which is that account's own privilege level, while every root-side exec and
+every service artifact names the protected target directly. Reachability is added without making a
+service-executed binary unprivileged-writable. This installer creates the veneer directory `0755` if it
+is absent and never re-modes one the distribution already set up.
 `dig-node` and `dig-relay` are linked for the same reason: they live in the protected root because root
 executes them (§1.6), and they are commands a user runs by name.
 `dig-updater`/`dig-updater-worker` MUST NOT be linked — the beacon invokes them, a user never does.
@@ -1446,15 +1469,23 @@ root-owned. This is §4.1a/§4.1c ("the privileged process never execs the user 
 execs a user-writable binary") stated for the library, because the library is what the GUI's root child
 calls into and it execs earlier in the run than the GUI's own `should_exec_verify`.
 
-**It is satisfied PRIMARILY BY PLACEMENT, not by a guard at each exec.** An elevated install places every
-binary in the root-owned protected root (§1.6), so the directory root execs from is not user-writable in
-the first place. This is the load-bearing property, and it is what makes the invariant hold at the exec
-sites no guard covers — `pathcheck::run_version` (the PATH probe) and `dns::doctor`'s two `dig-dns`
-invocations. A reimplementation MUST NOT read this section as "the guard covers every exec": there are at
-least four root-side exec sites, and `secure::root_exec_guard` is applied at two of them.
+**PLACEMENT is the primary defence, and the guard covers EVERY root-side exec.** An elevated install
+places every binary in the root-owned protected root (§1.6), so on the default path the directory root
+execs from is not user-writable in the first place. Placement alone is NOT sufficient, because an
+explicit `--bin-dir` override redirects the whole stack into a directory the invoking user chose — so
+`secure::root_exec_guard` is applied at every root-side exec in the library, all four of them:
 
-The guard is defence in depth for the two surfaces where a `--bin-dir` override can still direct root at
-a directory the invoking user chose:
+1. the version probe (§7.1);
+2. every privileged delegation (`service::run_capturing`);
+3. `pathcheck::run_version`'s direct-exec branch — reached when there is no account to drop to (a
+   root-shell install, or the macOS GUI's `osascript` child, §1.5a);
+4. `dns::doctor`'s two `dig-dns` invocations.
+
+The set is closed and test-locked: a fifth root-side exec added without the guard MUST fail the suite.
+Earlier revisions of this section claimed placement covered (3) and (4); it does not under an override,
+and a normative claim the code does not satisfy tells a reimplementation to reproduce the gap.
+
+The first two are detailed because they degrade differently:
 
 1. **the version probe (§7.1).** `update::detect_installed_version` RUNS `<dest> --version`, as root,
    for every component, BEFORE anything is downloaded or written. When the guard refuses, the probe is
@@ -1495,6 +1526,25 @@ links resolve into them, and root-side execs and services run them, so a group/o
 is an escalation. Unelevated, a user-writable directory holding binaries only that same user runs is
 their own authority, and failing on it would refuse every ordinary per-user install and every Homebrew
 Mac.
+
+**The privileged install root is a CHAIN, and EVERY level of it is normative.** Creating `/opt/dig/bin`
+with a recursive `mkdir -p` and pinning only that leaf leaves the PARENT at the process umask — measured
+`0755` at `umask 022`, `0775` at `002`, `0777` at `000`, all reporting a ready install. Write permission
+on `/opt/dig` is permission to rename `/opt/dig/bin` aside and substitute an attacker-owned directory of
+the same name, so every service `ExecStart=/opt/dig/bin/…`, every veneer symlink and the root-run beacon
+then resolve to planted binaries, with no race. Therefore:
+
+- **every DIG-owned level** (`/opt/dig` and below) MUST be created individually, root-owned, mode `0755`
+  — never implicitly at the umask by a deeper call. Levels the distribution owns (`/opt`) MUST NOT be
+  re-moded; they are verified, not changed.
+- **verification MUST cover every level from `/` down**, including the levels DIG does not own, and MUST
+  read each through an `O_NOFOLLOW|O_DIRECTORY` DESCRIPTOR (`fstat`), never a path `stat`. A path-based
+  check FOLLOWS symlinks — `--bin-dir /home/alice/bin` where `~/bin` links to `/etc` reported the root
+  secure while describing `/etc` — and re-resolves between check and use.
+- **the chain MUST be REPAIRED on every run**, not merely created correctly when absent. A machine that
+  installed an earlier version under a permissive umask already has a group- or world-writable level, and
+  an install that only refrains from making it worse leaves the escalation in place while reporting
+  success.
 
 **The protected root's mode MUST be `0755` explicitly, and MUST be enforced on an existing directory.**
 `mkdir` applies the process umask, so an inherited `umask 000` yields a WORLD-WRITABLE protected root —

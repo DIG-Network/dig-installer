@@ -18,6 +18,11 @@ use crate::proc::HideConsole;
 /// signal, not a spawn failure). Errors only if the binary could not be
 /// spawned at all, or its output did not parse as a doctor report.
 pub fn run_doctor(dig_dns_bin: &Path) -> Result<DoctorSummary, String> {
+    // Root runs this, so the containing directory must not be one an unprivileged account can write
+    // (#1748). Placement normally guarantees it — dig-dns is pinned to the protected root — but a
+    // `--bin-dir` override redirects the whole stack, and then only this guard stands between root and
+    // an attacker-supplied binary. Inert unelevated.
+    crate::secure::root_exec_guard(dig_dns_bin)?;
     let output = Command::new(dig_dns_bin)
         .arg("doctor")
         .arg("--json")
@@ -30,6 +35,8 @@ pub fn run_doctor(dig_dns_bin: &Path) -> Result<DoctorSummary, String> {
 /// Run `<dig_dns_bin> pac --json` (no `--port`, so it probes the running
 /// gateway for its actual bound port) and return the parsed PAC info.
 pub fn run_pac(dig_dns_bin: &Path) -> Result<PacInfo, String> {
+    // As in `run_doctor`: root execs this binary, so the directory it lives in is verified first (#1748).
+    crate::secure::root_exec_guard(dig_dns_bin)?;
     let output = Command::new(dig_dns_bin)
         .arg("pac")
         .arg("--json")

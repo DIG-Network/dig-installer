@@ -154,17 +154,25 @@ pub fn parse_acl_write_grants(output: &str) -> Result<(), String> {
 /// `digstore`", §4.1c "NEVER execs a user-writable binary"), and the GUI honours it via
 /// `should_exec_verify`. This is that same rule, enforced in the library the GUI's root child calls into.
 ///
-/// # This guard is NOT the primary defence, and does not cover every exec
+/// # Placement is the primary defence; this guard covers what an override can still redirect
 ///
 /// The invariant is upheld first by PLACEMENT: an elevated install puts every binary in the root-owned
 /// [`crate::paths::protected_bin_dir`], so the directory root execs from is not user-writable at all
-/// (§7.5). That is what covers the exec sites this guard is NOT applied to —
-/// `crate::pathcheck::run_version` and `crate::dns::doctor`'s two `dig-dns` invocations.
+/// (`SPEC.md` §7.5). Placement alone is NOT sufficient, because an explicit `--bin-dir` override
+/// redirects the whole stack to a directory the invoking user chose — so every root-side exec in the
+/// library is gated on this guard as well:
 ///
-/// This guard is defence in depth for the two surfaces a `--bin-dir` override can still aim at a
-/// directory the invoking user chose: the version probe and `crate::service::run_capturing`. Do not
-/// describe it as covering every root-side exec — it does not, and a claim the code fails to satisfy is
-/// worse than no claim.
+/// 1. `crate::update::detect_installed_version` — the `<dest> --version` probe, which runs before
+///    anything is downloaded;
+/// 2. `crate::service::run_capturing` — the `install`/`uninstall` verb delegation;
+/// 3. `crate::pathcheck::run_version`'s direct-exec branch — reached when there is no account to drop
+///    to (a root-shell install, or the macOS GUI's `osascript` child);
+/// 4. `crate::dns::doctor`'s two `dig-dns` invocations.
+///
+/// That list is the whole set, and it is asserted by
+/// `the_root_exec_guard_is_wired_into_every_root_side_exec`. An earlier revision of this comment claimed
+/// placement covered (3) and (4); it did not, and a claim the code fails to satisfy is worse than no
+/// claim.
 ///
 /// Unelevated it is always `Ok`: executing a binary the user themselves can write is not an escalation,
 /// it is their own authority. An INDETERMINATE permission read (`checked: false`) is also `Ok` — the
@@ -677,9 +685,19 @@ mod tests {
     /// existed but was called from neither would pass every behavioural test in this file.
     #[test]
     fn the_root_exec_guard_is_wired_into_every_root_side_exec() {
+        // ALL FOUR root-side exec sites, not a sample. The previous list held two while the doc claimed
+        // "every", and the two it omitted were both live root-exec paths (#1748, F8).
         let sites: &[(&str, &str)] = &[
             ("lib.rs (the --version probe)", include_str!("lib.rs")),
             ("service.rs (run_capturing)", include_str!("service.rs")),
+            (
+                "pathcheck.rs (run_version's direct-exec branch)",
+                include_str!("pathcheck.rs"),
+            ),
+            (
+                "dns/doctor.rs (dig-dns doctor + pac)",
+                include_str!("dns/doctor.rs"),
+            ),
         ];
         for (what, src) in sites {
             let production = src.split("\nmod tests {").next().unwrap_or("");
@@ -694,6 +712,13 @@ mod tests {
                  no-root-exec-of-a-user-writable-binary invariant would be unenforced there"
             );
         }
+        // Every KNOWN root-side exec is listed above; this asserts the list has not silently shrunk, so
+        // dropping a site from it fails rather than quietly narrowing the claim.
+        assert_eq!(
+            sites.len(),
+            4,
+            "the guard's doc comment enumerates four root-side exec sites — keep them in step"
+        );
         // Truthful control: the needle is one that WOULD be found if present.
         assert!("fn x(){ secure::root_exec_guard(p) }".contains("root_exec_guard"));
     }

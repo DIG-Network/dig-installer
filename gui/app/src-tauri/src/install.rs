@@ -246,8 +246,11 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     // Phase 6) by this process, so it is routed through the SAME protected-root
     // placement the CLI installer uses (`InstallPlan::bin_dir_for`): the
     // admin-only `%ProgramFiles%\DIG\bin` on Windows (the #565 "whole Windows
-    // stack in Program Files" invariant), the elevation-free per-user
-    // `~/.dig/bin` on unix (where digstore runs AS the user — not an escalation).
+    // stack in Program Files" invariant); on unix the root-owned `/opt/dig/bin`
+    // when the run is ELEVATED and the elevation-free per-user `~/.dig/bin` when it
+    // is not (#1748 — an elevated run must not write to, or exec from, a directory a
+    // non-root account can modify; unelevated, digstore runs AS the user, which is
+    // not an escalation).
     // The user's chosen `install_dir` still receives the NON-executable install
     // artifacts (completions, example store, the .dig icon) — data this process
     // never executes, so no escalation window exists there. The user runs
@@ -1127,9 +1130,12 @@ pub fn run_elevated_privileged_install_from_file(plan_path: &Path) -> Result<(),
 /// lands in the protected root that write is a privileged operation and the run
 /// MUST elevate first (a digstore-only Windows GUI run elevates too, matching the
 /// CLI installer's #565 behaviour). True on Windows (the whole stack lives in
-/// `%ProgramFiles%\DIG\bin`), false on unix (digstore is a user-run CLI in
-/// `~/.dig/bin`, executed as the user — not an escalation). Pure, so every OS
-/// branch is asserted directly.
+/// `%ProgramFiles%\DIG\bin`), false on unix — where digstore is not a PRIVILEGED
+/// component, so it follows the plan's bin dir: the root-owned protected root when
+/// the run is elevated, `~/.dig/bin` when it is not (#1748). An elevated unix run
+/// therefore does write digstore into the protected root, but by the plan's own
+/// placement rather than by the privileged-component classification this predicate
+/// reports on. Pure, so every OS branch is asserted directly.
 fn places_digstore_in_protected_root(os: Os) -> bool {
     dig_installer::paths::is_privileged_component(os, "digstore")
 }
@@ -1140,9 +1146,10 @@ fn places_digstore_in_protected_root(os: Os) -> bool {
 /// This MUST come from the vetted #565 routing ([`InstallPlan::bin_dir_for`]),
 /// NEVER an ad-hoc user-writable path, so a future elevated (root) run never
 /// write-then-execs a binary a lower-privileged process could swap. On Windows
-/// that is the admin-only protected root (`%ProgramFiles%\DIG\bin`); on unix it
-/// is the elevation-free per-user `~/.dig/bin` (digstore runs AS the user — not
-/// an escalation). An unresolved OS falls back to the library default bin dir
+/// that is the admin-only protected root (`%ProgramFiles%\DIG\bin`); on unix it is
+/// the root-owned protected root when the run is elevated and the elevation-free
+/// per-user `~/.dig/bin` when it is not (#1748). An unresolved OS falls back to the
+/// library default bin dir
 /// (which is the protected root on Windows) — never a bespoke directory.
 ///
 /// Extracted as a pure fn so the routing is test-locked: a revert to a
@@ -1166,7 +1173,12 @@ fn digstore_write_exec_dir(plan: &dig_installer::InstallPlan, os: Option<Os>) ->
 /// binary sits in the protected root (root-owned, not user-writable, so
 /// unswappable by a lower-privileged process). Otherwise it is DEFERRED to the
 /// unelevated GUI (a future root child returns, and the GUI verifies) — the root
-/// child never execs `~/.dig/bin/digstore`.
+/// child never execs a binary from a directory the invoking user can write.
+///
+/// Since #1748 an elevated unix run places digstore in the protected root, so this
+/// predicate PERMITS the exec-verify there rather than deferring it. The deferral
+/// remains load-bearing for a `--bin-dir` override, which can still aim an elevated
+/// run at a user-writable directory.
 fn should_exec_verify(elevated: bool, bin_in_protected_root: bool) -> bool {
     !elevated || bin_in_protected_root
 }
@@ -1785,8 +1797,9 @@ mod plan_from_selection_tests {
 
     // #610: digstore's protected-root placement drives elevation. On Windows it
     // lands in Program Files (privileged write) → a digstore-only GUI run must
-    // elevate too; on unix it is a user-run CLI in ~/.dig/bin → no elevation from
-    // digstore alone. `super::places_digstore_in_protected_root` is the pure
+    // elevate too; on unix digstore is not a privileged COMPONENT, so it alone forces
+    // no elevation (an already-elevated unix run still places it in the protected root,
+    // #1748). `super::places_digstore_in_protected_root` is the pure
     // predicate `run()` ORs into its elevation decision.
     #[test]
     fn digstore_placement_requires_elevation_only_on_windows() {
@@ -1798,8 +1811,9 @@ mod plan_from_selection_tests {
         assert!(!super::places_digstore_in_protected_root(Os::MacOs));
     }
 
-    // #610: on unix the GUI digstore CLI stays in the elevation-free per-user
-    // root (executed AS the user, so not an escalation) — matching the CLI.
+    // #610: on unix the GUI digstore CLI follows `default_bin_dir()` — the
+    // elevation-free per-user root when unelevated, the root-owned protected root when
+    // elevated (#1748) — matching the CLI installer rather than choosing its own dir.
     #[test]
     fn gui_places_digstore_in_the_user_root_on_unix() {
         let plan = plan_from_selection(&HashMap::new());
@@ -1807,7 +1821,7 @@ mod plan_from_selection_tests {
             assert_eq!(
                 plan.bin_dir_for("digstore", os),
                 paths::default_bin_dir(),
-                "unix digstore is a user-run CLI in ~/.dig/bin, not the protected root"
+                "unix digstore follows the plan's bin dir, not the privileged-component root"
             );
         }
     }

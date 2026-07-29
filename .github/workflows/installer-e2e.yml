@@ -672,12 +672,31 @@ jobs:
               *) echo "FAIL: $cli link does not resolve into the protected root"; exit 1 ;;
             esac
           done
-          # The protected root must not be user-writable, and must be traversable
-          # so the links above are usable.
-          stat -c '%U %a /opt/dig/bin' /opt/dig/bin
-          test "$(stat -c '%U' /opt/dig/bin)" = root
-          test -z "$(find /opt/dig/bin -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
-            || { echo "FAIL: the protected root is group- or world-writable"; exit 1; }
+          # EVERY LEVEL of the chain, not just the leaf. Write permission on /opt/dig is
+          # permission to rename /opt/dig/bin aside and substitute an attacker-owned
+          # directory of the same name, so a 0777 parent is a complete escalation on its
+          # own -- and checking only the leaf is what shipped.
+          for level in /opt /opt/dig /opt/dig/bin; do
+            stat -c '%n %U %a' "$level"
+            test "$(stat -c '%U' "$level")" = root \
+              || { echo "FAIL: $level is not root-owned"; exit 1; }
+            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+              || { echo "FAIL: $level is group- or world-writable"; exit 1; }
+          done
+
+          # And the REPAIR path: a pre-existing permissive level must be FIXED by an
+          # install, not merely left alone. A box that installed 0.30.0 under umask 000
+          # already has one, and 0.31.0 routes every binary and every service ExecStart
+          # through it. umask 000 is set for the re-run, so a fix that only pins newly
+          # created directories fails here too.
+          sudo chmod 0777 /opt/dig
+          test "$(stat -c '%a' /opt/dig)" = 777
+          sudo -H sh -c 'umask 000; ./target/release/dig-installer \
+            --no-dig-node --no-dig-dns --no-auto-update --no-dig-app --json' > repaired.json
+          stat -c '%n %U %a' /opt/dig
+          test -z "$(find /opt/dig -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+            || { echo "FAIL: a permissive /opt/dig was NOT repaired by the install"; exit 1; }
+          jq -e '.result.ready == true' repaired.json
 
       # The DEFAULT selection — every component, dig-app included — must obey the
       # same placement rule. Run as a dry-run so the full default set is covered
@@ -687,7 +706,15 @@ jobs:
         run: |
           sudo -H ./target/release/dig-installer --dry-run --json > planned.json
           jq -r '.result.components[] | "\(.component) -> \(.dest)"' planned.json
-          jq -e '(.result.components | length) > 2' planned.json
+          # An EXACT count plus explicit membership: "> 2" stayed green if a plan
+          # regression silently dropped dig-app (or anything else) from the default set.
+          jq -e '(.result.components | length) == 9' planned.json \
+            || { echo "FAIL: the default component set changed -- update this count deliberately"; \
+                 jq -r '.result.components | length' planned.json; exit 1; }
+          for want in dig-store digs dig-node dign dig-app dig-dns digd dig-updater dig-updater-worker; do
+            jq -e --arg c "$want" 'any(.result.components[]; .component == $c)' planned.json \
+              || { echo "FAIL: $want is missing from the DEFAULT plan"; exit 1; }
+          done
           jq -e 'all(.result.components[]; .dest | startswith("/opt/dig/bin/"))' planned.json \
             || { echo "FAIL: the default plan places a binary outside the protected root"; exit 1; }
 

@@ -40,7 +40,8 @@ The dig-relay (advanced, run-your-own-relay) and the DIG Browser stay OPT-IN (--
 contract (incl. the exit-code table)."
 )]
 struct Cli {
-    /// Directory to install the binaries into (default: per-user DIG bin dir).
+    /// Directory to install the binaries into (default: the root-owned protected root when elevated,
+    /// otherwise the per-user DIG bin dir).
     #[arg(long, value_name = "DIR")]
     bin_dir: Option<std::path::PathBuf>,
 
