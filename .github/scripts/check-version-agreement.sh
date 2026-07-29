@@ -19,15 +19,40 @@ set -euo pipefail
 
 fail=0
 
-# Print the first `version = "X"` line (TOML) after an optional anchor line.
-toml_version() { grep -m1 '^version = ' "$1" | sed -E 's/.*"([^"]+)".*/\1/'; }
+# Every extractor below is a SINGLE awk process, deliberately — NOT a `grep -m1 | sed` pipeline.
+#
+# Under this script's own `set -euo pipefail`, `grep -m1` exits at its first match and SIGPIPEs
+# whatever is upstream of it, so the pipeline yields 141, the command substitution fails, and `-e`
+# aborts the script. Because these run BEFORE the first `echo`, the failure produced no output at all
+# — a 15ms exit 1 that reads like a broken script rather than a flake. And it IS a flake: whether the
+# upstream finishes writing before the downstream exits is a race, so it passed locally and
+# intermittently in CI. (Same class as the three `grep -q` SIGPIPE sites fixed in #1748 round 9;
+# swept ecosystem-wide as dig_ecosystem#1813.)
+#
+# awk also lets each extractor say what it did NOT find, instead of silently yielding an empty string
+# that would then be compared as if it were a version.
+
+# Print the first `version = "X"` line (TOML).
+toml_version() {
+  awk -F'"' '/^version = / { print $2; found=1; exit } END { if (!found) exit 3 }' "$1" \
+    || { echo "check-version-agreement: no top-level 'version =' in $1" >&2; return 1; }
+}
+
 # Print the first top-level `"version": "X"` (JSON, 2-space indent).
-json_top_version() { grep -m1 '^  "version": ' "$1" | sed -E 's/.*"([^"]+)".*/\1/'; }
+json_top_version() {
+  awk -F'"' '/^  "version": / { print $4; found=1; exit } END { if (!found) exit 3 }' "$1" \
+    || { echo "check-version-agreement: no top-level '\"version\":' in $1" >&2; return 1; }
+}
 
 # --- extract the locked crate version (the `version` line that immediately
 # follows the crate's `name = "..."` line in its [[package]] block). ---
 locked_crate_version() { # $1=Cargo.lock  $2=crate-name
-  grep -A2 "^name = \"$2\"\$" "$1" | grep -m1 '^version = ' | sed -E 's/.*"([^"]+)".*/\1/'
+  awk -v want="name = \"$2\"" -F'"' '
+      $0 == want { in_pkg = 1; next }
+      in_pkg && /^version = / { print $2; found = 1; exit }
+      END { if (!found) exit 3 }
+    ' "$1" \
+    || { echo "check-version-agreement: no [[package]] '$2' with a version in $1" >&2; return 1; }
 }
 
 check_track() { # $1=track-name ; remaining args = "label=value" pairs
