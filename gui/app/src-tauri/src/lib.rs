@@ -169,13 +169,27 @@ enum WebviewDataDir {
 /// Decide the folder from the token we are running under.
 ///
 /// Pure and injected rather than reading the ambient token itself, so both arms are testable — the
-/// crate's own convention for an elevation-dependent decision (cf. `install::should_exec_verify`).
+/// crate's own convention for a token-dependent decision (cf. `install::should_exec_verify`).
 ///
-/// The direction is what matters: pinning to the machine root is what an ELEVATED or SYSTEM token
-/// needs, and it is exactly wrong for an unelevated one, whose `Administrators` group is deny-only.
+/// # The criterion is SYSTEM, *not* elevation (#1819)
+///
+/// This is the correction that actually fixed #1819. #715's rationale was specifically about
+/// **LocalSystem**: as SYSTEM, `%LOCALAPPDATA%` is
+/// `C:\Windows\system32\config\systemprofile\AppData\Local`, which WebView2 cannot create. The code
+/// generalised that to *any* elevated token — and on Windows the GUI carries
+/// `requestedExecutionLevel="requireAdministrator"` (#610), so it is **always** elevated. An
+/// elevation-keyed condition is therefore always true and always pins the machine root, which is why
+/// two rounds of "only pin when elevated" changed nothing at all.
+///
+/// UAC elevation does **not** change the profile: an elevated interactive user still has their own
+/// `%LOCALAPPDATA%`, which is precisely where WebView2 wants to be and where every other elevated
+/// WebView2 application puts its profile. Only a genuine SYSTEM token has no usable profile — and
+/// SYSTEM is a configuration `install.rs` refuses outright (#499).
+///
+/// So: SYSTEM takes the machine root; everything else, elevated or not, is left alone.
 #[cfg(windows)]
-fn webview_data_dir_for(elevated: bool, system: bool) -> WebviewDataDir {
-    if elevated || system {
+fn webview_data_dir_for(running_as_system: bool) -> WebviewDataDir {
+    if running_as_system {
         WebviewDataDir::MachineRoot
     } else {
         WebviewDataDir::OwnProfile
@@ -191,38 +205,38 @@ fn webview_data_dir_for(elevated: bool, system: bool) -> WebviewDataDir {
 /// with "couldn't create the data directory" before the UI loads. WebView2 reads
 /// `WEBVIEW2_USER_DATA_FOLDER` at init, so setting it here (before `tauri::Builder::run`) fixes that.
 ///
-/// # Why this is CONDITIONAL, and why it was a defect that it wasn't (#1819)
+/// # Why this is CONDITIONAL, and why the first two attempts at that failed (#1819)
 ///
-/// This used to pin the machine root **unconditionally**. The machine root is deliberately
-/// `{SYSTEM:F, Administrators:F}`, protected and non-inheriting — load-bearing for #565, and NOT to be
-/// widened. So an **unelevated** GUI, whose `Administrators` group is deny-only in its token, could not
-/// create `…\installer\webview\EBWebView` and WebView2 refused to start:
+/// This used to pin the machine root **unconditionally**, and WebView2 refused to start:
 ///
 /// > Microsoft Edge can't read and write to this data directory: `C:\ProgramData\DigNetwork\installer\webview\EBWebView`
 ///
-/// That failure is worse than it first looks, because it happens *before any UI exists*. The GUI's own
-/// elevation gate and its #499 SYSTEM refusal (`install.rs`) are command handlers that run only after
-/// the WebView is up — so a process that cannot start its WebView cannot tell the user **anything**,
-/// including the one thing it wants to say ("re-launch and accept the UAC prompt"). The data folder
-/// must therefore never depend on a privilege the process might not have: an unelevated run gets its
-/// own profile and a working window, and the elevation gate then speaks for itself.
+/// The machine root is deliberately `{SYSTEM:F, Administrators:F}`, protected and non-inheriting —
+/// load-bearing for #565 and NOT to be widened — and it is simply not somewhere a WebView2 profile can
+/// live. Measured: the DACL is correct (both ACEs carry `ContainerInherit, ObjectInherit`, owner
+/// SYSTEM) and `EBWebView` was never created, so the directory was never malformed; it is the wrong
+/// KIND of place.
 ///
-/// Elevated and SYSTEM still take the hardened root through the fail-closed
+/// **Two attempts keyed this on elevation and changed nothing**, because the GUI ships
+/// `requestedExecutionLevel="requireAdministrator"` (#610) — it is *always* elevated, so
+/// `elevated || system` is always true and always pinned. The criterion is SYSTEM alone; see
+/// [`webview_data_dir_for`].
+///
+/// That failure also happens *before any UI exists*. The GUI's elevation gate and its #499 SYSTEM
+/// refusal (`install.rs`) are command handlers that run only once the WebView is up — so a process
+/// that cannot start its WebView cannot tell the user **anything**, including the one thing it wants
+/// to say. A browser profile must never sit somewhere the process may be unable to use.
+///
+/// SYSTEM alone still takes the hardened root through the fail-closed
 /// [`dig_installer::daemon_dir::ensure_webview_data_dir`] (SYSTEM-owned, protected DACL, no
 /// reparse-point redirection) — never a bare `create_dir_all`, which a non-admin could pre-squat or
 /// junction into a path a privileged WebView2 would then write through. If that hardening cannot be
-/// established and verified we FAIL CLOSED rather than pin WebView2 to an unverified dir.
-///
-/// `is_system` is consulted as well as `is_elevated` because it fails CLOSED to "is SYSTEM", which
-/// pushes to the machine root — the safe direction: a SYSTEM token sent to its own profile is the
-/// original #715 crash. No-op off Windows.
+/// established and verified we FAIL CLOSED rather than pin WebView2 to an unverified dir. `is_system`
+/// fails CLOSED to "is SYSTEM", which is the safe direction here. No-op off Windows.
 #[cfg(windows)]
 fn pin_webview_data_dir() {
     // Ambient reads at the edge; the decision is the pure function above.
-    let target = webview_data_dir_for(
-        dig_installer::elevation::is_elevated(),
-        dig_installer::elevation::is_system(),
-    );
+    let target = webview_data_dir_for(dig_installer::elevation::is_system());
     if target == WebviewDataDir::OwnProfile {
         // Leave WEBVIEW2_USER_DATA_FOLDER unset: WebView2's default is already correct and writable.
         return;
@@ -268,52 +282,33 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    /// The direction is the whole point: an unelevated token must get its OWN profile.
+    /// An ordinary run — INCLUDING an elevated one — must be left on its own profile.
     ///
-    /// This is the #1819 regression. Pinning the machine root unconditionally meant an unelevated GUI
-    /// could not create `EBWebView` under a `{SYSTEM:F, Administrators:F}` directory, so WebView2
-    /// refused to start and the process died before it could render the very message telling the user
-    /// to re-launch elevated. Inverting this predicate reintroduces exactly that.
+    /// This is the #1819 regression, and the reason two earlier attempts missed it: the GUI carries
+    /// `requireAdministrator`, so it is ALWAYS elevated, and an elevation-keyed condition is always
+    /// true. Keying on elevation here would make this test unreachable in production while still
+    /// passing, which is the worst kind of green.
     #[test]
-    fn an_unelevated_process_uses_its_own_profile() {
-        assert_eq!(
-            webview_data_dir_for(false, false),
-            WebviewDataDir::OwnProfile
-        );
+    fn an_interactive_user_elevated_or_not_uses_its_own_profile() {
+        assert_eq!(webview_data_dir_for(false), WebviewDataDir::OwnProfile);
     }
 
-    /// ...and the control: a privileged token must NOT be sent to its own profile, because as SYSTEM
-    /// that is `…\systemprofile\AppData\Local`, which WebView2 cannot create (#715, the defect the
-    /// original pin existed to fix). Without this arm, "always use the own profile" would pass the
-    /// test above and regress #715.
+    /// ...and the control: a SYSTEM token has no usable profile (`…\systemprofile\AppData\Local`,
+    /// which WebView2 cannot create), so it must take the hardened machine root. Without this arm,
+    /// "never pin" would satisfy the test above and regress #715.
     #[test]
-    fn an_elevated_or_system_process_uses_the_hardened_machine_root() {
-        assert_eq!(
-            webview_data_dir_for(true, false),
-            WebviewDataDir::MachineRoot,
-            "elevated"
-        );
-        assert_eq!(
-            webview_data_dir_for(false, true),
-            WebviewDataDir::MachineRoot,
-            "SYSTEM"
-        );
-        assert_eq!(
-            webview_data_dir_for(true, true),
-            WebviewDataDir::MachineRoot,
-            "elevated AND SYSTEM"
-        );
+    fn a_system_token_takes_the_hardened_machine_root() {
+        assert_eq!(webview_data_dir_for(true), WebviewDataDir::MachineRoot);
     }
 
-    /// `is_system` fails CLOSED to "is SYSTEM" when the identity cannot be determined, so a SYSTEM
-    /// result must be sufficient on its own — never require BOTH signals, or an indeterminate identity
-    /// would be routed to a profile WebView2 cannot use.
+    /// The two outcomes must stay distinct. A refactor that collapsed them — returning one variant
+    /// unconditionally — would pass exactly one of the tests above, so pin the pair.
     #[test]
-    fn a_system_result_alone_is_enough_to_take_the_machine_root() {
+    fn the_two_tokens_do_not_get_the_same_folder() {
         assert_ne!(
-            webview_data_dir_for(false, true),
-            WebviewDataDir::OwnProfile,
-            "SYSTEM alone must not fall through to the own-profile branch"
+            webview_data_dir_for(true),
+            webview_data_dir_for(false),
+            "SYSTEM and an interactive user must not share a WebView2 profile decision"
         );
     }
 }
