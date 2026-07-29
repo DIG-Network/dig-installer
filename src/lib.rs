@@ -74,6 +74,7 @@ pub mod rootchain;
 pub mod scheme;
 pub mod secure;
 pub mod service;
+pub mod sources;
 pub mod svc;
 pub mod target;
 pub mod uninstall;

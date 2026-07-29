@@ -231,6 +231,14 @@ pub fn decide_with_force(
 /// probe instead of spawning a real process (mirrors
 /// `service::stop_running_dig_node_with`'s injectable "is serving" pattern).
 fn spawn_version_probe(bin_path: &Path) -> Option<String> {
+    // Guarded AT THE SPAWN, not only in the caller. `detect_installed_version` checks first so it can
+    // report WHY it skipped the probe, and that message is worth keeping — but a guard one call frame
+    // away from the exec is a guard the next caller of this helper will not inherit. Refusal here is
+    // `None`, which §7.1 already resolves to "version undetectable" → reinstall, so the install proceeds
+    // safely (#1748).
+    if crate::secure::root_exec_guard(bin_path).is_err() {
+        return None;
+    }
     let out = Command::new(bin_path)
         .arg("--version")
         .hide_console()

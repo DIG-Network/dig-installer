@@ -676,51 +676,169 @@ mod tests {
 
     // -- #1748 F1: root must never EXECUTE a binary out of a user-writable directory ----
 
-    /// The guard is only worth anything if it is WIRED IN, and its behavioural tests need root — so the
-    /// wiring itself is pinned here, mechanically, where it gates in CI on every platform.
+    /// Every root-side exec of an INSTALLER-PLACED binary must call [`root_exec_guard`] — and the site
+    /// list is DERIVED from the source, never written down.
     ///
-    /// Both root-side exec surfaces are covered: the version probe, which runs a component binary
-    /// before anything is downloaded, and `service::run_capturing`, the single choke point for every
-    /// privileged delegation (dig-node/dig-relay `install`, dig-updater `schedule`). A guard that
-    /// existed but was called from neither would pass every behavioural test in this file.
+    /// # Why a hardcoded list is not acceptable here
+    ///
+    /// The previous version of this test named four files and asserted `sites.len() == 4` under the
+    /// comment "Every KNOWN root-side exec is listed above". A FIFTH site
+    /// (`dns::os_config::run_os_config`, reached on the default plan, on all three OSes, on install AND
+    /// uninstall) was absent from the list, so the count made the omission invisible — and it was proved
+    /// to root code execution. A hardcoded count can only ever confirm the author's own belief about the
+    /// codebase.
+    ///
+    /// It was also satisfiable by a MENTION: the check was `file.contains("root_exec_guard")`, so a
+    /// surviving rustdoc link kept it green with the real call deleted, and a file with two guarded execs
+    /// could silently lose one.
+    ///
+    /// So this walks every `src/**/*.rs` file, strips comments, finds each `Command::new(<binary>)` whose
+    /// argument is a PATH-like binding rather than a trusted system tool, and requires a
+    /// `root_exec_guard(` CALL inside the enclosing function. It is self-checking: it fails if it stops
+    /// finding the sites it is supposed to police.
     #[test]
-    fn the_root_exec_guard_is_wired_into_every_root_side_exec() {
-        // ALL FOUR root-side exec sites, not a sample. The previous list held two while the doc claimed
-        // "every", and the two it omitted were both live root-exec paths (#1748, F8).
-        let sites: &[(&str, &str)] = &[
-            ("lib.rs (the --version probe)", include_str!("lib.rs")),
-            ("service.rs (run_capturing)", include_str!("service.rs")),
-            (
-                "pathcheck.rs (run_version's direct-exec branch)",
-                include_str!("pathcheck.rs"),
-            ),
-            (
-                "dns/doctor.rs (dig-dns doctor + pac)",
-                include_str!("dns/doctor.rs"),
-            ),
-        ];
-        for (what, src) in sites {
-            let production = src.split("\nmod tests {").next().unwrap_or("");
+    fn every_root_side_exec_of_an_installed_binary_is_guarded() {
+        let sources = crate::sources::all();
+        let mut checked = Vec::new();
+        for (file, src) in &sources {
+            for (function, body) in production_functions(src) {
+                if !spawns_an_installed_binary(&body) {
+                    continue;
+                }
+                checked.push(format!("{file}::{function}"));
+                assert!(
+                    body.contains("root_exec_guard("),
+                    "{file}::{function} executes an installer-placed binary but never CALLS \
+                     secure::root_exec_guard - root would run a binary out of whatever directory it \
+                     was handed, which under a --bin-dir override can be one an unprivileged account \
+                     writes (#1748). Add the guard, or route the spawn through a guarded helper."
+                );
+            }
+        }
+
+        // Self-check: the scan must still SEE the sites it exists to police. A regex that silently
+        // stopped matching would otherwise make this test pass by finding nothing at all — the same
+        // vacuity as the hardcoded count, one level up.
+        for required in [
+            "update.rs::spawn_version_probe",
+            "service.rs::run_capturing",
+            "pathcheck.rs::run_version",
+            "dns/doctor.rs::run_doctor",
+            "dns/doctor.rs::run_pac",
+            "dns/os_config.rs::run_os_config",
+        ] {
             assert!(
-                production.len() > 200,
-                "{what}: the production half came back empty — the mod-tests split has drifted and \
-                 this check would pass vacuously"
-            );
-            assert!(
-                production.contains("root_exec_guard"),
-                "{what} performs a root-side exec but never calls secure::root_exec_guard — the \
-                 no-root-exec-of-a-user-writable-binary invariant would be unenforced there"
+                checked.iter().any(|c| c == required),
+                "the scan no longer detects {required} as a root-side exec, so it is policing less \
+                 than it appears to. Found: {checked:?}"
             );
         }
-        // Every KNOWN root-side exec is listed above; this asserts the list has not silently shrunk, so
-        // dropping a site from it fails rather than quietly narrowing the claim.
-        assert_eq!(
-            sites.len(),
-            4,
-            "the guard's doc comment enumerates four root-side exec sites — keep them in step"
-        );
-        // Truthful control: the needle is one that WOULD be found if present.
-        assert!("fn x(){ secure::root_exec_guard(p) }".contains("root_exec_guard"));
+    }
+
+    /// Does this function body spawn a binary identified by a PATH the installer chose, as opposed to a
+    /// trusted system tool resolved from a fixed directory list (§7.6)?
+    ///
+    /// NOT installer-placed, and so not this invariant's business:
+    ///
+    /// * a string literal (`Command::new("sh")`);
+    /// * a `proc::system_tool(..)` / `elevation::resolve_system_tool(..)` result, inline or via a local
+    ///   binding — that is the trusted-resolution path, which has its own invariant and its own tests
+    ///   (§7.6). `elevation::is_elevated_unix` spawning a resolved `id` is the reference case.
+    ///
+    /// Anything else — a `&Path` parameter, a `PathBuf`, a struct field — is a binary this installer
+    /// placed, and root must not execute it without checking the directory it came from.
+    fn spawns_an_installed_binary(body: &str) -> bool {
+        body.match_indices("Command::new(")
+            .filter_map(|(i, _)| {
+                let rest = &body[i + "Command::new(".len()..];
+                rest.find(')').map(|end| rest[..end].trim().to_string())
+            })
+            .any(|arg| !arg.is_empty() && !is_trusted_tool(body, &arg))
+    }
+
+    /// Is `arg`, as spawned inside `body`, a TRUSTED system tool rather than an installer-placed binary?
+    fn is_trusted_tool(body: &str, arg: &str) -> bool {
+        if arg.starts_with('"') || arg.contains("system_tool") {
+            return true;
+        }
+        // A binding resolved from the trusted directory list, then spawned:
+        //   `let Some(id) = resolve_system_tool("id")` … `Command::new(id)`
+        //   `resolve_system_tool("su").map(|su| Command::new(su))`
+        // Requires BOTH that the function resolves a trusted tool at all, and that the spawned name is
+        // introduced as a binding here — a `&Path` PARAMETER (which is what every real root-side exec
+        // spawns) is neither, so it cannot be laundered by an unrelated `system_tool` call nearby.
+        let name = arg.trim_start_matches('&');
+        if !body.contains("system_tool") {
+            return false;
+        }
+        body.lines().any(|l| {
+            l.contains(&format!("let {name}"))
+                || l.contains(&format!("({name})"))
+                || l.contains(&format!("|{name}|"))
+                || l.contains(&format!("|{name},"))
+        })
+    }
+
+    /// Split `src` into `(function name, body)` pairs for the PRODUCTION half of the file, with comments
+    /// removed.
+    ///
+    /// Comments are stripped because the check must not be satisfiable by a doc-comment mention of the
+    /// guard — that is exactly how the previous version stayed green with the real call deleted. The
+    /// `mod tests` half is excluded because test helpers legitimately spawn fixture scripts by path.
+    fn production_functions(src: &str) -> Vec<(String, String)> {
+        let production = src.split("\nmod tests {").next().unwrap_or("");
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in production.lines() {
+            let code = strip_comment(line);
+            if let Some(name) = function_name(&code) {
+                if let Some(done) = current.take() {
+                    out.push(done);
+                }
+                current = Some((name, String::new()));
+            }
+            if let Some((_, body)) = current.as_mut() {
+                body.push_str(&code);
+                body.push('\n');
+            }
+        }
+        if let Some(done) = current.take() {
+            out.push(done);
+        }
+        out
+    }
+
+    /// The declared name when `code` opens a function, else `None`.
+    fn function_name(code: &str) -> Option<String> {
+        let trimmed = code.trim_start();
+        let rest = trimmed
+            .strip_prefix("pub fn ")
+            .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+            .or_else(|| trimmed.strip_prefix("fn "))?;
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// `line` with any `//` comment removed, ignoring `//` inside a string literal.
+    fn strip_comment(line: &str) -> String {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                    return line[..i].to_string()
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        line.to_string()
     }
 
     /// The exploit, in the shape it actually has: a Homebrew-style `0775` directory holding a binary
