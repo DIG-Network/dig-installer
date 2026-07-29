@@ -64,18 +64,23 @@ fi
 if grep -q 'uid=0(root)' attempt1.json attempt1.err; then
   fail "root EXECUTED the attacker's binary (G1)"
 fi
-# The amplifier: whatever the installer decided, `digs` must NOT still resolve to the attacker's file. A
-# version string SHE chose must not be able to persuade the installer that there is nothing to do.
-resolved="$(readlink -f /usr/local/bin/digs 2>/dev/null || true)"
-echo "digs resolves to: ${resolved:-<nothing>}"
-case "$resolved" in
-  /opt/dig/bin/*) ;;
-  # No apostrophe inside the parameter expansion: a single quote there opens a quote and breaks parsing.
-  *) fail "digs resolves to [${resolved:-nothing}], not into the protected root, so the planted binary is what root runs next (G1 amplifier)" ;;
-esac
-# And an install onto a veneer an unprivileged account owns must not report itself ready: root's own PATH
-# resolves DIG commands there, so she can simply replace the link again.
-jq -e '.result.ready == false' attempt1.json   || fail "an install onto an attacker-owned veneer reported READY, so nothing tells the operator that root's PATH is compromised"
+# The FALLBACK, asserted on what the installer controls.
+#
+# It must NOT plant a DIG symlink into a directory an unprivileged account owns — that is the vector, and it
+# is the one thing here that is entirely ours to decide.
+if [ -L /usr/local/bin/digs ] && readlink /usr/local/bin/digs | grep -q '^/opt/dig/bin/'; then
+  fail "a DIG link was planted in an attacker-owned veneer - she re-points it and root runs her binary (G1)"
+fi
+# It must report NOT READY, because her file still SHADOWS the install on PATH and we deliberately do not
+# delete it: a regular file in /usr/local/bin may be another package manager's, and vandalising a shared
+# system directory is not this installer's to do. So the operator has to be told, precisely.
+jq -e '.result.ready == false' attempt1.json   || fail "an install shadowed by a file in an unsafe veneer reported READY, so nothing tells the operator"
+jq -r '.result.failures[]' attempt1.json > a1-failures.txt
+grep -qi 'shadow' a1-failures.txt   || fail "the failure must name the SHADOWING, which is what an operator has to repair: $(cat a1-failures.txt)"
+# And it must have chosen the fallback mechanism rather than the veneer.
+jq -e '.result.reachability == "direct_path_entry"' attempt1.json   || fail "an unsafe veneer must fall back to putting the protected root on PATH directly"
+# The escalation itself never completed: root did not run her code, which the marker checks above prove.
+echo "fallback verified: no DIG link planted, mechanism=direct_path_entry, install reported NOT ready"
 
 note "CONTROL 1: repair ONLY the veneer's ownership and the same install must succeed"
 chown 0:0 /usr/local/bin
@@ -84,6 +89,16 @@ rm -f /usr/local/bin/digs
 "$INSTALLER" "${CLI_ONLY[@]}" --json > control1.json
 jq -e '.ok == true'           control1.json || fail "the refusal was not about the posture - it refuses regardless, so ATTEMPT 1 proves nothing"
 jq -e '.result.ready == true' control1.json || fail "the repaired install must be ready"
+# The OTHER half of the fallback, and the reason ATTEMPT 1 proves something: with the veneer safe, the link
+# IS planted and the veneer IS the mechanism. Without this, an installer that had simply stopped using the
+# veneer altogether would satisfy ATTEMPT 1 just as well.
+jq -e '.result.reachability == "veneer_links"' control1.json   || fail "a SAFE veneer must still be used - abandoning it gives up the property it was adopted for"
+test -L /usr/local/bin/digs   || fail "a safe veneer must get the symlink back"
+case "$(readlink -f /usr/local/bin/digs)" in
+  /opt/dig/bin/*) ;;
+  *) fail "the restored link must resolve into the protected root" ;;
+esac
+echo "safe-veneer control verified: mechanism=veneer_links, link restored into the protected root"
 
 note "ATTEMPT 2 (G2): the attacker owns the PARENT of the install root and swaps the whole directory"
 # Write permission on /opt/dig is permission to rename /opt/dig/bin aside and substitute an attacker-owned

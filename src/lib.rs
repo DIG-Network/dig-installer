@@ -524,6 +524,20 @@ pub struct InstallReport {
     ///
     /// `None` when no links were planted — an unelevated or `--bin-dir` install, or Windows.
     pub veneer_security: Option<secure::InstallRootSecurity>,
+    /// HOW this run made its CLIs reachable by bare name — symlinks in the `/usr/local/bin` veneer, or the
+    /// install directory placed on `PATH` directly ([`paths::Reachability`]).
+    ///
+    /// Reported because it is a real fork with a security meaning, not an implementation detail: the second
+    /// value on an ELEVATED unix install means the veneer was measured UNSAFE and this run deliberately
+    /// declined to plant a link there. Read it together with [`Self::veneer_security`], which carries the
+    /// verdict that caused the fork. `None` on a dry run.
+    pub reachability: Option<paths::Reachability>,
+    /// Any DIG symlink this run REMOVED from an unsafe veneer.
+    ///
+    /// A link an earlier, safe-at-the-time run planted is a live escalation vector once that directory
+    /// becomes writable — an unprivileged process replaces it and root runs whatever it points at. So the
+    /// fallback removes them, and says which, rather than leaving them for somebody to find.
+    pub veneer_links_removed: Vec<String>,
     /// The record of migrating an existing install off the legacy user-writable
     /// root onto the protected root (#565): services deregistered/re-pointed,
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
@@ -825,6 +839,8 @@ fn run_report_gated(
         install_root_security: None,
         bin_dir_security: None,
         veneer_security: None,
+        reachability: None,
+        veneer_links_removed: Vec::new(),
         migration: None,
         registration_audit: Vec::new(),
         install_manifest: None,
@@ -927,6 +943,41 @@ fn run_report_gated(
             report.components.push(digs);
         }
 
+        // The veneer's posture is measured ONCE, here, before anything is wired or linked, and the same
+        // answer drives both steps (#1748). Measuring twice would let them disagree, and a run that links
+        // into one directory while wiring another leaves the CLIs unreachable — which is this whole issue.
+        //
+        // The verdict is recorded either way. It is FATAL only when the veneer is actually the mechanism in
+        // play (`evaluate_readiness`): when we fall back it is a recorded DOWNGRADE, not a failure, because
+        // the install is then reachable through a chain root owns end to end.
+        let veneer_verdict = if cfg!(unix) && !plan.dry_run {
+            Some(secure::verify_install_root(
+                target.os,
+                std::path::Path::new(paths::UNIX_MACHINE_BIN_DIR),
+            ))
+        } else {
+            None
+        };
+        let veneer_is_safe = veneer_verdict
+            .as_ref()
+            // Absent measurement (Windows, or a dry run) must not silently mean "unsafe" and re-route the
+            // whole install: on Windows there is no veneer, and a dry run wires nothing.
+            .map(|v| v.is_established_safe())
+            .unwrap_or(true);
+        let reachability = paths::reachability_for(target.os, &plan.bin_dir, veneer_is_safe);
+        if let Some(v) = &veneer_verdict {
+            if !v.is_established_safe() {
+                log(&format!(
+                    "    ! {} is not safe to resolve DIG commands from: {}",
+                    paths::UNIX_MACHINE_BIN_DIR,
+                    v.note
+                ));
+                log("    · falling back: the protected root goes on PATH directly, and no link is planted");
+            }
+        }
+        report.veneer_security = veneer_verdict;
+        report.reachability = Some(reachability);
+
         // 2. PATH (only meaningful if we placed a PATH binary).
         if plan.modify_path
             && (plan.with_digstore || plan.with_dig_node || plan.with_dig_app || plan.with_dig_dns)
@@ -937,7 +988,7 @@ fn run_report_gated(
             // install dir here said "Adding /opt/dig/bin to PATH" for a run that did no such thing, and
             // put a directory that is deliberately never on PATH into `report.path.dir`, which is a
             // machine-consumed field.
-            let wired = paths::reachable_dir(target.os, &plan.bin_dir);
+            let wired = paths::reachable_dir(target.os, &plan.bin_dir, veneer_is_safe);
             // "Checking", not "Adding": on the default elevated install the veneer is already on PATH and
             // this step writes nothing, so announcing an addition described a run that did not happen
             // (#1748, C3).
@@ -951,7 +1002,7 @@ fn run_report_gated(
                     note: "would add to PATH".to_string(),
                 });
             } else {
-                match paths::add_to_path(&plan.bin_dir) {
+                match paths::add_to_path(&plan.bin_dir, veneer_is_safe) {
                     Ok(wiring) => {
                         log(&format!("    ✓ {}", wiring.note));
                         report.path = Some(PathResult {
@@ -1431,7 +1482,7 @@ fn run_report_gated(
         // name from a fresh shell, so the user can run `dig-node …` / `dig-dns …`
         // immediately. Non-dry-run only (dry-run installs nothing to resolve).
         if !plan.dry_run {
-            link_protected_clis(&target, report, log);
+            link_protected_clis(&target, report, veneer_is_safe, log);
             verify_clis_on_path(&target, invoker::target_user(), report, log);
         }
 
@@ -1798,7 +1849,12 @@ fn answers_version(component: &str) -> bool {
 ///
 /// Best-effort: a link failure is logged and folded into readiness by the PATH verification that
 /// follows (which will find the CLI unreachable), rather than aborting an otherwise-complete install.
-fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dyn FnMut(&str)) {
+fn link_protected_clis(
+    target: &Target,
+    report: &mut InstallReport,
+    veneer_is_safe: bool,
+    log: &mut dyn FnMut(&str),
+) {
     #[cfg(unix)]
     {
         let to_link: Vec<(String, String)> = report
@@ -1810,7 +1866,7 @@ fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dy
                 let dir = std::path::Path::new(&c.dest)
                     .parent()
                     .unwrap_or(std::path::Path::new(""));
-                paths::needs_machine_bin_link(target.os, &c.component, dir)
+                paths::needs_machine_bin_link(target.os, &c.component, dir, veneer_is_safe)
             })
             .map(|c| (c.component.clone(), c.dest.clone()))
             .collect();
@@ -1829,19 +1885,34 @@ fn link_protected_clis(target: &Target, report: &mut InstallReport, log: &mut dy
             }
         }
 
-        // The veneer's own posture, RECORDED and (under elevation) FATAL. This directory is what root's
-        // login PATH resolves DIG commands from, so an account that can write here replaces a link we just
-        // planted and root runs whatever it points at. Refusing the PATH-WIRING step alone was not enough:
-        // that step is non-fatal by design, so an install onto an attacker-owned veneer still reported
-        // `ok: true` — found by the container gate's executed escalation, not by review (#1748 WU3).
-        let veneer = std::path::Path::new(paths::UNIX_MACHINE_BIN_DIR);
-        let verdict = secure::verify_install_root(target.os, veneer);
-        log(&format!(
-            "    {} {}",
-            if verdict.is_blocking() { "!" } else { "✓" },
-            verdict.note
-        ));
-        report.veneer_security = Some(verdict);
+        // The veneer's posture was measured once, before anything was wired (see `run_report_gated`), and
+        // this step acts on that same answer rather than re-reading it.
+        if !veneer_is_safe {
+            // Not merely "decline to plant new links": a link an earlier, safe-at-the-time run left here is
+            // a live escalation vector now, so it goes. `/usr/local/bin` really does change posture under
+            // us — Homebrew gets installed, an admin re-modes it — and this is where that is noticed.
+            let names: Vec<String> = report
+                .components
+                .iter()
+                .map(|c| target.exe_name(&c.component))
+                .collect();
+            let removed = paths::remove_veneer_links(&names, target.os);
+            if removed.is_empty() {
+                log(&format!(
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the \
+                     protected root is on PATH directly instead",
+                    paths::UNIX_MACHINE_BIN_DIR
+                ));
+            } else {
+                for link in &removed {
+                    log(&format!(
+                        "    ✓ removed {link} — a link in a directory a non-root account can write is one \
+                         they can re-point, and root runs whatever it points at"
+                    ));
+                }
+            }
+            report.veneer_links_removed = removed;
+        }
     }
     #[cfg(not(unix))]
     {
@@ -2125,9 +2196,14 @@ fn evaluate_readiness_when(
     //
     // Unelevated it stays a REPORT: a directory holding binaries only that same user runs is their own
     // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
-    // #1748 WU3: the veneer is the directory root's PATH resolves DIG commands from, so an account that can
-    // write there can replace a link this installer planted and have root run it. Same rule, same reason.
-    if elevated {
+    // #1748: the veneer is fatal ONLY when it is the mechanism in play.
+    //
+    // When links are planted there, an account that can write the directory re-points one and root runs
+    // whatever it points at — a live escalation, so the install must not report ready. When the run FELL
+    // BACK (`Reachability::DirectPathEntry`), the same unsafe verdict is a recorded downgrade rather than a
+    // failure: no link was planted, any earlier one was removed, and reachability comes from a chain root
+    // owns end to end. Failing then would be a refusal — and a refusal is not a fix.
+    if elevated && report.reachability == Some(paths::Reachability::VeneerLinks) {
         if let Some(sec) = &report.veneer_security {
             if sec.is_blocking() {
                 failures.push(format!(
@@ -4849,6 +4925,8 @@ mod tests {
             install_root_security: None,
             bin_dir_security: None,
             veneer_security: None,
+            reachability: None,
+            veneer_links_removed: Vec::new(),
             migration: None,
             registration_audit: Vec::new(),
             install_manifest: None,
@@ -5285,6 +5363,70 @@ mod tests {
             unchecked.bin_dir_security.is_some(),
             "nothing verified the directory this run wrote binaries into (#1748)"
         );
+    }
+
+    /// An unsafe veneer FAILS the install when links are planted there, and does NOT when the run fell back.
+    ///
+    /// This is the round-7 decision in one assertion, and both arms are load-bearing in opposite directions:
+    ///
+    /// * fatal when `VeneerLinks` — an account that can write the veneer re-points a link this run planted
+    ///   and root executes whatever it points at. Unprivileged CODE running as that user cannot type their
+    ///   password but can write that directory, so "they could `sudo` anyway" does not make it benign.
+    /// * NOT fatal when `DirectPathEntry` — the run declined to plant a link, removed any earlier one, and
+    ///   put the root-owned protected root on `PATH` instead. Failing then would refuse every
+    ///   Homebrew-on-Intel Mac, and a refusal is not a fix.
+    ///
+    /// Without the second arm, making the verdict fatal unconditionally passes every other test in the
+    /// suite — which is exactly what it did before this test existed.
+    #[test]
+    fn an_unsafe_veneer_is_fatal_only_when_it_is_the_mechanism_in_play() {
+        let plan = InstallPlan {
+            with_digstore: true,
+            ..InstallPlan::default()
+        };
+        let unsafe_veneer = || {
+            Some(secure::InstallRootSecurity::detected_unsafe(
+                paths::UNIX_MACHINE_BIN_DIR,
+                "mode 775 allows group or other to write",
+            ))
+        };
+
+        // Links planted into a directory a non-root account can write: fatal.
+        let mut linking = report_shell();
+        linking.veneer_security = unsafe_veneer();
+        linking.reachability = Some(paths::Reachability::VeneerLinks);
+        let failures = evaluate_readiness_when(&plan, &linking, true);
+        assert!(
+            failures.iter().any(|f| f.contains(paths::UNIX_MACHINE_BIN_DIR)),
+            "a link planted in a writable veneer is a live escalation and must fail readiness: {failures:?}"
+        );
+
+        // Fell back: same verdict, no link planted, protected root on PATH instead. A recorded downgrade.
+        let mut fell_back = report_shell();
+        fell_back.veneer_security = unsafe_veneer();
+        fell_back.reachability = Some(paths::Reachability::DirectPathEntry);
+        let failures = evaluate_readiness_when(&plan, &fell_back, true);
+        assert!(
+            !failures.iter().any(|f| f.contains(paths::UNIX_MACHINE_BIN_DIR)),
+            "the fallback must INSTALL, not refuse - a refusal on every Homebrew Mac is the failure mode \
+             this design exists to avoid: {failures:?}"
+        );
+
+        // And unelevated it is never fatal either way, because nothing runs as root.
+        for mechanism in [
+            paths::Reachability::VeneerLinks,
+            paths::Reachability::DirectPathEntry,
+        ] {
+            let mut unelevated = report_shell();
+            unelevated.veneer_security = unsafe_veneer();
+            unelevated.reachability = Some(mechanism);
+            assert!(
+                !evaluate_readiness_when(&plan, &unelevated, false)
+                    .iter()
+                    .any(|f| f.contains(paths::UNIX_MACHINE_BIN_DIR)),
+                "unelevated, the veneer's posture is the user's own authority"
+            );
+        }
     }
 
     /// An ELEVATED install into a group/world-writable directory is FATAL, not a note.

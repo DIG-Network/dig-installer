@@ -753,6 +753,62 @@ mod tests {
         assert_eq!(v["root"], r"C:\Program Files\DIG\bin");
     }
 
+    /// `install.json` MUST keep the exact field names a consumer already parses, whatever the Rust fields
+    /// are called.
+    ///
+    /// The Rust fields were renamed to `posture_was_read`/`posture_is_safe` (#1748 WU1) so the check that
+    /// keeps the blocking policy in one place can name them precisely — `checked` is an ordinary word other
+    /// report types also use. The WIRE names must not move with them: `install.json` is a published,
+    /// machine-consumed artifact, and a silent rename there is a breaking change wearing a refactor's
+    /// clothes.
+    ///
+    /// Asserted exhaustively over the serialized KEY SET, not just the values, so ADDING a key is caught
+    /// too — an extra field is still a schema change for a strict parser.
+    #[test]
+    fn install_root_security_keeps_its_published_wire_names() {
+        for verdict in [
+            InstallRootSecurity::established_safe("/opt/dig/bin", "ok"),
+            InstallRootSecurity::detected_unsafe("/opt/dig/bin", "group-writable"),
+            InstallRootSecurity::indeterminate("/opt/dig/bin", "could not read"),
+        ] {
+            let v: serde_json::Value = serde_json::to_value(&verdict).unwrap();
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["checked", "note", "root", "secure"],
+                "the published field names changed - install.json consumers parse these"
+            );
+            // And the Rust-side rename really is in force, so this test is asserting a MAPPING rather than
+            // restating the field names.
+            assert!(
+                v["checked"].is_boolean() && v["secure"].is_boolean(),
+                "both must remain booleans: {v}"
+            );
+        }
+
+        // The three outcomes must still be distinguishable on the wire, or the rename would have flattened
+        // information a consumer relies on.
+        let safe = serde_json::to_value(InstallRootSecurity::established_safe("/x", "n")).unwrap();
+        let unsafe_ =
+            serde_json::to_value(InstallRootSecurity::detected_unsafe("/x", "n")).unwrap();
+        let unknown = serde_json::to_value(InstallRootSecurity::indeterminate("/x", "n")).unwrap();
+        assert_eq!(
+            (safe["checked"].as_bool(), safe["secure"].as_bool()),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            (unsafe_["checked"].as_bool(), unsafe_["secure"].as_bool()),
+            (Some(true), Some(false)),
+            "a DETECTED breach was read and found unsafe"
+        );
+        assert_eq!(
+            (unknown["checked"].as_bool(), unknown["secure"].as_bool()),
+            (Some(false), Some(false)),
+            "an INDETERMINATE posture was never established - distinct on the wire, even though both block"
+        );
+    }
+
     /// The fail-open policy MUST exist in exactly one place, and NO caller may reconstruct it.
     ///
     /// # The type this replaces

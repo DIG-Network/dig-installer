@@ -438,14 +438,14 @@ impl PathWiring {
 ///            then broadcast WM_SETTINGCHANGE. No elevation.
 ///   macOS/Linux: append an `export PATH` line to the user's shell profile(s)
 ///            (idempotent), so new shells see it. Returns a human note.
-pub fn add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
+pub fn add_to_path(bin_dir: &Path, veneer_is_safe: bool) -> Result<PathWiring, String> {
     #[cfg(windows)]
     {
         windows_add_to_path(bin_dir)
     }
     #[cfg(not(windows))]
     {
-        unix_add_to_path(bin_dir)
+        unix_add_to_path(bin_dir, veneer_is_safe)
     }
 }
 
@@ -505,10 +505,70 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
 ///
 /// `dig-updater`/`dig-updater-worker` are excluded even in the protected root — the beacon invokes them,
 /// a user never does, so they stay off `PATH` entirely.
-pub fn needs_machine_bin_link(os: Os, component: &str, bin_dir: &Path) -> bool {
-    !matches!(os, Os::Windows)
-        && links_out_of(bin_dir)
+pub fn needs_machine_bin_link(
+    os: Os,
+    component: &str,
+    bin_dir: &Path,
+    veneer_is_safe: bool,
+) -> bool {
+    reachability_for(os, bin_dir, veneer_is_safe) == Reachability::VeneerLinks
+        // The beacon binaries are protected but deliberately NOT linked — the beacon invokes them, a user
+        // never does, so they stay off `PATH` entirely.
         && !matches!(component, "dig-updater" | "dig-updater-worker")
+}
+
+/// How a run makes its installed CLIs reachable by bare name.
+///
+/// # Why this is a CHOICE, measured per run (#1748)
+///
+/// The veneer exists for reachability and nothing else — `paths.rs`'s own module doc has said since round
+/// 4 that placement and reachability are separate concerns. Treating `/usr/local/bin` as REQUIRED made a
+/// convenience load-bearing, and on a Homebrew-on-Intel Mac (`<user>:admin 0775`) that turned into a
+/// choice between two wrong answers: plant a link an unprivileged process can replace and have root run
+/// it, or refuse to install at all.
+///
+/// Both are wrong. Refusing is a refusal, not a fix, and the escalation is real even though the account
+/// that can write there could usually `sudo`: the threat is not the human's privilege, it is that CODE
+/// running as them — a malicious `npm` postinstall, a compromised editor extension — cannot type their
+/// password but CAN write that directory, unprompted, and own root at the next `sudo dign …`. It also
+/// lets one admin silently attack another's `sudo`.
+///
+/// So the DETECTION stays exactly as strict and the MECHANISM falls back: when the veneer is unsafe the
+/// protected root goes onto `PATH` directly, through the same `/etc/paths.d` (macOS) and `/etc/profile.d`
+/// (Linux) machinery an override already uses. Root-owned target, root-owned `PATH` entry, and no
+/// directory a non-root account can modify anywhere in the chain root touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reachability {
+    /// Symlinks in [`UNIX_MACHINE_BIN_DIR`], which is already on every supported platform's login `PATH`.
+    /// The default, and the quiet one: nothing has to be wired.
+    VeneerLinks,
+    /// The install directory itself goes on `PATH`. Used for a `--bin-dir` override, an unelevated
+    /// per-user root, Windows — and for an elevated install whose veneer is NOT safe.
+    DirectPathEntry,
+}
+
+/// Decide the reachability mechanism from the placement and the MEASURED veneer posture.
+///
+/// Pure: `veneer_is_safe` is a parameter, not a read, so every combination is testable on any runner and
+/// the same answer can be reused by the wiring step and the linking step without measuring twice. That
+/// those two must never disagree is the property `wiring_and_linking_agree_about_every_placement` pins —
+/// a run that links into one directory while wiring another leaves the CLIs unreachable, which is #1748.
+pub fn reachability_for(os: Os, bin_dir: &Path, veneer_is_safe: bool) -> Reachability {
+    // Windows has one install root and no veneer concept; the root itself goes on PATH.
+    if matches!(os, Os::Windows) {
+        return Reachability::DirectPathEntry;
+    }
+    // Only the protected root is ever reached through links: a `--bin-dir` the operator chose is theirs to
+    // make reachable, and an unelevated per-user root is wired onto that user's own PATH directly.
+    if !links_out_of(bin_dir) {
+        return Reachability::DirectPathEntry;
+    }
+    if veneer_is_safe {
+        Reachability::VeneerLinks
+    } else {
+        Reachability::DirectPathEntry
+    }
 }
 
 /// Is `bin_dir` the root-owned protected root — the one placement whose contents are made reachable by
@@ -539,11 +599,65 @@ fn links_out_of(bin_dir: &Path) -> bool {
 /// Takes `os` for the same reason [`needs_machine_bin_link`] does: on Windows the protected root IS the
 /// one install root, nothing is linked, and there is no `/usr/local/bin` — so the answer there is always
 /// the directory itself.
-pub fn reachable_dir(os: Os, bin_dir: &Path) -> PathBuf {
-    if !matches!(os, Os::Windows) && links_out_of(bin_dir) {
-        return PathBuf::from(UNIX_MACHINE_BIN_DIR);
+pub fn reachable_dir(os: Os, bin_dir: &Path, veneer_is_safe: bool) -> PathBuf {
+    match reachability_for(os, bin_dir, veneer_is_safe) {
+        Reachability::VeneerLinks => PathBuf::from(UNIX_MACHINE_BIN_DIR),
+        // The FALLBACK, and the whole point of it: when the veneer is unsafe the protected root goes on
+        // PATH itself, so nothing root wrote to or execs from is writable by a non-root account.
+        Reachability::DirectPathEntry => bin_dir.to_path_buf(),
     }
-    bin_dir.to_path_buf()
+}
+
+/// Remove any DIG symlink this installer previously planted in [`UNIX_MACHINE_BIN_DIR`], returning the
+/// ones it removed.
+///
+/// # Why removal is part of the fallback, not optional (#1748)
+///
+/// A link left behind in a veneer that has BECOME unsafe is a live escalation vector: an unprivileged
+/// process replaces it and root runs whatever it points at on the next `sudo dign …`. So when a run
+/// chooses [`Reachability::DirectPathEntry`] because the veneer is unsafe, it does not merely decline to
+/// plant new links — it removes the ones an earlier, safe-at-the-time run planted. `/usr/local/bin` can
+/// change posture under us (Homebrew is installed, an admin re-modes it), and the next run's repair path is
+/// where that gets noticed.
+///
+/// Only entries that are SYMLINKS pointing into the protected root are touched. A regular file, or a link
+/// to anywhere else, belongs to somebody else — quite possibly another package manager's `digs` — and
+/// deleting it would be this installer taking a liberty it has no standing for.
+#[cfg(unix)]
+pub fn remove_veneer_links(components: &[String], os: Os) -> Vec<String> {
+    let _ = os;
+    remove_links_in(
+        Path::new(UNIX_MACHINE_BIN_DIR),
+        &protected_bin_dir(),
+        components,
+    )
+}
+
+/// [`remove_veneer_links`] against explicit directories, so the "only our own links" discipline is
+/// exercisable without touching the real `/usr/local/bin`.
+#[cfg(unix)]
+fn remove_links_in(veneer: &Path, protected: &Path, components: &[String]) -> Vec<String> {
+    let mut removed = Vec::new();
+    for component in components {
+        let link = veneer.join(component);
+        // `symlink_metadata`, never `metadata`: the question is what the ENTRY is, not what it points at.
+        let Ok(meta) = std::fs::symlink_metadata(&link) else {
+            continue;
+        };
+        if !meta.is_symlink() {
+            continue;
+        }
+        let Ok(points_at) = std::fs::read_link(&link) else {
+            continue;
+        };
+        if !points_at.starts_with(protected) {
+            continue;
+        }
+        if std::fs::remove_file(&link).is_ok() {
+            removed.push(link.to_string_lossy().into_owned());
+        }
+    }
+    removed
 }
 
 /// The system-wide login-shell snippet an elevated install writes when its bin dir is not already on
@@ -624,10 +738,10 @@ fn login_path_fragment(dir: &str) -> (&'static str, String) {
 }
 
 #[cfg(not(windows))]
-fn unix_add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
+fn unix_add_to_path(bin_dir: &Path, veneer_is_safe: bool) -> Result<PathWiring, String> {
     let user = crate::invoker::target_user();
     if crate::invoker::is_root() {
-        return root_add_to_path(bin_dir, user);
+        return root_add_to_path(bin_dir, user, veneer_is_safe);
     }
     // Unelevated: we ARE the target user, so their own profile is the right place.
     unix_add_to_path_in(bin_dir, &user.home)
@@ -659,12 +773,13 @@ fn unix_add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
 fn root_add_to_path(
     bin_dir: &Path,
     user: &crate::invoker::TargetUser,
+    veneer_is_safe: bool,
 ) -> Result<PathWiring, String> {
     use crate::pathcheck;
 
     // This function is unix-only by `cfg`, and `reachable_dir` distinguishes only Windows from not, so
     // either unix variant gives the same answer.
-    let wired = reachable_dir(Os::Linux, bin_dir);
+    let wired = reachable_dir(Os::Linux, bin_dir, veneer_is_safe);
     let dir = wired.to_string_lossy().to_string();
     let reachable = |note: &str| -> Option<String> {
         match pathcheck::login_shell_path(user) {
@@ -762,8 +877,21 @@ fn root_add_to_path(
     }
     let observed =
         pathcheck::login_shell_path(user).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+    // The edge the fallback creates and must name rather than let somebody discover (#1748): when the veneer
+    // was UNSAFE we are here because it was the only other mechanism, so if the fragment does not take there
+    // is no safe reachability left at all. Say exactly that. The install still PROCEEDS — the binaries are
+    // placed correctly in a root-owned root and PATH wiring is non-fatal by design — but readiness fails on
+    // the CLI resolution checks, so nobody is told an unreachable install is ready.
+    let no_alternative = if veneer_is_safe {
+        String::new()
+    } else {
+        format!(
+            " — and {UNIX_MACHINE_BIN_DIR} is not safe to use instead, so there is no reachable path left:              the binaries are installed under {} but no shell will find them by name. Repair              {UNIX_MACHINE_BIN_DIR} (root-owned, no group/other write) or add {dir} to PATH yourself",
+            bin_dir.display()
+        )
+    };
     Err(format!(
-        "wrote {fragment_file} but {dir} is STILL not on {}'s login PATH (it searches: {observed})",
+        "wrote {fragment_file} but {dir} is STILL not on {}'s login PATH (it searches:          {observed}){no_alternative}",
         user.name
     ))
 }
@@ -897,6 +1025,14 @@ pub(crate) fn broadcast_environment_change() {
 
 #[cfg(test)]
 mod tests {
+    /// The measured posture these tests assume unless they say otherwise: `/usr/local/bin` is root-owned
+    /// and not group/other-writable, which is the stock Debian/Ubuntu and stock-macOS case. The FALLBACK
+    /// half — an unsafe veneer — is asserted by its own tests below, both ways.
+    const VENEER_SAFE: bool = true;
+    /// The Homebrew-on-Intel case: `/usr/local/bin` is `<user>:admin 0775`, so it is not safe to resolve
+    /// root's DIG commands from.
+    const VENEER_UNSAFE: bool = false;
+
     use super::*;
 
     #[test]
@@ -1080,13 +1216,18 @@ mod tests {
         // exec path cannot silently take `dig-node` off every user's PATH.
         for c in ["dig-dns", "dig-node", "dig-relay"] {
             assert!(
-                needs_machine_bin_link(Os::Linux, c, &protected_bin_dir()),
+                needs_machine_bin_link(Os::Linux, c, &protected_bin_dir(), VENEER_SAFE),
                 "{c} is protected AND user-facing, so it must be linked onto PATH"
             );
         }
         // The beacon binaries are protected but deliberately NOT linked — a user never invokes them.
         for c in ["dig-updater", "dig-updater-worker"] {
-            assert!(!needs_machine_bin_link(Os::Linux, c, &protected_bin_dir()));
+            assert!(!needs_machine_bin_link(
+                Os::Linux,
+                c,
+                &protected_bin_dir(),
+                VENEER_SAFE
+            ));
         }
     }
 
@@ -1251,19 +1392,29 @@ mod tests {
             "dig-app",
         ] {
             assert!(
-                needs_machine_bin_link(Os::Linux, cli, &protected),
+                needs_machine_bin_link(Os::Linux, cli, &protected, VENEER_SAFE),
                 "{cli} lives in a directory on no shell's PATH and must be linked"
             );
-            assert!(needs_machine_bin_link(Os::MacOs, cli, &protected));
+            assert!(needs_machine_bin_link(
+                Os::MacOs,
+                cli,
+                &protected,
+                VENEER_SAFE
+            ));
         }
         for never in ["dig-updater", "dig-updater-worker"] {
             assert!(
-                !needs_machine_bin_link(Os::Linux, never, &protected),
+                !needs_machine_bin_link(Os::Linux, never, &protected, VENEER_SAFE),
                 "{never} is invoked by the beacon, never by a user"
             );
         }
         // Windows keeps one root for the whole stack, so there is nothing to link.
-        assert!(!needs_machine_bin_link(Os::Windows, "dig-dns", &protected));
+        assert!(!needs_machine_bin_link(
+            Os::Windows,
+            "dig-dns",
+            &protected,
+            VENEER_SAFE
+        ));
 
         // And the placement half of the predicate: a binary that did NOT land in the protected root is
         // never linked. Without this, an unelevated install would try to write /usr/local/bin on every
@@ -1274,7 +1425,7 @@ mod tests {
             PathBuf::from(UNIX_MACHINE_BIN_DIR),
         ] {
             assert!(
-                !needs_machine_bin_link(Os::Linux, "dig-node", &other),
+                !needs_machine_bin_link(Os::Linux, "dig-node", &other, VENEER_SAFE),
                 "{} is not the protected root, so nothing is linked from it",
                 other.display()
             );
@@ -1414,12 +1565,12 @@ mod tests {",
     #[test]
     fn the_dir_that_must_be_on_path_is_the_veneer_for_a_protected_root_install() {
         assert_eq!(
-            reachable_dir(Os::Linux, &protected_bin_dir()),
+            reachable_dir(Os::Linux, &protected_bin_dir(), VENEER_SAFE),
             PathBuf::from(UNIX_MACHINE_BIN_DIR),
             "the protected root is reached through the veneer, never by being put on PATH"
         );
         assert_ne!(
-            reachable_dir(Os::Linux, &protected_bin_dir()),
+            reachable_dir(Os::Linux, &protected_bin_dir(), VENEER_SAFE),
             protected_bin_dir(),
             "wiring /opt/dig/bin onto every login shell defeats the veneer"
         );
@@ -1430,42 +1581,149 @@ mod tests {",
             PathBuf::from("/home/alice/.dig/bin"),
             PathBuf::from("/opt/somewhere-else"),
         ] {
-            assert_eq!(reachable_dir(Os::Linux, &owned), owned);
+            assert_eq!(reachable_dir(Os::Linux, &owned, VENEER_SAFE), owned);
         }
 
         // Windows has no veneer: the protected root IS the one install root, nothing is linked, and
         // `/usr/local/bin` does not exist. Without the OS arm this would report a unix path as the
         // directory a Windows install must have on PATH — and `report.path.dir` is machine-consumed.
         assert_eq!(
-            reachable_dir(Os::Windows, &protected_bin_dir()),
+            reachable_dir(Os::Windows, &protected_bin_dir(), VENEER_SAFE),
             protected_bin_dir(),
             "on Windows the install root is what goes on PATH; there is nothing to link"
         );
     }
 
-    /// The linking decision and the wiring decision must be the SAME decision.
+    // -- #1748: an unsafe veneer FALLS BACK, it does not refuse -------------------
+
+    /// The whole fallback, both ways, on the one decision that drives it.
     ///
-    /// If they ever diverge, a run links its CLIs into one directory while putting a different one on
-    /// `PATH` — the install reports success and `dign` is not found, which IS #1748. Asserted as a
-    /// coupling rather than two independent constants so the two cannot drift apart.
+    /// A refusal on every Homebrew-on-Intel Mac would be the "fail closed" the standing directive forbids,
+    /// and weakening the detection would leave the escalation in place: unprivileged CODE running as that
+    /// admin cannot type their password but CAN write `/usr/local/bin`, and owns root at the next
+    /// `sudo dign …`. So the detection stays exactly as strict and the MECHANISM moves.
+    ///
+    /// Both arms are asserted because each alone is satisfiable by a constant: always-veneer restores the
+    /// escalation, and always-direct abandons the property `/usr/local/bin` was adopted for — already on
+    /// every login `PATH`, so nothing to wire and nothing to get wrong.
     #[test]
-    fn wiring_and_linking_agree_about_every_placement() {
+    fn an_unsafe_veneer_falls_back_to_putting_the_protected_root_on_path() {
+        let protected = protected_bin_dir();
+
+        // SAFE: the stock Debian/Ubuntu and stock-macOS posture. Links, and the veneer is what must be
+        // searchable.
+        assert_eq!(
+            reachability_for(Os::Linux, &protected, VENEER_SAFE),
+            Reachability::VeneerLinks
+        );
+        assert_eq!(
+            reachable_dir(Os::Linux, &protected, VENEER_SAFE),
+            PathBuf::from(UNIX_MACHINE_BIN_DIR)
+        );
+        assert!(needs_machine_bin_link(
+            Os::Linux,
+            "dig-node",
+            &protected,
+            VENEER_SAFE
+        ));
+
+        // UNSAFE: the Homebrew posture. NO link is planted, and the protected root itself goes on PATH.
+        assert_eq!(
+            reachability_for(Os::Linux, &protected, VENEER_UNSAFE),
+            Reachability::DirectPathEntry
+        );
+        assert_eq!(
+            reachable_dir(Os::Linux, &protected, VENEER_UNSAFE),
+            protected,
+            "the fallback must wire the ROOT-OWNED directory, not the one that just failed its verify"
+        );
+        assert!(
+            !needs_machine_bin_link(Os::Linux, "dig-node", &protected, VENEER_UNSAFE),
+            "planting a link in a directory a non-root account can write IS the escalation"
+        );
+
+        // A placement that never used links is unaffected by the veneer's posture either way.
+        for safe in [VENEER_SAFE, VENEER_UNSAFE] {
+            let owned = PathBuf::from("/home/alice/.dig/bin");
+            assert_eq!(reachable_dir(Os::Linux, &owned, safe), owned);
+            assert!(!needs_machine_bin_link(Os::Linux, "dig-node", &owned, safe));
+        }
+    }
+
+    /// Wiring and linking must agree for EVERY (placement, posture) pair, not merely every placement.
+    ///
+    /// The fallback added a second dimension to a decision that already had to be consistent: a run that
+    /// links into the veneer while wiring the protected root — or the reverse — leaves the CLIs unreachable,
+    /// which is #1748 itself. Asserted as a coupling so the two cannot drift apart.
+    #[test]
+    fn wiring_and_linking_agree_about_every_placement_and_posture() {
         for dir in [
             protected_bin_dir(),
             PathBuf::from(UNIX_MACHINE_BIN_DIR),
             PathBuf::from("/home/alice/.dig/bin"),
             PathBuf::from("/opt/somewhere-else"),
         ] {
-            let links = needs_machine_bin_link(Os::Linux, "dig-node", &dir);
-            let wired_elsewhere = reachable_dir(Os::Linux, &dir) != dir;
-            assert_eq!(
-                links,
-                wired_elsewhere,
-                "{}: links are planted into the veneer exactly when the veneer is what gets wired \
-                 onto PATH",
-                dir.display()
-            );
+            for safe in [VENEER_SAFE, VENEER_UNSAFE] {
+                let links = needs_machine_bin_link(Os::Linux, "dig-node", &dir, safe);
+                let wired_elsewhere = reachable_dir(Os::Linux, &dir, safe) != dir;
+                assert_eq!(
+                    links, wired_elsewhere,
+                    "{} (veneer safe: {safe}): links are planted into the veneer exactly when the veneer \
+                     is what gets wired onto PATH",
+                    dir.display()
+                );
+            }
         }
+    }
+
+    /// A DIG link left in a veneer that has BECOME unsafe is removed; anything else there is left alone.
+    ///
+    /// Removal is part of the fallback rather than a nicety: a link an earlier, safe-at-the-time run planted
+    /// is a live vector once that directory is writable, and `/usr/local/bin` really does change posture
+    /// under us (Homebrew gets installed, an admin re-modes it).
+    ///
+    /// But the veneer is a shared system directory, so the fixture also puts a regular file and a foreign
+    /// symlink beside ours — the two things this installer has no standing to delete. A removal that took
+    /// everything would fail here, which is what makes the test about discrimination rather than deletion.
+    #[cfg(unix)]
+    #[test]
+    fn the_fallback_removes_only_dig_links_pointing_into_the_protected_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join("opt-dig-bin");
+        std::fs::create_dir_all(&protected).unwrap();
+        let target = protected.join("digs");
+        std::fs::write(&target, b"the real binary").unwrap();
+
+        let ours = tmp.path().join("digs");
+        std::os::unix::fs::symlink(&target, &ours).unwrap();
+        let someone_elses_file = tmp.path().join("dig-node");
+        std::fs::write(&someone_elses_file, b"another package manager's binary").unwrap();
+        let someone_elses_link = tmp.path().join("dig-dns");
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), &someone_elses_link).unwrap();
+
+        let removed = remove_links_in(
+            tmp.path(),
+            &protected,
+            &[
+                "digs".to_string(),
+                "dig-node".to_string(),
+                "dig-dns".to_string(),
+            ],
+        );
+
+        assert_eq!(removed.len(), 1, "removed: {removed:?}");
+        assert!(removed[0].ends_with("digs"));
+        assert!(!ours.exists(), "our own link must be gone");
+        assert!(
+            someone_elses_file.exists(),
+            "a REGULAR file is not ours to delete - it may be another package manager's binary"
+        );
+        assert!(
+            std::fs::symlink_metadata(&someone_elses_link).is_ok(),
+            "a link pointing somewhere other than the protected root is not ours either"
+        );
+        // The pointer goes; the binary never does.
+        assert!(target.exists());
     }
 
     /// The link destination must be the machine bin dir that is already on the login PATH — a link
