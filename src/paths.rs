@@ -535,8 +535,23 @@ pub fn needs_machine_bin_link(
 ///
 /// So the DETECTION stays exactly as strict and the MECHANISM falls back: when the veneer is unsafe the
 /// protected root goes onto `PATH` directly, through the same `/etc/paths.d` (macOS) and `/etc/profile.d`
-/// (Linux) machinery an override already uses. Root-owned target, root-owned `PATH` entry, and no
-/// directory a non-root account can modify anywhere in the chain root touches.
+/// (Linux) machinery an override already uses — root-owned target, root-owned `PATH` entry, and PREPENDED
+/// ([`path_position`]) so it wins a name against whatever made the veneer unsafe.
+///
+/// # What the fallback does NOT achieve
+///
+/// It does not remove every writable directory from root's `PATH`, and an earlier revision of this comment
+/// claimed as much. `/usr/local/bin` is on root's default `PATH` because the DISTRIBUTION put it there; this
+/// installer neither added it nor may silently remove it, and a regular file an attacker leaves there is not
+/// ours to delete. So after the fallback:
+///
+/// * every DIG name resolves to the protected root, because we are earlier on `PATH`;
+/// * a non-DIG name (`ls`, `cp`) can still be shadowed for root by whoever owns that directory — a
+///   pre-existing property of the machine's own configuration, which [`crate::secure::verify_install_root`]
+///   REPORTS (`InstallReport::veneer_security`, `preceding_unsafe_path_dirs`) and cannot repair.
+///
+/// Saying so precisely matters: the honest claim is "DIG's commands are safe and the machine's posture is
+/// reported", not "nothing writable remains".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reachability {

@@ -1536,6 +1536,31 @@ Requirements a reimplementation MUST satisfy:
   regular file or a foreign link in a shared system directory belongs to somebody else.
 - **If the fallback's `PATH` fragment cannot be written**, there is no safe reachability left. The install MAY
   proceed — the binaries are correctly placed — but it MUST say so explicitly and MUST NOT report ready.
+- **The fallback's `PATH` entry MUST be PREPENDED**, and this is a security requirement rather than a
+  preference. Appended, the protected root sits behind the directory that made the veneer unsafe, so an
+  attacker does not need any link the installer planted — she creates the command name herself and wins
+  because her directory is earlier. On macOS this is structural: `/etc/paths` ships `/usr/local/bin` and
+  `path_helper` reads it BEFORE `/etc/paths.d/*`, so an appended fragment can never win. Prepending is safe
+  for THIS directory specifically because it is root-owned, whole-chain verified, and contains only the
+  installer's own binaries; a user-chosen `--bin-dir` MUST still be appended, since it may be attacker-owned
+  and must not be able to shadow `/usr/bin` for root.
+- **Reachability MUST be verified POSITIONALLY, not by presence.** Any directory that precedes the install
+  directory on the target user's login `PATH` and is not established safe MUST fail readiness
+  (`InstallReport::preceding_unsafe_path_dirs`). A resolution check alone cannot see this: it only fires once
+  the shadowing file exists, so a `PATH` on which a writable directory merely comes first reports ready and
+  the attacker creates the name afterwards.
+- **The system-wide `PATH` fragment and any parent directory the installer creates for it MUST have their
+  modes pinned** (`0644`/`0755`) by the syscall, never left to the process umask, and the write MUST refuse
+  to follow a symlink. At `umask 000` the fragment was measured world-writable, and it is sourced by every
+  login shell including root's — an unprivileged account appending to it owns root without any install
+  running.
+
+**What the fallback does NOT achieve, and MUST NOT be claimed:** it does not remove every writable directory
+from root's `PATH`. `/usr/local/bin` is on that `PATH` because the distribution put it there, and a regular
+file an attacker leaves in it is not the installer's to delete. After the fallback every DIG name resolves to
+the protected root; a NON-DIG name can still be shadowed for root by whoever owns that directory. That
+residual is a property of the machine's configuration, and it MUST be reported rather than described as
+solved.
 Earlier revisions of this section claimed placement covered (3) and (4); it does not under an override,
 and a normative claim the code does not satisfy tells a reimplementation to reproduce the gap.
 
