@@ -438,6 +438,11 @@ impl PathWiring {
 ///            then broadcast WM_SETTINGCHANGE. No elevation.
 ///   macOS/Linux: append an `export PATH` line to the user's shell profile(s)
 ///            (idempotent), so new shells see it. Returns a human note.
+// `veneer_is_safe` describes the posture of the unix PATH veneer (`/usr/local/bin`), which has no
+// Windows counterpart — Windows reaches the install root through HKCU\Environment\Path directly and
+// plants no links, so there is no third directory whose writability could matter. The parameter stays
+// in the signature so callers are uniform across platforms.
+#[cfg_attr(windows, allow(unused_variables))]
 pub fn add_to_path(bin_dir: &Path, veneer_is_safe: bool) -> Result<PathWiring, String> {
     #[cfg(windows)]
     {

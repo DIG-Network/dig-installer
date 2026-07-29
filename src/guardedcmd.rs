@@ -105,6 +105,9 @@ impl GuardedCommand {
 
 #[cfg(test)]
 mod tests {
+    // Only the unix guard test constructs a `GuardedCommand`; the source-scan meta-test below reads
+    // files and needs nothing from `super`, so on Windows this import would be dead.
+    #[cfg(unix)]
     use super::*;
 
     /// The guard runs at construction, so a refusal means no process was ever spawned.

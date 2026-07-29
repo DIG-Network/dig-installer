@@ -1864,6 +1864,10 @@ fn answers_version(component: &str) -> bool {
 ///
 /// Best-effort: a link failure is logged and folded into readiness by the PATH verification that
 /// follows (which will find the CLI unreachable), rather than aborting an otherwise-complete install.
+// Windows plants no veneer links at all (it wires HKCU\Environment\Path to the install root), so the
+// whole body is `#[cfg(unix)]` and every parameter but `report` is unused there. Kept in the signature
+// so the call site does not need its own `cfg`.
+#[cfg_attr(windows, allow(unused_variables))]
 fn link_protected_clis(
     target: &Target,
     report: &mut InstallReport,
@@ -3370,6 +3374,9 @@ impl uninstall::UninstallActions for SystemActions<'_> {
 ///
 /// Split out from [`Installer::scan_residue`] because the decision is the ROOT LIST, and dropping the veneer
 /// from it left the whole suite green — the scan was only ever exercised against directories the test owned.
+// The veneer is the only conditional root, and it is unix-only — so on Windows the list is complete at
+// construction and never mutated.
+#[cfg_attr(windows, allow(unused_mut))]
 fn residue_roots(bin_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut roots = vec![bin_dir.to_path_buf(), paths::protected_bin_dir()];
     #[cfg(unix)]
