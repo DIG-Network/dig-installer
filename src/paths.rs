@@ -54,12 +54,19 @@ use crate::target::Os;
 /// symlinks that make them reachable by name ([`needs_machine_bin_link`]). Root never writes to it and
 /// never executes from it, so the class does not need a guard per surface.
 ///
-/// A user-writable veneer is worth REPORTING — an attacker who can replace a symlink here changes what
-/// the USER's shell resolves, which is their own privilege level rather than root's — and it is
-/// reported wherever this directory is the one that must be on `PATH`
-/// ([`reachable_dir`], `InstallReport::bin_dir_security`). It is NOT independently verified on the
-/// default elevated install, where the directory that gets verified is the protected root the binaries
-/// live in; an earlier revision of this comment claimed otherwise, and the claim was false.
+/// # It IS verified on every elevated install, and a writable veneer REFUSES (#1748 WU2)
+///
+/// The reasoning above — "replacing a link here only changes what the USER's shell resolves" — is wrong
+/// for the one account that matters. Root's login `PATH` contains this directory too, so an account that
+/// can write here replaces a link this installer planted and root runs whatever it points at on the next
+/// `sudo dign …`. That is not the user's own privilege level; it is root's. Proved at Homebrew's
+/// documented Intel-Mac posture (`<user>:admin 0775`).
+///
+/// So [`crate::secure::verify_install_root`] runs on this directory on every ELEVATED install, BEFORE the
+/// `PATH` wiring short-circuits, and a blocking verdict refuses the install rather than reporting it.
+/// Two earlier revisions of this comment were wrong in opposite directions: the first claimed the verify
+/// was applied when it was not, the second correctly said it was not applied and then treated that as
+/// acceptable. It is applied now.
 pub const UNIX_MACHINE_BIN_DIR: &str = "/usr/local/bin";
 
 /// Default install directory for DIG tool binaries.
@@ -684,6 +691,35 @@ fn root_add_to_path(
         ));
     }
 
+    // VERIFY THE VENEER BEFORE the early return, not after it (#1748 WU2).
+    //
+    // This check used to sit below the `reachable(..)` short-circuit, which is taken on the DEFAULT
+    // elevated install — `/usr/local/bin` is already on the login PATH, so the function returned
+    // `unchanged` and the verify never ran. That is the one path every stranger takes.
+    //
+    // It matters because the veneer is exactly the directory that is NOT root-owned everywhere: Homebrew
+    // on an Intel Mac leaves `/usr/local/bin` at `<user>:admin 0775`. Proved at that documented posture:
+    // an unprivileged account replaces the symlink this installer planted, and the next `sudo dign …`
+    // runs their binary as root. The detector was one call away and was being skipped.
+    //
+    // Only under elevation. Unelevated, the directory wired is the user's own and running their own
+    // binaries is their own authority.
+    if crate::invoker::is_root() {
+        let verdict = crate::secure::verify_install_root(
+            crate::target::Os::from_consts(std::env::consts::OS)
+                .unwrap_or(crate::target::Os::Linux),
+            &wired,
+        );
+        if verdict.is_blocking() {
+            return Err(format!(
+                "refusing to make {dir} the directory root's PATH resolves DIG commands from: {} — an \
+                 account that can write there can replace a link this installer planted, and root runs \
+                 whatever it points at",
+                verdict.note
+            ));
+        }
+    }
+
     if let Some(note) = reachable(" already — no PATH wiring needed") {
         // Nothing was written, and the report must not claim otherwise: this is the DEFAULT elevated
         // install, whose whole design is that the veneer is already on PATH (#1748, C3).
@@ -694,29 +730,6 @@ fn root_add_to_path(
     // Either way the directory about to be wired must exist before the user's shell is asked whether it
     // can enter it.
     ensure_bin_dir(&wired)?;
-
-    // REFUSE BEFORE WRITING to put a directory a non-root account can write onto every login shell's
-    // PATH, root's included (#1748, F3).
-    //
-    // The readiness verdict already failed such an install, but only AFTERWARDS — the fragment was
-    // already on disk, was never rolled back, and no uninstall removed it. Executed: with
-    // `--bin-dir /home/alice/digbin`, `sh -lc 'ls'` as root ran alice's `ls`. So the check moves in
-    // front of the write, and the message names the real problem rather than the bin dir's mode.
-    //
-    // Only under elevation: an unelevated run writes the user's OWN dotfile, which is their authority.
-    if crate::invoker::is_root() {
-        let verdict = crate::secure::verify_install_root(
-            crate::target::Os::from_consts(std::env::consts::OS)
-                .unwrap_or(crate::target::Os::Linux),
-            &wired,
-        );
-        if verdict.checked && !verdict.secure {
-            return Err(format!(
-                "refusing to put {dir} on every login shell's PATH: {} — a directory a non-root                  account can write, placed on root's own PATH, lets that account shadow every system                  command for root",
-                verdict.note
-            ));
-        }
-    }
 
     // Refuse to wire a directory the target user cannot even enter. The fragment is read by EVERY
     // login shell on the machine, so putting an inaccessible dir on PATH would degrade every
@@ -1350,6 +1363,38 @@ mod tests {
             !second.changed,
             "a re-run that writes nothing must not report a modification: {}",
             second.note
+        );
+    }
+
+    /// The veneer is verified on the DEFAULT elevated path, where the `PATH` wiring short-circuits.
+    ///
+    /// The verify used to sit BELOW the "already on PATH" early return, so on the one path every stranger
+    /// takes — `/usr/local/bin` already on the login PATH, nothing to wire — it never ran. Asserted
+    /// structurally because the behaviour needs root: the verify must appear before the early return in
+    /// the source, which is the ordering that was wrong.
+    #[test]
+    fn the_veneer_verify_runs_before_the_path_wiring_short_circuits() {
+        let src = include_str!("paths.rs");
+        let production = src
+            .split(
+                "
+mod tests {",
+            )
+            .next()
+            .unwrap_or("");
+        let body = production
+            .split("fn root_add_to_path(")
+            .nth(1)
+            .expect("root_add_to_path must exist");
+        let verify_at = body
+            .find("verify_install_root(")
+            .expect("the elevated run must verify the directory it puts on root's PATH");
+        let short_circuit_at = body.find("PathWiring::unchanged(").expect(
+            "the early return must still exist — it is what makes the default install quiet",
+        );
+        assert!(
+            verify_at < short_circuit_at,
+            "the veneer verify sits AFTER the early return, so it is skipped on the default elevated              install — the one path every stranger takes (#1748 WU2)"
         );
     }
 

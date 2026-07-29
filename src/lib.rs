@@ -1437,11 +1437,7 @@ fn run_report_gated(
                 let verdict = secure::verify_install_root(target.os, &root);
                 log(&format!(
                     "    {} {}",
-                    if verdict.checked && !verdict.secure {
-                        "!"
-                    } else {
-                        "✓"
-                    },
+                    if verdict.is_blocking() { "!" } else { "✓" },
                     verdict.note
                 ));
                 report.install_root_security = Some(verdict);
@@ -1644,7 +1640,7 @@ fn apply_windows_hardening(
     // plants no such pointer, still proceeds below).
     let protected = paths::protected_bin_dir();
     let verdict = secure::verify_install_root(target.os, &protected);
-    if verdict.checked && !verdict.secure {
+    if verdict.is_blocking() {
         log(&format!(
             "    ! skipping the Add/Remove Programs entry — the protected install root is not \
              owner-secure ({})",
@@ -1867,7 +1863,7 @@ fn report_bin_dir_posture(
     ));
     log(&format!(
         "    {} {}",
-        if verdict.checked && !verdict.secure {
+        if verdict.is_blocking() {
             // `!` because it is worth a human's attention, but readiness is unaffected: see the doc above.
             "!"
         } else {
@@ -2083,7 +2079,7 @@ fn evaluate_readiness_when(
     // inconclusive read (`checked == false`) is only a warning (logged above),
     // never a false failure: the admin-only LOCATION remains the primary guarantee.
     if let Some(sec) = &report.install_root_security {
-        if sec.checked && !sec.secure {
+        if sec.is_blocking() {
             failures.push(format!(
                 "install root {}: {} — a non-admin could replace a privileged service binary; \
                  repair the directory permissions",
@@ -2104,7 +2100,7 @@ fn evaluate_readiness_when(
     // authority, and failing on it would refuse every ordinary per-user install and every Homebrew Mac.
     if elevated {
         if let Some(sec) = &report.bin_dir_security {
-            if sec.checked && !sec.secure {
+            if sec.is_blocking() {
                 failures.push(format!(
                     "install directory {}: {} — an elevated install wrote binaries there, so a \
                      non-root account could replace one root or a service later executes; repair the \
@@ -4788,6 +4784,9 @@ mod tests {
     }
 
     /// A report shell (non-dry-run) the readiness tests populate per case.
+    /// The Windows protected root, as a literal, so the backslashes live in exactly one place.
+    const PROGRAM_FILES_BIN: &str = r"C:\Program Files\DIGin";
+
     fn report_shell() -> InstallReport {
         InstallReport {
             schema_version: SCHEMA_VERSION,
@@ -5170,7 +5169,7 @@ mod tests {
         assert_eq!(verdict.root, dir.to_string_lossy());
         #[cfg(unix)]
         {
-            assert!(verdict.checked && !verdict.secure, "got: {}", verdict.note);
+            assert!(verdict.is_blocking(), "got: {}", verdict.note);
         }
         // And it does NOT sink the install: a user-writable dir holding binaries only that user runs is
         // their own authority, so refusing would break every ordinary unelevated install.
@@ -5205,12 +5204,10 @@ mod tests {
 
         // The genuine duplicate: a verdict for this directory already exists, so no second one.
         let mut covered = report_shell();
-        covered.install_root_security = Some(secure::InstallRootSecurity {
-            root: plan.bin_dir.to_string_lossy().to_string(),
-            checked: true,
-            secure: true,
-            note: "already verified".to_string(),
-        });
+        covered.install_root_security = Some(secure::InstallRootSecurity::established_safe(
+            plan.bin_dir.to_string_lossy().to_string(),
+            "already verified".to_string(),
+        ));
         report_bin_dir_posture(&plan, &target, &mut covered, &mut |_| {});
         assert!(
             covered.bin_dir_security.is_none(),
@@ -5241,12 +5238,10 @@ mod tests {
             ..InstallPlan::default()
         };
         let mut report = report_shell();
-        report.bin_dir_security = Some(secure::InstallRootSecurity {
-            root: "/opt/dig/bin".to_string(),
-            checked: true,
-            secure: false,
-            note: "mode 0777: group and other can write".to_string(),
-        });
+        report.bin_dir_security = Some(secure::InstallRootSecurity::detected_unsafe(
+            "/opt/dig/bin".to_string(),
+            "mode 0777: group and other can write".to_string(),
+        ));
 
         // BOTH arms, stated explicitly rather than branched on the runner's own uid. Branching on
         // `is_root()` meant CI only ever ran the unelevated arm, so replacing the production
@@ -5288,29 +5283,43 @@ mod tests {
         };
         // Definitive breach → NOT ready, with a clear reason.
         let mut report = report_shell();
-        report.install_root_security = Some(secure::InstallRootSecurity {
-            root: r"C:\Program Files\DIG\bin".to_string(),
-            checked: true,
-            secure: false,
-            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
-        });
+        report.install_root_security = Some(secure::InstallRootSecurity::detected_unsafe(
+            r"C:\Program Files\DIG\bin".to_string(),
+            "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        ));
         let failures = evaluate_readiness(&plan, &report);
         assert!(
             failures.iter().any(|f| f.contains("install root")),
             "a definitive write breach must fail readiness: {failures:?}"
         );
-        // Inconclusive read → NOT a failure (the admin-only location still holds).
+        // An INDETERMINATE read also fails readiness (#1748 WU1). This assertion is inverted from what
+        // it used to be, deliberately: "indeterminate -> proceed" was the fail-open policy that seven
+        // call sites re-derived independently, and every round of this release found another site where
+        // it turned a REFUSAL into a tick. A posture nobody could establish is not evidence of safety,
+        // and the note always names the level that could not be verified.
         let mut report = report_shell();
-        report.install_root_security = Some(secure::InstallRootSecurity {
-            root: r"C:\Program Files\DIG\bin".to_string(),
-            checked: false,
-            secure: false,
-            note: "could not read the ACL back".to_string(),
-        });
+        report.install_root_security = Some(secure::InstallRootSecurity::indeterminate(
+            PROGRAM_FILES_BIN.to_string(),
+            "could not read the ACL back".to_string(),
+        ));
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            failures.iter().any(|f| f.contains("install root")),
+            "an unverifiable install root must not report ready: {failures:?}"
+        );
+
+        // The control that keeps the policy from collapsing into "always block": an ESTABLISHED-safe root
+        // passes. Without it, an `is_blocking()` that returned `true` unconditionally would satisfy both
+        // assertions above.
+        let mut report = report_shell();
+        report.install_root_security = Some(secure::InstallRootSecurity::established_safe(
+            PROGRAM_FILES_BIN.to_string(),
+            "admin-only, no unprivileged write ACE".to_string(),
+        ));
         let failures = evaluate_readiness(&plan, &report);
         assert!(
             !failures.iter().any(|f| f.contains("install root")),
-            "an inconclusive ACL read must not fail readiness: {failures:?}"
+            "a verified-safe install root must not fail readiness: {failures:?}"
         );
     }
 
@@ -5449,12 +5458,10 @@ mod tests {
         // A definitive write breach on that custom dir refuses ready.
         let mut report = report_shell();
         report.service = Some(running_service());
-        report.install_root_security = Some(secure::InstallRootSecurity {
-            root: custom.to_string_lossy().into_owned(),
-            checked: true,
-            secure: false,
-            note: "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
-        });
+        report.install_root_security = Some(secure::InstallRootSecurity::detected_unsafe(
+            custom.to_string_lossy().into_owned(),
+            "grants WRITE to an unprivileged principal (S-1-5-32-545)".to_string(),
+        ));
         let failures = evaluate_readiness(&plan, &report);
         assert!(
             failures.iter().any(|f| f.contains("install root")),

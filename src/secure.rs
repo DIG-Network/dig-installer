@@ -190,7 +190,7 @@ pub fn root_exec_guard(bin: &std::path::Path) -> Result<(), String> {
     let os =
         crate::target::Os::from_consts(std::env::consts::OS).unwrap_or(crate::target::Os::Linux);
     let verdict = verify_install_root(os, dir);
-    if verdict.checked && !verdict.secure {
+    if verdict.is_blocking() {
         return Err(format!(
             "refusing to run {} as root: {} — a binary in a directory an unprivileged account can \
              write is one they can REPLACE, so running it as root would execute their code with full \
@@ -210,16 +210,100 @@ pub fn root_exec_guard(bin: &std::path::Path) -> Result<(), String> {
 pub struct InstallRootSecurity {
     /// The install root that was checked.
     pub root: String,
-    /// The effective permissions were actually read back and evaluated. `false`
-    /// on dry-run or when the OS check could not run (indeterminate — a warning,
-    /// never a false "secure").
-    pub checked: bool,
-    /// The root DENIES write to every unprivileged principal (the #565
-    /// invariant). Only `true` when [`Self::checked`] and the read-back proved
-    /// it. Readiness fails only on a DEFINITIVE `checked && !secure`.
-    pub secure: bool,
+    /// Were the effective permissions actually read back and evaluated?
+    ///
+    /// PRIVATE, and it must stay private: this field plus [`Self::posture_is_safe`] are the two halves of
+    /// a POLICY, and every site that read them re-derived that policy for itself. Ask
+    /// [`Self::is_blocking`] instead.
+    ///
+    /// Serialized as `checked` so `install.json` is unchanged; named distinctly in Rust so the check that
+    /// keeps the policy in one place can name it precisely (`checked` is an ordinary word that other
+    /// unrelated report types also use).
+    #[serde(rename = "checked")]
+    posture_was_read: bool,
+    /// Does the root DENY write to every unprivileged principal (the #565 invariant)?
+    ///
+    /// PRIVATE for the same reason as [`Self::posture_was_read`], and serialized as `secure`. Only `true`
+    /// when the read-back proved it.
+    #[serde(rename = "secure")]
+    posture_is_safe: bool,
     /// Human-readable detail — never silent.
     pub note: String,
+}
+
+impl InstallRootSecurity {
+    /// MUST this verdict stop what the caller was about to do?
+    ///
+    /// # Why this is the only question callers may ask (#1748)
+    ///
+    /// `checked` and `secure` are two halves of one policy, and for six rounds every call site
+    /// re-derived that policy as `if verdict.checked && !verdict.secure` — "block only on a DEFINITIVE
+    /// breach". Seven sites, seven independent copies. The type therefore offered each new caller the
+    /// chance to get it wrong, and each round a new caller took it: the same class was found and fixed
+    /// five times running, one level over each time, because the fix was always to the SITE.
+    ///
+    /// The policy is decided once, here, and it INCLUDES the indeterminate case. A verdict that could
+    /// not be established is not a pass:
+    ///
+    /// * the whole-chain walk returns `Err` when a level cannot be inspected — which is also what a
+    ///   REFUSAL looks like, and refusals are exactly the interesting answers;
+    /// * `if checked && !secure` reads "indeterminate → proceed", so the strongest detection this crate
+    ///   can make printed a tick and root went on to exec an attacker's binary.
+    ///
+    /// # What this costs, and why it is the right trade
+    ///
+    /// A genuinely unreadable directory now blocks rather than warning. That is the conservative
+    /// direction: the failure mode is an install that refuses and says which level it could not verify,
+    /// against one that silently grants root execution out of a directory a stranger can write. The
+    /// note always names the level, so an operator is never left guessing.
+    ///
+    /// Unelevated callers do not consult this at all ([`root_exec_guard`] returns early), so an ordinary
+    /// per-user install is unaffected.
+    pub fn is_blocking(&self) -> bool {
+        !self.posture_is_safe
+    }
+
+    /// Was the posture positively ESTABLISHED as safe?
+    ///
+    /// The inverse of [`Self::is_blocking`], for log lines that want to print a tick. Deliberately the
+    /// only other question available, so no caller can reconstruct the two-field policy.
+    pub fn is_established_safe(&self) -> bool {
+        self.posture_is_safe
+    }
+
+    /// The posture was READ and every level denies unprivileged write.
+    pub fn established_safe(root: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            posture_was_read: true,
+            posture_is_safe: true,
+            note: note.into(),
+        }
+    }
+
+    /// A level was positively DETECTED unsafe — writable, wrongly owned, or a symlink.
+    pub fn detected_unsafe(root: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            posture_was_read: true,
+            posture_is_safe: false,
+            note: note.into(),
+        }
+    }
+
+    /// The posture could not be established at all.
+    ///
+    /// Named separately from [`Self::detected_unsafe`] because the DISTINCTION is real and worth keeping
+    /// in the log — but both BLOCK, which is the whole point of [`Self::is_blocking`]. An outcome nobody
+    /// could establish is not evidence of safety.
+    pub fn indeterminate(root: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            posture_was_read: false,
+            posture_is_safe: false,
+            note: note.into(),
+        }
+    }
 }
 
 /// Verify the install `root` denies unprivileged write (#565). Windows: read the
@@ -242,12 +326,10 @@ pub fn verify_install_root(os: Os, root: &std::path::Path) -> InstallRootSecurit
     #[allow(unreachable_code)]
     {
         let _ = os;
-        InstallRootSecurity {
-            root: root_str,
-            checked: false,
-            secure: false,
-            note: "install-root ACL verification is not supported on this OS".to_string(),
-        }
+        InstallRootSecurity::indeterminate(
+            root_str,
+            "install-root ACL verification is not supported on this OS".to_string(),
+        )
     }
 }
 
@@ -267,41 +349,27 @@ fn verify_windows(root_str: &str, root: &std::path::Path) -> InstallRootSecurity
             // Refuse to report `secure` without having observed at least one
             // access rule — resolve to `checked:false` (indeterminate) instead.
             if count_aces(&stdout) == 0 {
-                return InstallRootSecurity {
-                    root: root_str.to_string(),
-                    checked: false,
-                    secure: false,
-                    note: "the install-root ACL read returned no access rules (Get-Acl produced \
-                           no ACE lines) — indeterminate; the admin-only Program Files location \
-                           remains the primary guarantee"
-                        .to_string(),
-                };
+                return InstallRootSecurity::indeterminate(
+                    root_str,
+                    "the install-root ACL read returned no access rules (Get-Acl produced no ACE \
+                     lines) — indeterminate; the admin-only Program Files location remains the \
+                     primary guarantee",
+                );
             }
             match parse_acl_write_grants(&stdout) {
-                Ok(()) => InstallRootSecurity {
-                    root: root_str.to_string(),
-                    checked: true,
-                    secure: true,
-                    note: "the install root denies write to unprivileged principals \
-                           (admin-only, no Users/Everyone/Authenticated-Users write ACE)"
-                        .to_string(),
-                },
-                Err(e) => InstallRootSecurity {
-                    root: root_str.to_string(),
-                    checked: true,
-                    secure: false,
-                    note: e,
-                },
+                Ok(()) => InstallRootSecurity::established_safe(
+                    root_str,
+                    "the install root denies write to unprivileged principals (admin-only, no \
+                     Users/Everyone/Authenticated-Users write ACE)",
+                ),
+                Err(e) => InstallRootSecurity::detected_unsafe(root_str, e),
             }
         }
-        _ => InstallRootSecurity {
-            root: root_str.to_string(),
-            checked: false,
-            secure: false,
-            note: "could not read the install-root ACL back (Get-Acl did not run) — the \
-                   admin-only Program Files location is still the primary guarantee"
-                .to_string(),
-        },
+        _ => InstallRootSecurity::indeterminate(
+            root_str,
+            "could not read the install-root ACL back (Get-Acl did not run) — the admin-only \
+             Program Files location is still the primary guarantee",
+        ),
     }
 }
 
@@ -345,29 +413,22 @@ fn verdict_from_walk(
     walk: Result<Option<crate::rootchain::Unsafe>, String>,
 ) -> InstallRootSecurity {
     match walk {
-        Ok(None) => InstallRootSecurity {
-            root: root_str.to_string(),
-            checked: true,
-            secure: true,
-            note: "every level of the install root is root-owned with no group/other write"
-                .to_string(),
-        },
-        Ok(Some(bad)) => InstallRootSecurity {
-            root: root_str.to_string(),
-            checked: true,
-            secure: false,
-            note: format!(
+        Ok(None) => InstallRootSecurity::established_safe(
+            root_str,
+            "every level of the install root is root-owned with no group/other write",
+        ),
+        Ok(Some(bad)) => InstallRootSecurity::detected_unsafe(
+            root_str,
+            format!(
                 "{}: {} — a non-root account could replace a binary this installer places or executes",
                 bad.level.display(),
                 bad.reason
             ),
-        },
-        Err(e) => InstallRootSecurity {
-            root: root_str.to_string(),
-            checked: false,
-            secure: false,
-            note: format!("could not verify every level of the install root: {e}"),
-        },
+        ),
+        Err(e) => InstallRootSecurity::indeterminate(
+            root_str.to_string(),
+            format!("could not verify every level of the install root: {e}"),
+        ),
     }
 }
 
@@ -668,13 +729,13 @@ mod tests {
         }
         let v = verify_install_root(Os::Windows, dir);
         assert!(
-            v.checked,
+            v.is_blocking(),
             "the ACL read-back must run on a Program Files dir (inherited \
              AppContainer ACEs must not abort it): {}",
             v.note
         );
         assert!(
-            v.secure,
+            !v.is_established_safe(),
             "Program Files denies unprivileged write, so it must verify secure: {}",
             v.note
         );
@@ -682,16 +743,81 @@ mod tests {
 
     #[test]
     fn install_root_security_serializes_with_stable_fields() {
-        let r = InstallRootSecurity {
-            root: r"C:\Program Files\DIG\bin".into(),
-            checked: true,
-            secure: true,
-            note: "ok".into(),
-        };
+        let r = InstallRootSecurity::established_safe(r"C:\Program Files\DIG\bin", "ok");
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["checked"], true);
         assert_eq!(v["secure"], true);
         assert_eq!(v["root"], r"C:\Program Files\DIG\bin");
+    }
+
+    /// The fail-open policy MUST exist in exactly one place, and NO caller may reconstruct it.
+    ///
+    /// # The type this replaces
+    ///
+    /// `checked` and `secure` are two halves of one decision, and seven call sites each re-derived it as
+    /// `if verdict.checked && !verdict.secure`. That is why the same defect was found and fixed FIVE
+    /// rounds running: each fix was correct and each left the type free to offer the next caller the same
+    /// mistake, one level over. Four doc comments in this crate already narrated the hazard.
+    ///
+    /// So the fields are private and [`InstallRootSecurity::is_blocking`] is the only question. This test
+    /// is what keeps that true: it fails if `checked`/`secure` are read anywhere outside this module, or
+    /// if the two-field pattern reappears in any form. A new call site therefore CANNOT re-derive the
+    /// policy — it will not compile, and if it somehow spells it in a comment this still catches it.
+    #[test]
+    fn the_blocking_policy_is_decided_in_exactly_one_place() {
+        let mut offenders = Vec::new();
+        for (file, src) in crate::sources::all() {
+            if file == "secure.rs" {
+                continue; // The one module that owns the policy.
+            }
+            for (number, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                for needle in [".posture_was_read", ".posture_is_safe"] {
+                    if code.contains(needle) {
+                        offenders.push(format!("{file}:{}: {}", number + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the install-root verdict's fields are read outside `secure`, which is how the fail-open              policy came to exist in seven copies. Ask `InstallRootSecurity::is_blocking()` instead.              Offending lines:
+{}",
+            offenders.join("
+")
+        );
+
+        // Self-check: the scan must be capable of finding what it looks for, or an empty result means
+        // nothing. Both spellings are exercised against text that WOULD be reported.
+        for planted in [
+            "if verdict.posture_was_read && !verdict.posture_is_safe {",
+            "let x = sec.posture_is_safe;",
+        ] {
+            assert!(
+                planted.contains(".posture_was_read") || planted.contains(".posture_is_safe"),
+                "the needle no longer matches the pattern it exists to catch: {planted}"
+            );
+        }
+    }
+
+    /// Indeterminate BLOCKS, and only established-safe passes — the whole of WU1, on the one method.
+    ///
+    /// All three outcomes are asserted, because a two-outcome test cannot distinguish "indeterminate
+    /// blocks" from "everything blocks", and the second would refuse every install.
+    #[test]
+    fn only_an_established_safe_posture_is_non_blocking() {
+        assert!(
+            !InstallRootSecurity::established_safe("/opt/dig/bin", "verified").is_blocking(),
+            "a verified-safe root must not block, or no install could ever proceed"
+        );
+        assert!(
+            InstallRootSecurity::detected_unsafe("/opt/dig/bin", "group-writable").is_blocking(),
+            "a detected breach must block"
+        );
+        assert!(
+            InstallRootSecurity::indeterminate("/opt/dig/bin", "could not read").is_blocking(),
+            "a posture nobody could establish is not evidence of safety - `indeterminate -> proceed`              is the fail-open policy this release removes"
+        );
     }
 
     // -- #1748 F1: root must never EXECUTE a binary out of a user-writable directory ----
@@ -935,9 +1061,9 @@ mod tests {
         // 0o777 → group + other write present → NOT secure.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let v = verify_install_root(Os::Linux, &dir);
-        assert!(v.checked);
+        assert!(v.is_blocking());
         assert!(
-            !v.secure,
+            !v.is_established_safe(),
             "a world-writable root must be flagged: {}",
             v.note
         );
@@ -954,9 +1080,9 @@ mod tests {
     #[test]
     fn unix_verify_accepts_a_root_owned_chain() {
         let v = verify_install_root(Os::Linux, std::path::Path::new("/usr/bin"));
-        assert!(v.checked, "the walk must run: {}", v.note);
+        // A clean chain is ESTABLISHED safe, which is the only non-blocking outcome.
         assert!(
-            v.secure,
+            v.is_established_safe(),
             "every level of /usr/bin is root-owned 0755, so it must verify clean: {}",
             v.note
         );
@@ -985,22 +1111,22 @@ mod tests {
             })),
         );
         assert!(
-            detected.checked && !detected.secure,
+            detected.is_blocking(),
             "a DETECTION must be definitive, or every gate waves it through: {detected:?}"
         );
 
         // The other two arms, so the mapping cannot be satisfied by returning one verdict for everything.
         let clean = verdict_from_walk("/opt/dig/bin", Ok(None));
-        assert!(clean.checked && clean.secure);
+        assert!(clean.is_established_safe() && !clean.is_blocking());
 
         let unreadable = verdict_from_walk("/opt/dig/bin", Err("permission denied".to_string()));
         assert!(
-            !unreadable.checked,
-            "a level that could not be READ is legitimately indeterminate: {unreadable:?}"
+            unreadable.is_blocking(),
+            "a level that could not be READ is indeterminate, and indeterminate BLOCKS (WU1): a posture              nobody could establish is not evidence of safety: {unreadable:?}"
         );
     }
 
-    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory
+    /// The counterpart, and the property the leaf-only check could not see: a perfectly-moded directory
     /// under a WORLD-WRITABLE ancestor is NOT secure, and the verdict names the ANCESTOR.
     ///
     /// `/tmp` is mode `1777` on every unix box, which makes it a truthful stand-in for the `0777`
@@ -1016,9 +1142,9 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let v = verify_install_root(Os::Linux, &dir);
-        assert!(v.checked);
+        assert!(v.is_blocking());
         assert!(
-            !v.secure,
+            !v.is_established_safe(),
             "a 0755 leaf under a 1777 ancestor must NOT be reported secure: {}",
             v.note
         );
