@@ -216,6 +216,34 @@ export const OPTIONS = [
   },
 ];
 
+/**
+ * The Components step's initial checkbox state, DERIVED from the two catalogues
+ * above so `req`/`on`/`hidden` are the single source of truth for what is
+ * pre-selected.
+ *
+ * Deriving is the point. This used to be a hand-written literal in `App.jsx`
+ * while `data.jsx` carried `on` flags of its own, and the two drifted: `dig-app`
+ * was `on: true` here and missing from the literal, so its box rendered
+ * unchecked and `on` was dead metadata that read as if it worked. Now the next
+ * entry added to a catalogue cannot be forgotten.
+ *
+ * - `req` (digstore — the CLI) is always installed, so always on.
+ * - `hidden` entries (the DIG Browser, #491) are not offered, so they are
+ *   ABSENT rather than false: nothing downstream can read them back as an
+ *   offered-but-unchecked component.
+ * - Everything else is on exactly when its catalogue entry says `on: true`
+ *   (`dig-relay` is `on: false` — advanced, opt-in only, #491).
+ *
+ * @returns {Record<string, boolean>} a fresh map of selection id → checked.
+ */
+export function defaultSelection() {
+  return Object.fromEntries(
+    [...COMPONENTS, ...OPTIONS]
+      .filter((entry) => !entry.hidden)
+      .map((entry) => [entry.id, Boolean(entry.req || entry.on)]),
+  );
+}
+
 // Files surfaced in the progress header "writing <file>" while the real
 // pipeline runs (the Rust side overrides these with the actual current file).
 export const NOW_FILES = [

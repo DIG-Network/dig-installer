@@ -8,7 +8,7 @@ import { Installing } from "./steps/Installing.jsx";
 import { Finish } from "./steps/Finish.jsx";
 import { LanguageSelector } from "./i18n/LanguageSelector.jsx";
 import { FooterActions } from "./FooterActions.jsx";
-import { NOW_FILES, COMPONENTS, OPTIONS } from "./data.jsx";
+import { NOW_FILES, defaultSelection } from "./data.jsx";
 import { computeSteps } from "./steps.js";
 import glowD from "./assets/logos/D-glow-logo.svg";
 import nebula from "./assets/logos/galaxy-background.webp";
@@ -53,29 +53,15 @@ export function App() {
   // Always start at Welcome — the installer never resumes a prior run's step.
   const [step, setStep] = useState(0);
   const [agreed, setAgreed] = useState(false);
-  // The pre-selected set IS the one-click default path, and every default now lives in ONE place:
-  // `data.jsx`. dig-node, dig-dns, dig-app and the extension carry `on: true`; digstore is `req`
-  // (always installed); `dig-relay` is `on: false` (advanced — the node already uses
-  // relay.dig.net, #491); the DIG Browser is `hidden` and not offered at all. The options
-  // (`open-firewall` #424, `auto-update` #514, `dig-app-autostart`) default ON, mirroring the
-  // CLI's own default-on flags.
-  //
-  // DERIVED from the catalogs, never hand-listed. This used to be a literal object, and it had
-  // silently drifted: `data.jsx` marked `dig-app` with `on: true` while this list omitted it, so
-  // `sel["dig-app"]` was `undefined`, the box rendered UNCHECKED, and the `on` flag was dead
-  // metadata that read as if it worked. Deriving makes `on` load-bearing, so the next component
-  // added to `data.jsx` cannot be forgotten here.
-  //
-  // A `req` component is always on (digstore — the CLI). `hidden` entries are not offered at all,
-  // so they are absent rather than false. Options carry their own `on` default, and the Rust side
-  // treats an ABSENT option key as its default too (`unwrap_or(&true)`), so the two agree.
-  const [sel, setSel] = useState(() =>
-    Object.fromEntries(
-      [...COMPONENTS, ...OPTIONS]
-        .filter((entry) => !entry.hidden)
-        .map((entry) => [entry.id, Boolean(entry.req || entry.on)]),
-    ),
-  );
+  // The pre-selected set IS the one-click default path, and every default lives in ONE place:
+  // the `data.jsx` catalogues. `defaultSelection()` derives this state from them, so `on` is
+  // load-bearing rather than duplicated here — see its doc comment for the drift that motivated
+  // it. dig-node, dig-app, dig-dns and the extension are `on: true`; digstore is `req`;
+  // `dig-relay` is `on: false` (#491); the DIG Browser is `hidden` and not offered at all; the
+  // options (`open-firewall` #424, `auto-update` #514, `dig-app-autostart`) default ON, mirroring
+  // the CLI's own default-on flags. The Rust side treats an ABSENT option key as its default too
+  // (`unwrap_or(&true)`), so the two agree.
+  const [sel, setSel] = useState(defaultSelection);
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
   // Per-component Install/Update/Skip preview (#309) for the Components
   // screen — `null` while unchecked/loading, so the screen can distinguish

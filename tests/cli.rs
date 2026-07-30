@@ -575,6 +575,15 @@ fn rejects_unknown_flag_with_usage_error() {
 /// silently regress to pre-checked/offered. The CLI side is already guarded by
 /// `help_json_advertises_all_three_core_components_as_default` (dig-relay +
 /// browser are `default: false`).
+///
+/// The pre-selected set is DERIVED from the `data.jsx` catalogue by
+/// `defaultSelection()` rather than hand-listed in `App.jsx`, so the flags in
+/// the catalogue are the authoritative defaults and this guard reads them there.
+/// Each flag is matched INSIDE its own entry: a whole-file `contains("on: false")`
+/// stayed green as long as *any* entry carried the flag, which is not the
+/// property #491 needs. The behavioural half — evaluating `defaultSelection()`
+/// and asserting the resulting map — lives in
+/// `gui/app/src/default-selection.test.js`.
 #[test]
 fn gui_defaults_dig_relay_unchecked_and_browser_hidden() {
     use std::fs;
@@ -585,31 +594,46 @@ fn gui_defaults_dig_relay_unchecked_and_browser_hidden() {
         fs::read_to_string(Path::new(dir).join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
     };
 
-    // data.jsx: dig-relay present but NOT pre-checked; browser entry kept but hidden.
     let data = read("gui/app/src/data.jsx");
+    // The slice of `data.jsx` belonging to one catalogue entry: from its `id:` to
+    // the next entry's, so a flag can only satisfy the entry it is written in.
+    let entry = |id: &str| -> &str {
+        let marker = format!(r#"id: "{id}""#);
+        let start = data
+            .find(&marker)
+            .unwrap_or_else(|| panic!("data.jsx must keep an `{id}` catalogue entry (#491)"));
+        let rest = &data[start + marker.len()..];
+        let end = rest.find("id: \"").unwrap_or(rest.len());
+        &rest[..end]
+    };
+
+    // dig-relay: offered, but never pre-checked.
     assert!(
-        data.contains(r#"id: "dig-relay""#),
-        "dig-relay entry present"
+        entry("dig-relay").contains("on: false"),
+        "dig-relay must default UNCHECKED (`on: false`) in the data.jsx catalogue (#491)"
     );
+    // The DIG Browser: entry kept for easy re-enable, but hidden so it is not offered.
+    let browser = entry("browser");
     assert!(
-        data.contains(r#"id: "browser""#),
-        "browser entry kept (for easy re-enable)"
-    );
-    assert!(
-        data.contains("hidden: true"),
+        browser.contains("hidden: true"),
         "the DIG Browser must be hidden by default (#491)"
     );
-    // dig-relay is the only `on: false` optional component.
     assert!(
-        data.contains("on: false"),
-        "dig-relay must default UNCHECKED (on: false) (#491)"
+        !browser.contains("on: true"),
+        "the DIG Browser must not be pre-selected (#491)"
     );
 
-    // App.jsx initial selection: dig-relay false, browser NOT pre-selected.
+    // App.jsx must DERIVE its initial selection from the catalogue. A hand-listed
+    // literal is what let `dig-app` drift to unchecked while the catalogue said
+    // `on: true`, and it would let dig-relay drift back to checked the same way.
     let app = read("gui/app/src/App.jsx");
     assert!(
-        app.contains(r#""dig-relay": false"#),
-        "dig-relay must default OFF in the initial GUI selection (#491)"
+        app.contains("useState(defaultSelection)"),
+        "App.jsx must derive its initial selection via defaultSelection(), not hand-list it (#491)"
+    );
+    assert!(
+        !app.contains(r#""dig-relay": true"#),
+        "dig-relay must not be forced ON in App.jsx (#491)"
     );
     assert!(
         !app.contains("browser: true"),
