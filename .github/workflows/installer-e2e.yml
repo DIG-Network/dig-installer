@@ -659,18 +659,29 @@ jobs:
       # a directory the distribution owns, so the image's own `/opt` is repaired
       # here. Asserted, not assumed: if a future image ships it correctly this
       # still passes, and the check below proves the level really is safe.
-      - name: Normalise the runner image's world-writable /opt and /usr/local/bin
+      - name: Normalise the runner image's world-writable /opt and veneer chain
         run: |
-          stat -c '%n %U %a' /opt /usr/local/bin
-          # BOTH are shipped permissive by the runner image, and both are directories the installer
+          stat -c '%n %U %a' /opt /usr /usr/local /usr/local/bin
+          # BOTH roots are shipped permissive by the runner image, and both are directories the installer
           # deliberately does not re-mode because the distribution owns them. /usr/local/bin matters as much
           # as /opt now: it is where root's own login PATH resolves DIG commands from, so an account that can
           # write it replaces a planted link and root runs whatever it points at. The image's own posture is
           # repaired here, and asserted rather than assumed.
-          sudo chmod 755 /opt /usr/local/bin
-          sudo chown 0:0 /usr/local/bin
-          for level in /opt /usr/local/bin; do
-            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))"               || { echo "FAIL: $level is still group- or world-writable"; exit 1; }
+          #
+          # EVERY ANCESTOR, not just the leaf. `secure::verify_install_root` walks the whole chain (write
+          # permission on `/usr/local` is permission to rename `/usr/local/bin` aside and substitute an
+          # attacker-owned directory of the same name), so normalising only the leaf leaves the verdict at
+          # the mercy of whatever the image happens to ship above it. It is not hypothetical: runner images
+          # vary here, `/usr/local/bin` arrived `root 777` on one run and `runner 777` on the next, and the
+          # walk reported `/usr` owned by uid 1001. Pinning the whole chain is what makes the veneer shape
+          # this job asserts DETERMINISTIC rather than image-dependent.
+          sudo chmod 755 /opt /usr /usr/local /usr/local/bin
+          sudo chown 0:0 /usr /usr/local /usr/local/bin
+          for level in /opt /usr /usr/local /usr/local/bin; do
+            test "$(stat -c '%U' "$level")" = root \
+              || { echo "FAIL: $level is still not root-owned"; exit 1; }
+            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+              || { echo "FAIL: $level is still group- or world-writable"; exit 1; }
           done
 
       - name: Install as root with HOME=/root and the DEFAULT bin dir
@@ -707,20 +718,103 @@ jobs:
       # and `/usr/local/bin` holds only SYMLINKS. Asserted BOTH ways: a regression
       # that installs into the veneer again keeps `command -v` green above, so the
       # reachability assertion alone cannot see it.
-      - name: Every binary lives in the protected root; the veneer holds only links
+      # The PLACEMENT invariant is unconditional; the REACHABILITY MECHANISM is a
+      # measured choice, so it is asserted per the mechanism the run reported.
+      #
+      # `reachability_for()` picks `veneer_links` only when the veneer chain is
+      # safe, and falls back to `direct_path_entry` — the protected root PREPENDED
+      # onto the login PATH via /etc/profile.d — when it is not. That fallback is
+      # #1748's own design, not a degradation: refusing to install is a refusal,
+      # and planting a link in a directory an unprivileged account can write is
+      # the escalation the whole task was about. The step above pins the veneer
+      # chain so `veneer_links` is the branch that normally runs here.
+      #
+      # NEITHER branch is a free pass. Each asserts the full requirement for its
+      # shape, an unrecognised value fails closed, and the placement + chain-posture
+      # assertions below run either way. What #1748 actually requires — the invoking
+      # non-root user reaches what was installed — is proven independently by the
+      # login-shell step above, which runs before this one under both shapes.
+      - name: Every binary lives in the protected root; reachability matches the reported mechanism
         run: |
           jq -e '(.result.components | length) > 0' install.json
           jq -e 'all(.result.components[]; .dest | startswith("/opt/dig/bin/"))' install.json \
             || { echo "FAIL: an elevated install placed a binary outside the protected root"; exit 1; }
-          for cli in dig-store digs; do
-            test -L "/usr/local/bin/$cli" \
-              || { echo "FAIL: /usr/local/bin/$cli must be a symlink, not an installed binary"; exit 1; }
-            printf '%s -> %s\n' "$cli" "$(readlink -f "/usr/local/bin/$cli")"
-            case "$(readlink -f "/usr/local/bin/$cli")" in
-              /opt/dig/bin/*) ;;
-              *) echo "FAIL: $cli link does not resolve into the protected root"; exit 1 ;;
-            esac
-          done
+
+          MECHANISM=$(jq -r '.result.reachability' install.json)
+          echo "reported reachability mechanism: $MECHANISM"
+          case "$MECHANISM" in
+            veneer_links)
+              # The veneer must hold ONLY symlinks into the protected root. Asserted
+              # BOTH ways: a regression that installs a real binary into the veneer
+              # again keeps `command -v` green above, so reachability cannot see it.
+              jq -e '.result.veneer_security.secure == true' install.json \
+                || { echo "FAIL: links were planted in a veneer the installer itself calls unsafe"; exit 1; }
+              for cli in dig-store digs; do
+                test -L "/usr/local/bin/$cli" \
+                  || { echo "FAIL: /usr/local/bin/$cli must be a symlink, not an installed binary"; exit 1; }
+                printf '%s -> %s\n' "$cli" "$(readlink -f "/usr/local/bin/$cli")"
+                case "$(readlink -f "/usr/local/bin/$cli")" in
+                  /opt/dig/bin/*) ;;
+                  *) echo "FAIL: $cli link does not resolve into the protected root"; exit 1 ;;
+                esac
+              done
+              jq -e '.result.path.dir == "/usr/local/bin"' install.json \
+                || { echo "FAIL: report.path.dir must name the veneer under veneer_links"; exit 1; }
+              ;;
+            direct_path_entry)
+              # The fallback's own requirements, and it is held to MORE than the
+              # veneer branch, because falling back must not become the cheap way
+              # to a green check.
+              jq -e '.result.veneer_security.secure == false' install.json \
+                || { echo "FAIL: fell back to a direct PATH entry from a veneer that was SAFE"; exit 1; }
+              # 1. NOTHING may be planted in the veneer it declined to trust.
+              for cli in dig-store digs; do
+                test ! -e "/usr/local/bin/$cli" \
+                  || { echo "FAIL: $cli was planted in /usr/local/bin the installer declined to trust"; \
+                       ls -l "/usr/local/bin/$cli"; exit 1; }
+              done
+              # 2. The protected root must be the reported PATH dir, and be root-owned.
+              jq -e '.result.path.dir == "/opt/dig/bin"' install.json \
+                || { echo "FAIL: report.path.dir must name the protected root under direct_path_entry"; exit 1; }
+              jq -e '.result.path.modified == true' install.json \
+                || { echo "FAIL: the fallback must actually wire the protected root onto PATH"; exit 1; }
+              # 3. It must be PREPENDED, so a DIG name resolves to the protected root and
+              #    not to whatever made the veneer unsafe. Read the login PATH the user
+              #    really gets and require the protected root to precede the veneer.
+              #    Done in ONE awk over a FILE, with no pipeline: a `grep … | head -1`
+              #    here would SIGPIPE grep under `pipefail` and yield an empty answer
+              #    rather than a verdict, which is the #1813 skip-instead-of-fail shape.
+              USER_NAME=$(id -un 1001)
+              sudo su - "$USER_NAME" -c 'printf "%s\n" "$PATH"' > login-path.txt
+              cat login-path.txt
+              awk -v RS=':' '
+                { gsub(/\n/, "") }
+                $0 == "/opt/dig/bin"  && !dig { dig = NR }
+                $0 == "/usr/local/bin" && !ven { ven = NR }
+                END {
+                  if (!dig) { print "FAIL: /opt/dig/bin is not on the login PATH at all"; exit 1 }
+                  if (ven && ven < dig) {
+                    print "FAIL: /usr/local/bin precedes /opt/dig/bin on the login PATH"; exit 1
+                  }
+                }
+              ' login-path.txt
+              # 4. And every CLI must still resolve INTO the protected root for that user.
+              for cli in dig-store digs; do
+                sudo su - "$USER_NAME" -c "command -v $cli" > "resolved-$cli.txt" \
+                  || { echo "FAIL: $cli is not on $USER_NAME's PATH under the fallback"; exit 1; }
+                cat "resolved-$cli.txt"
+                case "$(cat "resolved-$cli.txt")" in
+                  /opt/dig/bin/*) ;;
+                  *) echo "FAIL: $cli does not resolve into the protected root under the fallback"; exit 1 ;;
+                esac
+              done
+              ;;
+            *)
+              # Fail CLOSED. A null/absent/renamed mechanism must never skip the branch.
+              echo "FAIL: unrecognised reachability mechanism '$MECHANISM' — neither shape was asserted"
+              exit 1
+              ;;
+          esac
           # EVERY LEVEL of the chain, not just the leaf. Write permission on /opt/dig is
           # permission to rename /opt/dig/bin aside and substitute an attacker-owned
           # directory of the same name, so a 0777 parent is a complete escalation on its
@@ -779,10 +873,26 @@ jobs:
           jq -e 'all(.result.cli_path_checks[]; .resolved == true)' install.json
           # No user-facing binary may live under root's home.
           jq -e 'all(.result.components[]; (.dest | startswith("/root")) | not)' install.json
-          # And the PATH result must name the dir that actually has to be searchable — the veneer, not
-          # the install dir, which is deliberately never on any PATH. This field is machine-consumed.
-          jq -e '.result.path.dir == "/usr/local/bin"' install.json \
-            || { echo "FAIL: report.path.dir names a directory that is not on the user's PATH"; exit 1; }
+          # And the PATH result must name the dir that actually has to be searchable. This field is
+          # machine-consumed, so the requirement is that it names the dir the REPORTED mechanism makes
+          # searchable — the veneer under `veneer_links`, the protected root under the fallback (which
+          # puts the root on PATH directly instead). Asserted per-mechanism in the placement step above;
+          # here the property is that the named dir is genuinely on the invoking user's login PATH,
+          # which is the agreement the pre-#1748 report failed to have.
+          PATH_DIR=$(jq -r '.result.path.dir' install.json)
+          echo "reported path.dir: $PATH_DIR"
+          USER_NAME=$(id -un 1001)
+          sudo su - "$USER_NAME" -c 'printf "%s\n" "$PATH"' > agree-login-path.txt
+          awk -v RS=':' -v want="$PATH_DIR" '
+            { gsub(/\n/, "") }
+            $0 == want { found = 1 }
+            END {
+              if (!found) {
+                print "FAIL: report.path.dir names a directory that is not on the user'"'"'s PATH"
+                exit 1
+              }
+            }
+          ' agree-login-path.txt
 
       # The other half of the bound: the check must be capable of going RED.
       # Point an install at a root-only directory (mode 0700, unreachable by any
