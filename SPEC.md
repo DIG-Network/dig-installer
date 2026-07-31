@@ -582,16 +582,28 @@ the install reports NOT ready (`MigrationResult::deregister_failures`), never a 
 tolerated re-install that could leave the service at the legacy binPath. Recorded in
 `InstallReport.migration`.
 
-A run that does NOT select the auto-update beacon MUST still leave the host's auto-updates as it
-found them: declining the beacon means "install nothing", never "remove what is already there".
-Since the migration vacates the beacon's scheduled task independent of the plan, a run whose plan
-declines the beacon and whose migration deregistered that task MUST re-register the daily schedule
-against `<protected root>/dig-updater` (`dig-updater schedule install`, which also rescinds any
-opt-out sentinel) — never against the legacy binary, which has been removed and MUST NEVER be
-executed. When that re-arm cannot succeed, the installer MUST report that auto-updates are now
-disabled and how to restore them; it is not a readiness failure, because the beacon was not part of
-what the run was asked to install. Recorded in `InstallReport.beacon_rearm`
-(`{applied, note}`, `null` when there was nothing to restore).
+A run that does NOT select the auto-update beacon MUST NOT install or register it: declining the
+beacon means "install nothing". The #565 migration nevertheless vacates a beacon schedule that
+resolves under a legacy user-writable root, independent of the plan, and MUST do so — such a
+schedule is itself the vulnerability. A run whose plan declines the beacon and whose migration
+deregistered that schedule therefore leaves the host with auto-updates OFF, and MUST REPORT that
+state rather than swallow it: the installer MUST record the outcome in
+`InstallReport.beacon_rearm` (`{applied, note}`, `null` when there was nothing to restore) and MUST
+log that auto-updates are now disabled and the exact command that restores them. It MUST NOT
+download, place, or execute `dig-updater` to restore the schedule — doing so would install a
+component the run was explicitly asked not to install.
+
+Where a protected-root `dig-updater` is already present, the installer MAY re-register the daily
+schedule against `<protected root>/dig-updater` only, never against a legacy binary (which has been
+removed and MUST NEVER be executed) and never against a `--bin-dir`/GUI-redirected root: a run
+whose privileged install root differs from the protected root MUST SKIP the re-arm and log the
+reason, because a machine-wide privileged schedule MUST NEVER be registered at a caller-selected
+path. This is not a readiness failure — the beacon was not part of what the run was asked to install.
+
+A re-arm that succeeded is a reversible privileged action: it MUST be recorded in the install's
+rollback guard, so a later step's failure deregisters the schedule rather than leaving a
+machine-wide privileged registration pointing into a root the rollback reverts. The re-arm MUST run
+AFTER the protected root has been created + hardened.
 
 **Authoritative install-root record (`install.json`, #581).** The installer writes
 `<install-home>/install.json` (`%ProgramFiles%\DIG\install.json` / `/opt/dig/install.json` — the
