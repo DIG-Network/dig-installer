@@ -744,12 +744,28 @@ jobs:
           jq -e '.result.ready == true' install.json
           jq -e '.result.failures == []' install.json
 
-      - name: Assert no privileged registration is left resolving under a legacy root (#565 H2b)
+      # The escalation must be CLOSED, and asserted on the host rather than on the
+      # report: this run declined the beacon and installs no other machine-wide
+      # privileged registration, so `registration_audit` is legitimately EMPTY once
+      # the schedule is vacated — a `select(.under_legacy_root) | length == 0`
+      # filter would pass vacuously on an empty array and prove nothing. The
+      # systemd + filesystem checks below cannot pass vacuously.
+      - name: Assert the legacy-root escalation is closed on the host (#565)
         run: |
-          jq -e '(.result.registration_audit | length) > 0' install.json
           jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
           # The run declined the beacon, so nothing may have re-installed it.
           jq -e '.result.beacon == null' install.json
+
+          # The seeded root-run timer must no longer resolve at all. `systemctl disable`
+          # alone leaves the unit file loadable, which is the defect this leg found.
+          systemctl show -p LoadState dig-updater.timer | tee post-loadstate.txt
+          grep -qx 'LoadState=loaded' post-loadstate.txt \
+            && { echo "FAIL: the beacon timer is still loaded — the schedule was not vacated"; exit 1; }
+          test ! -f /etc/systemd/system/dig-updater.timer \
+            || { echo "FAIL: the beacon timer unit file survived the deregister"; exit 1; }
+          # And the user-writable binary the root timer used to execute is gone.
+          test ! -f "$LEGACY_DIR/dig-updater" \
+            || { echo "FAIL: the legacy dig-updater binary survived the migration"; exit 1; }
 
       - name: Cleanup — remove the seeded units + uninstall
         if: always()
@@ -769,6 +785,7 @@ jobs:
             install.json
             uninstall.json
             seeded-execstart.txt
+            post-loadstate.txt
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
