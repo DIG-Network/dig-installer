@@ -605,7 +605,11 @@ mod tests {",
         // The sites that MUST be wired. Named, so removing the ambient read anywhere fails here rather
         // than passing by finding one fewer call.
         for (file, count) in [
-            ("autostart.rs", 3),
+            // 2, not 3, since dig_ecosystem#919: the third site was `enable_command`, which existed
+            // only to PRINT a `systemctl --user enable` command a human had to run — an autostart
+            // mechanism that never autostarted. Its replacement (an XDG desktop entry) needs no
+            // enable step, so there is no third boundary decision to make.
+            ("autostart.rs", 2),
             // The launch of dig-app decides whether to delegate to `su - <user>` or run directly
             // (#1831). Deciding it wrong runs the user's identity agent as root.
             ("launch.rs", 1),
@@ -621,8 +625,8 @@ mod tests {",
         }
         assert_eq!(
             wired.len(),
-            8,
-            "the crate has 8 privilege-boundary decision points; found {}: {wired:?}",
+            7,
+            "the crate has 7 privilege-boundary decision points; found {}: {wired:?}",
             wired.len()
         );
     }

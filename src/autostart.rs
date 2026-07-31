@@ -8,7 +8,21 @@
 //! * **Windows** — a per-user `HKCU\…\CurrentVersion\Run` value ([`WINDOWS_RUN_KEY`]), the same HKCU
 //!   idiom [`crate::scheme`] already uses for the `chia://` handler.
 //! * **macOS** — a `launchd` **LaunchAgent** plist under `~/Library/LaunchAgents`.
-//! * **Linux** — a systemd **user** unit under `$XDG_CONFIG_HOME/systemd/user`.
+//! * **Linux** — an XDG **autostart desktop entry** under `$XDG_CONFIG_HOME/autostart`.
+//!
+//! # Why Linux is an XDG desktop entry and NOT a systemd user unit (dig_ecosystem#919)
+//!
+//! This wrote a systemd **user** unit and then never enabled or started it: a unit file in
+//! `~/.config/systemd/user` that is not linked into `default.target.wants` is inert, so Linux
+//! autostart had never once worked. The installer could not fix that itself either — `systemctl
+//! --user enable` needs the TARGET user's session bus, which a `sudo` install does not have (root
+//! has no `--user` bus at all), so the code merely PRINTED a command a human had to run. An install
+//! step whose success depends on the user reading a log line is not an install step.
+//!
+//! An XDG `autostart` desktop entry has neither problem: every desktop session reads
+//! `$XDG_CONFIG_HOME/autostart/*.desktop` at login with no `enable`, no session bus and no
+//! privilege. The stale systemd unit is REMOVED on upgrade — leaving it behind means a user who ever
+//! ran `systemctl --user enable dig-app.service` gets two agents at login.
 //!
 //! # Byte-identical with dig-app's own renderers
 //!
@@ -43,8 +57,12 @@ pub const WINDOWS_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Ru
 /// autostart for the same agent.
 pub const WINDOWS_RUN_VALUE: &str = "DIG App";
 
-/// The Linux systemd user-unit filename.
+/// The Linux systemd user-unit filename. Retained for REMOVAL only: nothing writes this any more
+/// (dig_ecosystem#919), but an upgrade must delete what earlier versions wrote.
 const LINUX_UNIT_NAME: &str = "dig-app.service";
+
+/// The Linux XDG autostart desktop-entry filename.
+const LINUX_DESKTOP_NAME: &str = "dig-app.desktop";
 
 /// What the autostart registration did (or, on `--dry-run`, would do).
 ///
@@ -65,6 +83,10 @@ pub struct AutostartResult {
     pub artifact: String,
     /// Human-readable detail behind [`Self::registered`].
     pub note: String,
+    /// WHY this run did (or did not) register — the machine-readable half of `note`
+    /// (dig_ecosystem#919). `SkipHeadless`/`SkipNoTargetUser` mean nothing was written ON PURPOSE,
+    /// which a bare `registered: false` could not distinguish from a failure.
+    pub disposition: crate::svcscope::AgentDisposition,
 }
 
 /// The per-OS mechanism name for `os`, so the report and the log agree on one vocabulary.
@@ -72,11 +94,87 @@ pub fn mechanism_for(os: Os) -> &'static str {
     match os {
         Os::Windows => "run-key",
         Os::MacOs => "launch-agent",
-        Os::Linux => "systemd-user",
+        Os::Linux => "xdg-autostart",
     }
 }
 
-/// Render the macOS LaunchAgent plist that runs `binary_path` at login and restarts it if it exits.
+/// The observable session facts the headless verdict is derived from — gathered by
+/// [`SessionFacts::probe`], judged by the pure [`is_headless`].
+///
+/// Split so the verdict is asserted for all three operating systems from any host: a
+/// `#[cfg(unix)]`-only test cannot falsify the Windows arm, and the mutation stays green
+/// (dig_ecosystem#1774).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFacts {
+    /// A graphical display is named in the environment (`DISPLAY` / `WAYLAND_DISPLAY`, or
+    /// `XDG_SESSION_TYPE` naming x11/wayland). Linux/BSD concept.
+    pub display_env: bool,
+    /// This host has desktop sessions INSTALLED at all (`/usr/share/xsessions` or
+    /// `/usr/share/wayland-sessions` is non-empty) — i.e. somebody could log into a desktop here even
+    /// if nobody is right now. A server image has neither directory.
+    pub desktop_sessions_installed: bool,
+    /// macOS: the Aqua session infrastructure is present (`loginwindow` exists).
+    pub aqua_session: bool,
+    /// Windows: this process holds an INTERACTIVE window station (`SESSIONNAME` is set — `Console`
+    /// or `RDP-Tcp#n`). A service/Session-0 context has none.
+    pub interactive_window_station: bool,
+}
+
+impl SessionFacts {
+    /// Read the facts from this host.
+    ///
+    /// Deliberately cheap and side-effect-free — no spawn, no `loginctl`: this decides whether to
+    /// write one small file, and it runs on every install.
+    pub fn probe() -> Self {
+        let graphical_session_type = std::env::var("XDG_SESSION_TYPE")
+            .map(|t| t == "x11" || t == "wayland")
+            .unwrap_or(false);
+        let display_env = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || graphical_session_type;
+        SessionFacts {
+            display_env,
+            desktop_sessions_installed: ["/usr/share/xsessions", "/usr/share/wayland-sessions"]
+                .iter()
+                .any(|d| dir_has_entries(Path::new(d))),
+            aqua_session: Path::new("/System/Library/CoreServices/loginwindow.app").exists(),
+            interactive_window_station: std::env::var("SESSIONNAME")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Does `dir` exist and contain at least one entry? An EMPTY `xsessions` directory proves nothing,
+/// and some minimal images ship the directory without a session in it.
+fn dir_has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// Is this host HEADLESS — no graphical session for a tray agent to appear in?
+///
+/// # This verdict errs toward REGISTERING, deliberately
+///
+/// The two mistakes are not symmetric. Wrongly deciding "headless" denies a desktop user the agent
+/// they installed, silently, until they notice; wrongly deciding "graphical" leaves one inert
+/// `.desktop` file that no session ever reads. So `true` is returned only on positive evidence:
+///
+/// * **Linux** — no display in the environment AND no desktop session installed on the box at all. A
+///   `sudo` install whose `DISPLAY` was not forwarded still has `/usr/share/xsessions`, so a
+///   workstation is never mistaken for a server.
+/// * **macOS** — the Aqua session infrastructure is absent, which in practice means a stripped CI
+///   image rather than a Mac somebody uses.
+/// * **Windows** — this process has no interactive window station, i.e. it is running in a
+///   service/Session-0 context where an `HKCU\…\Run` value would belong to nobody who logs in.
+pub fn is_headless(os: Os, facts: &SessionFacts) -> bool {
+    match os {
+        Os::Linux => !facts.display_env && !facts.desktop_sessions_installed,
+        Os::MacOs => !facts.aqua_session,
+        Os::Windows => !facts.interactive_window_station,
+    }
+}
+
+/// Render the macOS LaunchAgent plist that runs `binary_path` at login/// Render the macOS LaunchAgent plist that runs `binary_path` at login and restarts it if it exits.
 /// Byte-identical to `dig_app::autostart::macos::launch_agent_plist`.
 pub fn launch_agent_plist(binary_path: &str) -> String {
     format!(
@@ -131,6 +229,30 @@ pub fn systemd_user_unit_path(xdg_config_home: &Path) -> PathBuf {
     xdg_config_home.join("systemd/user").join(LINUX_UNIT_NAME)
 }
 
+/// Render the XDG autostart desktop entry that launches `binary_path` at login.
+///
+/// `X-GNOME-Autostart-enabled=true` and `Hidden=false` are stated explicitly rather than left to
+/// each desktop's default, so an entry a previous version disabled is re-enabled by being rewritten.
+/// The spec's `Type=Application` + `Exec=` pair is all a session needs — there is nothing to enable.
+pub fn autostart_desktop_entry(binary_path: &str) -> String {
+    format!(
+        "[Desktop Entry]
+Type=Application
+Name=DIG App
+Comment=DIG user identity agent
+Exec={binary_path}
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Hidden=false
+"
+    )
+}
+
+/// The XDG autostart entry path: `<xdg_config_home>/autostart/dig-app.desktop`.
+pub fn autostart_desktop_path(xdg_config_home: &Path) -> PathBuf {
+    xdg_config_home.join("autostart").join(LINUX_DESKTOP_NAME)
+}
+
 /// Resolve `$XDG_CONFIG_HOME`, falling back to `<home>/.config` per the XDG base-directory spec when
 /// the variable is unset or empty. Byte-identical to `dig_app::autostart::linux::xdg_config_home`.
 pub fn xdg_config_home(env_value: Option<&str>, home: &Path) -> PathBuf {
@@ -168,6 +290,7 @@ pub fn register(dig_app_bin: &Path, os: Os, dry_run: bool) -> AutostartResult {
         dry_run,
         user,
         user.acting_for_another_account(crate::invoker::is_root()),
+        is_headless(os, &SessionFacts::probe()),
     )
 }
 
@@ -184,33 +307,65 @@ pub fn register_for(
     dry_run: bool,
     user: &crate::invoker::TargetUser,
     acting_for_another_account: bool,
+    headless: bool,
 ) -> AutostartResult {
+    use crate::svcscope::AgentDisposition;
+
     let mechanism = mechanism_for(os).to_string();
     let artifact = artifact_path(user, os, acting_for_another_account);
+    // The target user is KNOWN unless we are acting for another account and could not name it — the
+    // macOS `osascript` root child, whose environment carries no hint (SPEC §1.5a).
+    let target_user_known = !acting_for_another_account || user.uid.is_some();
+    let disposition = crate::svcscope::agent_disposition(os, headless, target_user_known);
+    let result = |registered: bool, note: String| AutostartResult {
+        registered,
+        mechanism: mechanism.clone(),
+        artifact: artifact.clone(),
+        note,
+        disposition,
+    };
+
+    match disposition {
+        // Nothing is written, and nothing is enabled — in particular NOT `loginctl enable-linger`,
+        // which would run a tray agent forever on a server nobody is looking at.
+        AgentDisposition::SkipHeadless => {
+            return result(
+                false,
+                "skipped the dig-app login autostart: this host has no graphical session for a \
+                 tray agent to appear in. dig-app is installed and on PATH; the DIG node/service \
+                 side is unaffected"
+                    .to_string(),
+            );
+        }
+        // LOUD, not silent: registering into root's own scope is the #1748 inversion, and an
+        // uninstall that then "cleaned" root's scope would leave the real user's autostart behind.
+        AgentDisposition::SkipNoTargetUser => {
+            return result(
+                false,
+                "skipped the dig-app login autostart: this run is elevated and could not determine \
+                 which account it is acting for, so there is no user scope to register in. Re-run \
+                 `dig-installer` as that user (unelevated) to add it"
+                    .to_string(),
+            );
+        }
+        AgentDisposition::Register => {}
+    }
+
     if dry_run {
-        return AutostartResult {
-            registered: false,
-            mechanism,
-            artifact,
-            note: format!("would register dig-app to start at {}'s login", user.name),
-        };
+        return result(
+            false,
+            format!("would register dig-app to start at {}'s login", user.name),
+        );
     }
     match apply(dig_app_bin, os, user, acting_for_another_account) {
-        Ok(note) => AutostartResult {
-            registered: true,
-            mechanism,
-            artifact,
-            note,
-        },
-        Err(e) => AutostartResult {
-            registered: false,
-            mechanism,
-            artifact,
-            note: format!(
+        Ok(note) => result(true, note),
+        Err(e) => result(
+            false,
+            format!(
                 "could not register dig-app to start at login ({e}); dig-app is installed and on \
                  PATH — launch it manually, or re-run the installer"
             ),
-        },
+        ),
     }
 }
 
@@ -256,7 +411,7 @@ fn artifact_path(
     match os {
         Os::Windows => format!("HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"),
         Os::MacOs => launch_agent_path(&user.home).to_string_lossy().into_owned(),
-        Os::Linux => systemd_user_unit_path(&target_xdg_config_home_when(
+        Os::Linux => autostart_desktop_path(&target_xdg_config_home_when(
             user,
             acting_for_another_account,
         ))
@@ -287,52 +442,59 @@ fn apply(
                 user.name
             ))
         }
-        Os::Linux => {
-            let xdg = target_xdg_config_home(user);
-            let path =
-                install_systemd_user_unit(&xdg, dig_app_bin, user, acting_for_another_account)?;
-            Ok(format!(
-                "wrote the systemd user unit {} — it starts at {}'s next login, or start it now \
-                 with: {}",
-                path.display(),
-                user.name,
-                enable_command(user)
-            ))
-        }
+        Os::Linux => apply_linux(
+            &target_xdg_config_home(user),
+            dig_app_bin,
+            user,
+            acting_for_another_account,
+        ),
     }
 }
 
-/// The command that enables the unit, in a scope where the unit actually EXISTS.
+/// The Linux arm of [`apply`], against an EXPLICIT `$XDG_CONFIG_HOME`.
 ///
-/// A root install must not print `systemctl --user enable --now dig-app.service` verbatim: run by
-/// root it fails (`Failed to connect to bus` — root has no session bus during a `curl | sudo sh`), and
-/// the account that CAN run it is the target user, who has to get into their own session first. So
-/// under elevation the printed command names that user explicitly, via `machinectl shell`'s
-/// non-privileged stand-in `sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user`, which
-/// works from the same root shell the installer was launched from.
-fn enable_command(user: &crate::invoker::TargetUser) -> String {
-    enable_command_when(
-        user,
-        user.acting_for_another_account(crate::invoker::is_root()),
-    )
-}
-
-/// [`enable_command`] with the boundary decision supplied rather than read from the ambient uid — see
-/// [`target_xdg_config_home_when`] for why.
-fn enable_command_when(
+/// Split out so the write + the stale-unit removal are asserted against a temp directory rather than
+/// whatever `$XDG_CONFIG_HOME` the test runner happens to export — an ambient-env dependency is how a
+/// test comes to pass for a reason unrelated to its property.
+fn apply_linux(
+    xdg: &Path,
+    dig_app_bin: &Path,
     user: &crate::invoker::TargetUser,
     acting_for_another_account: bool,
-) -> String {
-    const ENABLE: &str = "systemctl --user enable --now dig-app.service";
-    match (acting_for_another_account, user.uid) {
-        (true, Some(uid)) => format!(
-            "sudo -u {} XDG_RUNTIME_DIR=/run/user/{uid} {ENABLE}",
-            user.name
+) -> Result<String, String> {
+    let path = install_autostart_entry(xdg, dig_app_bin, user, acting_for_another_account)?;
+    // Best-effort: a stale unit that cannot be removed is reported, never fatal — the desktop entry
+    // this run wrote is what actually starts the agent.
+    let stale = remove_stale_systemd_user_unit(xdg);
+    Ok(format!(
+        "wrote the XDG autostart entry {} — dig-app starts at {}'s next login, with no further          step{stale}",
+        path.display(),
+        user.name,
+    ))
+}
+
+/// Remove the systemd **user** unit earlier versions wrote, returning a phrase for the success note
+/// (empty when there was nothing to remove).
+///
+/// Not optional cleanup: the unit and the desktop entry are two independent autostart mechanisms for
+/// the same agent, so a user who ever ran `systemctl --user enable dig-app.service` would get TWO
+/// dig-app processes at their next login. Removing the file is enough — an enabled unit's
+/// `default.target.wants` symlink is dangling once its target is gone, and systemd skips it.
+fn remove_stale_systemd_user_unit(xdg: &Path) -> String {
+    let unit = systemd_user_unit_path(xdg);
+    if !unit.exists() {
+        return String::new();
+    }
+    match std::fs::remove_file(&unit) {
+        Ok(()) => format!(
+            " (also removed the stale systemd user unit {}, which never actually autostarted)",
+            unit.display()
         ),
-        // Without a uid we cannot name a runtime dir, so tell the user what to do from their own
-        // shell rather than printing a command that will fail from this one.
-        (true, None) => format!("log in as {} and run: {ENABLE}", user.name),
-        (false, _) => ENABLE.to_string(),
+        Err(e) => format!(
+            " (could NOT remove the stale systemd user unit {} ({e}); if you ever ran `systemctl \
+             --user enable dig-app.service`, remove it by hand or dig-app may start twice)",
+            unit.display()
+        ),
     }
 }
 
@@ -355,20 +517,20 @@ pub fn install_launch_agent(
     Ok(path)
 }
 
-/// Write the Linux systemd user unit for `dig_app_bin` under `xdg`, creating `systemd/user/` if
+/// Write the Linux XDG autostart entry for `dig_app_bin` under `xdg`, creating `autostart/` if
 /// needed.
 ///
 /// Written with `user`'s own authority, never root's — see [`crate::userwrite`].
-pub fn install_systemd_user_unit(
+pub fn install_autostart_entry(
     xdg: &Path,
     dig_app_bin: &Path,
     user: &crate::invoker::TargetUser,
     acting_for_another_account: bool,
 ) -> Result<PathBuf, String> {
-    let path = systemd_user_unit_path(xdg);
+    let path = autostart_desktop_path(xdg);
     crate::userwrite::write_as_user_when(
         &path,
-        &systemd_user_unit(&dig_app_bin.to_string_lossy()),
+        &autostart_desktop_entry(&dig_app_bin.to_string_lossy()),
         user,
         acting_for_another_account,
     )?;
@@ -407,7 +569,13 @@ pub fn deregister(os: Os) -> Result<(), String> {
     match os {
         Os::Windows => deregister_windows(),
         Os::MacOs => remove_if_present(&launch_agent_path(&user.home)),
-        Os::Linux => remove_if_present(&systemd_user_unit_path(&target_xdg_config_home(user))),
+        // BOTH mechanisms: an uninstall that removed only the current one would leave a host that
+        // was installed by an older version still starting dig-app at every login.
+        Os::Linux => {
+            let xdg = target_xdg_config_home(user);
+            remove_if_present(&autostart_desktop_path(&xdg))
+                .and(remove_if_present(&systemd_user_unit_path(&xdg)))
+        }
     }
 }
 
@@ -537,7 +705,7 @@ WantedBy=default.target
         assert!(!WINDOWS_RUN_KEY.contains("HKEY_LOCAL_MACHINE"));
         assert_eq!(mechanism_for(Os::Windows), "run-key");
         assert_eq!(mechanism_for(Os::MacOs), "launch-agent");
-        assert_eq!(mechanism_for(Os::Linux), "systemd-user");
+        assert_eq!(mechanism_for(Os::Linux), "xdg-autostart");
     }
 
     /// A default Windows install lands in `C:\Program Files\DIG\bin` — a path WITH A SPACE. An
@@ -558,9 +726,9 @@ WantedBy=default.target
         let plist = launch_agent_plist("/opt/dig/bin/dig-app");
         assert!(plist.contains("<string>/opt/dig/bin/dig-app</string>"));
         assert!(!plist.contains("dig-node"));
-        let unit = systemd_user_unit("/opt/dig/bin/dig-app");
-        assert!(unit.contains("ExecStart=/opt/dig/bin/dig-app"));
-        assert!(!unit.contains("dig-node"));
+        let entry = autostart_desktop_entry("/opt/dig/bin/dig-app");
+        assert!(entry.contains("Exec=/opt/dig/bin/dig-app"));
+        assert!(!entry.contains("dig-node"));
     }
 
     #[test]
@@ -577,13 +745,13 @@ WantedBy=default.target
             launch_agent_plist("/opt/dig/bin/dig-app")
         );
 
-        let unit =
-            install_systemd_user_unit(tmp.path(), Path::new("/opt/dig/bin/dig-app"), &me, false)
-                .expect("unit written");
-        assert_eq!(unit, systemd_user_unit_path(tmp.path()));
+        let entry =
+            install_autostart_entry(tmp.path(), Path::new("/opt/dig/bin/dig-app"), &me, false)
+                .expect("desktop entry written");
+        assert_eq!(entry, autostart_desktop_path(tmp.path()));
         assert_eq!(
-            std::fs::read_to_string(&unit).expect("readable"),
-            systemd_user_unit("/opt/dig/bin/dig-app")
+            std::fs::read_to_string(&entry).expect("readable"),
+            autostart_desktop_entry("/opt/dig/bin/dig-app")
         );
     }
 
@@ -596,10 +764,20 @@ WantedBy=default.target
 
     #[test]
     fn a_dry_run_registers_nothing_and_says_so() {
-        let r = register(Path::new("/usr/local/bin/dig-app"), Os::Linux, true);
+        // `register_for` with the session facts as DATA, not `register`: the real probe would read
+        // this host, and a Linux target on a Windows box is legitimately headless — which would make
+        // the dry-run property untestable here for a reason that has nothing to do with dry runs.
+        let r = register_for(
+            Path::new("/usr/local/bin/dig-app"),
+            Os::Linux,
+            true,
+            &unelevated_alice(),
+            false,
+            false,
+        );
         assert!(!r.registered);
-        assert_eq!(r.mechanism, "systemd-user");
-        assert!(r.note.contains("would register"));
+        assert_eq!(r.mechanism, "xdg-autostart");
+        assert!(r.note.contains("would register"), "got: {}", r.note);
     }
 
     // -- #1748: a sudo install registers autostart for the INVOKING user --------
@@ -644,13 +822,16 @@ WantedBy=default.target
             // Root, acting for ubuntu — stated explicitly so the elevated arm is exercised on an
             // unprivileged CI runner.
             true,
+            // A graphical host, as data: the headless verdict has its own tests, and reading it from
+            // the runner here would make this assertion depend on which box CI happens to use.
+            false,
         );
         // Compared as paths, not strings: `join` uses the HOST separator, so a literal
         // forward-slash expectation would fail on a Windows CI runner for a reason that has
         // nothing to do with the property under test.
         assert_eq!(
             Path::new(&r.artifact),
-            systemd_user_unit_path(Path::new("/home/ubuntu/.config"))
+            autostart_desktop_path(Path::new("/home/ubuntu/.config"))
         );
         assert!(
             !r.artifact.contains("root"),
@@ -685,10 +866,11 @@ WantedBy=default.target
             true,
             &alice,
             false,
+            false,
         );
         assert_eq!(
             Path::new(&r.artifact),
-            systemd_user_unit_path(Path::new("/home/alice/.config")),
+            autostart_desktop_path(Path::new("/home/alice/.config")),
             "an unelevated run must register under its own home, not the ambient process home"
         );
     }
@@ -702,6 +884,7 @@ WantedBy=default.target
             true,
             &sudoing_ubuntu(),
             true,
+            false,
         );
         assert_eq!(
             Path::new(&r.artifact),
@@ -745,56 +928,222 @@ WantedBy=default.target
         std::env::remove_var("XDG_CONFIG_HOME");
     }
 
-    /// The printed remediation must be runnable in a scope where the unit exists.
+    // -- dig_ecosystem#919: an autostart that actually autostarts, and headless hosts -------------
+
+    /// Linux autostart is an XDG **desktop entry**, not a systemd user unit.
     ///
-    /// The shipped advice was a bare `systemctl --user enable --now dig-app.service`, which fails for
-    /// root (no session bus during `curl | sudo sh`) and for the user (no such unit, because it was
-    /// written to root's scope). Under elevation the command must therefore NAME the target user and
-    /// their runtime dir.
+    /// The shipped code wrote `~/.config/systemd/user/dig-app.service` and never enabled or started
+    /// it, so Linux autostart had never worked once. A desktop entry needs no `enable` and no session
+    /// bus, which is exactly why the installer can complete the job itself.
     #[test]
-    fn the_enable_command_names_the_target_user_under_elevation() {
-        let cmd = enable_command_when(&sudoing_ubuntu(), true);
-        assert!(cmd.contains("-u ubuntu"), "got: {cmd}");
-        assert!(
-            cmd.contains("XDG_RUNTIME_DIR=/run/user/1000"),
-            "systemctl --user needs the target user's runtime dir: {cmd}"
+    fn the_linux_artifact_is_an_xdg_desktop_entry_that_needs_no_enable_step() {
+        let entry = autostart_desktop_entry("/opt/dig/bin/dig-app");
+        assert!(entry.starts_with("[Desktop Entry]"), "got: {entry}");
+        assert!(entry.contains("Type=Application"));
+        assert!(entry.contains("Exec=/opt/dig/bin/dig-app"));
+        assert!(entry.contains("X-GNOME-Autostart-enabled=true"));
+        assert!(entry.contains("Hidden=false"));
+        assert_eq!(
+            autostart_desktop_path(Path::new("/home/alice/.config")),
+            Path::new("/home/alice/.config/autostart/dig-app.desktop")
         );
-        assert!(cmd.contains("systemctl --user enable --now dig-app.service"));
     }
 
-    /// Run as the user themselves, the plain command IS correct — so the elevated decoration must not
-    /// leak into the unelevated case.
+    /// An upgrade REMOVES the systemd user unit earlier versions wrote.
+    ///
+    /// Leaving it is not harmless residue: a user who ever ran `systemctl --user enable
+    /// dig-app.service` would get TWO dig-app processes at their next login, one per mechanism.
     #[test]
-    fn the_enable_command_is_plain_when_we_are_the_user() {
-        let alice = crate::invoker::TargetUser {
-            name: "alice".to_string(),
-            home: PathBuf::from("/home/alice"),
+    fn an_upgrade_removes_the_stale_systemd_user_unit_it_used_to_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unit = systemd_user_unit_path(tmp.path());
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, systemd_user_unit("/old/path/dig-app")).unwrap();
+
+        let note = apply_linux(
+            tmp.path(),
+            Path::new("/opt/dig/bin/dig-app"),
+            &user_with_config_home(tmp.path()),
+            false,
+        )
+        .expect("the desktop entry is written");
+
+        assert!(
+            autostart_desktop_path(tmp.path()).exists(),
+            "the entry that actually autostarts must be written"
+        );
+        assert!(
+            !unit.exists(),
+            "the stale unit must be removed, or the user gets two agents at login"
+        );
+        assert!(
+            note.contains("removed the stale systemd user unit"),
+            "got: {note}"
+        );
+    }
+
+    /// An uninstall removes BOTH mechanisms — a host installed by an older version must stop
+    /// autostarting dig-app too.
+    #[test]
+    fn removing_the_autostart_removes_both_mechanisms() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unit = systemd_user_unit_path(tmp.path());
+        let entry = autostart_desktop_path(tmp.path());
+        for path in [&unit, &entry] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        remove_if_present(&entry)
+            .and(remove_if_present(&unit))
+            .expect("both removed");
+        assert!(!entry.exists() && !unit.exists());
+    }
+
+    /// A HEADLESS host writes NOTHING and says why — and in particular does not enable linger to
+    /// force a tray agent onto a server nobody is looking at.
+    ///
+    /// The write path is a real temp dir, so a registration that ignored the disposition would leave
+    /// an observable file rather than merely a wrong flag.
+    #[test]
+    fn a_headless_host_registers_nothing_and_reports_the_skip() {
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let r = register_for(
+                Path::new("/opt/dig/bin/dig-app"),
+                os,
+                false, // a REAL run, not a dry run: a dry run cannot prove nothing was written
+                &user_with_config_home(tmp.path()),
+                false,
+                true, // headless
+            );
+            assert!(!r.registered, "{os:?}");
+            assert_eq!(
+                r.disposition,
+                crate::svcscope::AgentDisposition::SkipHeadless
+            );
+            assert!(
+                r.note.contains("no graphical session"),
+                "{os:?} must say why: {}",
+                r.note
+            );
+            assert!(
+                !Path::new(&r.artifact).exists(),
+                "{os:?}: a headless host must have nothing written at {}",
+                r.artifact
+            );
+            assert!(
+                !r.note.contains("linger"),
+                "{os:?}: linger must not be enabled to force a GUI onto a headless box"
+            );
+        }
+    }
+
+    /// An elevated unix run that cannot name the account it is acting for skips LOUDLY: registering
+    /// into root's own scope is the #1748 inversion, and cleaning root's scope on uninstall would
+    /// leave the real user's autostart behind.
+    #[test]
+    fn an_elevated_run_with_no_resolvable_target_user_skips_loudly() {
+        let unknown = crate::invoker::TargetUser {
+            name: "root".to_string(),
+            home: PathBuf::from("/root"),
             uid: None,
             gid: None,
             via_elevation: false,
         };
-        assert_eq!(
-            enable_command_when(&alice, false),
-            "systemctl --user enable --now dig-app.service"
+        for os in [Os::Linux, Os::MacOs] {
+            let r = register_for(
+                Path::new("/opt/dig/bin/dig-app"),
+                os,
+                false,
+                &unknown,
+                true, // acting for ANOTHER account, but no uid to name it
+                false,
+            );
+            assert!(!r.registered, "{os:?}");
+            assert_eq!(
+                r.disposition,
+                crate::svcscope::AgentDisposition::SkipNoTargetUser,
+                "{os:?}"
+            );
+            assert!(
+                r.note.contains("could not determine which account"),
+                "{}",
+                r.note
+            );
+        }
+        // Windows addresses the running account through HKCU, so the same facts are registrable.
+        let r = register_for(
+            Path::new("C:/dig/dig-app.exe"),
+            Os::Windows,
+            true,
+            &unknown,
+            true,
+            false,
         );
+        assert_eq!(r.disposition, crate::svcscope::AgentDisposition::Register);
     }
 
-    /// Elevated but with no resolvable uid: we cannot name a runtime dir, so the advice must tell the
-    /// user what to do from their own shell rather than print a command that will fail from this one.
+    /// The headless verdict, per OS, from the facts — asserted for all three from any host.
     #[test]
-    fn without_a_uid_the_advice_does_not_print_a_command_that_cannot_work() {
-        let ghost = crate::invoker::TargetUser {
-            name: "ghost".to_string(),
-            home: PathBuf::from("/root"),
-            uid: None,
-            gid: None,
-            via_elevation: true,
+    fn the_headless_verdict_reads_each_os_own_evidence() {
+        let graphical = SessionFacts {
+            display_env: true,
+            desktop_sessions_installed: true,
+            aqua_session: true,
+            interactive_window_station: true,
         };
-        let cmd = enable_command_when(&ghost, true);
-        assert!(cmd.contains("log in as ghost"), "got: {cmd}");
+        let server = SessionFacts {
+            display_env: false,
+            desktop_sessions_installed: false,
+            aqua_session: false,
+            interactive_window_station: false,
+        };
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            assert!(!is_headless(os, &graphical), "{os:?}");
+            assert!(is_headless(os, &server), "{os:?}");
+        }
+
+        // A `sudo` install on a WORKSTATION whose DISPLAY was not forwarded: no display in the
+        // environment, but desktop sessions ARE installed. Erring toward "headless" here would
+        // silently deny a desktop user the agent they just installed — the asymmetric mistake.
+        let sudo_on_a_workstation = SessionFacts {
+            display_env: false,
+            desktop_sessions_installed: true,
+            ..graphical
+        };
         assert!(
-            !cmd.contains("XDG_RUNTIME_DIR"),
-            "no uid means no runtime dir to name: {cmd}"
+            !is_headless(Os::Linux, &sudo_on_a_workstation),
+            "a workstation must not be mistaken for a server just because DISPLAY was not forwarded"
         );
+
+        // Each OS reads its OWN evidence: Windows must not be swayed by a Linux display variable,
+        // and Linux must not be swayed by a Windows window station.
+        let only_windows_evidence = SessionFacts {
+            interactive_window_station: true,
+            ..server
+        };
+        assert!(is_headless(Os::Linux, &only_windows_evidence));
+        assert!(!is_headless(Os::Windows, &only_windows_evidence));
+        let only_linux_evidence = SessionFacts {
+            display_env: true,
+            ..server
+        };
+        assert!(is_headless(Os::Windows, &only_linux_evidence));
+        assert!(!is_headless(Os::Linux, &only_linux_evidence));
+    }
+
+    /// A target user whose `$XDG_CONFIG_HOME` is `dir` — so a write test observes a temp directory
+    /// rather than the runner's real home.
+    fn user_with_config_home(dir: &Path) -> crate::invoker::TargetUser {
+        crate::invoker::TargetUser {
+            name: "alice".to_string(),
+            // `apply` derives `<home>/.config` for another account and honours the env otherwise;
+            // this fixture is used with `acting_for_another_account: false` plus an explicit env, or
+            // with a home whose `.config` is `dir` — see each call site.
+            home: dir.to_path_buf(),
+            uid: Some(1000),
+            gid: Some(1000),
+            via_elevation: false,
+        }
     }
 }
