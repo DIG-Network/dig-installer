@@ -638,3 +638,44 @@ Litmus, and the thing to check before touching either side: **does the assertion
 behaviour the guard was written to catch?** Here, against v0.30.0's shape (everything in `/root/.dig/bin`,
 no `reachability` field) it goes red twice over — the unconditional placement assertion fails and the
 fail-closed arm fires. If retargeting a guard cannot be shown to preserve that, it is a weakening.
+
+
+## `systemctl disable` never removes a unit file — and the file that must go is not always root's to delete (dig_ecosystem#1854)
+
+**1. `systemctl disable --now <unit>` only un-links the ENABLEMENT symlinks.** The unit FILE stays on
+disk, so systemd keeps answering `LoadState=loaded` and any post-check that reads `LoadState` to
+confirm a deregister can NEVER report success on Linux. The #565 migration treats a deregister failure
+as FATAL, so this made every upgrade off a legacy root fail on Linux — a defect no unit test could see,
+because the loop's own mock scheduler answers "gone". The parallel macOS path had always removed its
+plist; Linux needed the same, via systemd's own answer (`systemctl show -p FragmentPath <unit>`) rather
+than a guessed directory.
+
+**2. Removing that file as root is an escalation, because a "system" path can be a user's path.** This
+project documents `sudo -E` as the elevation, and `sudo -E` propagates `XDG_CONFIG_HOME` into the root
+process — so a root `systemctl --user` talks to a unit directory the *invoking* account controls
+(observed under #1748: `~/.config/systemd/{,user}` end up `root:root` after such a run, and the e2e has
+to force `XDG_RUNTIME_DIR=/run/user/0` for exactly this reason). Unlinking "whatever systemd said" as
+root is therefore an attacker-chosen deletion primitive: plant `~/.config/systemd/user/<unit>.service`
+(optionally as a symlink), `daemon-reload`, and root removes a file you chose.
+
+The durable shape for any privileged removal derived from a third party's answer:
+
+* **vet the path against the property you actually rely on** — absolute, no `.`/`..`/empty component,
+  basename EXACTLY the object being removed, expected file kind, parent in an allowlist. A doc comment
+  asserting "this is systemd's answer for that unit" is not enforcement, and a parser test over benign
+  fixtures cannot falsify a wrong deletion target;
+* **match authority to ownership** — a user-scope artifact is removed with the USER's authority (drop
+  privilege: `su - <user> -c rm`), so a planted symlink out of their tree fails with `EPERM` instead of
+  deleting root's files;
+* **refuse package-owned locations** rather than deleting from them (`/usr/lib/systemd/system`,
+  `/lib/systemd/system`): the unlink leaves the package database inconsistent and `apt install
+  --reinstall` silently restores the artifact you just removed;
+* **write the vetting on path STRINGS when the rules are POSIX** — `Path::is_absolute()` is `false` for
+  `/etc/...` on Windows, so a `Path`-based rule makes the cross-platform test vacuous rather than red.
+
+**3. A rollback must not reach for a verb with durable side effects.** The re-arm's undo originally ran
+`dig-updater schedule uninstall`, which records a STICKY opt-out suppressing later self-heal — so a
+blameless failure in an unrelated later step rolled the host into auto-updates permanently off. The
+rollback is also LIFO, and the schedule was recorded BEFORE the binaries, so the undo spawned a
+`dig-updater` the same rollback had already unlinked. Prefer the binary-free OS-tool path for an undo,
+and retract the report's claim when a reversal takes the state away again.

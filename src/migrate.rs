@@ -175,7 +175,11 @@ pub fn migrate_from_legacy_roots(target: &Target, log: &mut dyn FnMut(&str)) -> 
         match reg.deregister() {
             Ok(()) => {
                 log(&format!(
-                    "    ✓ deregistered {label} (re-registered from the protected root below)"
+                    // Deliberately does NOT promise a re-registration: only the
+                    // components this run installs are re-registered below, and a
+                    // registration this run declines is restored (or reported gone) by
+                    // the caller instead (dig_ecosystem#1854).
+                    "    ✓ deregistered {label} off the legacy root"
                 ));
                 result.deregistered.push(label.to_string());
             }

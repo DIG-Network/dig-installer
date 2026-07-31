@@ -117,6 +117,20 @@ pub enum InstallAction {
     /// dig-app's per-user login autostart was registered (undo = remove the Run
     /// value / LaunchAgent / systemd user unit — issue #912).
     AutostartRegistered,
+    /// The auto-update beacon's daily schedule was RE-armed after the #565
+    /// migration vacated it off a legacy root (undo = deregister the schedule with
+    /// the OS scheduler tool — dig_ecosystem#1854).
+    ///
+    /// Reversible for the same reason every other privileged registration here is:
+    /// a later step's failure rolls the run back to its pre-install state, and an
+    /// un-reversed machine-wide privileged schedule would outlive the root the
+    /// rollback reverts — a dangling privileged registration, the #565 harm class.
+    ///
+    /// Carries no `dig-updater` path on purpose: the undo must not depend on that
+    /// binary still existing (the LIFO rollback unlinks it FIRST) and must not run
+    /// it (`dig-updater schedule uninstall` writes a STICKY opt-out — see
+    /// `undo_install_action`).
+    BeaconRearmed,
 }
 
 /// Records the actions an install performed and, on failure, reverses them in
