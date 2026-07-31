@@ -780,7 +780,10 @@ fn user_unit_dirs(home: &Path, uid: Option<u32>, xdg_config_home: Option<&str>) 
         format!("{}/.config/systemd/user", home.display()),
         format!("{}/.local/share/systemd/user", home.display()),
     ];
-    if let Some(xdg) = xdg_config_home.map(str::trim).filter(|x| x.starts_with('/')) {
+    if let Some(xdg) = xdg_config_home
+        .map(str::trim)
+        .filter(|x| x.starts_with('/'))
+    {
         dirs.push(format!("{}/systemd/user", xdg.trim_end_matches('/')));
     }
     if let Some(uid) = uid {
@@ -1337,13 +1340,16 @@ mod tests {
                 .contains("not named for the unit"),
         );
         // A relative answer: nothing anchors it, so it could resolve anywhere.
-        assert!(refusal("etc/systemd/system/dig-updater.timer", SYSTEM_UNIT_DIRS)
-            .contains("not an absolute path"));
-        // Traversal out of an allowlisted directory.
         assert!(
-            refusal("/etc/systemd/system/../../tmp/dig-updater.timer", SYSTEM_UNIT_DIRS)
-                .contains("relative or empty component")
+            refusal("etc/systemd/system/dig-updater.timer", SYSTEM_UNIT_DIRS)
+                .contains("not an absolute path")
         );
+        // Traversal out of an allowlisted directory.
+        assert!(refusal(
+            "/etc/systemd/system/../../tmp/dig-updater.timer",
+            SYSTEM_UNIT_DIRS
+        )
+        .contains("relative or empty component"));
         // A user-controlled directory, on a SYSTEM-scope removal: the exact escalation.
         assert!(refusal(
             "/home/u/.config/systemd/user/dig-updater.timer",
@@ -1351,13 +1357,15 @@ mod tests {
         )
         .contains("not one of the unit directories"));
         // A path bearing the right name but the wrong kind of file.
-        assert!(
-            match plan_unit_file_removal(&show("/etc/systemd/system/passwd"), "passwd", SYSTEM_UNIT_DIRS) {
-                UnitFileRemoval::Refused(why) => why,
-                other => panic!("a non-unit file must be refused, got {other:?}"),
-            }
-            .contains("not a .service or .timer")
-        );
+        assert!(match plan_unit_file_removal(
+            &show("/etc/systemd/system/passwd"),
+            "passwd",
+            SYSTEM_UNIT_DIRS
+        ) {
+            UnitFileRemoval::Refused(why) => why,
+            other => panic!("a non-unit file must be refused, got {other:?}"),
+        }
+        .contains("not a .service or .timer"));
         // Package-owned units are refused rather than unlinked (a deleted dpkg-owned unit
         // leaves the package DB inconsistent, and `apt install --reinstall` would silently
         // restore the very timer this deregister removed).

@@ -559,7 +559,7 @@ jobs:
         run: |
           jq -e '.result.migration.migrated == true' install.json
           jq -e '[.result.migration.deregistered[] | select(ascii_downcase | contains("beacon"))] | length > 0' install.json
-          jq -e '(.result.migration.deregister_failures | length) == 0' install.json
+          jq -e '.result.migration | has("deregister_failures") and (.deregister_failures | length == 0)' install.json
 
       - name: Assert the audit ran + no privileged registration resolves under a legacy root (#565 H2b)
         run: |
@@ -729,7 +729,7 @@ jobs:
           jq -e '.ok == true' install.json
           jq -e '.result.migration.migrated == true' install.json
           jq -e '[.result.migration.deregistered[] | select(ascii_downcase | contains("beacon"))] | length > 0' install.json
-          jq -e '(.result.migration.deregister_failures | length) == 0' install.json
+          jq -e '.result.migration | has("deregister_failures") and (.deregister_failures | length == 0)' install.json
 
       # THE #1854 acceptance assertions. `beacon_rearm` non-null is what proves the
       # opt-out path RAN and REPORTED — `null` is exactly the silent state the issue
@@ -763,6 +763,12 @@ jobs:
             && { echo "FAIL: the beacon timer is still loaded — the schedule was not vacated"; exit 1; }
           test ! -f /etc/systemd/system/dig-updater.timer \
             || { echo "FAIL: the beacon timer unit file survived the deregister"; exit 1; }
+          # The .service fragment too: `beacon_is_registered` reads only the TIMER, so
+          # dropping the .service removal is invisible to both the unit tests and the
+          # LoadState check above, and the leftover unit is what a stray `systemctl start`
+          # would run out of the legacy root.
+          test ! -f /etc/systemd/system/dig-updater.service \
+            || { echo "FAIL: the beacon .service unit file survived the deregister"; exit 1; }
           # And the user-writable binary the root timer used to execute is gone.
           test ! -f "$LEGACY_DIR/dig-updater" \
             || { echo "FAIL: the legacy dig-updater binary survived the migration"; exit 1; }

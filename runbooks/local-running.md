@@ -46,7 +46,9 @@ actually testing; `--uninstall-dig-updater` reverses the scheduler registration 
 (delegates to `dig-updater schedule uninstall`, idempotent). `--uninstall-dig-updater` is the ONLY
 way the installer turns auto-updates off, and it is deliberate: `dig-updater schedule uninstall`
 records a sticky opt-out that suppresses any later self-heal, so it is never used for an internal
-step. A `--no-auto-update` run on a host being migrated off a legacy root leaves that host with
+step — including the rollback of a failed install, which deregisters a re-armed schedule with the OS
+scheduler tool instead (`regaudit::PrivilegedReg::Beacon.deregister()`, which never runs
+`dig-updater`). A `--no-auto-update` run on a host being migrated off a legacy root leaves that host with
 auto-updates OFF — the migration must vacate a legacy-root schedule (it is itself the #565
 vulnerability) and a declining run never installs `dig-updater` to put one back. That outcome is
 REPORTED, not silent: `InstallReport.beacon_rearm` in `--json` carries `{applied, note}` (`null`

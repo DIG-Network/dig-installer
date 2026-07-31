@@ -1695,7 +1695,11 @@ fn retract_beacon_rearm_claim(
         .reversed
         .iter()
         .any(|a| matches!(a, InstallAction::BeaconRearmed));
-    let Some(rearm) = report.beacon_rearm.as_mut().filter(|r| r.applied && reversed) else {
+    let Some(rearm) = report
+        .beacon_rearm
+        .as_mut()
+        .filter(|r| r.applied && reversed)
+    else {
         return;
     };
     rearm.applied = false;
@@ -7548,8 +7552,14 @@ mod beacon_rearm {
             !rearm.applied,
             "a reversed re-arm must not still read as applied"
         );
-        assert!(rearm.note.contains("REMOVED again by the rollback"), "{rearm:?}");
-        assert!(lines.iter().any(|l| l.contains("REMOVED again")), "{lines:?}");
+        assert!(
+            rearm.note.contains("REMOVED again by the rollback"),
+            "{rearm:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("REMOVED again")),
+            "{lines:?}"
+        );
 
         // A rollback that did NOT reverse the re-arm leaves the claim standing.
         let mut report = crate::tests::report_shell();

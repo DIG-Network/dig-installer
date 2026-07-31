@@ -572,7 +572,9 @@ the installer re-points the install onto the protected root (`migrate` module): 
 privileged registration whose binary resolves under a legacy root — INDEPENDENT of the current plan —
 the dig-node/dig-relay/dig-dns
 services BY ID *and the SYSTEM auto-update beacon scheduled task* by its own scheduler tool
-(`schtasks /Delete` / systemd-timer disable / launchd bootout), so a component OMITTED from the run
+(`schtasks /Delete` on Windows; `systemctl disable --now` **plus removal of the unit FILE** on Linux —
+`disable` alone only un-links the enablement symlinks, so the unit stays loadable and the deregister
+could never report success; `launchctl bootout` + plist removal on macOS), so a component OMITTED from the run
 cannot keep an auto-start service or daily SYSTEM task registered against a replaceable legacy
 binPath; the normal install then re-registers whatever is in-plan fresh from the protected path. It
 removes the legacy binaries by KNOWN filename (never a recursive walk that could follow a planted
@@ -581,6 +583,21 @@ from the user PATH on Windows. It never executes a legacy-dir binary. A DEREGIST
 the install reports NOT ready (`MigrationResult::deregister_failures`), never a silent continue into a
 tolerated re-install that could leave the service at the legacy binPath. Recorded in
 `InstallReport.migration`.
+
+**The Linux beacon unit-file removal is BOUNDED (`regaudit::plan_unit_file_removal`).** The path
+removed is the one systemd itself names (`systemctl show -p FragmentPath <unit>`), and it MUST be
+vetted before anything is unlinked: absolute, no `.`/`..`/empty component, named EXACTLY for the unit
+being deregistered, a `.service` or `.timer`, and its parent one of the allowed unit directories —
+`/etc/systemd/system` and `/run/systemd/system` for the SYSTEM scope, the invoking account's own
+`~/.config/systemd/user`, `~/.local/share/systemd/user`, `$XDG_CONFIG_HOME/systemd/user` and
+`/run/user/<uid>/systemd/user` for the `--user` scope. A package-owned directory
+(`/usr/lib/systemd/system`, `/lib/systemd/system`) is REFUSED, never unlinked: removing a
+package-owned unit leaves the package database inconsistent and `apt install --reinstall` would
+silently restore the schedule. A `--user`-scope unit file MUST NOT be unlinked with root's authority
+— under elevation the removal is dropped to the invoking account (`su - <user> -c rm`), because
+`sudo -E` propagates `XDG_CONFIG_HOME` and a root `systemctl --user` therefore reads units from a
+directory that account controls. Every refusal MUST be reported (it is folded into the fatal
+deregister verdict), never silent.
 
 A run that does NOT select the auto-update beacon MUST NOT install or register it: declining the
 beacon means "install nothing". The #565 migration nevertheless vacates a beacon schedule that
@@ -602,8 +619,19 @@ path. This is not a readiness failure — the beacon was not part of what the ru
 
 A re-arm that succeeded is a reversible privileged action: it MUST be recorded in the install's
 rollback guard, so a later step's failure deregisters the schedule rather than leaving a
-machine-wide privileged registration pointing into a root the rollback reverts. The re-arm MUST run
-AFTER the protected root has been created + hardened.
+machine-wide privileged registration pointing into a root the rollback reverts. That reversal MUST
+deregister the schedule with the OS scheduler tool and MUST NOT run `dig-updater schedule uninstall`:
+that verb records a sticky opt-out which suppresses every later self-heal, so a failure in an
+unrelated step would leave the host with auto-updates permanently off. A reversed re-arm MUST be
+retracted in `InstallReport.beacon_rearm` (`applied: false` plus the reason), never left claiming the
+schedule is back.
+
+The re-arm MUST run AFTER the protected root has been created + hardened. The ordering is *attempted*
+by the install step, and ENFORCED by `secure::root_exec_guard` (reached through
+`guardedcmd::GuardedCommand::for_installed_binary`, the only way an installed binary can be spawned):
+an elevated re-arm of a `dig-updater` whose directory is not owner-secure is refused there, so a
+failed or skipped root pre-creation cannot turn into a privileged spawn out of a user-writable
+directory.
 
 **Authoritative install-root record (`install.json`, #581).** The installer writes
 `<install-home>/install.json` (`%ProgramFiles%\DIG\install.json` / `/opt/dig/install.json` — the
