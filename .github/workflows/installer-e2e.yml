@@ -1332,7 +1332,11 @@ jobs:
             --dig-dns-version "$DIG_DNS_VERSION" \
             --json > install.json
           echo "installer exit: $?"
-          jq . install.json | head -5
+          # No pipe into `head`: this job runs with `-o pipefail`, and `head`
+          # closing the pipe early SIGPIPEs `jq`, which would fail the step for a
+          # diagnostic line. The assertions below are what decide this job.
+          jq -r '{ready: .result.ready, scope: .result.service.scope}' install.json
+          true
 
       # THE assertion this job exists for. This is the scope the installer
       # DECIDED on its own for a protected-root install — "system" — which the
