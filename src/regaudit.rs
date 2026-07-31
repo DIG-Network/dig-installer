@@ -614,7 +614,7 @@ fn deregister_beacon() -> Result<(), String> {
                 format!("{BEACON_SYSTEMD_UNIT}.service"),
             ] {
                 let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
-                args.extend(["disable".into(), "--now".into(), unit]);
+                args.extend(["disable".into(), "--now".into(), unit.clone()]);
                 let _ = spawn("systemctl", &args);
                 // `disable` only un-links the enablement symlinks — the unit FILE stays
                 // on disk, so systemd keeps reporting `LoadState=loaded` and the beacon
