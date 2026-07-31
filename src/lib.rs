@@ -82,6 +82,7 @@ pub mod svc;
 pub mod svcscope;
 pub mod target;
 pub mod uninstall;
+pub mod units;
 pub mod update;
 pub mod userwrite;
 
@@ -450,6 +451,11 @@ pub struct ServiceResult {
     pub survives_reboot: bool,
     /// Human-readable detail behind [`Self::survives_reboot`].
     pub scope_note: String,
+    /// Per-user units this run REMOVED because they would shadow the system-scope registration
+    /// (dig_ecosystem#526) — `systemd --user` starts such a unit at the next login alongside the
+    /// system one, and both bind the node's port. Empty when there were none. Named, never silent:
+    /// this run deleted a file somebody's earlier install put there.
+    pub shadowing_units_removed: Vec<String>,
 }
 
 /// The result of uninstalling the dig-node service + removing the `dig.local`
@@ -2587,6 +2593,61 @@ fn reboot_survival_note(label: &str, outcome: &service::ServiceInstallOutcome) -
     )
 }
 
+/// The `$XDG_CONFIG_HOME`s (macOS: home directories) whose per-user scope may hold a DIG unit.
+///
+/// The invoking user's AND root's own: a pre-#526 `sudo` install wrote the unit into ROOT's user
+/// scope, where root has no session bus to load it — invisible to the real user and to `systemctl`
+/// alike, and still there to shadow a later system registration.
+fn user_config_homes() -> Vec<std::path::PathBuf> {
+    let user = invoker::target_user();
+    let mut homes = vec![user.home.join(".config"), user.home.clone()];
+    for root_path in [
+        std::path::PathBuf::from("/root/.config"),
+        std::path::PathBuf::from("/root"),
+    ] {
+        if !homes.contains(&root_path) {
+            homes.push(root_path);
+        }
+    }
+    homes
+}
+
+/// Remove every per-user unit that would SHADOW the registration this run just made, returning the
+/// paths removed (for the report) — never silently.
+///
+/// Not tidy-up: `systemd --user` starts a leftover user unit at the next login ALONGSIDE the system
+/// unit, and both bind the node's port; one loses, non-deterministically. macOS has the same
+/// collision between a `gui/<uid>` LaunchAgent and a system LaunchDaemon of the same label. The
+/// decision about WHICH paths qualify is the pure [`svcscope::shadowing_units_to_remove`]; this only
+/// performs it.
+fn remove_shadowing_units(
+    os: target::Os,
+    scope: svcscope::ServiceScope,
+    existing: &[svcscope::UnitRecord],
+    log: &mut dyn FnMut(&str),
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    for path in svcscope::shadowing_units_to_remove(os, scope, existing) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                log(&format!(
+                    "    ✓ removed the per-user unit {} — it would have started a SECOND dig-node \
+                     at the next login, colliding with the machine-wide service on the node's port",
+                    path.display()
+                ));
+                removed.push(path.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log(&format!(
+                "    ! could not remove the per-user unit {} ({e}); if it is enabled, dig-node may \
+                 start twice at the next login — remove it by hand",
+                path.display()
+            )),
+        }
+    }
+    removed
+}
+
 /// Register dig-relay as an OS service by delegating to its own `install`/`start` subcommands.
 /// Never returns `Err` — a service failure is recorded in the result, not propagated (the binary
 /// is already placed). Mirrors [`register_dig_node`].
@@ -2906,6 +2967,7 @@ fn register_dig_node(
         scope,
         survives_reboot: false,
         scope_note: String::new(),
+        shadowing_units_removed: Vec::new(),
         dig_local: String::new(),
         dig_local_resolves: false,
         dig_local_resolve_note: String::new(),
@@ -2936,7 +2998,23 @@ fn register_dig_node(
         return result;
     }
 
-    if decision.action == update::UpdateAction::Skip {
+    let existing = units::existing_units(target.os, svc::DIG_NODE_SERVICE_ID, &user_config_homes());
+    if svcscope::engine_registration(target.os, scope, &existing)
+        == svcscope::EngineRegistration::AdoptPackaged
+    {
+        // The apt.dig.net `.deb` already ships and ENABLES `net.dignetwork.dig-node.service`.
+        // Delegating `install` on top of it produces a SECOND enabled unit for one service, both
+        // binding the node's port — and the second is the one this installer would then report as
+        // healthy. Adopting is not a shortcut; it is the only non-colliding outcome.
+        result.installed = true;
+        result.survives_reboot = true;
+        result.scope_note = "adopted the packaged system service already installed on this host \
+                             (it starts on boot with nobody logged in); registering a second unit \
+                             would collide on the node's port"
+            .to_string();
+        result.note = result.scope_note.clone();
+        log(&format!("    · {}", result.scope_note));
+    } else if decision.action == update::UpdateAction::Skip {
         // Already up to date: leave the registered service exactly as it is
         // rather than bouncing it via a needless `install`/`start`. The
         // health check below still independently confirms it is genuinely
@@ -2958,6 +3036,8 @@ fn register_dig_node(
                 result.scope_note = reboot_survival_note("dig-node", &outcome);
                 log(&format!("    · {}", result.scope_note));
                 result.note = outcome.note;
+                result.shadowing_units_removed =
+                    remove_shadowing_units(target.os, outcome.requested_scope, &existing, log);
             }
             Err(e) => {
                 // Service install can need elevation (Windows SCM). Best-effort:
@@ -5765,6 +5845,7 @@ mod tests {
             scope: svcscope::ServiceScope::System,
             survives_reboot: true,
             scope_note: "starts on boot".to_string(),
+            shadowing_units_removed: Vec::new(),
         }
     }
 
