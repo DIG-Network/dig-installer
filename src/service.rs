@@ -133,7 +133,7 @@ pub struct ServiceInstallOutcome {
 ///
 /// The contract now: an `install` failure is tolerated ONLY when a registration
 /// already exists at the REQUESTED scope, which `probe` answers scope-explicitly
-/// ([`svc::service_run_state_in_scope`]). Nothing there → `Err`, and readiness
+/// ([`svc::registration_in_scope`]). Nothing there → `Err`, and readiness
 /// fails.
 pub fn install_service(
     bin: &Path,

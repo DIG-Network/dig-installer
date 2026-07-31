@@ -201,7 +201,7 @@ pub enum ScopeQuery {
 
 /// Plan the scope-explicit query for `id` at `scope` on `os`, given the target
 /// user's `uid` (macOS per-user domain addressing only). Pure — the spawn is
-/// [`service_run_state_in_scope`].
+/// [`registration_in_scope`].
 pub fn scope_query(os: Os, scope: ServiceScope, id: &str, uid: Option<u32>) -> ScopeQuery {
     match (os, scope) {
         (Os::Windows, ServiceScope::System) => ScopeQuery::ScQuery(id.to_string()),

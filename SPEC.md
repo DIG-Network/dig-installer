@@ -1052,9 +1052,10 @@ therefore NOT a downgrade on Windows and MUST NOT be warned about as one; it is 
 **An `install` failure is tolerated ONLY at the requested scope.** `install` is not idempotent, so a
 re-install over a live registration can hard-fail while the registration is perfectly usable — that
 tolerance is retained, but it is now judged by a SCOPE-EXPLICIT probe
-(`svc::service_run_state_in_scope`). A failure with nothing registered at the requested scope is an
-ERROR and fails readiness (§4.2); an `Unknown` probe result is NOT tolerance, because "could not ask"
-is not "it is there".
+(`svc::registration_in_scope`, which answers PRESENCE — `systemctl is-active` says `inactive` for a
+unit that does not exist, so a run-state query cannot answer "is anything registered here?" at all). A
+failure with nothing registered at the requested scope is an ERROR and fails readiness (§4.2); an
+`Unknown` probe result is NOT tolerance, because "could not ask" is not "it is there".
 
 **No unit may shadow a system registration.** After a system-scope register, every unpackaged
 per-user unit for that service — the invoking user's AND root's own, which a pre-#526 `sudo` install
