@@ -60,5 +60,16 @@ fn main() {
         }
     }
 
+    // Add/Remove Programs uninstall (#854): the installed `dig-installer.exe` is
+    // THIS executable (the install hardening persists `current_exe()`, and on the
+    // normal user path the installing process is the GUI), so the ARP
+    // `UninstallString` runs it with `--uninstall`. Handle that BEFORE any Tauri
+    // WebView is created — otherwise the OS Uninstall button just re-opens the
+    // installer window, which is the bug users actually reported.
+    let intent = digstore_installer_lib::cli::intent_from_args(std::env::args_os().skip(1));
+    if intent != digstore_installer_lib::cli::Intent::Gui {
+        std::process::exit(digstore_installer_lib::run_uninstall(intent));
+    }
+
     digstore_installer_lib::run()
 }
