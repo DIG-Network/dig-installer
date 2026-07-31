@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.32.0] - 2026-07-31
+
+### Features
+- **gui:** Check dig-app by default, and lock dig-node while it is selected (#48)
+
 ## [0.31.2] - 2026-07-29
 
 ### Bug Fixes
