@@ -3,6 +3,44 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## Root has no systemd `--user` bus under `sudo`, so a "user-level" service is unreachable there
+
+`systemd --user` is per-login-session infrastructure: it needs `XDG_RUNTIME_DIR=/run/user/<uid>` and a
+session D-Bus. A `sudo`/`curl | sudo sh` shell has neither — root reached that way has no session at
+all — so under elevation every `systemctl --user …` fails with `Failed to connect to bus: No such file
+or directory`, and a unit written into `/root/.config/systemd/user/` is loaded by nobody, ever.
+
+Two consequences that cost real debugging:
+
+- delegating `dig-node install` as root while dig-node preferred a USER-level unit produced a
+  registration that was reported successful, then did not come back after a reboot. The unit existed;
+  no session existed to load it. That is dig_ecosystem#526, and the fix is to name the scope
+  explicitly (`--scope system`) rather than accept a component's default.
+- a headless box has no login session at all, so ANY per-user mechanism is permanently inert there.
+  "It works on my laptop" is not evidence: the laptop had a graphical login.
+
+Corollary for reading state: a scope-BLIND health probe ("is it running anywhere?") is the right
+question for a health check and the WRONG one for deciding whether a failed registration may be
+tolerated — a leftover user-scope unit will happily answer for a system registration that never
+happened.
+
+## A systemd user unit that is written but never enabled is not autostart
+
+`~/.config/systemd/user/dig-app.service` sitting on disk starts nothing. A unit is started only when
+it is linked into a `.wants` directory, which is what `systemctl --user enable` does — and the
+installer cannot do that for the target user (see above: no bus under elevation, and it is the user's
+own session that owns it). The shipped code therefore PRINTED the enable command in its log and
+reported the autostart as registered. Linux autostart had never worked once.
+
+An XDG autostart desktop entry (`~/.config/autostart/*.desktop`) has none of that: every desktop
+session reads the directory at login, there is nothing to enable, no bus is involved and no privilege
+is needed. It is the correct mechanism for a per-user GUI agent; a systemd user unit is the correct
+mechanism for something the user will manage with `systemctl`, which a tray app is not.
+
+Two traps when switching: the old unit must be REMOVED (a user who ever ran `systemctl --user enable`
+gets two agents at login, one per mechanism), and "the artifact exists" must never again stand in for
+"it will start" — assert the mechanism that actually starts things.
+
 ## #1748: a self-check that supplies its own input cannot fail
 
 The post-install PATH check took the install's bin dir, prepended it to the current process's `PATH`,

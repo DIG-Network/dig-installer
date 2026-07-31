@@ -107,14 +107,46 @@ treats it unlike every daemon in this catalogue:
   |----|-----------------------------------------------|----------|
   | Windows | `run-key` | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `DIG App` = the QUOTED dig-app path |
   | macOS | `launch-agent` | `~/Library/LaunchAgents/net.dig.dig-app.plist` (`RunAtLoad` + `KeepAlive`) |
-  | Linux | `systemd-user` | `$XDG_CONFIG_HOME/systemd/user/dig-app.service` (`Restart=on-failure`; `$XDG_CONFIG_HOME` defaults to `~/.config`) |
+  | Linux | `xdg-autostart` | `$XDG_CONFIG_HOME/autostart/dig-app.desktop` (`Type=Application`, `Exec=<dig-app path>`, `X-GNOME-Autostart-enabled=true`, `Hidden=false`; `$XDG_CONFIG_HOME` defaults to `~/.config`) |
 
   `HKCU`, never `HKLM`: a machine-wide Run entry would launch one user's identity agent in every
   account on the machine. The Windows command string is quoted, because the default install root
   (`%ProgramFiles%\DIG\bin`) contains a space and an unquoted Run value would never start.
-  The Linux unit is WRITTEN, not enabled — the install log names the exact
-  `systemctl --user enable --now dig-app.service` command, since enabling a user unit is a user-session
-  action the installer must not assume it can perform.
+  The Linux artifact MUST be an XDG autostart desktop entry, NOT a systemd user unit. A desktop
+  session reads `$XDG_CONFIG_HOME/autostart/*.desktop` at login with no `enable` step, no session bus
+  and no privilege, so the installer completes the registration itself. A systemd **user** unit
+  cannot be completed by the installer: `systemctl --user enable` requires the TARGET user's session
+  bus, which an elevated install does not have (root has none at all), so a written-but-never-enabled
+  unit is INERT and is not autostart. An install MUST NOT discharge this obligation by printing a
+  command for the user to run.
+
+  An install MUST REMOVE the systemd user unit earlier versions wrote
+  (`$XDG_CONFIG_HOME/systemd/user/dig-app.service`), on both install and uninstall: the two
+  mechanisms are independent, so a user who ever ran `systemctl --user enable dig-app.service` would
+  otherwise get TWO agents at the next login. Failure to remove it is REPORTED, never fatal.
+
+- **Headless hosts are SKIPPED, and say so.** The disposition is
+  `svcscope::agent_disposition(os, headless, target_user_known)` and appears verbatim on
+  `InstallReport.autostart.disposition`:
+
+  | disposition | when | behaviour |
+  |---|---|---|
+  | `register` | a graphical session, and a resolvable target user | write the artifact above |
+  | `skip-headless` | no graphical session on this host | write NOTHING; report why. MUST NOT enable `loginctl` linger or otherwise force a GUI agent onto a server |
+  | `skip-no-target-user` | elevated on unix with no resolvable invoking account (§1.5a) | write NOTHING; report LOUDLY — registering into root's own scope is the §1.5a inversion |
+
+  Windows never reports `skip-no-target-user`: `HKCU` addresses the account this process runs as, so
+  a target user is always known.
+
+  `is_headless(os, facts)` MUST err toward REGISTERING, because the two mistakes are not symmetric —
+  a wrong "headless" silently denies a desktop user the agent they installed, while a wrong
+  "graphical" leaves one inert file no session reads. `true` therefore requires positive evidence:
+  Linux — no `DISPLAY`/`WAYLAND_DISPLAY`/graphical `XDG_SESSION_TYPE` **and** no desktop session
+  installed on the host at all (so a `sudo` install on a workstation whose `DISPLAY` was not
+  forwarded is NOT headless); macOS — no Aqua session infrastructure; Windows — no interactive window
+  station (a Session-0/service context).
+
+  A skipped autostart does not gate `ready` (§4.2), and the node/service side is unaffected.
 - **The macOS + Linux artifacts are BYTE-IDENTICAL to dig-app's own renderers**
   (`dig_app::autostart::{macos,linux}`, which likewise use the shared `net.dig.dig-app` label);
   dig-app's module documentation assigns Windows autostart to this installer. dig-app exposes those
@@ -976,6 +1008,68 @@ boot-start, so it comes up on the next boot. This boot-start contract is regress
 `dns::plan::tests::dns_service_is_registered_as_boot_start` and
 `service::tests::dig_node_is_registered_boot_start_via_the_install_verb`.
 
+### 2.1a Service SCOPE — which domain an engine registers in (dig_ecosystem#526)
+
+An **engine** (`dig-node`, `dig-relay`, `dig-dns`) is a machine daemon holding no user identity. The
+**agent** (`dig-app`) is per-user and MUST NEVER become a machine daemon (§1.11).
+
+Reboot survival with NO login session comes from exactly three mechanisms — the systemd
+`multi-user.target.wants` symlink, a launchd **system**-domain plist with `RunAtLoad`, and the SCM's
+`AUTO_START`. Every per-user mechanism (a systemd `--user` unit, a `gui/<uid>` LaunchAgent, an XDG
+autostart entry, `HKCU\…\Run`) waits for a login BY DESIGN.
+
+The scope is `svcscope::engine_scope(os, elevated, program_in_protected_root)`:
+
+| OS | elevated + binary in the protected root (§1.6) | elevated + `--bin-dir` override | unelevated |
+|---|---|---|---|
+| Linux | **System** — `/etc/systemd/system/` + the `multi-user.target.wants` symlink | **User** (forced), reported as "will NOT survive a reboot" | User — `~/.config/systemd/user/` |
+| macOS | **System** — `/Library/LaunchDaemons/…plist`, `RunAtLoad` | User (`gui/<uid>`), same report | User — `~/Library/LaunchAgents/` |
+| Windows | System — SCM `start= auto` | same | refused by the elevation gate (§4.1) |
+
+A `--bin-dir` run is FORCED to user scope: a machine-wide daemon pointed at a caller-selected path is
+the §7.5 escalation itself. The forced downgrade MUST be reported
+(`ServiceResult.survives_reboot: false` + `scope_note`), never silent.
+
+**The argument surface.** The installer passes `--scope <system|user>` to the component's
+`install`/`start`/`uninstall` verbs, as two tokens. The value set is byte-identical with dig-node's
+own `--scope <auto|system|user>`; the installer never passes `auto`, because "whatever the component
+defaults to" is the defect this closes.
+
+**Compat with a pre-`--scope` build.** dig-installer installs the LATEST component release with no
+version pin, so an older binary is a real state. clap rejects an unknown flag with a non-zero exit
+BEFORE running any subcommand body, so that failure is side-effect-free: the installer retries the
+verb WITHOUT the flag and records `reboot_survival: false` with a plain-language note. The retry MUST
+be gated on a message naming `--scope` specifically (`svcscope::is_unknown_scope_flag_rejection`) —
+retrying any other failure unflagged would silently downgrade a system registration to a login-gated
+one and still report success. No `--help` probing and no version parsing.
+
+**An `install` failure is tolerated ONLY at the requested scope.** `install` is not idempotent, so a
+re-install over a live registration can hard-fail while the registration is perfectly usable — that
+tolerance is retained, but it is now judged by a SCOPE-EXPLICIT probe
+(`svc::service_run_state_in_scope`). A failure with nothing registered at the requested scope is an
+ERROR and fails readiness (§4.2); an `Unknown` probe result is NOT tolerance, because "could not ask"
+is not "it is there".
+
+**No unit may shadow a system registration.** After a system-scope register, every unpackaged
+per-user unit for that service — the invoking user's AND root's own, which a pre-#526 `sudo` install
+wrote — MUST be removed and NAMED in `ServiceResult.shadowing_units_removed`. `systemd --user` starts
+such a unit at the next login alongside the system unit, and both bind the node's port.
+
+**An enabled packaged unit is ADOPTED, not duplicated.** When the apt.dig.net `.deb`'s
+`net.dignetwork.dig-node.service` is present AND enabled in the system domain, the installer skips
+delegating `install` and reports the adoption: two enabled units for one service is a live port
+collision. A present-but-DISABLED packaged unit starts nothing and is no reason to skip.
+
+**Uninstall visits EVERY scope, on every OS, unconditionally** — `svcscope::deregister_scopes` always
+returns both. An uninstall that only visits the scope THIS run would have installed into leaves an
+earlier run's registration starting a service the user believes they removed. On macOS that means
+booting out BOTH `system/<id>` and `gui/<uid>/<id>`. The authoritative signal is the scope-explicit
+END STATE, never the verbs' exit codes (an `uninstall` of an absent registration exits non-zero on
+some platforms); a scope still holding a registration afterwards is a REPORTED failure, and a scope
+that could not be reached is reported even when the end state is clean. Per-user artifacts resolve
+through the target user (§1.5a); when no target user can be determined under elevation this is
+reported loudly rather than cleaned silently.
+
 ### 2.2 dig-dns service identity + clean reinstall (task #494)
 
 dig-dns's OS service identity is canonical and stable across releases:
@@ -1102,6 +1196,43 @@ result, so a caller can tell "declined" apart from "attempted and failed". `read
 the aggregate readiness verdict (§4.2) — the firewall rule and the scheme handler are best-effort
 and never gate `ready`; the beacon's scheduler registration DOES gate `ready` (§1.5, like
 dig-node/dig-relay's own service registration). The `--json` envelope's `ok` mirrors `ready`.
+
+### 3.1 Scope + re-arm fields (dig_ecosystem#526/#1863)
+
+| field | meaning |
+|---|---|
+| `service.scope` / `relay.scope` | `system` or `user` — the domain this run registered in (§2.1a) |
+| `service.survives_reboot` / `relay.survives_reboot` | will it start after a reboot with NOBODY logged in? `false` for every per-user registration by design, and `false` when the component predates `--scope` |
+| `service.scope_note` / `relay.scope_note` | the plain-language reason behind `survives_reboot` — never silent |
+| `service.shadowing_units_removed` | per-user unit files this run deleted because they would shadow the system registration (§2.1a) |
+| `autostart.disposition` | `register` / `skip-headless` / `skip-no-target-user` (§1.11) |
+| `rearmed_registrations[]` | `{label, applied, note}` per engine-service registration the #565 migration removed and this run restored (§3.11a) |
+
+## 3.11a Restoring a registration the migration removed (dig_ecosystem#1854/#1863)
+
+The §7.5 legacy-root migration deregisters every privileged registration whose binary resolves under
+a legacy user-writable root, INDEPENDENT of the current plan. Each component's install step
+re-registers only when the plan SELECTS that component. A re-run that DECLINES a component therefore
+MUST restore the registration the migration vacated: declining a component installs nothing, it never
+means "uninstall what is already there".
+
+This applies to the auto-update beacon AND to all three engine services, under one rule
+(`rearm::rearm_after_migration`), whose guard order is normative:
+
+1. **plan selects the component** → do nothing; its own install step registers it fresh.
+2. **the migration did not deregister it** → do nothing; this host's registration was never touched.
+3. **this run's privileged root is not the protected root** → do NOTHING and say why: creating a
+   machine-wide privileged registration at a caller-selected `--bin-dir` path is the §7.5 escalation.
+4. otherwise **register from the protected root** (never the legacy path, whose binary the migration
+   deleted) and REPORT the outcome.
+
+A restored registration is a reversible privileged action: it is recorded for rollback (§3.11) and
+deregistered by canonical id if a later step fails, and the report's claim is RETRACTED when that
+happens. A re-arm that FAILS is reported with the component's own consequence and the EXACT command
+that restores it (§5) — never a generic sentence.
+
+The audited privileged set (`regaudit::privileged_regs`) is all three services plus the beacon on
+EVERY OS, matching `paths::is_privileged_component`.
 
 ## 4. Exit codes
 

@@ -194,14 +194,20 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "DIG App"
 #    macOS
 cat ~/Library/LaunchAgents/net.dig.dig-app.plist
 #    Linux
-cat "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/dig-app.service"
+cat "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/dig-app.desktop"
 
-# 3. start it now, without logging out
-#    Windows / macOS: run the binary (macOS may also `launchctl load` the agent)
+# 3. start it now, without logging out — on every OS, just run it
 dig-app
-#    Linux: enable + start the user unit
-systemctl --user enable --now dig-app.service
 ```
+
+The Linux artifact is an XDG **autostart desktop entry**, not a systemd user unit: a desktop session
+loads it at login with no `enable` step. Nothing to enable, and nothing for you to run. If an older
+dig-installer left `~/.config/systemd/user/dig-app.service` behind, the current one removes it — two
+mechanisms would start two agents.
+
+On a HEADLESS host the installer skips the autostart on purpose and says so; `dig-installer --json`
+reports `autostart.disposition = "skip-headless"`. The binary is still installed and on PATH, and the
+node/service side is unaffected.
 
 dig-app is a tray / menu-bar agent: on a desktop session it appears in the tray, and on a GUI-less
 host it degrades to a headless agent and says so on stderr. It looks for a running dig-node over the
@@ -210,4 +216,50 @@ than silent.
 
 `--no-dig-app` skips it entirely; `--no-dig-app-autostart` installs the binary without the login
 registration. `dig-installer --json` reports both under `components[]` (`"component": "dig-app"`)
-and `autostart` (`mechanism` / `artifact` / `registered` / `note`).
+and `autostart` (`mechanism` / `artifact` / `registered` / `disposition` / `note`).
+
+## Service scope — will the node come back after a reboot?
+
+An elevated install registers the engine services (dig-node, dig-relay, dig-dns) MACHINE-WIDE, so
+they start at boot with nobody logged in. An unelevated install, or one redirected with `--bin-dir`,
+registers them per-user, which starts them at LOGIN instead. The installer says which, every run:
+
+```bash
+dig-installer --json | jq '{scope: .service.scope, reboot: .service.survives_reboot, why: .service.scope_note}'
+```
+
+Inspect the registration directly:
+
+```bash
+# Linux — a machine-wide unit AND the enable symlink that makes it boot-start
+systemctl cat dignetwork-dig-node.service
+ls -l /etc/systemd/system/multi-user.target.wants/ | grep dignetwork
+systemctl --user is-active dignetwork-dig-node.service   # per-user scope, if that is what you got
+
+# macOS
+sudo launchctl print system/net.dignetwork.dig-node
+launchctl print "gui/$(id -u)/net.dignetwork.dig-node"
+
+# Windows (elevated)
+sc qc net.dignetwork.dig-node        # START_TYPE : 2 AUTO_START
+```
+
+Two things the installer handles for you, and reports:
+
+- if a per-user unit for the same service is left over from an earlier (unelevated, or older) install,
+  it is REMOVED — `systemd --user` would otherwise start a second dig-node at your next login and both
+  would fight for the node's port. The paths removed appear in
+  `.service.shadowing_units_removed`;
+- if the apt.dig.net `.deb`'s `net.dignetwork.dig-node.service` is already installed and enabled, the
+  installer ADOPTS it instead of registering a second unit.
+
+If `survives_reboot` is `false` on a machine you expected to be boot-start, the two usual causes are
+(a) the run was not elevated, and (b) `--bin-dir` was used — a machine-wide daemon is never pointed at
+a caller-chosen directory. Re-run elevated, without `--bin-dir`.
+
+## Uninstalling a service — both scopes, always
+
+`dig-installer --uninstall` deregisters each engine service from BOTH the machine-wide and the
+per-user scope on every OS, unconditionally, because an earlier run may have chosen either. A scope
+that still holds a registration afterwards is reported as a failure rather than passed over. To check
+by hand, run the per-OS probes above and expect "not registered" from both.
