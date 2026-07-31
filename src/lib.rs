@@ -70,6 +70,7 @@ pub mod migrate;
 pub mod pathcheck;
 pub mod paths;
 pub mod proc;
+pub mod rearm;
 pub mod regaudit;
 pub mod release;
 pub mod rootchain;
@@ -575,6 +576,14 @@ pub struct InstallReport {
     /// silent, but not a readiness failure: the beacon was not part of what this run was
     /// asked to install.
     pub beacon_rearm: Option<beacon::BeaconResult>,
+    /// The record of restoring any of the three ENGINE-SERVICE registrations the #565 migration
+    /// removed off a legacy root on a run that did NOT select that component
+    /// (dig_ecosystem#1863 — the services' half of the beacon defect PR #49 fixed).
+    ///
+    /// Empty when there was nothing to restore. An entry with `applied: false` means that service
+    /// is now UNREGISTERED on this host and this run could not put it back — reported rather than
+    /// silent.
+    pub rearmed_registrations: Vec<rearm::RearmRecord>,
     /// The post-registration binPath audit of every privileged DIG registration
     /// (#565 review — H1 backstop + H2b): each service / the SYSTEM beacon task's
     /// ACTUAL configured binary, read back from the OS, and whether it still
@@ -883,6 +892,7 @@ fn run_report_gated(
         preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
         beacon_rearm: None,
+        rearmed_registrations: Vec::new(),
         registration_audit: Vec::new(),
         install_manifest: None,
         ready: true,
@@ -1659,6 +1669,7 @@ fn run_report_gated(
         Err(e) => {
             let rollback = rollback_partial_install(&guard, &target, log);
             retract_beacon_rearm_claim(&mut report, &rollback, log);
+            retract_service_rearm_claims(&mut report, &rollback, log);
             return Err(e);
         }
     }
@@ -1768,6 +1779,36 @@ fn retract_beacon_rearm_claim(
         rearm.note
     );
     log(&format!("    ↩ {}", rearm.note));
+}
+
+/// Un-say every engine-service re-arm the rollback just reversed (dig_ecosystem#1863).
+///
+/// The service counterpart of [`retract_beacon_rearm_claim`], and for the same reason: the report is
+/// the contract for what state the host is in, so a claim the rollback undid would tell the operator
+/// a service is registered when this run left it removed.
+fn retract_service_rearm_claims(
+    report: &mut InstallReport,
+    rollback: &hardening::RollbackReport,
+    log: &mut dyn FnMut(&str),
+) {
+    for record in &mut report.rearmed_registrations {
+        let Some(service) = ENGINE_SERVICES.iter().find(|s| s.label == record.label) else {
+            continue;
+        };
+        let reversed = rollback
+            .reversed
+            .iter()
+            .any(|a| matches!(a, InstallAction::ServiceRegistered(id) if id == service.id));
+        if !record.applied || !reversed {
+            continue;
+        }
+        record.applied = false;
+        record.note = format!(
+            "{} — then REMOVED again by the rollback of this failed install, so {} is unregistered              on this host; restore it with `{}`",
+            record.note, service.label, service.restore_command
+        );
+        log(&format!("    ↩ {}", record.note));
+    }
 }
 
 /// Reverse the privileged steps a partial-failure install recorded — LIFO,
@@ -3185,6 +3226,10 @@ struct MigrationStepHooks<'a> {
     ensure_protected_dir: Box<EnsureProtectedDirFn<'a>>,
     /// Register the beacon's daily schedule against this `dig-updater` binary.
     register_beacon: Box<RegisterBeaconFn<'a>>,
+    /// Re-register ONE engine service (dig-node/dig-relay/dig-dns) from the protected root
+    /// (dig_ecosystem#1863) — the boundary that lets the re-arm's guard table be asserted
+    /// without registering a real service.
+    register_service: Box<RegisterServiceFn<'a>>,
 }
 
 /// [`migrate::migrate_from_legacy_roots`], as an injectable boundary.
@@ -3196,6 +3241,10 @@ type EnsureProtectedDirFn<'a> = dyn FnMut(target::Os, &std::path::Path) -> Resul
 /// [`beacon::register`] (never dry-run), as an injectable boundary.
 type RegisterBeaconFn<'a> = dyn FnMut(&std::path::Path) -> beacon::BeaconResult + 'a;
 
+/// Re-register one engine service, given the component and the protected root it lives in.
+type RegisterServiceFn<'a> =
+    dyn FnMut(&EngineService, &std::path::Path) -> rearm::RearmOutcome + 'a;
+
 impl MigrationStepHooks<'_> {
     /// The real OS boundaries.
     fn production() -> Self {
@@ -3203,7 +3252,140 @@ impl MigrationStepHooks<'_> {
             migrate: Box::new(migrate::migrate_from_legacy_roots),
             ensure_protected_dir: Box::new(secure::ensure_protected_dir),
             register_beacon: Box::new(|bin| beacon::register(bin, false)),
+            register_service: Box::new(reregister_engine_service),
         }
+    }
+}
+
+/// An engine service the legacy-root migration may have deregistered, and which this run must put
+/// back when the plan does not select it (dig_ecosystem#1863).
+///
+/// The three are grouped as data rather than as three code paths because they differ only in their
+/// label, their canonical id and how they are registered — and three near-identical code paths is
+/// precisely how #1863 came to exist for the services after PR #49 fixed it for the beacon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineService {
+    /// [`regaudit::PrivilegedReg::label`] — the string the migration reports deregistering, so the
+    /// two halves match by construction rather than by a duplicated literal.
+    pub label: &'static str,
+    /// The canonical reverse-DNS service id, for the rollback's deregistration.
+    pub id: &'static str,
+    /// The binary stem to resolve under the protected root.
+    pub stem: &'static str,
+    /// The EXACT command that re-installs this component, for the failed-re-arm advice — a command,
+    /// never a procedure (SPEC §5).
+    pub restore_command: &'static str,
+}
+
+/// The engine services whose privileged registrations the migration vacates, in a stable order.
+pub const ENGINE_SERVICES: [EngineService; 3] = [
+    EngineService {
+        label: "dig-node",
+        id: svc::DIG_NODE_SERVICE_ID,
+        stem: "dig-node",
+        restore_command: "dig-installer",
+    },
+    EngineService {
+        label: "dig-relay",
+        id: svc::DIG_RELAY_SERVICE_ID,
+        stem: "dig-relay",
+        restore_command: "dig-installer --with-relay",
+    },
+    EngineService {
+        label: "dig-dns",
+        id: svc::DIG_DNS_SERVICE_ID,
+        stem: "dig-dns",
+        restore_command: "dig-installer",
+    },
+];
+
+/// Does this plan SELECT `service` — i.e. will this run's own install step register it, making a
+/// re-arm a double registration? Pure.
+fn plan_selects_engine_service(plan: &InstallPlan, service: &EngineService) -> bool {
+    match service.stem {
+        "dig-node" => plan.with_dig_node,
+        "dig-relay" => plan.with_relay,
+        _ => plan.with_dig_dns,
+    }
+}
+
+/// Re-register one engine service from the PROTECTED root — the production
+/// [`RegisterServiceFn`].
+///
+/// dig-node and dig-relay register themselves through their own `install` verb (at the
+/// machine-wide scope, since the protected root is the only root this is ever reached with);
+/// dig-dns ships no such verb, so the installer owns its wiring ([`dns::install`]). Every
+/// delegation still goes through [`guardedcmd::GuardedCommand::for_installed_binary`] via
+/// [`service::install_service`] — a privileged binary is never executed from anywhere else (#565).
+fn reregister_engine_service(
+    service: &EngineService,
+    protected_root: &std::path::Path,
+) -> rearm::RearmOutcome {
+    let Ok(target) = Target::current() else {
+        return rearm::RearmOutcome {
+            applied: false,
+            note: "could not detect this host's OS/arch target".to_string(),
+        };
+    };
+    let bin = protected_root.join(target.exe_name(service.stem));
+    if !bin.exists() {
+        return rearm::RearmOutcome {
+            applied: false,
+            note: format!("no {} in the protected root", bin.display()),
+        };
+    }
+    // `start: false` — the re-arm restores the REGISTRATION the migration removed; whether the
+    // service was running is the running service's own business, and starting one the user did not
+    // ask this run to install would be a second decision made on their behalf.
+    match service.stem {
+        "dig-dns" => {
+            let result = dns::install(&bin, &dns::DnsInstallConfig::default(), false);
+            rearm::RearmOutcome {
+                applied: result.installed,
+                note: result.note,
+            }
+        }
+        "dig-relay" => {
+            let cfg = service::RelayServiceConfig {
+                start: false,
+                ..service::RelayServiceConfig::default()
+            };
+            engine_rearm_outcome(service::install_relay_service(
+                &bin,
+                &cfg,
+                target.os,
+                svcscope::ServiceScope::System,
+            ))
+        }
+        _ => {
+            let cfg = service::ServiceConfig {
+                start: false,
+                ..service::ServiceConfig::default()
+            };
+            engine_rearm_outcome(service::install_service(
+                &bin,
+                &cfg,
+                target.os,
+                svcscope::ServiceScope::System,
+            ))
+        }
+    }
+}
+
+/// Fold a scoped registration result into a [`rearm::RearmOutcome`] — one conversion, so dig-node
+/// and dig-relay report a restored registration identically.
+fn engine_rearm_outcome(
+    result: Result<service::ServiceInstallOutcome, String>,
+) -> rearm::RearmOutcome {
+    match result {
+        Ok(outcome) => rearm::RearmOutcome {
+            applied: true,
+            note: outcome.note,
+        },
+        Err(e) => rearm::RearmOutcome {
+            applied: false,
+            note: e,
+        },
     }
 }
 
@@ -3259,6 +3441,62 @@ fn migrate_legacy_roots_step(
     if report.beacon_rearm.as_ref().is_some_and(|r| r.applied) {
         guard.record(InstallAction::BeaconRearmed);
     }
+
+    rearm_engine_services_after_migration(plan, report, guard, &expected_root, hooks, log);
+}
+
+/// Restore any of the three engine-service registrations the migration vacated that this run will
+/// not re-register (dig_ecosystem#1863) — the services' half of the same defect PR #49 fixed for the
+/// beacon.
+///
+/// Each restored registration is recorded in `guard` as an [`InstallAction::ServiceRegistered`], so
+/// the existing LIFO rollback deregisters it rather than leaving a privileged registration pointing
+/// into a root the rollback reverts — and [`retract_rearm_claims`] un-says the report's claim when
+/// that happens.
+fn rearm_engine_services_after_migration(
+    plan: &InstallPlan,
+    report: &mut InstallReport,
+    guard: &mut RollbackGuard,
+    expected_root: &std::path::Path,
+    hooks: &mut MigrationStepHooks<'_>,
+    log: &mut dyn FnMut(&str),
+) {
+    let Some(deregistered) = report.migration.as_ref().map(|m| m.deregistered.clone()) else {
+        return; // no migration ran, so nothing was vacated
+    };
+    let protected = paths::protected_bin_dir();
+    for service in ENGINE_SERVICES {
+        let advice = rearm::RearmAdvice {
+            consequence: format!(
+                "the {} service is now UNREGISTERED on this host: it was removed off the legacy \
+                 root and could not be re-registered",
+                service.label
+            ),
+            restore: format!(
+                "Re-run the installer with {} enabled to restore it: `{}`",
+                service.label, service.restore_command
+            ),
+        };
+        let outcome = rearm::rearm_after_migration(
+            &rearm::RearmRequest {
+                label: service.label,
+                deregistered: &deregistered,
+                plan_selects: plan_selects_engine_service(plan, &service),
+                expected_root,
+                protected_root: &protected,
+                advice: &advice,
+            },
+            &mut |root| (hooks.register_service)(&service, root),
+            log,
+        );
+        let Some(outcome) = outcome else { continue };
+        if outcome.applied {
+            guard.record(InstallAction::ServiceRegistered(service.id.to_string()));
+        }
+        report
+            .rearmed_registrations
+            .push(rearm::RearmRecord::new(service.label, &outcome));
+    }
 }
 
 /// Re-arm the auto-update beacon's daily schedule when the #565 legacy-root migration
@@ -3295,6 +3533,21 @@ fn migrate_legacy_roots_step(
 /// protected root either, so the schedule is genuinely gone until the next install that
 /// selects the beacon). Never fatal: everything else in the run succeeded, and the state
 /// is REPORTED rather than swallowed.
+/// The beacon's failed-re-arm advice — verbatim the wording PR #49 shipped.
+///
+/// A generic sentence would be a regression: the operator has to learn that AUTO-UPDATES are now off
+/// and the EXACT command that restores them (SPEC §5 requires a command, not a procedure).
+fn beacon_rearm_advice() -> rearm::RearmAdvice {
+    rearm::RearmAdvice {
+        consequence: "auto-updates are now DISABLED on this host: the daily schedule was removed \
+                      off the legacy root and could not be re-armed"
+            .to_string(),
+        restore: "Re-run the installer with the auto-update beacon enabled to restore it: \
+                  `dig-installer --auto-update`"
+            .to_string(),
+    }
+}
+
 fn rearm_beacon_after_migration(
     migration: Option<&migrate::MigrationResult>,
     plan_installs_beacon: bool,
@@ -3303,49 +3556,33 @@ fn rearm_beacon_after_migration(
     register: &mut dyn FnMut(&std::path::Path) -> beacon::BeaconResult,
     log: &mut dyn FnMut(&str),
 ) -> Option<beacon::BeaconResult> {
-    if plan_installs_beacon {
-        return None; // step 5 registers it fresh, from the binary it just placed
-    }
-    if !migration_deregistered_the_beacon(migration?) {
-        return None; // this host's schedule was never touched — nothing to restore
-    }
-
-    let protected = paths::protected_bin_dir();
-    if expected_root != protected {
-        log(&format!(
-            "Not re-arming the auto-update beacon's daily schedule the migration removed (#1854): \
-             this run's privileged install root is {}, not the protected root {}, and a \
-             machine-wide privileged schedule must never be registered at a caller-selected path \
-             (#565). Auto-updates stay off on this host; restore them with a default-root \
-             `dig-installer --auto-update`.",
-            expected_root.display(),
-            protected.display()
-        ));
-        return None;
-    }
-
-    let bin = protected.join(target.exe_name("dig-updater"));
-    log("Re-arming the auto-update beacon's daily schedule the migration removed (#1854):");
-    let result = register(&bin);
-    if result.applied {
-        log(&format!("    ✓ {}", result.note));
-    } else {
-        log(&format!(
-            "    ! auto-updates are now DISABLED on this host: the daily schedule was removed off \
-             the legacy root and could not be re-armed ({}). Re-run the installer with the \
-             auto-update beacon enabled to restore it: `dig-installer --auto-update`",
-            result.note
-        ));
-    }
-    Some(result)
-}
-
-/// Did the #565 migration deregister the auto-update beacon's schedule, as opposed to
-/// only a service? Pure — compares against the beacon registration's OWN label rather
-/// than a string literal, so renaming the label cannot silently un-match.
-fn migration_deregistered_the_beacon(migration: &migrate::MigrationResult) -> bool {
-    let beacon_label = regaudit::PrivilegedReg::Beacon.label();
-    migration.deregistered.iter().any(|d| d == beacon_label)
+    let deregistered = migration
+        .map(|m| m.deregistered.clone())
+        .unwrap_or_default();
+    // The beacon's own result type is what the report carries, so capture exactly what `register`
+    // returned rather than reconstructing it from the generic outcome.
+    let mut registered = None;
+    rearm::rearm_after_migration(
+        &rearm::RearmRequest {
+            label: regaudit::PrivilegedReg::Beacon.label(),
+            deregistered: &deregistered,
+            plan_selects: plan_installs_beacon,
+            expected_root,
+            protected_root: &paths::protected_bin_dir(),
+            advice: &beacon_rearm_advice(),
+        },
+        &mut |protected| {
+            let result = register(&protected.join(target.exe_name("dig-updater")));
+            let outcome = rearm::RearmOutcome {
+                applied: result.applied,
+                note: result.note.clone(),
+            };
+            registered = Some(result);
+            outcome
+        },
+        log,
+    )?;
+    registered
 }
 
 /// The production [`uninstall::UninstallActions`] — wires the real per-component
@@ -5433,6 +5670,7 @@ mod tests {
             preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
             beacon_rearm: None,
+            rearmed_registrations: Vec::new(),
             registration_audit: Vec::new(),
             install_manifest: None,
             ready: true,
@@ -7536,8 +7774,10 @@ mod beacon_rearm {
     struct StepRecorder {
         /// `"migrate"` / `"ensure_protected_dir"` / `"register"`, in the order called.
         calls: Vec<&'static str>,
-        /// Every `dig-updater` path the step asked the scheduler to arm.
+        /// Every path the step asked a re-arm to register against.
         armed: Vec<PathBuf>,
+        /// Every ENGINE SERVICE label the step re-armed, in order (dig_ecosystem#1863).
+        services_rearmed: Vec<&'static str>,
     }
 
     /// Run the step exactly as the install path does — the plan supplies BOTH the
@@ -7566,6 +7806,16 @@ mod beacon_rearm {
                     r.calls.push("register");
                     r.armed.push(bin.to_path_buf());
                     beacon::BeaconResult {
+                        applied: arm_succeeds,
+                        note: "stub".to_string(),
+                    }
+                }),
+                register_service: Box::new(|service, root| {
+                    let mut r = rec.borrow_mut();
+                    r.calls.push("register_service");
+                    r.services_rearmed.push(service.label);
+                    r.armed.push(root.to_path_buf());
+                    rearm::RearmOutcome {
                         applied: arm_succeeds,
                         note: "stub".to_string(),
                     }
@@ -7605,6 +7855,175 @@ mod beacon_rearm {
                 .any(|a| matches!(a, InstallAction::BeaconRearmed)),
             "a later-step failure must deregister the re-armed schedule: {reversed:?}"
         );
+    }
+
+    // -- dig_ecosystem#1863: the SERVICES' half of the same defect -------------------------------
+
+    /// A plan that DECLINES all three engine services but still places a privileged binary (the
+    /// beacon), which is the shape that reaches the re-arm at all.
+    fn declining_all_services_plan() -> InstallPlan {
+        InstallPlan {
+            with_dig_node: false,
+            with_relay: false,
+            with_dig_dns: false,
+            auto_update: true,
+            ..InstallPlan::default()
+        }
+    }
+
+    /// THE #1863 regression, per component: a re-run that DECLINES a component, on a host whose
+    /// registration the migration just vacated off the legacy root, must put it back — declining a
+    /// component is documented as "installs nothing", never "uninstall what is already there".
+    ///
+    /// Driven through the STEP the install path actually runs, so this proves the CALL SITE exists
+    /// (the thing that was missing) rather than only that the generic works.
+    #[test]
+    fn a_declining_rerun_restores_each_engine_service_the_migration_removed() {
+        for service in ENGINE_SERVICES {
+            let migration = migration_deregistering(&[service.label]);
+            let (report, _, rec) = run_step(&declining_all_services_plan(), &migration, true);
+            assert_eq!(
+                rec.services_rearmed,
+                vec![service.label],
+                "declining {} must restore exactly its own registration",
+                service.label
+            );
+            let record = report
+                .rearmed_registrations
+                .iter()
+                .find(|r| r.label == service.label)
+                .unwrap_or_else(|| panic!("{} must be reported, never silent", service.label));
+            assert!(record.applied);
+        }
+    }
+
+    /// The full (plan_selects x was_deregistered) table at the step, per component: a SELECTED
+    /// component's own install step registers it fresh, and a registration the migration never
+    /// touched is not one this host ever had. The third axis — root-is-protected — is driven by
+    /// [`a_custom_bin_dir_plan_restores_no_service`].
+    #[test]
+    fn only_a_declined_and_deregistered_service_is_restored_by_the_step() {
+        for service in ENGINE_SERVICES {
+            for plan_selects in [true, false] {
+                for was_deregistered in [true, false] {
+                    let plan = InstallPlan {
+                        with_dig_node: plan_selects && service.stem == "dig-node",
+                        with_relay: plan_selects && service.stem == "dig-relay",
+                        with_dig_dns: plan_selects && service.stem == "dig-dns",
+                        ..declining_all_services_plan()
+                    };
+                    let labels: Vec<&str> = if was_deregistered {
+                        vec![service.label]
+                    } else {
+                        Vec::new()
+                    };
+                    let migration = migration_deregistering(&labels);
+                    let (report, _, rec) = run_step(&plan, &migration, true);
+                    let expected = !plan_selects && was_deregistered;
+                    assert_eq!(
+                        rec.services_rearmed.contains(&service.label),
+                        expected,
+                        "{}: plan_selects {plan_selects}, deregistered {was_deregistered}",
+                        service.label
+                    );
+                    assert_eq!(
+                        report
+                            .rearmed_registrations
+                            .iter()
+                            .any(|r| r.label == service.label),
+                        expected,
+                        "{}: the report must name exactly what was restored",
+                        service.label
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `--bin-dir`/GUI-redirected run restores NOTHING: creating a machine-wide privileged
+    /// registration at a CALLER-SELECTED path is the #565 escalation this migration exists to close.
+    #[test]
+    fn a_custom_bin_dir_plan_restores_no_service() {
+        let custom = std::env::temp_dir().join("dig-1863-custom-bin-dir");
+        let plan = InstallPlan {
+            bin_dir: custom.clone(),
+            ..declining_all_services_plan()
+        };
+        let target = Target::current().expect("target");
+        assert_eq!(
+            plan.privileged_install_root(target.os).as_deref(),
+            Some(custom.as_path()),
+            "the fixture must actually redirect the privileged root, or nothing is tested"
+        );
+        let labels: Vec<&str> = ENGINE_SERVICES.iter().map(|s| s.label).collect();
+        let migration = migration_deregistering(&labels);
+        let (report, _, rec) = run_step(&plan, &migration, true);
+        assert!(
+            rec.services_rearmed.is_empty(),
+            "a caller-selected privileged root must never be registered: {:?}",
+            rec.services_rearmed
+        );
+        assert!(report.rearmed_registrations.is_empty());
+    }
+
+    /// A restored registration is a REVERSIBLE privileged action: a later step's failure must
+    /// deregister it by canonical id rather than leave it pointing into a root the rollback reverts,
+    /// and the report must stop claiming it (#573's rollback contract + #1863's reporting contract).
+    #[test]
+    fn a_restored_service_is_rolled_back_and_its_claim_retracted() {
+        let service = ENGINE_SERVICES[0];
+        let migration = migration_deregistering(&[service.label]);
+        let (mut report, guard, _) = run_step(&declining_all_services_plan(), &migration, true);
+
+        let mut reversed = Vec::new();
+        let rollback = guard.rollback(&mut |action| {
+            reversed.push(action.clone());
+            Ok(())
+        });
+        assert!(
+            reversed
+                .iter()
+                .any(|a| matches!(a, InstallAction::ServiceRegistered(id) if id == service.id)),
+            "the restored registration must be recorded for rollback BY canonical id: {reversed:?}"
+        );
+
+        let mut lines = Vec::new();
+        retract_service_rearm_claims(&mut report, &rollback, &mut |l| lines.push(l.to_string()));
+        let record = &report.rearmed_registrations[0];
+        assert!(
+            !record.applied,
+            "a reversed restore must not still read as applied"
+        );
+        assert!(
+            record.note.contains("REMOVED again by the rollback"),
+            "{record:?}"
+        );
+        assert!(
+            record.note.contains(service.restore_command),
+            "the retraction must carry the EXACT restoring command: {record:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("REMOVED again")),
+            "{lines:?}"
+        );
+    }
+
+    /// An unrelated rollback leaves a restore's claim standing — the control that separates
+    /// "retract when reversed" from "always retract".
+    #[test]
+    fn an_unrelated_rollback_leaves_a_restored_service_claim_standing() {
+        let mut report = crate::tests::report_shell();
+        report.rearmed_registrations.push(rearm::RearmRecord {
+            label: ENGINE_SERVICES[0].label.to_string(),
+            applied: true,
+            note: "re-registered".to_string(),
+        });
+        let unrelated = hardening::RollbackReport {
+            reversed: vec![InstallAction::SchemeRegistered],
+            failures: Vec::new(),
+        };
+        retract_service_rearm_claims(&mut report, &unrelated, &mut |_| {});
+        assert!(report.rearmed_registrations[0].applied);
     }
 
     /// The re-arm's undo must reverse the schedule WITHOUT the `dig-updater` binary — the
