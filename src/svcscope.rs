@@ -189,6 +189,23 @@ pub fn deregister_scopes(_os: Os) -> Vec<ServiceScope> {
     vec![ServiceScope::System, ServiceScope::User]
 }
 
+/// The scope a component that does NOT understand `--scope` will register at — its own default.
+///
+/// * **Windows** — System, unavoidably: the SCM has no per-user service domain, and `dig-node
+///   install` sets `start= auto` there (#301). An older build on Windows is therefore still
+///   boot-start, and warning that it "only starts at login" would be false.
+/// * **Linux/macOS** — User: dig-node's pre-`--scope` `install` PREFERRED a user-level unit
+///   regardless of privilege (its `PREFERS_USER_LEVEL`), which is the whole of dig_ecosystem#526.
+///
+/// Used to answer honestly what a compat fallback actually achieved
+/// ([`survives_reboot_without_login`]) instead of assuming every fallback is a downgrade.
+pub fn legacy_default_scope(os: Os) -> ServiceScope {
+    match os {
+        Os::Windows => ServiceScope::System,
+        Os::Linux | Os::MacOs => ServiceScope::User,
+    }
+}
+
 /// Does a registration at `scope` on `os` start after a reboot with NOBODY logged in?
 ///
 /// Only the machine-wide domain does, on all three operating systems: the systemd
@@ -430,6 +447,26 @@ mod tests {
         for os in ALL_OS {
             assert!(survives_reboot_without_login(os, ServiceScope::System));
             assert!(!survives_reboot_without_login(os, ServiceScope::User));
+        }
+    }
+
+    #[test]
+    fn a_pre_scope_binary_still_registers_machine_wide_on_windows_but_not_on_unix() {
+        // The compat fallback is NOT a downgrade everywhere: the Windows SCM has no per-user domain,
+        // so an older `dig-node install` there is still boot-start. Claiming otherwise would print a
+        // false warning on every Windows install pinned to an older component — which is exactly what
+        // the installer-e2e caught (run 30645063625).
+        assert_eq!(legacy_default_scope(Os::Windows), ServiceScope::System);
+        assert!(survives_reboot_without_login(
+            Os::Windows,
+            legacy_default_scope(Os::Windows)
+        ));
+        for os in [Os::Linux, Os::MacOs] {
+            assert_eq!(legacy_default_scope(os), ServiceScope::User, "{os:?}");
+            assert!(
+                !survives_reboot_without_login(os, legacy_default_scope(os)),
+                "{os:?}: a user-level unit is the #526 defect — it waits for a login"
+            );
         }
     }
 

@@ -1043,6 +1043,12 @@ be gated on a message naming `--scope` specifically (`svcscope::is_unknown_scope
 retrying any other failure unflagged would silently downgrade a system registration to a login-gated
 one and still report success. No `--help` probing and no version parsing.
 
+The reported `reboot_survival` after a fallback is the truth about what the component ACTUALLY did,
+which is `svcscope::legacy_default_scope(os)` — **System on Windows** (the SCM has no per-user domain,
+and `install` sets `start= auto` there), **User on Linux/macOS** (dig-node's pre-`--scope` `install`
+preferred a user-level unit regardless of privilege, which is this whole defect). A fallback is
+therefore NOT a downgrade on Windows and MUST NOT be warned about as one; it is disclosed either way.
+
 **An `install` failure is tolerated ONLY at the requested scope.** `install` is not idempotent, so a
 re-install over a live registration can hard-fail while the registration is perfectly usable — that
 tolerance is retained, but it is now judged by a SCOPE-EXPLICIT probe

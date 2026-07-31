@@ -224,28 +224,151 @@ pub fn scope_query(os: Os, scope: ServiceScope, id: &str, uid: Option<u32>) -> S
     }
 }
 
-/// The run-state of service `id` in ONE explicit scope, on the current host.
+/// Is a registration PRESENT in one scope — a different question from whether it is RUNNING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// A registration exists in this scope (running or not).
+    Present,
+    /// No registration exists in this scope.
+    Absent,
+    /// The scope could not be asked. NOT the same as absent, and never treated as either
+    /// "registered" or "removed" — the caller REPORTS it.
+    Unknown,
+}
+
+impl Presence {
+    /// A short phrase for a note — never silent.
+    pub fn describe(self, id: &str) -> String {
+        match self {
+            Presence::Present => format!("'{id}' is registered here"),
+            Presence::Absent => format!("no registration for '{id}' here"),
+            Presence::Unknown => format!("could not determine whether '{id}' is registered here"),
+        }
+    }
+}
+
+/// Is service `id` REGISTERED in one explicit scope, on the current host?
 ///
-/// The scope-blind [`service_run_state`] answers "is it running ANYWHERE?",
-/// which is the right question for a health check and the WRONG one for
-/// deciding whether a failed `install` may be tolerated: a user-scope
-/// registration left over from an earlier run would excuse a system-scope
-/// registration that never happened (dig_ecosystem#526). Callers that care
-/// WHERE it is registered ask this.
-pub fn service_run_state_in_scope(id: &str, scope: ServiceScope) -> ServiceRunState {
+/// The scope-blind [`service_run_state`] answers "is it running ANYWHERE?", which is right for a
+/// health check and wrong for deciding whether a failed `install` may be tolerated: a leftover
+/// user-scope registration would excuse a system-scope registration that never happened
+/// (dig_ecosystem#526).
+///
+/// # Why this is not a RUN-STATE query
+///
+/// `systemctl is-active <unit>` prints `inactive` for a unit that DOES NOT EXIST, and `inactive`
+/// legitimately means "stopped" for one that does — so a run-state query cannot answer "is anything
+/// registered here?" at all. Reading `Stopped` as presence would tolerate a failed install against a
+/// unit that was never created (the exact false-ready this closes) and would report a successfully
+/// completed uninstall as residual. Linux therefore asks `is-enabled`, whose vocabulary distinguishes
+/// an existing unit (`enabled`/`disabled`/`static`/`masked`/…) from a missing one ("No such file or
+/// directory"). Found by the installer-e2e on ubuntu, run 30645063625.
+pub fn registration_in_scope(id: &str, scope: ServiceScope) -> Presence {
     let Ok(target) = crate::target::Target::current() else {
-        return ServiceRunState::Unknown;
+        return Presence::Unknown;
     };
     let uid = crate::invoker::target_user().uid;
     match scope_query(target.os, scope, id, uid) {
-        ScopeQuery::NoSuchDomain => ServiceRunState::NotFound,
-        ScopeQuery::Unaddressable => ServiceRunState::Unknown,
+        ScopeQuery::NoSuchDomain => Presence::Absent,
+        ScopeQuery::Unaddressable => Presence::Unknown,
         ScopeQuery::Systemctl(args) => {
-            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            query_systemctl_is_active(&borrowed)
+            // Same scope + unit, different verb: presence, not activity.
+            let enabled_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a == "is-active" {
+                        "is-enabled".to_string()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            let borrowed: Vec<&str> = enabled_args.iter().map(String::as_str).collect();
+            query_systemctl_presence(&borrowed)
         }
-        ScopeQuery::LaunchctlPrint(target) => query_launchctl_print(&target),
-        ScopeQuery::ScQuery(id) => query_sc(&id),
+        ScopeQuery::LaunchctlPrint(target) => launchctl_presence(&target),
+        ScopeQuery::ScQuery(id) => parse_sc_query_presence(&sc_query_text(&id)),
+    }
+}
+
+/// Classify `systemctl [--user] is-enabled <unit>` output. Pure.
+///
+/// Every state word systemd uses for a unit that EXISTS maps to `Present` — including `disabled`,
+/// `static` and `masked`, none of which mean "not registered". A missing unit is reported as
+/// "No such file or directory" (or an empty answer on some versions), which is `Absent`. Anything
+/// unrecognised is `Unknown` rather than guessed at.
+pub fn parse_systemctl_is_enabled(text: &str) -> Presence {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+    if lower.contains("no such file")
+        || lower.contains("does not exist")
+        || lower.contains("not found")
+    {
+        return Presence::Absent;
+    }
+    match trimmed {
+        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "masked"
+        | "masked-runtime" | "static" | "indirect" | "generated" | "transient" | "alias"
+        | "disabled" => Presence::Present,
+        "" => Presence::Absent,
+        _ => Presence::Unknown,
+    }
+}
+
+/// Classify Windows `sc query <id>` output as presence. Pure. A `1060`/"does not exist" reply is
+/// definitively absent; any reported STATE means the service exists; anything else is unknown.
+pub fn parse_sc_query_presence(text: &str) -> Presence {
+    match parse_sc_query(text) {
+        ServiceRunState::NotFound => Presence::Absent,
+        ServiceRunState::Running | ServiceRunState::Stopped => Presence::Present,
+        ServiceRunState::Unknown => Presence::Unknown,
+    }
+}
+
+/// Spawn `systemctl <args>` and classify its combined output as presence.
+fn query_systemctl_presence(args: &[&str]) -> Presence {
+    match std::process::Command::new("systemctl")
+        .args(args)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            parse_systemctl_is_enabled(&text)
+        }
+        Err(_) => Presence::Unknown,
+    }
+}
+
+/// `launchctl print <target>` succeeds only for a label loaded in that domain.
+fn launchctl_presence(target: &str) -> Presence {
+    match std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(target)
+        .hide_console()
+        .output()
+    {
+        Ok(o) if o.status.success() => Presence::Present,
+        Ok(_) => Presence::Absent,
+        Err(_) => Presence::Unknown,
+    }
+}
+
+/// The combined stdout+stderr of `sc query <id>`, for [`parse_sc_query_presence`].
+fn sc_query_text(id: &str) -> String {
+    match std::process::Command::new(crate::proc::system_tool("sc"))
+        .arg("query")
+        .arg(id)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text
+        }
+        Err(_) => String::new(),
     }
 }
 
@@ -744,6 +867,76 @@ mod tests {
             scope_query(Os::MacOs, ServiceScope::User, DIG_NODE_SERVICE_ID, None),
             ScopeQuery::Unaddressable
         );
+    }
+
+    #[test]
+    fn is_enabled_distinguishes_an_existing_unit_from_a_missing_one() {
+        // THE bug this replaced: `is-active` prints `inactive` for a unit that does not exist, and
+        // `parse_systemctl_is_active` maps `inactive` to Stopped — "registered but not running". So a
+        // run-state query cannot answer presence at all.
+        assert_eq!(
+            parse_systemctl_is_active("inactive"),
+            ServiceRunState::Stopped,
+            "documenting the trap: is-active says `inactive` for a unit that is not there"
+        );
+        assert_eq!(
+            parse_systemctl_is_enabled(
+                "Failed to get unit file state for dignetwork-dig-node.service: No such file or \
+                 directory"
+            ),
+            Presence::Absent
+        );
+        // Every word for a unit that EXISTS is Present — `disabled` and `masked` are registrations.
+        for state in [
+            "enabled",
+            "enabled-runtime",
+            "disabled",
+            "static",
+            "masked",
+            "linked",
+            "indirect",
+            "generated",
+            "transient",
+        ] {
+            assert_eq!(
+                parse_systemctl_is_enabled(state),
+                Presence::Present,
+                "`{state}` describes a unit that exists"
+            );
+        }
+        assert_eq!(parse_systemctl_is_enabled(""), Presence::Absent);
+        assert_eq!(
+            parse_systemctl_is_enabled("something new"),
+            Presence::Unknown
+        );
+    }
+
+    #[test]
+    fn sc_query_presence_separates_absent_from_unreadable() {
+        assert_eq!(
+            parse_sc_query_presence(
+                "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\n\r\nThe specified \
+                 service does not exist as an installed service.\r\n"
+            ),
+            Presence::Absent
+        );
+        assert_eq!(
+            parse_sc_query_presence("STATE : 1  STOPPED\r\n"),
+            Presence::Present,
+            "a STOPPED service is still REGISTERED"
+        );
+        assert_eq!(
+            parse_sc_query_presence("STATE : 4  RUNNING\r\n"),
+            Presence::Present
+        );
+        assert_eq!(parse_sc_query_presence("garbage"), Presence::Unknown);
+    }
+
+    #[test]
+    fn presence_is_never_silent() {
+        for p in [Presence::Present, Presence::Absent, Presence::Unknown] {
+            assert!(p.describe("net.dignetwork.dig-node").contains("dig-node"));
+        }
     }
 
     #[test]

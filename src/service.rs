@@ -148,7 +148,7 @@ pub fn install_service(
         scope,
         &install_env(cfg),
         &mut |args, env| run_dig_node(bin, args, env),
-        &mut |scope| svc::service_run_state_in_scope(svc::DIG_NODE_SERVICE_ID, scope),
+        &mut |scope| svc::registration_in_scope(svc::DIG_NODE_SERVICE_ID, scope),
     )
 }
 
@@ -158,7 +158,7 @@ pub fn install_service(
 type Runner<'a> = dyn FnMut(&[String], &BTreeMap<String, String>) -> Result<(), String> + 'a;
 
 /// A scope-explicit "is anything registered here?" probe.
-type ScopeProbe<'a> = dyn FnMut(ServiceScope) -> svc::ServiceRunState + 'a;
+type ScopeProbe<'a> = dyn FnMut(ServiceScope) -> svc::Presence + 'a;
 
 /// The shared scoped registration for the engine components (dig-node,
 /// dig-relay) — one implementation of the scope contract, the compat fallback
@@ -189,12 +189,25 @@ fn install_engine_service(
         started = true;
     }
 
-    let reboot_survival = scope_flag_accepted && svcscope::survives_reboot_without_login(os, scope);
-    if !scope_flag_accepted {
+    // What the component ACTUALLY registered at: the requested scope when the flag was honoured, else
+    // that component's own default for this OS. Not every fallback is a downgrade — the Windows SCM
+    // has no per-user domain, so an older build there is still boot-start, and warning otherwise
+    // would print a false alarm on every Windows install pinned to an older component.
+    let effective_scope = if scope_flag_accepted {
+        scope
+    } else {
+        svcscope::legacy_default_scope(os)
+    };
+    let reboot_survival = svcscope::survives_reboot_without_login(os, effective_scope);
+    if !scope_flag_accepted && effective_scope != scope {
         note.push_str(&format!(
-            " — but this {label} build does not understand `--scope`, so it registered wherever it \
-             defaults to (a per-user registration, which only starts once someone LOGS IN). The \
-             service will NOT come back on its own after a reboot until {label} is updated"
+            " — but this {label} build does not understand `--scope`, so it registered in {}              instead, which only starts once someone LOGS IN. The service will NOT come back on its              own after a reboot until {label} is updated",
+            effective_scope.describe()
+        ));
+    } else if !scope_flag_accepted {
+        note.push_str(&format!(
+            " (this {label} build does not understand `--scope`; on this OS its own default is the              same {}, so the registration is unaffected)",
+            effective_scope.describe()
         ));
     }
     Ok(ServiceInstallOutcome {
@@ -244,13 +257,13 @@ fn tolerate_install_failure_only_if_already_registered(
 ) -> Result<String, String> {
     let existing = probe(scope);
     match existing {
-        svc::ServiceRunState::Running | svc::ServiceRunState::Stopped => Ok(format!(
+        svc::Presence::Present => Ok(format!(
             "{label} install did not complete cleanly ({error}); tolerated because a registration \
              already exists in {} ({})",
             scope.describe(),
             existing.describe(label)
         )),
-        svc::ServiceRunState::NotFound | svc::ServiceRunState::Unknown => Err(format!(
+        svc::Presence::Absent | svc::Presence::Unknown => Err(format!(
             "{label} could not be registered in {} ({error}), and no existing registration was \
              found there ({}). {label} will NOT start on this machine",
             scope.describe(),
@@ -356,7 +369,7 @@ pub fn uninstall_service(bin: &Path, os: Os) -> Result<String, String> {
         "dig-node",
         os,
         &mut |args, env| run_dig_node(bin, args, env),
-        &mut |scope| svc::service_run_state_in_scope(svc::DIG_NODE_SERVICE_ID, scope),
+        &mut |scope| svc::registration_in_scope(svc::DIG_NODE_SERVICE_ID, scope),
     )
 }
 
@@ -398,15 +411,17 @@ fn uninstall_engine_service(
         ));
     }
 
-    let residual: Vec<String> = svcscope::deregister_scopes(os)
-        .into_iter()
-        .filter_map(|scope| match probe(scope) {
-            svc::ServiceRunState::Running | svc::ServiceRunState::Stopped => {
-                Some(scope.describe().to_string())
-            }
-            _ => None,
-        })
-        .collect();
+    let mut residual = Vec::new();
+    let mut unverified = Vec::new();
+    for scope in &scopes {
+        match probe(*scope) {
+            svc::Presence::Present => residual.push(scope.describe().to_string()),
+            // Reported, never silently counted as removed — but not a failure either: the attempt
+            // succeeded and the scope simply could not be read back.
+            svc::Presence::Unknown => unverified.push(scope.describe().to_string()),
+            svc::Presence::Absent => {}
+        }
+    }
     if !residual.is_empty() {
         return Err(format!(
             "{label} is still registered in {} after the uninstall{}",
@@ -414,8 +429,13 @@ fn uninstall_engine_service(
             format_attempt_errors(&attempt_errors)
         ));
     }
+    let unverified_note = if unverified.is_empty() {
+        String::new()
+    } else {
+        format!(" (could not verify {})", unverified.join(" and "))
+    };
     Ok(format!(
-        "{label} service uninstalled from every scope{}",
+        "{label} service uninstalled from every scope{unverified_note}{}",
         format_attempt_errors(&attempt_errors)
     ))
 }
@@ -501,7 +521,7 @@ pub fn install_relay_service(
         scope,
         &relay_install_env(cfg),
         &mut |args, env| run_relay(bin, args, env),
-        &mut |scope| svc::service_run_state_in_scope(svc::DIG_RELAY_SERVICE_ID, scope),
+        &mut |scope| svc::registration_in_scope(svc::DIG_RELAY_SERVICE_ID, scope),
     )
 }
 
@@ -835,6 +855,47 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_scope_binary_on_windows_keeps_reboot_survival_and_is_not_warned_about() {
+        // The same fallback, different OS, opposite honest answer: the Windows SCM has no per-user
+        // domain, so an older `dig-node install` is still `start= auto`. This is the row that
+        // distinguishes "the flag was refused, so assume the worst" (which prints a false warning on
+        // every Windows install pinned to an older component — caught by the installer-e2e) from
+        // "the flag was refused, so report what the component actually does".
+        let mut node = MockComponent::new(|args| {
+            if args.iter().any(|a| a == "--scope") {
+                Err(PRE_SCOPE_REJECTION.to_string())
+            } else {
+                Ok(())
+            }
+        });
+        let outcome = install_engine_service(
+            "dig-node",
+            true,
+            Os::Windows,
+            ServiceScope::System,
+            &BTreeMap::new(),
+            &mut |a, e| node.run(a, e),
+            &mut |_| panic!("the flagged attempt is a compat rejection, not a failure"),
+        )
+        .expect("the unflagged retry succeeds");
+        assert!(!outcome.scope_flag_accepted);
+        assert!(
+            outcome.reboot_survival,
+            "the SCM has no per-user domain, so an older build is still boot-start"
+        );
+        assert!(
+            !outcome.note.contains("LOGS IN"),
+            "no login warning may be printed where none applies: {}",
+            outcome.note
+        );
+        assert!(
+            outcome.note.contains("registration is unaffected"),
+            "the fallback is still disclosed: {}",
+            outcome.note
+        );
+    }
+
+    #[test]
     fn a_genuine_install_failure_is_never_retried_unflagged() {
         // The nearest wrong implementation retries on ANY failure, which would silently downgrade a
         // system-scope install to a login-gated one. This failure MENTIONS --scope and still is not
@@ -849,7 +910,7 @@ mod tests {
             ServiceScope::System,
             &BTreeMap::new(),
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ServiceRunState::NotFound,
+            &mut |_| svc::Presence::Absent,
         )
         .unwrap_err();
 
@@ -888,8 +949,8 @@ mod tests {
             &mut |scope| {
                 probed.push(scope);
                 match scope {
-                    ServiceScope::System => svc::ServiceRunState::NotFound,
-                    ServiceScope::User => svc::ServiceRunState::Running,
+                    ServiceScope::System => svc::Presence::Absent,
+                    ServiceScope::User => svc::Presence::Present,
                 }
             },
         )
@@ -927,7 +988,7 @@ mod tests {
             ServiceScope::System,
             &BTreeMap::new(),
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ServiceRunState::Running,
+            &mut |_| svc::Presence::Present,
         )
         .expect("an existing registration at the requested scope tolerates the failure");
         assert!(outcome
@@ -955,7 +1016,7 @@ mod tests {
             ServiceScope::System,
             &BTreeMap::new(),
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ServiceRunState::Unknown,
+            &mut |_| svc::Presence::Unknown,
         )
         .unwrap_err();
         assert!(
@@ -994,7 +1055,7 @@ mod tests {
             let mut node = MockComponent::ok();
             let note =
                 uninstall_engine_service("dig-node", os, &mut |a, e| node.run(a, e), &mut |_| {
-                    svc::ServiceRunState::NotFound
+                    svc::Presence::Absent
                 })
                 .expect("nothing left registered ⇒ Ok");
             let issued: Vec<Vec<String>> =
@@ -1031,8 +1092,9 @@ mod tests {
             Os::Linux,
             &mut |a, e| node.run(a, e),
             &mut |scope| match scope {
-                ServiceScope::User => svc::ServiceRunState::Stopped,
-                ServiceScope::System => svc::ServiceRunState::NotFound,
+                // A DISABLED unit is still a registration — the arm a run-state probe got wrong.
+                ServiceScope::User => svc::Presence::Present,
+                ServiceScope::System => svc::Presence::Absent,
             },
         )
         .unwrap_err();
@@ -1059,7 +1121,7 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ServiceRunState::NotFound,
+            &mut |_| svc::Presence::Absent,
         )
         .expect("a clean end state is Ok despite the tool's exit code");
         assert!(note.contains("per-scope command errors"), "got: {note}");
@@ -1081,7 +1143,7 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ServiceRunState::NotFound,
+            &mut |_| svc::Presence::Absent,
         )
         .unwrap_err();
         assert!(err.contains("state is UNKNOWN"), "got: {err}");
@@ -1106,7 +1168,7 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ServiceRunState::NotFound,
+            &mut |_| svc::Presence::Absent,
         )
         .expect("the unflagged retries succeed");
         let unflagged = node
