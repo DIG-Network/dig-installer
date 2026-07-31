@@ -582,6 +582,17 @@ the install reports NOT ready (`MigrationResult::deregister_failures`), never a 
 tolerated re-install that could leave the service at the legacy binPath. Recorded in
 `InstallReport.migration`.
 
+A run that does NOT select the auto-update beacon MUST still leave the host's auto-updates as it
+found them: declining the beacon means "install nothing", never "remove what is already there".
+Since the migration vacates the beacon's scheduled task independent of the plan, a run whose plan
+declines the beacon and whose migration deregistered that task MUST re-register the daily schedule
+against `<protected root>/dig-updater` (`dig-updater schedule install`, which also rescinds any
+opt-out sentinel) — never against the legacy binary, which has been removed and MUST NEVER be
+executed. When that re-arm cannot succeed, the installer MUST report that auto-updates are now
+disabled and how to restore them; it is not a readiness failure, because the beacon was not part of
+what the run was asked to install. Recorded in `InstallReport.beacon_rearm`
+(`{applied, note}`, `null` when there was nothing to restore).
+
 **Authoritative install-root record (`install.json`, #581).** The installer writes
 `<install-home>/install.json` (`%ProgramFiles%\DIG\install.json` / `/opt/dig/install.json` — the
 protected root's parent, admin-only-writable by inheritance) with `{ "schema": 1, "bin_dir": <the

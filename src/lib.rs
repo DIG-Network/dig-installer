@@ -7116,7 +7116,11 @@ mod beacon_rearm {
         let (_, armed, _) = rearm(Some(&migration), false, true);
         let expected = paths::protected_bin_dir()
             .join(Target::current().expect("target").exe_name("dig-updater"));
-        assert_eq!(armed, vec![expected], "the re-arm must use the protected root");
+        assert_eq!(
+            armed,
+            vec![expected],
+            "the re-arm must use the protected root"
+        );
     }
 
     /// A migration that deregistered only a SERVICE must not arm a schedule this host

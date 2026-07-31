@@ -43,7 +43,11 @@ default-on like dig-node/dig-dns, so a bare `--dry-run` still resolves ITS lates
 real network too (resolution runs regardless of `--dry-run` — only the download is skipped). Add
 `--no-auto-update` when iterating on something unrelated to keep the run scoped to what you're
 actually testing; `--uninstall-dig-updater` reverses the scheduler registration a real run created
-(delegates to `dig-updater schedule uninstall`, idempotent).
+(delegates to `dig-updater schedule uninstall`, idempotent). `--uninstall-dig-updater` is the ONLY
+way the installer turns auto-updates off, and it is deliberate: `dig-updater schedule uninstall`
+records a sticky opt-out that suppresses any later self-heal, so it is never used for an internal
+step. A `--no-auto-update` run on a host being migrated off a legacy root re-arms the schedule the
+migration removed instead (`InstallReport.beacon_rearm` in `--json` says whether it succeeded).
 
 **Alias binaries `digs`/`dign`/`digd` (issues #434/#548):** selecting `digstore`/`dig-node`/
 `dig-dns` also installs its alias binary (`digs`/`dign`/`digd` respectively) alongside it, in the
