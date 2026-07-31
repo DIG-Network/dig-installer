@@ -2700,6 +2700,7 @@ fn register_relay(
             result.survives_reboot = outcome.reboot_survival;
             result.scope_note = reboot_survival_note("dig-relay", &outcome);
             log(&format!("    · {}", result.scope_note));
+            let outcome_scope = outcome.effective_scope;
             result.note = outcome.note;
             // Same sweep the node path owes: registering the system unit does not stop a leftover
             // per-user relay unit from being started at the next login (#526 review, finding 2).
@@ -2707,7 +2708,10 @@ fn register_relay(
                 units::existing_units(target.os, svc::DIG_RELAY_SERVICE_ID, &user_config_homes());
             result.shadowing_units_removed = remove_shadowing_units(
                 target.os,
-                svcscope::settled_scope(scope, svcscope::RegistrationConclusion::Registered),
+                svcscope::settled_scope(
+                    outcome_scope,
+                    svcscope::RegistrationConclusion::Registered,
+                ),
                 &existing,
                 log,
             );
@@ -3020,6 +3024,9 @@ fn register_dig_node(
     // registration is in place" and silently skip the sweep, which is how adoption came to leave a
     // colliding per-user unit behind (#526 review, finding 2).
     let mut conclusion: Option<svcscope::RegistrationConclusion> = None;
+    // Set only by the delegate arm, which is the only one that can learn the component chose a
+    // different scope than the one requested. `None` means the requested scope stands.
+    let mut settled: Option<svcscope::ServiceScope> = None;
     if svcscope::engine_registration(target.os, scope, &existing)
         == svcscope::EngineRegistration::AdoptPackaged
     {
@@ -3058,6 +3065,9 @@ fn register_dig_node(
                 result.survives_reboot = outcome.reboot_survival;
                 result.scope_note = reboot_survival_note("dig-node", &outcome);
                 log(&format!("    · {}", result.scope_note));
+                // The scope the component ACTUALLY used, never the one we asked for: a pre-`--scope`
+                // build falls back to a per-user unit, and sweeping on the request would delete it.
+                settled = Some(outcome.effective_scope);
                 result.note = outcome.note;
                 conclusion = Some(svcscope::RegistrationConclusion::Registered);
             }
@@ -3077,6 +3087,7 @@ fn register_dig_node(
     // The single sweep, for whichever way the run concluded. A failed install sets no conclusion, so
     // nothing is deleted on the strength of a registration that was never established.
     if let Some(conclusion) = conclusion {
+        let scope = settled.unwrap_or(scope);
         result.shadowing_units_removed = remove_shadowing_units(
             target.os,
             svcscope::settled_scope(scope, conclusion),

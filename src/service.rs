@@ -102,6 +102,14 @@ pub struct ServiceInstallOutcome {
     pub note: String,
     /// The scope this run ASKED for.
     pub requested_scope: ServiceScope,
+    /// The scope the component ACTUALLY registered in — the requested one when `--scope` was
+    /// honoured, else that component's own default for this OS.
+    ///
+    /// Distinct from [`Self::requested_scope`] because acting on the request rather than the outcome
+    /// is destructive: when a pre-`--scope` build falls back to a per-user unit, a shadowing sweep
+    /// driven by the REQUESTED system scope would delete the very registration the fallback just
+    /// created (dig_ecosystem#526 review, finding 2).
+    pub effective_scope: ServiceScope,
     /// Did the component accept `--scope`? `false` means an older build chose
     /// its own (per-user-preferring) domain, so the requested scope was NOT
     /// honoured — which is why this is reported rather than inferred.
@@ -221,6 +229,7 @@ fn install_engine_service(
     Ok(ServiceInstallOutcome {
         note,
         requested_scope: scope,
+        effective_scope,
         scope_flag_accepted,
         reboot_survival,
         started,
@@ -881,6 +890,70 @@ mod tests {
             "the note must explain the downgrade in plain language, got: {}",
             outcome.note
         );
+    }
+
+    /// The effective scope is what a shadowing sweep must act on, never the requested one.
+    ///
+    /// A pre-`--scope` build asked for SYSTEM falls back to a per-user unit. Sweeping "the per-user
+    /// units that shadow a system registration" on the strength of the REQUEST would then delete the
+    /// registration the fallback had just created — an install that reports success and leaves the
+    /// host with no dig-node at all. Linux and macOS are both checked because they are the two
+    /// platforms whose legacy default is user scope; Windows is the control, where the legacy default
+    /// really is system and the request therefore stands.
+    #[test]
+    fn a_rejected_scope_flag_reports_the_scope_the_component_actually_used() {
+        for (os, expected) in [
+            (Os::Linux, ServiceScope::User),
+            (Os::MacOs, ServiceScope::User),
+            (Os::Windows, ServiceScope::System),
+        ] {
+            let mut node = MockComponent::new(|args| {
+                if args.iter().any(|a| a == "--scope") {
+                    Err(PRE_SCOPE_REJECTION.to_string())
+                } else {
+                    Ok(())
+                }
+            });
+            let outcome = install_engine_service(
+                "dig-node",
+                true,
+                os,
+                ServiceScope::System,
+                &BTreeMap::new(),
+                &mut |a, e| node.run(a, e),
+                &mut |_| panic!("the flagged attempt is a compat rejection, not a failure"),
+            )
+            .expect("the unflagged retry succeeds");
+
+            assert!(!outcome.scope_flag_accepted, "{os:?}");
+            assert_eq!(
+                outcome.requested_scope,
+                ServiceScope::System,
+                "{os:?}: the request is reported as made"
+            );
+            assert_eq!(
+                outcome.effective_scope, expected,
+                "{os:?}: the effective scope is what the component actually did"
+            );
+            // The consequence that matters: on the fallback platforms the sweep must propose
+            // NOTHING, because the units it would delete are the registration itself.
+            let planted = vec![svcscope::UnitRecord::new(
+                "/root/.config/systemd/user/dignetwork-dig-node.service",
+                ServiceScope::User,
+            )];
+            let sweep = svcscope::shadowing_units_to_remove(
+                os,
+                svcscope::settled_scope(
+                    outcome.effective_scope,
+                    svcscope::RegistrationConclusion::Registered,
+                ),
+                &planted,
+            );
+            assert!(
+                sweep.is_empty(),
+                "{os:?}: a fallback's own per-user registration must never be swept, got: {sweep:?}"
+            );
+        }
     }
 
     #[test]

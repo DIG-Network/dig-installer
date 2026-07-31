@@ -1030,10 +1030,17 @@ A `--bin-dir` run is FORCED to user scope: a machine-wide daemon pointed at a ca
 the §7.5 escalation itself. The forced downgrade MUST be reported
 (`ServiceResult.survives_reboot: false` + `scope_note`), never silent.
 
-**The argument surface.** The installer passes `--scope <system|user>` to the component's
-`install`/`start`/`uninstall` verbs, as two tokens. The value set is byte-identical with dig-node's
-own `--scope <auto|system|user>`; the installer never passes `auto`, because "whatever the component
-defaults to" is the defect this closes.
+**The argument surface — REQUIRED of the component, not yet provided by one.** The installer passes
+`--scope <system|user>` to the component's `install`/`start`/`uninstall` verbs, as two tokens. This
+is the surface dig-installer REQUIRES of a future component release; the value set is specified to be
+byte-identical with the `--scope <auto|system|user>` proposed in DIG-Network/dig-node#123. The
+installer never passes `auto`, because "whatever the component defaults to" is the defect this closes.
+
+> **Status.** No released dig-node implements `--scope`. As of dig-node v0.69.0 the flag does not
+> exist and `PREFERS_USER_LEVEL` is unconditionally `true` on unix, so every unix install today takes
+> the compat path below and registers at USER scope. A reimplementation MUST NOT assume the flag is
+> accepted: the compat fallback is not a legacy branch, it is the branch that currently runs. This
+> paragraph becomes present-tense only once a dig-node release ships the flag.
 
 **Compat with a pre-`--scope` build.** dig-installer installs the LATEST component release with no
 version pin, so an older binary is a real state. clap rejects an unknown flag with a non-zero exit
