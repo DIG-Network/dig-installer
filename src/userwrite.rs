@@ -298,7 +298,7 @@ fn write_via_user_shell(path: &Path, contents: &[u8], user: &TargetUser) -> Resu
 /// Single-quote for a POSIX shell, escaping embedded single quotes, so a path containing spaces or
 /// shell metacharacters reaches `su -c` as exactly one word.
 #[cfg(unix)]
-fn shell_quote(path: &Path) -> String {
+pub(crate) fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 

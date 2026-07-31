@@ -596,12 +596,21 @@ fn beacon_is_registered() -> bool {
 
 /// Deregister the beacon's daily scheduler artifact by the built-in scheduler
 /// tool — Windows `schtasks /Delete`, Linux `systemctl disable --now
-/// <unit>.timer` (both scopes), macOS `launchctl bootout` + plist removal. Never
-/// executes dig-updater (#565). `Ok(())` when the beacon is no longer registered.
+/// <unit>.timer` (both scopes) plus removal of the unit FILE systemd names, macOS
+/// `launchctl bootout` + plist removal. Never executes dig-updater (#565).
+/// `Ok(())` when the beacon is no longer registered; a refusal to remove a
+/// unit file that failed vetting is folded into the error so the (fatal) verdict
+/// explains itself.
 fn deregister_beacon() -> Result<(), String> {
     if !beacon_is_registered() {
         return Ok(());
     }
+    // Every unit-file removal this deregister REFUSED (a path that failed vetting, a
+    // vendor-owned unit, a user-scope removal that could not drop privilege). Kept so the
+    // fatal post-check below can say WHY the beacon is still registered instead of
+    // reporting a bare "still registered".
+    #[allow(unused_mut)]
+    let mut notes: Vec<String> = Vec::new();
     #[cfg(windows)]
     {
         let _ = spawn("schtasks", &schtasks_delete_args(BEACON_WINDOWS_TASK));
@@ -621,11 +630,11 @@ fn deregister_beacon() -> Result<(), String> {
                 // reads as still registered. Without removing the file the deregister
                 // could NEVER succeed on Linux and the (fatal) #565 migration failed
                 // every upgrade off a legacy root. Mirrors the macOS branch below, which
-                // has always removed its plist. The path comes from systemd itself
-                // (`FragmentPath`) rather than a guessed directory, so a user-scope unit
-                // under `~/.config/systemd/user` is removed as reliably as a
-                // machine-wide one under `/etc/systemd/system`.
-                remove_systemd_unit_file(&scope, &unit);
+                // has always removed its plist.
+                if let Some(note) = remove_systemd_unit_file(&scope, &unit) {
+                    eprintln!("    ! {note}");
+                    notes.push(note);
+                }
             }
             let mut reload: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
             reload.push("daemon-reload".into());
@@ -646,24 +655,155 @@ fn deregister_beacon() -> Result<(), String> {
         ));
     }
     if beacon_is_registered() {
+        let refused = if notes.is_empty() {
+            String::new()
+        } else {
+            format!("; refused unit-file removals: {}", notes.join("; "))
+        };
         Err(format!(
             "the beacon scheduled task is still registered after a deregister attempt \
-             ({BEACON_WINDOWS_TASK} / {BEACON_SYSTEMD_UNIT}.timer / {BEACON_LAUNCHD_LABEL})"
+             ({BEACON_WINDOWS_TASK} / {BEACON_SYSTEMD_UNIT}.timer / {BEACON_LAUNCHD_LABEL}){refused}"
         ))
     } else {
         Ok(())
     }
 }
 
-/// Delete the on-disk unit file backing `unit` in `scope`, as named by systemd's own
-/// `FragmentPath` property. Best-effort: an absent file, an unparseable answer, or a
-/// removal failure all leave the caller's post-check to decide, which is where the real
-/// verdict lives.
+/// The unit-file directories a MACHINE-WIDE (system-scope) removal may delete from —
+/// the two admin/runtime-owned locations a DIG beacon schedule is ever installed into.
+/// Both are root-owned on any sane host, so a path vetted into this set is not one an
+/// unprivileged account chose.
+pub const SYSTEM_UNIT_DIRS: &[&str] = &["/etc/systemd/system", "/run/systemd/system"];
+
+/// Vendor/package-owned unit directories. A unit here belongs to a package manager, so
+/// deleting it would leave the package database inconsistent and `apt install
+/// --reinstall` would silently restore the very timer this deregister removed. Such a
+/// unit is REFUSED (and reported) rather than unlinked; masking/removing it is an
+/// operator action, not an installer's.
+pub const VENDOR_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/system", "/lib/systemd/system"];
+
+/// What to do about the unit file systemd named for a unit being deregistered — the
+/// decision, separated from the unlink so it is unit-testable on any host. See
+/// [`plan_unit_file_removal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitFileRemoval {
+    /// systemd reported no backing file — nothing to remove.
+    Nothing,
+    /// The named path failed vetting; the string says why, for the log + the (fatal)
+    /// post-check's error.
+    Refused(String),
+    /// A vetted path that may be unlinked.
+    Remove(String),
+}
+
+/// Decide what to do with the `FragmentPath` in `show_output` for `unit`, given the
+/// directories a removal is allowed to delete from. Pure.
 ///
-/// Only ever removes the DIG beacon's own unit ([`BEACON_SYSTEMD_UNIT`]) — the caller
-/// passes nothing else, and the path is systemd's answer for that exact unit name.
+/// The path comes from systemd, but systemd's answer is derived from a unit directory an
+/// unprivileged account may control (`~/.config/systemd/user`, possibly reached through a
+/// symlinked component — and `sudo -E` leaks `XDG_CONFIG_HOME` into the root process, so a
+/// root `systemctl --user` really does read the invoking user's units, see
+/// [`crate::userwrite`]). An unlink of "whatever systemd said" is therefore an
+/// attacker-chosen deletion primitive running as root. This function is where that is
+/// closed: the path must be absolute, must have NO `.`/`..`/empty component, must be named
+/// EXACTLY for the unit being deregistered, must be a `.service` or `.timer`, and its
+/// parent must be one of `allowed_dirs` — with [`VENDOR_UNIT_DIRS`] refused by name so the
+/// refusal explains itself.
+pub fn plan_unit_file_removal(
+    show_output: &str,
+    unit: &str,
+    allowed_dirs: &[&str],
+) -> UnitFileRemoval {
+    let Some(path) = parse_systemctl_fragment_path(show_output) else {
+        return UnitFileRemoval::Nothing;
+    };
+    match vet_unit_file_path(&path, unit, allowed_dirs) {
+        Ok(()) => UnitFileRemoval::Remove(path),
+        Err(why) => UnitFileRemoval::Refused(why),
+    }
+}
+
+/// Is `path` safe to unlink as the unit file of `unit`? `Err(why)` names the violated
+/// rule. Pure, and deliberately written on POSIX path STRINGS rather than [`Path`] so the
+/// rules hold identically wherever the tests run (`Path::is_absolute` is false for
+/// `/etc/...` on Windows, which would make a host-run test vacuous).
+fn vet_unit_file_path(path: &str, unit: &str, allowed_dirs: &[&str]) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("refusing to remove {path}: not an absolute path"));
+    }
+    let (dir, base) = path
+        .rsplit_once('/')
+        .map(|(dir, base)| (if dir.is_empty() { "/" } else { dir }, base))
+        .ok_or_else(|| format!("refusing to remove {path}: no parent directory"))?;
+    if path
+        .split('/')
+        .skip(1)
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(format!(
+            "refusing to remove {path}: the path has a relative or empty component"
+        ));
+    }
+    if base != unit {
+        return Err(format!(
+            "refusing to remove {path}: it is not named for the unit being deregistered ({unit})"
+        ));
+    }
+    if !(base.ends_with(".service") || base.ends_with(".timer")) {
+        return Err(format!(
+            "refusing to remove {path}: not a .service or .timer unit file"
+        ));
+    }
+    if VENDOR_UNIT_DIRS.contains(&dir) {
+        return Err(format!(
+            "refusing to remove {path}: {dir} is package-owned, so removing the file would leave \
+             the package database inconsistent — mask or uninstall the package instead"
+        ));
+    }
+    if !allowed_dirs.contains(&dir) {
+        return Err(format!(
+            "refusing to remove {path}: {dir} is not one of the unit directories a deregister may \
+             delete from ({})",
+            allowed_dirs.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// The user-scope unit directories belonging to `user` — the only places a `--user`-scope
+/// removal may touch, all inside that account's own tree. `xdg_config_home` is the
+/// process's `XDG_CONFIG_HOME` when set (systemd honours it, and `sudo -E` propagates it).
+/// Pure.
+#[cfg(any(target_os = "linux", test))]
+fn user_unit_dirs(home: &Path, uid: Option<u32>, xdg_config_home: Option<&str>) -> Vec<String> {
+    let mut dirs = vec![
+        format!("{}/.config/systemd/user", home.display()),
+        format!("{}/.local/share/systemd/user", home.display()),
+    ];
+    if let Some(xdg) = xdg_config_home.map(str::trim).filter(|x| x.starts_with('/')) {
+        dirs.push(format!("{}/systemd/user", xdg.trim_end_matches('/')));
+    }
+    if let Some(uid) = uid {
+        dirs.push(format!("/run/user/{uid}/systemd/user"));
+    }
+    dirs
+}
+
+/// Delete the on-disk unit file backing `unit` in `scope`, as named by systemd's own
+/// `FragmentPath` property and VETTED by [`plan_unit_file_removal`] before anything is
+/// unlinked. `Some(note)` when a removal was refused or failed — the caller logs it and
+/// folds it into the (fatal) post-check's verdict; `None` when there was nothing to do or
+/// the file is gone.
+///
+/// Scope decides the authority as well as the allowlist. A SYSTEM-scope unit file is
+/// root's to remove, bounded to [`SYSTEM_UNIT_DIRS`]. A `--user`-scope unit file belongs
+/// to the invoking account — `unix_audits_only_the_machine_wide_dig_dns_and_beacon` records
+/// that those services are not an escalation — so it is never unlinked with root's
+/// authority: under elevation the removal is DROPPED to that user (`su - <user> -c rm`,
+/// the idiom [`crate::userwrite`] already uses), which makes a planted symlink out of the
+/// account's own tree fail with `EPERM` instead of deleting root's files.
 #[cfg(target_os = "linux")]
-fn remove_systemd_unit_file(scope: &[&str], unit: &str) {
+fn remove_systemd_unit_file(scope: &[&str], unit: &str) -> Option<String> {
     let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
     args.extend([
         "show".into(),
@@ -671,12 +811,89 @@ fn remove_systemd_unit_file(scope: &[&str], unit: &str) {
         "FragmentPath".into(),
         unit.to_string(),
     ]);
-    let Some(out) = spawn("systemctl", &args) else {
-        return;
+    let out = spawn("systemctl", &args)?;
+
+    let user_scope = scope.contains(&"--user");
+    let user = crate::invoker::target_user();
+    let owned_dirs: Vec<String> = if user_scope {
+        user_unit_dirs(
+            &user.home,
+            user.uid,
+            std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        )
+    } else {
+        SYSTEM_UNIT_DIRS.iter().map(|d| d.to_string()).collect()
     };
-    if let Some(path) = parse_systemctl_fragment_path(&out) {
-        let _ = std::fs::remove_file(path);
+    let allowed: Vec<&str> = owned_dirs.iter().map(String::as_str).collect();
+
+    match plan_unit_file_removal(&out, unit, &allowed) {
+        UnitFileRemoval::Nothing => None,
+        UnitFileRemoval::Refused(why) => Some(why),
+        UnitFileRemoval::Remove(path) => {
+            if user_scope && crate::invoker::is_root() {
+                remove_file_as_user(&path, user).err()
+            } else {
+                apply_unit_file_removal(&UnitFileRemoval::Remove(path))
+            }
+        }
     }
+}
+
+/// Perform a vetted removal decision: unlink on [`UnitFileRemoval::Remove`], and on
+/// anything else touch nothing. `Some(note)` when a refusal must be reported or the unlink
+/// failed; an already-absent file is a clean `None` (idempotent, like every other undo
+/// here).
+///
+/// Separated from [`plan_unit_file_removal`] so a test can drive the WHOLE decision →
+/// unlink path against a real file and observe that a path failing vetting is not deleted.
+#[cfg(any(target_os = "linux", test))]
+fn apply_unit_file_removal(plan: &UnitFileRemoval) -> Option<String> {
+    match plan {
+        UnitFileRemoval::Nothing => None,
+        UnitFileRemoval::Refused(why) => Some(why.clone()),
+        UnitFileRemoval::Remove(path) => match std::fs::remove_file(path) {
+            Ok(()) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(format!("could not remove {path}: {e}")),
+        },
+    }
+}
+
+/// Unlink `path` with `user`'s own authority rather than root's, by running `rm` under
+/// `su - <user>` (`su` resolved from the trusted system directories, never `$PATH` — this
+/// runs as root; same reasoning as [`crate::userwrite`]).
+#[cfg(target_os = "linux")]
+fn remove_file_as_user(path: &str, user: &crate::invoker::TargetUser) -> Result<(), String> {
+    use crate::proc::HideConsole;
+    use std::process::Command;
+
+    let su = crate::elevation::resolve_system_tool("su")
+        .ok_or_else(|| "su not found in any trusted system directory".to_string())?;
+    let script = format!(
+        "rm -f -- {}",
+        crate::userwrite::shell_quote(Path::new(path))
+    );
+    let out = Command::new(su)
+        .arg("-")
+        .arg(&user.name)
+        .arg("-c")
+        .arg(&script)
+        .hide_console()
+        .output()
+        .map_err(|e| format!("could not remove {path} as {}: {e}", user.name))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(format!(
+        "could not remove {path} as {}: {}",
+        user.name,
+        if stderr.is_empty() {
+            format!("exit {}", out.status.code().unwrap_or(-1))
+        } else {
+            stderr
+        }
+    ))
 }
 
 /// Extract the unit-file path from `systemctl show -p FragmentPath <unit>` output —
@@ -1040,6 +1257,132 @@ mod tests {
             .as_deref(),
             Some("/home/u/.config/systemd/user/dig-updater.timer")
         );
+    }
+
+    // -- the vetting that bounds the unit-file removal (#1854 security round) ---
+    //
+    // The removal target is systemd's own `FragmentPath`, but systemd derives it from a
+    // unit directory an unprivileged account may control: `sudo -E` (the elevation this
+    // project documents) leaks `XDG_CONFIG_HOME` into the root process, so a root
+    // `systemctl --user` reads the invoking user's units (`crate::userwrite`). Unlinking
+    // "whatever systemd said" as root is therefore an attacker-chosen deletion primitive.
+    // These tests fix the bound; each one distinguishes the vetting from a naive
+    // `remove_file(parsed)`, which satisfies none of them.
+
+    /// A `FragmentPath` whose basename is NOT the unit being deregistered must be REFUSED,
+    /// and — the property that actually matters — the file must still be there afterwards.
+    /// Driven through the real decision → unlink path (`plan` + `apply`), so a guard moved
+    /// or dropped anywhere along it fails here.
+    #[test]
+    #[cfg(unix)]
+    fn a_fragment_path_not_named_for_the_unit_is_refused_and_the_file_survives() {
+        let dir = std::env::temp_dir().join(format!("regaudit-vet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.display().to_string();
+        let victim = dir.join("shadow.service");
+        std::fs::write(&victim, b"not ours").unwrap();
+
+        let show = format!("FragmentPath={}\n", victim.display());
+        let plan = plan_unit_file_removal(&show, "dig-updater.service", &[dir_s.as_str()]);
+        let note = apply_unit_file_removal(&plan).expect("a refusal must be reported");
+
+        assert!(
+            victim.exists(),
+            "a unit file NOT named for the unit being deregistered was deleted — root would \
+             unlink an attacker-chosen path"
+        );
+        assert!(
+            note.contains("not named for the unit"),
+            "the refusal must name the violated rule: {note}"
+        );
+
+        // Control: the SAME directory and the SAME code path do delete the unit that IS
+        // being deregistered — so the assertion above is a bound, not a broken fixture.
+        let ours = dir.join("dig-updater.service");
+        std::fs::write(&ours, b"ours").unwrap();
+        let show = format!("FragmentPath={}\n", ours.display());
+        let plan = plan_unit_file_removal(&show, "dig-updater.service", &[dir_s.as_str()]);
+        assert_eq!(apply_unit_file_removal(&plan), None);
+        assert!(!ours.exists(), "the beacon's own unit file must be removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The decision-level bound, host-independent (the paths are POSIX strings, never
+    /// [`Path`], precisely so these hold when the suite runs on Windows too).
+    #[test]
+    fn only_an_absolute_allowlisted_path_named_for_the_unit_may_be_removed() {
+        let unit = "dig-updater.timer";
+        let show = |p: &str| format!("FragmentPath={p}\n");
+
+        assert_eq!(
+            plan_unit_file_removal(
+                &show("/etc/systemd/system/dig-updater.timer"),
+                unit,
+                SYSTEM_UNIT_DIRS
+            ),
+            UnitFileRemoval::Remove("/etc/systemd/system/dig-updater.timer".into())
+        );
+
+        let refusal = |p: &str, dirs: &[&str]| match plan_unit_file_removal(&show(p), unit, dirs) {
+            UnitFileRemoval::Refused(why) => why,
+            other => panic!("{p} must be refused, got {other:?}"),
+        };
+
+        // A relative answer: nothing anchors it, so it could resolve anywhere.
+        assert!(refusal("etc/systemd/system/dig-updater.timer", SYSTEM_UNIT_DIRS)
+            .contains("not an absolute path"));
+        // Traversal out of an allowlisted directory.
+        assert!(
+            refusal("/etc/systemd/system/../../tmp/dig-updater.timer", SYSTEM_UNIT_DIRS)
+                .contains("relative or empty component")
+        );
+        // A user-controlled directory, on a SYSTEM-scope removal: the exact escalation.
+        assert!(refusal(
+            "/home/u/.config/systemd/user/dig-updater.timer",
+            SYSTEM_UNIT_DIRS
+        )
+        .contains("not one of the unit directories"));
+        // A path bearing the right name but the wrong kind of file.
+        assert!(
+            match plan_unit_file_removal(&show("/etc/systemd/system/passwd"), "passwd", SYSTEM_UNIT_DIRS) {
+                UnitFileRemoval::Refused(why) => why,
+                other => panic!("a non-unit file must be refused, got {other:?}"),
+            }
+            .contains("not a .service or .timer")
+        );
+        // Package-owned units are refused rather than unlinked (a deleted dpkg-owned unit
+        // leaves the package DB inconsistent, and `apt install --reinstall` would silently
+        // restore the very timer this deregister removed).
+        for vendor in VENDOR_UNIT_DIRS.iter().copied() {
+            let path = format!("{vendor}/dig-updater.timer");
+            let mut dirs = SYSTEM_UNIT_DIRS.to_vec();
+            dirs.push(vendor);
+            assert!(
+                refusal(&path, &dirs).contains("package-owned"),
+                "{path} must be refused even when the caller allowlists it"
+            );
+        }
+        // systemd's answer for a unit with no backing file removes nothing.
+        assert_eq!(
+            plan_unit_file_removal("FragmentPath=\n", unit, SYSTEM_UNIT_DIRS),
+            UnitFileRemoval::Nothing
+        );
+    }
+
+    /// A `--user`-scope removal is bounded to the invoking account's OWN unit directories,
+    /// so even the privilege-dropped `rm` cannot be pointed outside them.
+    #[test]
+    fn user_scope_unit_dirs_stay_inside_the_accounts_own_tree() {
+        let dirs = user_unit_dirs(Path::new("/home/u"), Some(1000), Some("/home/u/.cfg"));
+        assert!(dirs.contains(&"/home/u/.config/systemd/user".to_string()));
+        assert!(dirs.contains(&"/home/u/.local/share/systemd/user".to_string()));
+        assert!(dirs.contains(&"/home/u/.cfg/systemd/user".to_string()));
+        assert!(dirs.contains(&"/run/user/1000/systemd/user".to_string()));
+        // A relative `XDG_CONFIG_HOME` names no directory we can bound, so it is dropped
+        // rather than turned into a relative allowlist entry.
+        let dirs = user_unit_dirs(Path::new("/home/u"), None, Some("relative/cfg"));
+        assert!(dirs.iter().all(|d| d.starts_with("/home/u/")), "{dirs:?}");
     }
 
     #[test]
