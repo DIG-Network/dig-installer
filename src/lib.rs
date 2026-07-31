@@ -440,6 +440,15 @@ pub struct ServiceResult {
     pub health_ok: bool,
     /// Human-readable detail behind [`Self::health_ok`].
     pub health_note: String,
+    /// The service-manager domain this run registered the node in
+    /// (dig_ecosystem#526).
+    pub scope: svcscope::ServiceScope,
+    /// Will the registration start after a reboot with NOBODY logged in? `false`
+    /// for every per-user registration BY DESIGN, and `false` when the installed
+    /// `dig-node` predates `--scope` — see [`Self::scope_note`], never silent.
+    pub survives_reboot: bool,
+    /// Human-readable detail behind [`Self::survives_reboot`].
+    pub scope_note: String,
 }
 
 /// The result of uninstalling the dig-node service + removing the `dig.local`
@@ -603,6 +612,12 @@ pub struct RelayResult {
     pub port: u16,
     pub health_port: u16,
     pub note: String,
+    /// The service-manager domain this run registered the relay in (#526).
+    pub scope: svcscope::ServiceScope,
+    /// Will the registration start after a reboot with nobody logged in?
+    pub survives_reboot: bool,
+    /// Human-readable detail behind [`Self::survives_reboot`] — never silent.
+    pub scope_note: String,
 }
 
 /// The `--json` schema version. Bump on a breaking change to the payload shape.
@@ -1134,7 +1149,13 @@ fn run_report_gated(
                 Err(e) => return Err(e),
             }
 
-            report.service = Some(register_dig_node(&dig_node_path, plan, &decision, log));
+            report.service = Some(register_dig_node(
+                &dig_node_path,
+                plan,
+                &target,
+                &decision,
+                log,
+            ));
             // Record ONLY a genuinely fresh registration (`Install`) for rollback —
             // never an `Update`/`Skip` of a service the user already had, so a
             // rollback restores the pre-install state without removing what predated
@@ -1488,7 +1509,7 @@ fn run_report_gated(
             let relay_path = PathBuf::from(c.dest.clone());
             report.components.push(c);
 
-            report.relay = Some(register_relay(&relay_path, plan, log));
+            report.relay = Some(register_relay(&relay_path, plan, &target, log));
             // The relay is opt-in + not update-tracked here, so any successful
             // registration this run is fresh and rollback-reversible.
             if report.relay.as_ref().is_some_and(|r| r.installed) {
@@ -2492,24 +2513,62 @@ fn log_readiness_verdict(report: &InstallReport, log: &mut dyn FnMut(&str)) {
     }
 }
 
+/// The service-manager scope an ENGINE binary placed at `program` must be registered in
+/// (dig_ecosystem#526) — the pure [`svcscope::engine_scope_for_program`] decision, with this
+/// process's real privilege and the real protected root supplied.
+fn engine_scope_for(os: target::Os, program: &std::path::Path) -> svcscope::ServiceScope {
+    svcscope::engine_scope_for_program(
+        os,
+        elevation::is_elevated(),
+        program,
+        &paths::protected_bin_dir(),
+    )
+}
+
+/// The plain-language reboot-survival sentence for a scoped registration — the one thing a
+/// stranger actually needs to know about the scope, said the same way for every component.
+///
+/// Never silent, and never optimistic: an outcome whose `--scope` flag was refused is reported as
+/// not surviving even though the requested scope was `system`, because what the component DID is
+/// what matters (dig_ecosystem#526).
+fn reboot_survival_note(label: &str, outcome: &service::ServiceInstallOutcome) -> String {
+    if outcome.reboot_survival {
+        return format!(
+            "{label} is registered {} and will start again on its own after a reboot, with nobody \
+             logged in",
+            outcome.requested_scope.describe()
+        );
+    }
+    format!(
+        "{label} is registered {} — it starts when you LOG IN, so it will NOT come back on its own \
+         after a reboot until someone logs into this machine",
+        outcome.requested_scope.describe()
+    )
+}
+
 /// Register dig-relay as an OS service by delegating to its own `install`/`start` subcommands.
 /// Never returns `Err` — a service failure is recorded in the result, not propagated (the binary
 /// is already placed). Mirrors [`register_dig_node`].
 fn register_relay(
     relay_path: &std::path::Path,
     plan: &InstallPlan,
+    target: &Target,
     log: &mut dyn FnMut(&str),
 ) -> RelayResult {
     log(&format!(
         "Registering dig-relay as an OS service (relay {}, health {}):",
         plan.relay_service.port, plan.relay_service.health_port
     ));
+    let scope = engine_scope_for(target.os, relay_path);
     let mut result = RelayResult {
         installed: false,
         started: false,
         port: plan.relay_service.port,
         health_port: plan.relay_service.health_port,
         note: String::new(),
+        scope,
+        survives_reboot: false,
+        scope_note: String::new(),
     };
 
     if plan.dry_run {
@@ -2525,12 +2584,15 @@ fn register_relay(
         return result;
     }
 
-    match service::install_relay_service(relay_path, &plan.relay_service) {
-        Ok(note) => {
-            log(&format!("    ✓ {note}"));
+    match service::install_relay_service(relay_path, &plan.relay_service, target.os, scope) {
+        Ok(outcome) => {
+            log(&format!("    ✓ {}", outcome.note));
             result.installed = true;
-            result.started = plan.relay_service.start;
-            result.note = note;
+            result.started = outcome.started;
+            result.survives_reboot = outcome.reboot_survival;
+            result.scope_note = reboot_survival_note("dig-relay", &outcome);
+            log(&format!("    · {}", result.scope_note));
+            result.note = outcome.note;
         }
         Err(e) => {
             // Service install can need elevation (Windows SCM). Best-effort: surface it, do NOT
@@ -2786,9 +2848,11 @@ fn resolve_dig_node(
 fn register_dig_node(
     dig_node_path: &std::path::Path,
     plan: &InstallPlan,
+    target: &Target,
     decision: &update::UpdateDecision,
     log: &mut dyn FnMut(&str),
 ) -> ServiceResult {
+    let scope = engine_scope_for(target.os, dig_node_path);
     log(&format!(
         "Registering dig-node as an OS service (port {}):",
         plan.service.port
@@ -2798,6 +2862,9 @@ fn register_dig_node(
         started: false,
         port: plan.service.port,
         note: String::new(),
+        scope,
+        survives_reboot: false,
+        scope_note: String::new(),
         dig_local: String::new(),
         dig_local_resolves: false,
         dig_local_resolve_note: String::new(),
@@ -2841,12 +2908,15 @@ fn register_dig_node(
         );
         log(&format!("    · {}", result.note));
     } else {
-        match service::install_service(dig_node_path, &plan.service) {
-            Ok(note) => {
-                log(&format!("    ✓ {note}"));
+        match service::install_service(dig_node_path, &plan.service, target.os, scope) {
+            Ok(outcome) => {
+                log(&format!("    ✓ {}", outcome.note));
                 result.installed = true;
-                result.started = plan.service.start;
-                result.note = note;
+                result.started = outcome.started;
+                result.survives_reboot = outcome.reboot_survival;
+                result.scope_note = reboot_survival_note("dig-node", &outcome);
+                log(&format!("    · {}", result.scope_note));
+                result.note = outcome.note;
             }
             Err(e) => {
                 // Service install can need elevation (Windows SCM). Best-effort:
@@ -3013,7 +3083,7 @@ pub fn uninstall_dig_node(
 
     log("Uninstalling the dig-node OS service:");
     let mut notes: Vec<String> = Vec::new();
-    let uninstalled = match service::uninstall_service(&bin) {
+    let uninstalled = match service::uninstall_service(&bin, target.os) {
         Ok(n) => {
             log(&format!("    ✓ {n}"));
             notes.push(n);
@@ -3409,7 +3479,7 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 ));
                 continue;
             }
-            match service::uninstall_service(&bin) {
+            match service::uninstall_service(&bin, target.os) {
                 Ok(n) => notes.push(format!("{stem}: {n}")),
                 Err(e) if service_absent_is_ok(&e) => notes.push(format!("{stem}: already absent")),
                 Err(e) => {
@@ -5454,6 +5524,9 @@ mod tests {
             health_checked: true,
             health_ok: true,
             health_note: "service 'net.dignetwork.dig-node' is RUNNING".to_string(),
+            scope: svcscope::ServiceScope::System,
+            survives_reboot: true,
+            scope_note: "starts on boot".to_string(),
         }
     }
 

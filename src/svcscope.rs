@@ -153,6 +153,22 @@ pub fn engine_scope(os: Os, elevated: bool, program_in_protected_root: bool) -> 
     }
 }
 
+/// [`engine_scope`] for a binary this run actually PLACED at `program`, judged
+/// against the admin-only `protected_root`.
+///
+/// Takes the root as a parameter rather than reading
+/// [`crate::paths::protected_bin_dir`] itself, so the "is it protected?" decision
+/// is exercised for both answers from any host — and so a `--bin-dir` run's
+/// forced user scope is a test, not a hope.
+pub fn engine_scope_for_program(
+    os: Os,
+    elevated: bool,
+    program: &Path,
+    protected_root: &Path,
+) -> ServiceScope {
+    engine_scope(os, elevated, program.starts_with(protected_root))
+}
+
 /// The `--scope <value>` argument pair to append to a component's `install`/`uninstall`/`start`/
 /// `stop` verb.
 ///
@@ -341,6 +357,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_scope_follows_the_directory_the_binary_was_actually_placed_in() {
+        let protected = Path::new("/opt/dig/bin");
+        for os in [Os::Linux, Os::MacOs] {
+            assert_eq!(
+                engine_scope_for_program(os, true, Path::new("/opt/dig/bin/dig-node"), protected),
+                ServiceScope::System
+            );
+            // A `--bin-dir` the caller chose, even while elevated: user scope.
+            assert_eq!(
+                engine_scope_for_program(
+                    os,
+                    true,
+                    Path::new("/home/alice/.dig/bin/dig-node"),
+                    protected
+                ),
+                ServiceScope::User
+            );
+            // A sibling directory that merely SHARES a prefix is not the root.
+            assert_eq!(
+                engine_scope_for_program(
+                    os,
+                    true,
+                    Path::new("/opt/dig/bin-evil/dig-node"),
+                    protected
+                ),
+                ServiceScope::User
+            );
+        }
+        // Windows is System either way — the SCM has no per-user domain.
+        assert_eq!(
+            engine_scope_for_program(
+                Os::Windows,
+                true,
+                Path::new("C:/Users/a/dig/dig-node.exe"),
+                Path::new("C:/Program Files/DIG/bin")
+            ),
+            ServiceScope::System
+        );
+    }
+
     // -- scope_args: the byte-for-byte cross-repo argument surface ----------------------------
 
     #[test]
@@ -479,7 +536,9 @@ mod tests {
     #[test]
     fn a_user_scope_register_removes_nothing_and_windows_has_no_user_domain() {
         // A user-scope run IS the user unit — deleting it would delete what it just wrote.
-        assert!(shadowing_units_to_remove(Os::Linux, ServiceScope::User, &mixed_units()).is_empty());
+        assert!(
+            shadowing_units_to_remove(Os::Linux, ServiceScope::User, &mixed_units()).is_empty()
+        );
         assert!(
             shadowing_units_to_remove(Os::Windows, ServiceScope::System, &mixed_units()).is_empty()
         );

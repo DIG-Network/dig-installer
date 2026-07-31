@@ -64,6 +64,7 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
         ("service.rs", include_str!("service.rs")),
         ("sources.rs", include_str!("sources.rs")),
         ("svc.rs", include_str!("svc.rs")),
+        ("svcscope.rs", include_str!("svcscope.rs")),
         ("target.rs", include_str!("target.rs")),
         ("uninstall.rs", include_str!("uninstall.rs")),
         ("update.rs", include_str!("update.rs")),

@@ -37,6 +37,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::proc::HideConsole;
+use crate::svcscope::ServiceScope;
 use crate::target::Os;
 
 /// Canonical dig-node service id (reverse-DNS) and human display name (#494).
@@ -148,6 +149,106 @@ pub fn launchctl_system_target(id: &str) -> String {
     format!("system/{id}")
 }
 
+/// The `launchctl` per-user (`gui/<uid>/<id>`) domain target string — the
+/// LaunchAgent domain, where an UNELEVATED `dig-node install` registers. Pure.
+pub fn launchctl_gui_target(uid: u32, id: &str) -> String {
+    format!("gui/{uid}/{id}")
+}
+
+/// Every macOS `launchctl bootout` target that must be visited to deregister
+/// service `id` — BOTH domains, always (dig_ecosystem#526).
+///
+/// Booting out only `system/<id>` was the uninstall-asymmetry defect: an
+/// unelevated (or pre-#526) install registers a `gui/<uid>` LaunchAgent, which a
+/// system-only teardown leaves running and re-launching at every login while the
+/// installer reports a clean uninstall. `uid` is the TARGET user's
+/// ([`crate::invoker::target_user`]) — `None` means the per-user domain could not
+/// be addressed, which the caller must REPORT rather than treat as absent.
+/// Pure.
+pub fn macos_bootout_targets(uid: Option<u32>, id: &str) -> Vec<String> {
+    let mut targets = vec![launchctl_system_target(id)];
+    if let Some(uid) = uid {
+        targets.push(launchctl_gui_target(uid, id));
+    }
+    targets
+}
+
+/// How service `id` is queried at one explicit [`ServiceScope`] on `os`.
+///
+/// Pure, and the reason this is a value rather than a `cfg`-gated branch: the
+/// scope-to-command mapping — including the two arms that ask NOTHING — is then
+/// asserted for all three operating systems from any host. A `#[cfg(unix)]`-only
+/// test cannot falsify the Windows arm, so the mutation stays green
+/// (dig_ecosystem#1774).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeQuery {
+    /// This OS has no such domain, so the answer is definitively "not
+    /// registered here" without asking anything (the Windows SCM has no
+    /// per-user services).
+    NoSuchDomain,
+    /// The domain exists but could not be ADDRESSED (a macOS per-user domain
+    /// with no resolvable uid). Not the same as absent — it resolves to
+    /// [`ServiceRunState::Unknown`] so a caller never reads it as "nothing is
+    /// registered".
+    Unaddressable,
+    /// `systemctl <args>` (already including `--user` for the per-user scope).
+    Systemctl(Vec<String>),
+    /// `launchctl print <target>`.
+    LaunchctlPrint(String),
+    /// `sc query <id>`.
+    ScQuery(String),
+}
+
+/// Plan the scope-explicit query for `id` at `scope` on `os`, given the target
+/// user's `uid` (macOS per-user domain addressing only). Pure — the spawn is
+/// [`service_run_state_in_scope`].
+pub fn scope_query(os: Os, scope: ServiceScope, id: &str, uid: Option<u32>) -> ScopeQuery {
+    match (os, scope) {
+        (Os::Windows, ServiceScope::System) => ScopeQuery::ScQuery(id.to_string()),
+        (Os::Windows, ServiceScope::User) => ScopeQuery::NoSuchDomain,
+        (Os::Linux, ServiceScope::System) => {
+            ScopeQuery::Systemctl(vec!["is-active".to_string(), linux_unit_name(id)])
+        }
+        (Os::Linux, ServiceScope::User) => ScopeQuery::Systemctl(vec![
+            "--user".to_string(),
+            "is-active".to_string(),
+            linux_unit_name(id),
+        ]),
+        (Os::MacOs, ServiceScope::System) => {
+            ScopeQuery::LaunchctlPrint(launchctl_system_target(id))
+        }
+        (Os::MacOs, ServiceScope::User) => match uid {
+            Some(uid) => ScopeQuery::LaunchctlPrint(launchctl_gui_target(uid, id)),
+            None => ScopeQuery::Unaddressable,
+        },
+    }
+}
+
+/// The run-state of service `id` in ONE explicit scope, on the current host.
+///
+/// The scope-blind [`service_run_state`] answers "is it running ANYWHERE?",
+/// which is the right question for a health check and the WRONG one for
+/// deciding whether a failed `install` may be tolerated: a user-scope
+/// registration left over from an earlier run would excuse a system-scope
+/// registration that never happened (dig_ecosystem#526). Callers that care
+/// WHERE it is registered ask this.
+pub fn service_run_state_in_scope(id: &str, scope: ServiceScope) -> ServiceRunState {
+    let Ok(target) = crate::target::Target::current() else {
+        return ServiceRunState::Unknown;
+    };
+    let uid = crate::invoker::target_user().uid;
+    match scope_query(target.os, scope, id, uid) {
+        ScopeQuery::NoSuchDomain => ServiceRunState::NotFound,
+        ScopeQuery::Unaddressable => ServiceRunState::Unknown,
+        ScopeQuery::Systemctl(args) => {
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            query_systemctl_is_active(&borrowed)
+        }
+        ScopeQuery::LaunchctlPrint(target) => query_launchctl_print(&target),
+        ScopeQuery::ScQuery(id) => query_sc(&id),
+    }
+}
+
 /// STOP the service `id` via the OS service manager — WITHOUT ever executing the
 /// service's own binary (#565: the installer must never elevate-spawn a binary
 /// that a non-admin could have replaced in the legacy user-writable dir). Issues
@@ -202,10 +303,9 @@ fn stop_service_command(id: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = run_svc_tool(
-            "launchctl",
-            &["bootout".into(), launchctl_system_target(id)],
-        );
+        for target in macos_bootout_targets(crate::invoker::target_user().uid, id) {
+            let _ = run_svc_tool("launchctl", &["bootout".into(), target]);
+        }
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -215,7 +315,9 @@ fn stop_service_command(id: &str) {
 
 /// Issue the OS "deregister this service by id" command. Windows `sc delete`;
 /// Linux `systemctl [--user] disable`; macOS `launchctl bootout` (which both
-/// stops AND deregisters). Best-effort — [`deregister_service`] polls the state.
+/// stops AND deregisters) in BOTH the system and `gui/<uid>` domains
+/// ([`macos_bootout_targets`], dig_ecosystem#526). Best-effort —
+/// [`deregister_service`] polls the state.
 fn deregister_service_command(id: &str) {
     #[cfg(windows)]
     {
@@ -237,10 +339,9 @@ fn deregister_service_command(id: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = run_svc_tool(
-            "launchctl",
-            &["bootout".into(), launchctl_system_target(id)],
-        );
+        for target in macos_bootout_targets(crate::invoker::target_user().uid, id) {
+            let _ = run_svc_tool("launchctl", &["bootout".into(), target]);
+        }
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -384,45 +485,48 @@ pub fn parse_sc_qc_display_name(text: &str) -> Option<String> {
 /// [`service_run_state`] for an explicit [`Os`] — spawns the OS-appropriate
 /// query and parses it. Split out so the OS dispatch is explicit.
 fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
-    use std::process::Command;
     match os {
-        Os::Windows => {
-            let out = Command::new(crate::proc::system_tool("sc"))
-                .arg("query")
-                .arg(id)
-                .hide_console()
-                .output();
-            match out {
-                Ok(o) => {
-                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-                    text.push_str(&String::from_utf8_lossy(&o.stderr));
-                    parse_sc_query(&text)
-                }
-                Err(_) => ServiceRunState::Unknown,
-            }
-        }
+        Os::Windows => query_sc(id),
         Os::Linux => {
             let unit = linux_unit_name(id);
             let user = query_systemctl_is_active(&["--user", "is-active", &unit]);
             let system = query_systemctl_is_active(&["is-active", &unit]);
             combine_systemctl_states(user, system)
         }
-        Os::MacOs => {
-            let out = Command::new("launchctl")
-                .arg("print")
-                .arg(format!("system/{id}"))
-                .hide_console()
-                .output();
-            match out {
-                Ok(o) if o.status.success() => {
-                    parse_launchctl_print(&String::from_utf8_lossy(&o.stdout))
-                }
-                // A non-zero exit from `launchctl print` means the label is not
-                // loaded in the system domain.
-                Ok(_) => ServiceRunState::NotFound,
-                Err(_) => ServiceRunState::Unknown,
-            }
+        Os::MacOs => query_launchctl_print(&launchctl_system_target(id)),
+    }
+}
+
+/// Spawn `sc query <id>` and parse it. Windows-only in effect; the spawn simply
+/// fails elsewhere, resolving to [`ServiceRunState::Unknown`].
+fn query_sc(id: &str) -> ServiceRunState {
+    match std::process::Command::new(crate::proc::system_tool("sc"))
+        .arg("query")
+        .arg(id)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            parse_sc_query(&text)
         }
+        Err(_) => ServiceRunState::Unknown,
+    }
+}
+
+/// Spawn `launchctl print <target>` (e.g. `system/<id>` or `gui/<uid>/<id>`) and
+/// parse it. A non-zero exit means the label is not loaded in THAT domain.
+fn query_launchctl_print(target: &str) -> ServiceRunState {
+    match std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(target)
+        .hide_console()
+        .output()
+    {
+        Ok(o) if o.status.success() => parse_launchctl_print(&String::from_utf8_lossy(&o.stdout)),
+        Ok(_) => ServiceRunState::NotFound,
+        Err(_) => ServiceRunState::Unknown,
     }
 }
 
@@ -565,6 +669,82 @@ pub fn parse_launchctl_print(text: &str) -> ServiceRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Scope-explicit addressing (dig_ecosystem#526) ----------------------
+    //
+    // Every assertion below is over the PURE plan, for all three operating
+    // systems, from any host: a `#[cfg(unix)]`-only test would leave the
+    // Windows arms unfalsifiable on CI's Windows runner and on this repo's
+    // dev boxes alike (#1774).
+
+    #[test]
+    fn a_macos_deregister_boots_out_both_the_system_and_the_per_user_domain() {
+        // The uninstall-asymmetry defect: a system-only bootout leaves an
+        // unelevated install's `gui/<uid>` LaunchAgent running and relaunching
+        // at every login while the installer reports a clean uninstall.
+        let targets = macos_bootout_targets(Some(501), DIG_NODE_SERVICE_ID);
+        assert_eq!(
+            targets,
+            vec![
+                "system/net.dignetwork.dig-node".to_string(),
+                "gui/501/net.dignetwork.dig-node".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uid_still_boots_out_the_system_domain() {
+        // Nothing addressable in the per-user domain, so only the system target
+        // is issued — and the caller REPORTS the unreachable scope rather than
+        // claiming a complete uninstall (`uninstall::scope_report`).
+        assert_eq!(
+            macos_bootout_targets(None, DIG_DNS_SERVICE_ID),
+            vec!["system/net.dignetwork.dig-dns".to_string()]
+        );
+    }
+
+    #[test]
+    fn scope_query_addresses_the_right_domain_on_every_os() {
+        let id = DIG_NODE_SERVICE_ID;
+        let unit = linux_unit_name(id);
+        assert_eq!(
+            scope_query(Os::Windows, ServiceScope::System, id, None),
+            ScopeQuery::ScQuery(id.to_string())
+        );
+        // The Windows SCM has NO per-user services, so the answer is known
+        // without asking — never an Unknown that a caller might read as "maybe".
+        assert_eq!(
+            scope_query(Os::Windows, ServiceScope::User, id, Some(1000)),
+            ScopeQuery::NoSuchDomain
+        );
+        assert_eq!(
+            scope_query(Os::Linux, ServiceScope::System, id, None),
+            ScopeQuery::Systemctl(vec!["is-active".to_string(), unit.clone()])
+        );
+        assert_eq!(
+            scope_query(Os::Linux, ServiceScope::User, id, None),
+            ScopeQuery::Systemctl(vec!["--user".to_string(), "is-active".to_string(), unit])
+        );
+        assert_eq!(
+            scope_query(Os::MacOs, ServiceScope::System, id, Some(501)),
+            ScopeQuery::LaunchctlPrint("system/net.dignetwork.dig-node".to_string())
+        );
+        assert_eq!(
+            scope_query(Os::MacOs, ServiceScope::User, id, Some(501)),
+            ScopeQuery::LaunchctlPrint("gui/501/net.dignetwork.dig-node".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unaddressable_macos_user_domain_is_unknown_not_absent() {
+        // "Could not ask" must never collapse into "nothing is registered":
+        // tolerating a failed install on that answer is exactly the #526
+        // false-ready.
+        assert_eq!(
+            scope_query(Os::MacOs, ServiceScope::User, DIG_NODE_SERVICE_ID, None),
+            ScopeQuery::Unaddressable
+        );
+    }
 
     #[test]
     fn canonical_ids_are_reverse_dns_and_stable() {
