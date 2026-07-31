@@ -46,8 +46,14 @@ actually testing; `--uninstall-dig-updater` reverses the scheduler registration 
 (delegates to `dig-updater schedule uninstall`, idempotent). `--uninstall-dig-updater` is the ONLY
 way the installer turns auto-updates off, and it is deliberate: `dig-updater schedule uninstall`
 records a sticky opt-out that suppresses any later self-heal, so it is never used for an internal
-step. A `--no-auto-update` run on a host being migrated off a legacy root re-arms the schedule the
-migration removed instead (`InstallReport.beacon_rearm` in `--json` says whether it succeeded).
+step. A `--no-auto-update` run on a host being migrated off a legacy root leaves that host with
+auto-updates OFF — the migration must vacate a legacy-root schedule (it is itself the #565
+vulnerability) and a declining run never installs `dig-updater` to put one back. That outcome is
+REPORTED, not silent: `InstallReport.beacon_rearm` in `--json` carries `{applied, note}` (`null`
+only when there was nothing to vacate), and the log names the exact restoring command
+(`dig-installer --auto-update`). A re-arm is only ever attempted against
+`<protected root>/dig-updater`, so a `--bin-dir` run skips it and logs why — a machine-wide
+privileged schedule is never registered at a caller-selected path.
 
 **Alias binaries `digs`/`dign`/`digd` (issues #434/#548):** selecting `digstore`/`dig-node`/
 `dig-dns` also installs its alias binary (`digs`/`dign`/`digd` respectively) alongside it, in the

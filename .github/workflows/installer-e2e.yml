@@ -597,6 +597,165 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
+  # dig_ecosystem#1854: what happens to a host's auto-updates when the #565
+  # migration vacates a legacy-root beacon schedule on a run that DECLINED the
+  # beacon?
+  #
+  # The Windows `migrate-e2e` job above installs WITH the beacon, so its run
+  # re-registers the schedule at step 5 and `rearm_beacon_after_migration` returns
+  # `None` on every CI run — no e2e reached the opt-out path at all, which is how
+  # the whole branch shipped unexercised end to end.
+  #
+  # This leg drives the opt-out shape: a SYSTEM beacon timer whose ExecStart
+  # resolves under the user-writable legacy root (`~/.dig/bin`), then an install
+  # that says `--no-auto-update`. The migration MUST still vacate that schedule
+  # (it is itself the #565 vulnerability), the run MUST stay READY (the beacon was
+  # not part of what was asked for), and the resulting auto-updates-OFF state MUST
+  # be REPORTED in `beacon_rearm` rather than swallowed.
+  #
+  # Linux only for now — the Windows + macOS parity legs are a sibling ticket.
+  migrate-optout-e2e:
+    name: "#1854 a declining run reports the auto-updates it lost (Linux)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-1854-optout-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-1854-optout-
+            ubuntu-1748-reach-
+
+      - name: Build the installer
+        run: cargo build --release --locked --bin dig-installer
+
+      # The runner image ships `/opt` world-writable, and the #1748 install-root
+      # verify walks every ancestor — so an unrepaired image makes the install
+      # report NOT ready for a reason unrelated to this leg. Repaired + asserted
+      # exactly as the `#1748` job documents.
+      - name: Normalise the runner image's world-writable /opt chain
+        run: |
+          sudo chmod 755 /opt /usr /usr/local /usr/local/bin
+          sudo chown 0:0 /usr /usr/local /usr/local/bin
+          for level in /opt /usr /usr/local /usr/local/bin; do
+            test -z "$(find "$level" -maxdepth 0 \( -perm -0002 -o -perm -0020 \))" \
+              || { echo "FAIL: $level is still group- or world-writable"; exit 1; }
+          done
+
+      # Seed the PRE-#565 shape on Linux: a machine-wide (root-run) dig-updater
+      # timer whose service ExecStart lives in the INVOKING user's `~/.dig/bin` —
+      # a directory that user can write, so the root timer would execute a binary
+      # they can replace. `regaudit::beacon_bin_path` reads that ExecStart back via
+      # `systemctl show`, which is what makes the migration act on it.
+      - name: Seed a legacy-root SYSTEM beacon timer (pre-#565 shape)
+        run: |
+          LEGACY_DIR="$HOME/.dig/bin"
+          mkdir -p "$LEGACY_DIR"
+          # A stand-in binary at the legacy path — never executed by the installer
+          # (#565); only its PRESENCE and the unit's ExecStart matter.
+          printf '#!/bin/sh\nexit 0\n' > "$LEGACY_DIR/dig-updater"
+          chmod +x "$LEGACY_DIR/dig-updater"
+          echo "LEGACY_DIR=$LEGACY_DIR" >> "$GITHUB_ENV"
+          sudo tee /etc/systemd/system/dig-updater.service >/dev/null <<UNIT
+          [Unit]
+          Description=DIG auto-update beacon (seeded pre-#565 legacy-root shape)
+          [Service]
+          Type=oneshot
+          ExecStart=$LEGACY_DIR/dig-updater run
+          UNIT
+          sudo tee /etc/systemd/system/dig-updater.timer >/dev/null <<'UNIT'
+          [Unit]
+          Description=DIG auto-update beacon daily check
+          [Timer]
+          OnCalendar=daily
+          Unit=dig-updater.service
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now dig-updater.timer
+          echo "seeded ExecStart:"
+          systemctl show -p ExecStart dig-updater.service | tee seeded-execstart.txt
+          grep -F "$LEGACY_DIR/dig-updater" seeded-execstart.txt > /dev/null
+
+      # DECLINE the beacon (`--no-auto-update`) while still installing a privileged
+      # binary (dig-node, default-on) so the #565 migration gate fires. No
+      # `--bin-dir`: the privileged root is the protected root, which is the only
+      # root the re-arm is permitted to consider at all.
+      - name: Install with the beacon DECLINED into the default protected root
+        run: |
+          sudo ./target/release/dig-installer \
+            --no-digstore --no-dig-dns --no-dig-app --no-auto-update \
+            --json | tee install.json
+
+      - name: Assert the migration vacated the legacy-root beacon schedule (#565)
+        run: |
+          jq -e '.ok == true' install.json
+          jq -e '.result.migration.migrated == true' install.json
+          jq -e '[.result.migration.deregistered[] | select(ascii_downcase | contains("beacon"))] | length > 0' install.json
+          jq -e '(.result.migration.deregister_failures | length) == 0' install.json
+
+      # THE #1854 acceptance assertions. `beacon_rearm` non-null is what proves the
+      # opt-out path RAN and REPORTED — `null` is exactly the silent state the issue
+      # was filed about, and is what this leg sees if the re-arm block is removed.
+      - name: Assert the lost auto-updates are REPORTED, and the run is still ready
+        run: |
+          jq -e '.result.beacon_rearm != null' install.json \
+            || { echo "FAIL: the declining run said nothing about the auto-updates it lost"; exit 1; }
+          jq -e '.result.beacon_rearm | has("applied") and has("note")' install.json
+          # Declining the beacon is NOT a readiness failure — the beacon was never
+          # part of what this run was asked to install.
+          jq -e '.result.ready == true' install.json
+          jq -e '.result.failures == []' install.json
+
+      - name: Assert no privileged registration is left resolving under a legacy root (#565 H2b)
+        run: |
+          jq -e '(.result.registration_audit | length) > 0' install.json
+          jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
+          # The run declined the beacon, so nothing may have re-installed it.
+          jq -e '.result.beacon == null' install.json
+
+      - name: Cleanup — remove the seeded units + uninstall
+        if: always()
+        run: |
+          sudo ./target/release/dig-installer --uninstall --json \
+            | tee uninstall.json || true
+          sudo systemctl disable --now dig-updater.timer || true
+          sudo rm -f /etc/systemd/system/dig-updater.service /etc/systemd/system/dig-updater.timer
+          sudo systemctl daemon-reload || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-migrate-optout-e2e-linux
+          path: |
+            install.json
+            uninstall.json
+            seeded-execstart.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
   # #1748: does the person who typed `sudo` actually end up with working CLIs?
   #
   # The `e2e` job above could not answer that, and passed against an install that
