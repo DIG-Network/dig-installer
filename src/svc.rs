@@ -395,6 +395,13 @@ pub fn classify_systemctl_is_enabled(
         detail,
     };
     match token {
+        // systemd's OWN not-found token, printed on stdout by a query that ran fine. This IS the
+        // recognised not-found reply, so it is the one error-free reading that means Absent. Found by
+        // the #526 system-scope e2e (run 30665680769), where classifying it as an unrecognised
+        // verdict made a plainly-empty scope read "could not determine".
+        "not-found" => {
+            return ScopeRegistration::absent("systemd reports `not-found` — no such unit here")
+        }
         "enabled" | "enabled-runtime" | "alias" => {
             return present(
                 BootEnablement::Enabled,
@@ -1168,6 +1175,33 @@ mod tests {
         assert!(classify_systemctl_is_enabled("masked", "", true)
             .detail
             .contains("NEVER start"));
+    }
+
+    /// `not-found` on stdout is systemd ANSWERING "there is no such unit", not failing to answer.
+    ///
+    /// Distinguishing it from the two neighbours is the whole point, so all three are asserted
+    /// together: a real state token is Present, `not-found` is Absent, and a token systemd has never
+    /// printed is Unknown. Reading `not-found` as Unknown made an empty scope report "could not
+    /// determine" and turned a clean install failure into an unreadable one (run 30665680769).
+    #[test]
+    fn the_not_found_token_is_a_successful_answer_meaning_absent() {
+        let r = classify_systemctl_is_enabled("not-found", "", false);
+        assert_eq!(r.presence, Presence::Absent);
+        assert_eq!(r.boot_enabled, BootEnablement::NotEnabled);
+        assert!(r.detail.contains("no such unit"), "{}", r.detail);
+
+        // The neighbours, on the same shape of input, so this cannot pass by treating everything
+        // alike.
+        assert_eq!(
+            classify_systemctl_is_enabled("disabled", "", false).presence,
+            Presence::Present,
+            "a real state token is a unit that EXISTS"
+        );
+        assert_eq!(
+            classify_systemctl_is_enabled("not-found-ish", "", false).presence,
+            Presence::Unknown,
+            "only the exact token systemd prints is a verdict"
+        );
     }
 
     #[test]

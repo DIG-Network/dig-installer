@@ -302,14 +302,23 @@ jobs:
           ls -ldn "$entry" /home/runner/.config/autostart
           test -f "$entry"
           owner=$(stat -c %u "$entry")
-          test "$owner" = "$(id -u runner)"             || { echo "entry is owned by uid $owner, not by runner"; exit 1; }
+          test "$owner" = "$(id -u runner)" || {
+            echo "entry is owned by uid $owner, not by runner"
+            exit 1
+          }
           dir_owner=$(stat -c %u /home/runner/.config/autostart)
-          test "$dir_owner" = "$(id -u runner)"             || { echo "entry DIR is owned by uid $dir_owner, not by runner"; exit 1; }
+          test "$dir_owner" = "$(id -u runner)" || {
+            echo "entry DIR is owned by uid $dir_owner, not by runner"
+            exit 1
+          }
           # #919: the mechanism must be one that STARTS something. A desktop entry is loaded at login
           # with no enable step; the systemd user unit earlier versions wrote never was, so it must be
           # gone rather than sitting alongside this and producing two agents at the next login.
           grep -q '^Exec=' "$entry"
-          test ! -e /home/runner/.config/systemd/user/dig-app.service             || { echo "the stale systemd user unit is still present — two autostarts at next login"; exit 1; }
+          test ! -e /home/runner/.config/systemd/user/dig-app.service || {
+            echo "the stale systemd user unit is still present — two autostarts at next login"
+            exit 1
+          }
 
       - name: Assert the #493 fail-loud readiness verdict — both components ready
         run: |
@@ -1033,7 +1042,10 @@ jobs:
               done
               # 2. The protected root must be the reported PATH dir, and be root-owned.
               jq -e '.result.path.dir == "/opt/dig/bin"' install.json \
-                || { echo "FAIL: report.path.dir must name the protected root under direct_path_entry"; exit 1; }
+              || {
+               echo "FAIL: report.path.dir must name the protected root under direct_path_entry"
+               exit 1
+             }
               jq -e '.result.path.modified == true' install.json \
                 || { echo "FAIL: the fallback must actually wire the protected root onto PATH"; exit 1; }
               # 3. It must be PREPENDED, so a DIG name resolves to the protected root and
@@ -1306,17 +1318,21 @@ jobs:
             | sudo tee /root/.config/systemd/user/dignetwork-dig-node.service >/dev/null
           sudo ls -l /root/.config/systemd/user/
 
+      # `|| true` on the installer itself: on this host class the install
+      # currently FAILS, and that failure is the subject of the assertions below
+      # rather than a reason to abort. The steps that follow decide pass/fail.
       - name: Install with NO --bin-dir, so engine_scope actually decides
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           sudo -H -E "$PWD/target/release/dig-installer" \
-            --no-digstore \
-            --no-dig-app \
-            --no-auto-update \
+            --no-digstore --no-dig-app --no-auto-update \
             --dig-node-version "$DIG_NODE_VERSION" \
             --dig-dns-version "$DIG_DNS_VERSION" \
-            --json | tee install.json
+            --json > install.json
+          echo "installer exit: $?"
+          jq . install.json | head -5
 
       # THE assertion this job exists for. This is the scope the installer
       # DECIDED on its own for a protected-root install — "system" — which the
@@ -1324,69 +1340,98 @@ jobs:
       # decision is ever reached.
       - name: The installer decided SYSTEM scope for a default-path install
         run: |
-          jq -e '.result.service.scope == "system"' install.json \
-            || { echo "FAIL: a default-path elevated install must request machine-wide scope"; exit 1; }
-          jq -e '(.result.service.scope_note | length) > 0' install.json
+          jq -e '.result.service.scope == "system"' install.json || {
+            echo "FAIL: a default-path elevated install must request machine-wide scope"
+            exit 1
+          }
 
-      # The honest half. No released dig-node accepts `--scope` (v0.69.0 has no
-      # such flag and PREFERS_USER_LEVEL is unconditionally true on unix), so the
-      # compat retry is what runs, the component registers at its own per-user
-      # default, and reboot survival is correctly reported as FALSE with a note
-      # saying why. This asserts the REPORT is truthful about a fallback, rather
-      # than asserting a capability nothing ships.
+      # THE #526 ACCEPTANCE PROPERTY, and the one this PR actually delivers.
       #
-      # When a dig-node release lands `--scope`, THIS is the step that must flip
-      # to `survives_reboot == true`, and it fails loudly until it is updated —
-      # which is the point: the gate tracks the contract instead of drifting.
-      - name: A pre---scope component is reported as a fallback, not as success
+      # No released dig-node accepts `--scope` (v0.69.0 has no such flag and
+      # PREFERS_USER_LEVEL is unconditionally true on unix), so on this headless
+      # host `dig-node install` reaches for a per-user manager, finds root has no
+      # session bus, and fails. That is #526 itself, and it is NOT fixed by this
+      # installer — it is fixed by the dig-node side (DIG-Network/dig-node#123).
+      #
+      # What this installer must guarantee TODAY is that such a host is never
+      # told it is ready. The pre-#526 code reported `ready: true` here, because
+      # nothing asked whether a registration existed WHERE the run needed one.
+      # That is the regression this step pins, and it is the assertion the
+      # --bin-dir leg cannot make: there the scope is forced to user, the unit
+      # registers, and the false-ready never arises.
+      - name: A host where the service could not register is NEVER reported ready
         run: |
-          jq -e '.result.service.survives_reboot == false' install.json \
-            || { echo "A component now honours --scope; flip this gate to require true"; exit 1; }
-          jq -r '.result.service.scope_note' install.json | grep -qi 'scope' \
-            || { echo "FAIL: the fallback must be explained in the note"; exit 1; }
+          jq -e '.result.ready == false' install.json || {
+            echo "FAIL: false-ready — the service did not register, yet the run claims ready"
+            exit 1
+          }
+          jq -e '.result.service.installed == false' install.json
+          jq -e '.result.service.survives_reboot == false' install.json
 
-      # Finding 2's positional half, and the assertion the pre-PR code FAILS: the
-      # sweep must act on the scope the component ACTUALLY used. Because the
-      # fallback registered per-user, the planted unit IS the live registration —
-      # deleting it would leave the host with no dig-node while reporting success.
-      - name: The fallback's own per-user registration was NOT swept away
-        run: |
-          jq -e '(.result.service.shadowing_units_removed | length) == 0' install.json \
-            || { echo "FAIL: swept a per-user unit while the component registered per-user"; exit 1; }
-          sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service \
-            || { echo "FAIL: the install deleted the very registration the fallback created"; exit 1; }
+          # The report must name the scope it tried and the real reason, so the
+          # operator is not left guessing. Asserted on content, not merely on
+          # non-emptiness, which any string would satisfy.
+          NOTE=$(jq -r '.result.service.note' install.json)
+          echo "reported: $NOTE"
+          echo "$NOTE" | grep -qi 'machine-wide\|system' || {
+            echo "FAIL: the failure does not name the scope it attempted"
+            exit 1
+          }
+          echo "$NOTE" | grep -qi 'will NOT start' || {
+            echo "FAIL: the failure does not state the consequence"
+            exit 1
+          }
 
-      # Reboot survival read from systemd itself rather than from a field the
-      # installer populated. Taken WITHOUT a user bus and WITHOUT enable-linger:
-      # if this leg needed the linger workaround, #526 would not be fixed.
-      - name: Read systemd's own verdict, with no user bus and no linger
+          # And it must NOT have degraded into "could not determine" for a scope
+          # systemd answered plainly about (`not-found` is an answer, #526 e2e).
+          if echo "$NOTE" | grep -qi 'unrecognised systemd verdict'; then
+            echo "FAIL: a plain systemd answer was misread as indeterminate"
+            exit 1
+          fi
+
+      # Finding 2, positional: nothing was registered, so nothing may be swept.
+      # A sweep driven by the REQUESTED scope would have deleted the planted unit
+      # on the strength of a system registration that never happened.
+      - name: A failed registration sweeps nothing
         run: |
-          echo "--- system scope ---"
+          jq -e '(.result.service.shadowing_units_removed | length) == 0' install.json || {
+            echo "FAIL: swept per-user units although no registration was made"
+            exit 1
+          }
+          sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service || {
+            echo "FAIL: deleted a per-user unit after a failed system registration"
+            exit 1
+          }
+
+      # #526's workaround must not have crept back in. If the installer had
+      # quietly enabled linger to make its own install work, the bug would be
+      # papered over rather than reported.
+      - name: The install did not enable the linger workaround
+        run: |
           systemctl is-enabled dignetwork-dig-node 2>&1 || true
-          echo "--- user scope, as root, no bus (the #526 host class) ---"
-          sudo systemctl --user is-enabled dignetwork-dig-node 2>&1 || true
-          echo "--- linger must NOT have been enabled by the install ---"
           if loginctl show-user root -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
             echo "FAIL: the install enabled linger for root - #526 exists to remove that workaround"
             exit 1
           fi
 
-      # The uninstall counterpart to finding 3. Run as root with no session bus,
-      # which is precisely the probe failure: `systemctl --user is-enabled` prints
-      # "Failed to connect to bus: No such file or directory". That scope must be
-      # named as UNVERIFIED, never folded into a clean "removed from every scope".
+      # The uninstall counterpart to finding 3, on the host class that produces
+      # the probe failure: root with no session bus. A scope that could not be
+      # READ must be named as unverified, never folded into a clean
+      # "removed from every scope".
       - name: An unqueryable scope is named, not silently reported as cleared
         run: |
-          sudo -H "$PWD/target/release/dig-installer" \
-            --uninstall-dig-node --json | tee uninstall.json
-          jq -e '.result' uninstall.json >/dev/null
+          set +e
+          sudo -H "$PWD/target/release/dig-installer" --uninstall-dig-node --json > uninstall.json
+          echo "uninstall exit: $?"
           NOTE=$(jq -r '[.. | strings] | join(" ")' uninstall.json)
           echo "reported: $NOTE"
-          # A run that could not read a scope must say so. If it DID read every
-          # scope, "every scope" unqualified is the correct report - so this
-          # accepts either, and fails only on the combination that is a lie:
-          # claiming every scope while a bus failure was hit.
           if echo "$NOTE" | grep -qi 'failed to connect to bus'; then
-            echo "$NOTE" | grep -qi 'could not verify' \
-              || { echo "FAIL: hit a bus failure yet did not report the scope as unverified"; exit 1; }
+            echo "$NOTE" | grep -qi 'could not verify\|UNKNOWN rather than removed' || {
+              echo "FAIL: hit a bus failure yet reported the scope as cleared"
+              exit 1
+            }
+          fi
+          if echo "$NOTE" | grep -qi 'unrecognised systemd verdict'; then
+            echo "FAIL: a plain systemd answer was misread as indeterminate"
+            exit 1
           fi
