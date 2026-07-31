@@ -183,6 +183,11 @@ exit 0
             "paths.rs",
             "userwrite.rs",
             "pathcheck.rs",
+            // Spawns `explorer.exe` / `su` / `sh` to start dig-app in the USER's session (#1831). The
+            // tool is trusted; the binary it goes on to run is put through `secure::root_exec_guard`
+            // by `launch::carry_out`, which covers the one arrangement (a root-ACCOUNT install, so no
+            // `su` delegation) where the launch would carry root's authority.
+            "launch.rs",
             // The wrapper itself.
             "guardedcmd.rs",
         ];

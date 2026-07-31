@@ -606,6 +606,9 @@ mod tests {",
         // than passing by finding one fewer call.
         for (file, count) in [
             ("autostart.rs", 3),
+            // The launch of dig-app decides whether to delegate to `su - <user>` or run directly
+            // (#1831). Deciding it wrong runs the user's identity agent as root.
+            ("launch.rs", 1),
             ("pathcheck.rs", 2),
             ("paths.rs", 1),
             ("userwrite.rs", 1),
@@ -618,8 +621,8 @@ mod tests {",
         }
         assert_eq!(
             wired.len(),
-            7,
-            "the crate has 7 privilege-boundary decision points; found {}: {wired:?}",
+            8,
+            "the crate has 8 privilege-boundary decision points; found {}: {wired:?}",
             wired.len()
         );
     }

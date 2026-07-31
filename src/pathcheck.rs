@@ -475,10 +475,10 @@ fn as_user_command(binary: &Path, user: &TargetUser) -> Option<Result<Command, S
             .ok_or_else(|| "su not found in any trusted system directory".to_string())
             .map(|su| {
                 let mut c = Command::new(su);
-                c.arg("-")
-                    .arg(&user.name)
-                    .arg("-c")
-                    .arg(format!("{} --version", shell_quote(binary)));
+                c.arg("-").arg(&user.name).arg("-c").arg(format!(
+                    "{} --version",
+                    crate::userwrite::shell_quote(binary)
+                ));
                 c
             }),
     )
@@ -540,16 +540,6 @@ pub(crate) fn run_version(binary: &Path, user: &TargetUser) -> Result<String, St
         stdout.trim().to_string()
     };
     Ok(reported.lines().last().unwrap_or("").trim().to_string())
-}
-
-/// Single-quote `path` for a POSIX shell, escaping any embedded single quote, so a path containing
-/// spaces or shell metacharacters is passed to `su -c` as one word.
-///
-/// unix-only, like its sole caller [`as_user_command`]: Windows has no `su` boundary to cross, so the
-/// probe there runs the binary directly and never composes a shell command line.
-#[cfg(unix)]
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -691,22 +681,7 @@ mod tests {
         ));
     }
 
-    // -- quoting ---------------------------------------------------------------
-
-    /// The default Windows root contains a space and the `su -c` path must survive it as one word;
-    /// an embedded single quote must not break out of the quoting.
-    #[cfg(unix)]
-    #[test]
-    fn shell_quote_survives_spaces_and_quotes() {
-        assert_eq!(
-            shell_quote(Path::new("/opt/dig bin/dig-app")),
-            "'/opt/dig bin/dig-app'"
-        );
-        assert_eq!(
-            shell_quote(Path::new("/tmp/it's/dig-app")),
-            r"'/tmp/it'\''s/dig-app'"
-        );
-    }
+    // Quoting is tested where the one shared quoter lives (`crate::userwrite::shell_quote`).
 
     // -- the live boundary -----------------------------------------------------
 
