@@ -667,6 +667,22 @@ jobs:
       # a directory that user can write, so the root timer would execute a binary
       # they can replace. `regaudit::beacon_bin_path` reads that ExecStart back via
       # `systemctl show`, which is what makes the migration act on it.
+      # dig-node's own `install` prefers a USER-level systemd unit regardless of
+      # privilege, and an elevated run executes it as uid 0, which has no user
+      # session by default ("Failed to connect to bus: Operation not permitted",
+      # dig_ecosystem#524). Same recipe the `e2e` job documents: give root its own
+      # lingering session so the dig-node service registration succeeds and the run
+      # can reach `ready` — otherwise this leg would red on #524, not on #1854.
+      - name: Bring up a systemd/D-Bus user session for root
+        run: |
+          sudo loginctl enable-linger root
+          sudo systemctl start user@0.service
+          for _ in $(seq 1 10); do
+            [ -S "/run/user/0/bus" ] && break
+            sleep 1
+          done
+          echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
+
       - name: Seed a legacy-root SYSTEM beacon timer (pre-#565 shape)
         run: |
           LEGACY_DIR="$HOME/.dig/bin"
@@ -704,7 +720,7 @@ jobs:
       # root the re-arm is permitted to consider at all.
       - name: Install with the beacon DECLINED into the default protected root
         run: |
-          sudo ./target/release/dig-installer \
+          sudo -E ./target/release/dig-installer \
             --no-digstore --no-dig-dns --no-dig-app --no-auto-update \
             --json | tee install.json
 

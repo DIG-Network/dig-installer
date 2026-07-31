@@ -616,7 +616,20 @@ fn deregister_beacon() -> Result<(), String> {
                 let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
                 args.extend(["disable".into(), "--now".into(), unit]);
                 let _ = spawn("systemctl", &args);
+                // `disable` only un-links the enablement symlinks — the unit FILE stays
+                // on disk, so systemd keeps reporting `LoadState=loaded` and the beacon
+                // reads as still registered. Without removing the file the deregister
+                // could NEVER succeed on Linux and the (fatal) #565 migration failed
+                // every upgrade off a legacy root. Mirrors the macOS branch below, which
+                // has always removed its plist. The path comes from systemd itself
+                // (`FragmentPath`) rather than a guessed directory, so a user-scope unit
+                // under `~/.config/systemd/user` is removed as reliably as a
+                // machine-wide one under `/etc/systemd/system`.
+                remove_systemd_unit_file(&scope, &unit);
             }
+            let mut reload: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+            reload.push("daemon-reload".into());
+            let _ = spawn("systemctl", &reload);
         }
     }
     #[cfg(target_os = "macos")]
@@ -640,6 +653,41 @@ fn deregister_beacon() -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Delete the on-disk unit file backing `unit` in `scope`, as named by systemd's own
+/// `FragmentPath` property. Best-effort: an absent file, an unparseable answer, or a
+/// removal failure all leave the caller's post-check to decide, which is where the real
+/// verdict lives.
+///
+/// Only ever removes the DIG beacon's own unit ([`BEACON_SYSTEMD_UNIT`]) — the caller
+/// passes nothing else, and the path is systemd's answer for that exact unit name.
+#[cfg(target_os = "linux")]
+fn remove_systemd_unit_file(scope: &[&str], unit: &str) {
+    let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+    args.extend([
+        "show".into(),
+        "-p".into(),
+        "FragmentPath".into(),
+        unit.to_string(),
+    ]);
+    let Some(out) = spawn("systemctl", &args) else {
+        return;
+    };
+    if let Some(path) = parse_systemctl_fragment_path(&out) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Extract the unit-file path from `systemctl show -p FragmentPath <unit>` output —
+/// the `FragmentPath=<path>` line. `None` when systemd reported no backing file (an
+/// absent or purely-transient unit answers with an empty value). Pure.
+pub fn parse_systemctl_fragment_path(text: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("FragmentPath="))
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .map(str::to_string)
 }
 
 /// Spawn a query tool and return its combined stdout+stderr, or `None` on a spawn
@@ -957,6 +1005,41 @@ mod tests {
             Some("/opt/dig/bin/dig-dns")
         );
         assert_eq!(parse_systemctl_execstart_path("nope"), None);
+    }
+
+    /// `systemctl disable` only un-links the enablement symlinks — the unit FILE survives,
+    /// systemd keeps reporting `LoadState=loaded`, and the #565 beacon deregister could
+    /// never report success on Linux (a FATAL migration failure on every upgrade off a
+    /// legacy root). Removing the file requires reading systemd's own `FragmentPath`.
+    ///
+    /// The fixtures are the three answers a real host gives, and each separates the parser
+    /// from a nearer-wrong one: an EMPTY value (systemd's answer for a unit with no
+    /// backing file) must NOT read as a path to delete; a value embedded in a DIFFERENT
+    /// property's text must not be picked up (deleting an attacker-influenced description
+    /// string would be a file-removal primitive); and the real answer must be exact.
+    #[test]
+    fn parse_systemctl_fragment_path_reads_only_a_real_unit_file() {
+        assert_eq!(
+            parse_systemctl_fragment_path("FragmentPath=/etc/systemd/system/dig-updater.timer\n")
+                .as_deref(),
+            Some("/etc/systemd/system/dig-updater.timer")
+        );
+        // A user-scope query for a unit that is not installed there.
+        assert_eq!(parse_systemctl_fragment_path("FragmentPath=\n"), None);
+        assert_eq!(parse_systemctl_fragment_path("FragmentPath=   \n"), None);
+        // Only a line that IS the property counts — never one that merely mentions it.
+        assert_eq!(
+            parse_systemctl_fragment_path("Description=see FragmentPath=/etc/passwd\n"),
+            None
+        );
+        // The empty machine-scope answer must not shadow the real user-scope one.
+        assert_eq!(
+            parse_systemctl_fragment_path(
+                "FragmentPath=\nFragmentPath=/home/u/.config/systemd/user/dig-updater.timer\n"
+            )
+            .as_deref(),
+            Some("/home/u/.config/systemd/user/dig-updater.timer")
+        );
     }
 
     #[test]
