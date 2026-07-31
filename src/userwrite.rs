@@ -297,7 +297,13 @@ fn write_via_user_shell(path: &Path, contents: &[u8], user: &TargetUser) -> Resu
 
 /// Single-quote for a POSIX shell, escaping embedded single quotes, so a path containing spaces or
 /// shell metacharacters reaches `su -c` as exactly one word.
-#[cfg(unix)]
+///
+/// The crate's ONE such quoter: [`crate::pathcheck`] and [`crate::launch`] compose `su -c` command
+/// lines too, and three byte-identical copies of an escaping rule is three places for it to drift.
+///
+/// Deliberately NOT `#[cfg(unix)]`, even though only unix crosses a `su` boundary: it is a pure string
+/// transformation, and the callers that build these command lines describe every platform's behaviour
+/// from any host so their decisions can be unit-tested on a Windows runner.
 pub(crate) fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
@@ -306,6 +312,47 @@ pub(crate) fn shell_quote(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The one quoter every `su -c` command line in this crate composes through, so it is tested here
+    /// rather than once per caller.
+    ///
+    /// The default Windows root contains a space and must survive as ONE word; an embedded single quote
+    /// must not break out of the quoting; and a path carrying a whole injected command must come back
+    /// inert — the property a merely-spacey fixture cannot observe, since double-quoting satisfies that
+    /// one while still interpolating `$(…)`.
+    ///
+    /// "Inert" is checked by quote PARITY rather than by a substring search: correct output still
+    /// contains the attacker's text, so `!contains(…)` would fail against a correct implementation.
+    #[test]
+    fn shell_quote_survives_spaces_quotes_and_injection() {
+        assert_eq!(
+            shell_quote(Path::new("/opt/dig bin/dig-app")),
+            "'/opt/dig bin/dig-app'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/tmp/it's/dig-app")),
+            r"'/tmp/it'\''s/dig-app'"
+        );
+
+        let quoted = shell_quote(Path::new("/tmp/'; touch /tmp/pwned; '/dig-app"));
+        let mut chars = quoted.chars();
+        let mut inside = false;
+        while let Some(c) = chars.next() {
+            match c {
+                // Inside single quotes nothing is special — which is why the standard escape for an
+                // embedded quote CLOSES the quoting first (`'\''`), and why a scan that ignores the
+                // backslash rule below misreads correct output as an escape.
+                _ if inside => inside = c != '\'',
+                '\\' => {
+                    chars.next();
+                }
+                '\'' => inside = true,
+                ';' => panic!("an active separator escaped the quoting: {quoted}"),
+                _ => {}
+            }
+        }
+        assert!(!inside, "the quoting must close: {quoted}");
+    }
 
     fn user(name: &str, elevated: bool) -> TargetUser {
         TargetUser {

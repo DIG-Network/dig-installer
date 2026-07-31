@@ -64,6 +64,7 @@ pub mod hardening;
 pub mod health;
 pub mod hosts;
 pub mod invoker;
+pub mod launch;
 pub mod manifest;
 pub mod migrate;
 pub mod pathcheck;
@@ -486,6 +487,10 @@ pub struct InstallReport {
     /// dig-app's per-user login-autostart registration (only when `with_dig_app &&
     /// dig_app_autostart` and dig-app actually resolved) — #912.
     pub autostart: Option<autostart::AutostartResult>,
+    /// Whether the install actually STARTED dig-app before finishing, and how (#1831). Distinct from
+    /// [`Self::autostart`], which only registers it for future logins: a run can register successfully
+    /// and still leave the user staring at an empty system tray, which is what this records.
+    pub dig_app_launch: Option<launch::LaunchResult>,
     /// Absolute paths actually written (empty on dry-run).
     pub installed: Vec<String>,
     /// Per-CLI PATH-resolution checks (#496): confirms each required DIG CLI
@@ -850,6 +855,7 @@ fn run_report_gated(
         firewall: None,
         beacon: None,
         autostart: None,
+        dig_app_launch: None,
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
@@ -1196,6 +1202,10 @@ fn run_report_gated(
                     let dig_app_path = PathBuf::from(c.dest.clone());
                     report.components.push(c);
 
+                    // Did THIS run leave a service-manager artifact for the launch below to load? The
+                    // unix launch enables that artifact, which both starts dig-app now and makes the
+                    // registration live — the registration alone never started anything.
+                    let mut registered_autostart = false;
                     if plan.dig_app_autostart {
                         log("Registering dig-app to start at login (per-user, no elevation):");
                         let a = autostart::register(&dig_app_path, target.os, plan.dry_run);
@@ -1210,8 +1220,35 @@ fn run_report_gated(
                         if a.registered {
                             guard.record(InstallAction::AutostartRegistered);
                         }
+                        registered_autostart = a.registered;
                         report.autostart = Some(a);
                     }
+
+                    // Start it NOW (dig_ecosystem#1831). Placing a tray agent and never starting it
+                    // means the visible outcome of a successful install is no tray icon until the
+                    // user's next login — which reads as "it did not work".
+                    //
+                    // Unconditional on the autostart CHOICE: "start it now" and "start it at every
+                    // login" are different consents, and someone who just chose to install dig-app
+                    // expects to see it. Declining the login autostart declines the LOGIN entry.
+                    //
+                    // Never as a child of this process: the GUI installer is elevated (#610) and
+                    // dig-app is a per-user custody surface, so a high-integrity first run would seal
+                    // account state the normal-integrity login autostart cannot read back. `launch`
+                    // de-elevates — see its module docs for the measured integrity SIDs.
+                    log("Starting dig-app:");
+                    let l = launch::launch(
+                        &dig_app_path,
+                        target.os,
+                        registered_autostart,
+                        plan.dry_run,
+                    );
+                    log(&format!(
+                        "    {} {}",
+                        if l.launched { "✓" } else { "!" },
+                        l.note
+                    ));
+                    report.dig_app_launch = Some(l);
                 }
                 Err(e) if e.code() == "ASSET_NOT_FOUND" => {
                     log(&format!(
@@ -5313,6 +5350,7 @@ mod tests {
             firewall: None,
             beacon: None,
             autostart: None,
+            dig_app_launch: None,
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),

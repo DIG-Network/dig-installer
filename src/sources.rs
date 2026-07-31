@@ -49,6 +49,7 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
         ("health.rs", include_str!("health.rs")),
         ("hosts.rs", include_str!("hosts.rs")),
         ("invoker.rs", include_str!("invoker.rs")),
+        ("launch.rs", include_str!("launch.rs")),
         ("lib.rs", include_str!("lib.rs")),
         ("manifest.rs", include_str!("manifest.rs")),
         ("migrate.rs", include_str!("migrate.rs")),
