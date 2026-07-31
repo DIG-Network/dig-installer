@@ -846,7 +846,7 @@ fn remove_systemd_unit_file(scope: &[&str], unit: &str) -> Option<String> {
 ///
 /// Separated from [`plan_unit_file_removal`] so a test can drive the WHOLE decision →
 /// unlink path against a real file and observe that a path failing vetting is not deleted.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn apply_unit_file_removal(plan: &UnitFileRemoval) -> Option<String> {
     match plan {
         UnitFileRemoval::Nothing => None,
