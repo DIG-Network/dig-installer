@@ -380,17 +380,28 @@ mod tests {
         let (program, argument) =
             windows_launch_program(&PathBuf::from(r"C:\Program Files\DIG\bin\dig-app.exe"));
         assert_eq!(program, PathBuf::from(WINDOWS_LAUNCHER));
+        // Compared as STRINGS, not with `Path::ends_with`/`is_absolute`: those work on components, and
+        // a Windows path is one opaque component on a Linux runner (`\` is not a separator there), so
+        // the path assertions would fail for a reason unrelated to the property under test. The
+        // property is about a Windows path literal whichever host is asserting it.
+        let program_text = program.to_string_lossy();
         assert!(
-            program.ends_with("explorer.exe"),
-            "the de-elevation IS Explorer: {}",
-            program.display()
+            program_text.ends_with(r"\explorer.exe"),
+            "the de-elevation IS Explorer: {program_text}"
+        );
+        assert!(
+            !program_text.contains("dig-app"),
+            "dig-app must never be the program spawned: {program_text}"
         );
         assert_eq!(
             argument,
             PathBuf::from(r"C:\Program Files\DIG\bin\dig-app.exe"),
             "dig-app is Explorer's ARGUMENT, never the program spawned"
         );
-        assert!(program.is_absolute(), "never resolved through %PATH%");
+        assert!(
+            program_text.starts_with(r"C:\"),
+            "never resolved through %PATH%: {program_text}"
+        );
     }
 
     /// On unix, "start it now" and "start it at login" are one command against the artifact autostart
