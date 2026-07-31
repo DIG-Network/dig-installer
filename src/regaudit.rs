@@ -1329,6 +1329,13 @@ mod tests {
             other => panic!("{p} must be refused, got {other:?}"),
         };
 
+        // The path is inside an allowlisted directory and is a real unit file — but it is
+        // NOT the unit being deregistered, so it is somebody else's and must not be
+        // unlinked. A naive `remove_file(parsed)` deletes it.
+        assert!(
+            refusal("/etc/systemd/system/some-other.service", SYSTEM_UNIT_DIRS)
+                .contains("not named for the unit"),
+        );
         // A relative answer: nothing anchors it, so it could resolve anywhere.
         assert!(refusal("etc/systemd/system/dig-updater.timer", SYSTEM_UNIT_DIRS)
             .contains("not an absolute path"));
