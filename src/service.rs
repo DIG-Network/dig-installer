@@ -378,11 +378,24 @@ fn uninstall_engine_service(
     run: &mut Runner<'_>,
     probe: &mut ScopeProbe<'_>,
 ) -> Result<String, String> {
+    let scopes = svcscope::deregister_scopes(os);
     let mut attempt_errors = Vec::new();
-    for scope in svcscope::deregister_scopes(os) {
-        if let Err(e) = run_with_scope_compat(uninstall_args, scope, &BTreeMap::new(), run) {
+    for scope in &scopes {
+        if let Err(e) = run_with_scope_compat(uninstall_args, *scope, &BTreeMap::new(), run) {
             attempt_errors.push(format!("{}: {e}", scope.describe()));
         }
+    }
+    if attempt_errors.len() == scopes.len() {
+        // NOT tolerable, and not the same as "already absent": if EVERY scope's attempt failed we
+        // never deregistered anything, so a clean probe cannot distinguish "there was nothing there"
+        // from "we could not act, and could not ask either" (a missing launcher binary is exactly
+        // this state). Reporting an uninstall as complete here is the false-tick this crate refuses
+        // elsewhere too — see `lib.rs`'s launcher-gone branch.
+        return Err(format!(
+            "{label} could not be deregistered from ANY scope, so its state is UNKNOWN rather than \
+             removed{}",
+            format_attempt_errors(&attempt_errors)
+        ));
     }
 
     let residual: Vec<String> = svcscope::deregister_scopes(os)
@@ -1051,6 +1064,31 @@ mod tests {
         .expect("a clean end state is Ok despite the tool's exit code");
         assert!(note.contains("per-scope command errors"), "got: {note}");
         assert!(note.contains("no such unit"), "got: {note}");
+    }
+
+    /// A missing launcher (or any failure that hits EVERY scope) leaves the service's state
+    /// UNKNOWN, not removed — the same stance `lib.rs` takes for a launcher-gone uninstall.
+    ///
+    /// The probe reports NotFound everywhere, which is exactly the fixture on which the tempting
+    /// implementation ("the end state is clean, so we are done") is wrong: nothing was deregistered,
+    /// and on a host where the binary cannot even be run the probe is not authoritative either.
+    #[test]
+    fn a_failure_in_every_scope_is_unknown_state_not_a_clean_uninstall() {
+        let mut node = MockComponent::new(|_| {
+            Err("could not run /opt/dig/bin/dig-node: No such file or directory".to_string())
+        });
+        let err = uninstall_engine_service(
+            "dig-node",
+            Os::Linux,
+            &mut |a, e| node.run(a, e),
+            &mut |_| svc::ServiceRunState::NotFound,
+        )
+        .unwrap_err();
+        assert!(err.contains("state is UNKNOWN"), "got: {err}");
+        assert!(
+            err.contains("No such file"),
+            "the cause must be carried: {err}"
+        );
     }
 
     #[test]

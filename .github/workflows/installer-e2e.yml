@@ -216,6 +216,21 @@ jobs:
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.
+      # A CI runner is not an interactive desktop, and dig_ecosystem#919 makes the installer SKIP
+      # dig-app's login autostart on a host with no graphical session — correctly, since a tray agent
+      # has nowhere to appear and an `HKCU\…\Run` value written from Session 0 belongs to nobody who
+      # logs in. Both facts below are the ones the installer reads, named here so this job exercises
+      # the REGISTERING path (the write, its ownership, and the artifact location) rather than the
+      # skip. The skip itself is covered by `autostart::tests` for all three operating systems.
+      - name: Represent an interactive desktop session, so the autostart write path is exercised
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "SESSIONNAME=Console" >> "$GITHUB_ENV"
+          fi
+
       - name: Install (dig-node + dig-dns + the auto-update beacon, pinned versions)
         run: |
           $SUDO "$INSTALLER" \
@@ -253,24 +268,39 @@ jobs:
       # invisible -- autostart is best-effort, so `ready` stayed true while dig-app
       # would never start. A tray agent that installs and never launches is the failure
       # this contract exists to prevent, one layer over.
-      - name: Assert dig-app autostart registered (#1748)
+      - name: Assert dig-app autostart registered (#1748), or a REPORTED skip (#919)
         run: |
-          jq -e '.result.autostart.registered == true' install.json
           jq -c '.result.autostart' install.json
+          # Registered, or skipped for a stated reason — and NEVER "not registered with no reason",
+          # which is what a genuine registration failure looks like. The step above names a session,
+          # so a green run here is the REGISTERED arm; the disjunction exists so a runner image
+          # change surfaces as a legible outcome instead of an unexplained red.
+          jq -e '.result.autostart
+                 | (.registered == true and .disposition == "register")
+                   or (.registered == false
+                       and (.disposition == "skip-headless" or .disposition == "skip-no-target-user"))' install.json
+          # This job names a session, so the registering arm is the one that must be taken.
+          jq -e '.result.autostart.registered == true' install.json
+          jq -e '.result.autostart.disposition == "register"' install.json
 
       # And on Linux the artifact must really exist AND belong to the invoking user --
       # a unit root owns is one `systemd --user` declines to load, so ownership is part
       # of the property, not a nicety.
-      - name: (Linux) Assert the systemd user unit exists and is owned by the invoking user (#1748)
+      - name: (Linux) Assert the XDG autostart entry exists, is owned by the invoking user, and no stale unit remains
         if: runner.os == 'Linux'
         run: |
-          unit=/home/runner/.config/systemd/user/dig-app.service
-          ls -ldn "$unit" /home/runner/.config/systemd/user
-          test -f "$unit"
-          owner=$(stat -c %u "$unit")
-          test "$owner" = "$(id -u runner)"             || { echo "unit is owned by uid $owner, not by runner"; exit 1; }
-          dir_owner=$(stat -c %u /home/runner/.config/systemd/user)
-          test "$dir_owner" = "$(id -u runner)"             || { echo "unit DIR is owned by uid $dir_owner, not by runner"; exit 1; }
+          entry=/home/runner/.config/autostart/dig-app.desktop
+          ls -ldn "$entry" /home/runner/.config/autostart
+          test -f "$entry"
+          owner=$(stat -c %u "$entry")
+          test "$owner" = "$(id -u runner)"             || { echo "entry is owned by uid $owner, not by runner"; exit 1; }
+          dir_owner=$(stat -c %u /home/runner/.config/autostart)
+          test "$dir_owner" = "$(id -u runner)"             || { echo "entry DIR is owned by uid $dir_owner, not by runner"; exit 1; }
+          # #919: the mechanism must be one that STARTS something. A desktop entry is loaded at login
+          # with no enable step; the systemd user unit earlier versions wrote never was, so it must be
+          # gone rather than sitting alongside this and producing two agents at the next login.
+          grep -q '^Exec=' "$entry"
+          test ! -e /home/runner/.config/systemd/user/dig-app.service             || { echo "the stale systemd user unit is still present — two autostarts at next login"; exit 1; }
 
       - name: Assert the #493 fail-loud readiness verdict — both components ready
         run: |
@@ -292,6 +322,27 @@ jobs:
           jq -e '.result.install_root_security.secure == true' install.json
           jq -e '(.result.registration_audit | length) > 0' install.json
           jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
+
+      # dig_ecosystem#526: the registration's SCOPE and its reboot survival are now reported, so the
+      # e2e asserts them rather than only "installed". This leg passes `--bin-dir`, which is FORCED to
+      # user scope (#565: a machine-wide daemon must never be pointed at a caller-selected path), so
+      # the expected verdict here is user scope AND `survives_reboot: false` — stated positively, and
+      # from both sides, so a run that silently registered machine-wide from a caller-chosen root
+      # would FAIL here rather than look like an improvement.
+      - name: Assert the reported service scope matches the --bin-dir contract (#526)
+        if: runner.os != 'Windows'
+        run: |
+          jq -e '.result.service.scope == "user"' install.json
+          jq -e '.result.service.survives_reboot == false' install.json
+          jq -e '(.result.service.scope_note | length) > 0' install.json
+
+      # Windows has no per-user service domain, so the SCM registration is machine-wide and DOES
+      # survive a reboot with nobody logged in.
+      - name: Assert the reported service scope is machine-wide on Windows (#526)
+        if: runner.os == 'Windows'
+        run: |
+          jq -e '.result.service.scope == "system"' install.json
+          jq -e '.result.service.survives_reboot == true' install.json
 
       - name: Assert dig-node registered + RUNNING by canonical id, dig.local resolves
         run: |
