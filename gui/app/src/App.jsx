@@ -8,7 +8,7 @@ import { Installing } from "./steps/Installing.jsx";
 import { Finish } from "./steps/Finish.jsx";
 import { LanguageSelector } from "./i18n/LanguageSelector.jsx";
 import { FooterActions } from "./FooterActions.jsx";
-import { NOW_FILES } from "./data.jsx";
+import { NOW_FILES, defaultSelection } from "./data.jsx";
 import { computeSteps } from "./steps.js";
 import glowD from "./assets/logos/D-glow-logo.svg";
 import nebula from "./assets/logos/galaxy-background.webp";
@@ -53,24 +53,15 @@ export function App() {
   // Always start at Welcome — the installer never resumes a prior run's step.
   const [step, setStep] = useState(0);
   const [agreed, setAgreed] = useState(false);
-  // The core DIG stack (dig-node + dig-dns) is pre-selected — the one-click
-  // default path (digstore is always installed, added separately below). Per
-  // task #491, `dig-relay` defaults OFF (advanced/optional — the node already
-  // uses relay.dig.net) but stays user-checkable, and the DIG Browser is not
-  // offered (hidden in `data.jsx`), so it is absent here entirely. `open-firewall`
-  // (#424) and `auto-update` (#514) default ON, mirroring the CLI's default-on
-  // `open_firewall`/`auto_update`.
-  // The extension (#602/#611) is pre-checked; keeping it selected reveals the
-  // conditional Browsers step (see `steps` below) where the user picks which
-  // detected browsers get the managed extension.
-  const [sel, setSel] = useState({
-    "dig-node": true,
-    "dig-dns": true,
-    "dig-relay": false,
-    extension: true,
-    "open-firewall": true,
-    "auto-update": true,
-  });
+  // The pre-selected set IS the one-click default path, and every default lives in ONE place:
+  // the `data.jsx` catalogues. `defaultSelection()` derives this state from them, so `on` is
+  // load-bearing rather than duplicated here — see its doc comment for the drift that motivated
+  // it. dig-node, dig-app, dig-dns and the extension are `on: true`; digstore is `req`;
+  // `dig-relay` is `on: false` (#491); the DIG Browser is `hidden` and not offered at all; the
+  // options (`open-firewall` #424, `auto-update` #514, `dig-app-autostart`) default ON, mirroring
+  // the CLI's own default-on flags. The Rust side treats an ABSENT option key as its default too
+  // (`unwrap_or(&true)`), so the two agree.
+  const [sel, setSel] = useState(defaultSelection);
   const [installPath, setInstallPath] = useState("/usr/local/digstore");
   // Per-component Install/Update/Skip preview (#309) for the Components
   // screen — `null` while unchecked/loading, so the screen can distinguish

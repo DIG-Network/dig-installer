@@ -609,3 +609,32 @@ never at `/tmp`, and never at a system directory whose ownership the image may h
 
 Corollary worth keeping: when a check flags a CI machine, check whether the machine is actually
 misconfigured before weakening the check. In all three cases here the check was correct.
+
+### The same runner label varies between runs, and an assertion that names ONE legitimate shape reads the other as a bug
+
+Two follow-ons to the entry above, both of which turned a correct install into a red required check on
+PR #48 and cost a full diagnosis round.
+
+**1. `ubuntu-latest` is not one posture — it varies run to run.** `/usr/local/bin` arrived `root 777` on one
+run and `runner 777` on the next, 40 minutes apart, same workflow, same base commit. So "the image ships X"
+is not a fact a job may rely on even after observing X once. It follows that **a normalise step must pin
+every level the product actually inspects, not just the leaf**: `secure::verify_install_root` →
+`rootchain::verify` walks the WHOLE ancestor chain, so chowning `/usr/local/bin` while leaving `/usr` and
+`/usr/local` to the image leaves the verdict — and therefore the mechanism chosen downstream — decided by
+whichever image the run happened to get. Normalise the chain, and assert owner *and* mode afterwards.
+
+**2. When behaviour is a measured CHOICE between two correct shapes, assert per the reported shape — and
+assert both.** `paths::reachability_for()` returns `VeneerLinks` when the veneer chain is safe and
+`DirectPathEntry` when it is not; the fallback is #1748's own design, because refusing to install is a
+refusal and planting a link where an unprivileged account can write it is the escalation the task was
+about. A job asserting `test -L /usr/local/bin/<cli>` unconditionally therefore reported a *correct* safe
+fallback as a failure. The durable shape is: read the mechanism the run reported, assert the full
+requirement for that branch, hold the fallback branch to at least as much as the primary (so falling back
+never becomes the cheap way to green), and make an unrecognised/absent value **fail closed** — a `case`
+whose `*)` arm exits non-zero. A null mechanism silently matching no branch is the same class of defect as
+the `grep … | head` SIGPIPE skip (#1813).
+
+Litmus, and the thing to check before touching either side: **does the assertion still go RED against the
+behaviour the guard was written to catch?** Here, against v0.30.0's shape (everything in `/root/.dig/bin`,
+no `reachability` field) it goes red twice over — the unconditional placement assertion fails and the
+fail-closed arm fires. If retargeting a guard cannot be shown to preserve that, it is a weakening.

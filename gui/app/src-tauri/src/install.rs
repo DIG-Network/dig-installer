@@ -743,6 +743,13 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
 /// unit-tested directly without mocking the network or a service manager.
 fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::InstallPlan {
     let selected_on = |id: &str| *selected.get(id).unwrap_or(&false);
+    // dig-app is a CONTROL PANE over dig-node: it ships no engine, so without a node it can only
+    // ever report "no node". The GUI locks dig-node's checkbox while dig-app is checked
+    // (`Components.jsx`), but the UI is not the enforcement — this map arrives over the Tauri
+    // command boundary and a hand-built one could ask for the app with no engine. Deciding it here
+    // means the plan cannot express that combination at all.
+    let with_dig_app = selected_on("dig-app");
+    let with_dig_node = selected_on("dig-node") || with_dig_app;
     dig_installer::InstallPlan {
         // #610 (re-opened #565 LPE): the privileged, service-executed components
         // this plan installs — the LocalSystem dig-node/dig-dns/dig-relay
@@ -765,7 +772,7 @@ fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::Insta
         bin_dir: dig_installer::paths::default_bin_dir(),
         with_digstore: false,
         digstore_version: None,
-        with_dig_node: selected_on("dig-node"),
+        with_dig_node,
         dig_node_version: None,
         service: dig_installer::service::ServiceConfig::default(),
         with_browser: selected_on("browser"),
@@ -777,7 +784,7 @@ fn plan_from_selection(selected: &HashMap<String, bool>) -> dig_installer::Insta
         // GUI installs it into the user bin dir and registers a LOGIN autostart, not a
         // service. Its autostart follows the same absent-key-means-ON convention as the
         // options below.
-        with_dig_app: selected_on("dig-app"),
+        with_dig_app,
         dig_app_version: None,
         dig_app_autostart: *selected.get("dig-app-autostart").unwrap_or(&true),
         with_dig_dns: selected_on("dig-dns"),
@@ -1956,6 +1963,40 @@ mod plan_from_selection_tests {
         assert!(
             plan.auto_update,
             "the auto-update beacon defaults ON in the GUI, mirroring the CLI"
+        );
+    }
+
+    /// dig-app cannot be installed without dig-node, whatever the selection says.
+    ///
+    /// The app is a control pane over the node — it ships no engine, so an app-without-node install
+    /// produces something that can only report "no node". The GUI locks the box, but this map crosses
+    /// the Tauri command boundary, so the rule is enforced where the plan is built.
+    #[test]
+    fn selecting_dig_app_forces_dig_node_even_when_it_is_explicitly_deselected() {
+        let plan = plan_from_selection(&HashMap::from([
+            ("dig-app".to_string(), true),
+            ("dig-node".to_string(), false),
+        ]));
+        assert!(plan.with_dig_app, "the app was asked for");
+        assert!(
+            plan.with_dig_node,
+            "an explicit dig-node=false must NOT be honoured while dig-app is selected"
+        );
+    }
+
+    /// ...and the control: without dig-app, dig-node is whatever the user chose. Without this, a
+    /// blanket `with_dig_node: true` would satisfy the test above and silently install a node for
+    /// someone who deselected it.
+    #[test]
+    fn deselecting_dig_node_is_honoured_when_dig_app_is_not_selected() {
+        let plan = plan_from_selection(&HashMap::from([
+            ("dig-app".to_string(), false),
+            ("dig-node".to_string(), false),
+        ]));
+        assert!(!plan.with_dig_app);
+        assert!(
+            !plan.with_dig_node,
+            "with no dig-app there is nothing to force dig-node on"
         );
     }
 
