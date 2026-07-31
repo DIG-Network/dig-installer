@@ -552,6 +552,14 @@ pub struct InstallReport {
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
     /// when no legacy install was detected.
     pub migration: Option<migrate::MigrationResult>,
+    /// The record of restoring an auto-update schedule the #565 migration removed off a
+    /// legacy root on a run that did NOT select the beacon (dig_ecosystem#1854).
+    ///
+    /// `None` when there was nothing to restore. `applied: false` means the host is now
+    /// WITHOUT auto-updates and this run could not re-arm them — reported rather than
+    /// silent, but not a readiness failure: the beacon was not part of what this run was
+    /// asked to install.
+    pub beacon_rearm: Option<beacon::BeaconResult>,
     /// The post-registration binPath audit of every privileged DIG registration
     /// (#565 review — H1 backstop + H2b): each service / the SYSTEM beacon task's
     /// ACTUAL configured binary, read back from the OS, and whether it still
@@ -852,6 +860,7 @@ fn run_report_gated(
         veneer_links_removed: Vec::new(),
         preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
+        beacon_rearm: None,
         registration_audit: Vec::new(),
         install_manifest: None,
         ready: true,
@@ -884,6 +893,20 @@ fn run_report_gated(
             if migration.migrated {
                 report.migration = Some(migration);
             }
+            // #1854: the migration above vacates the beacon's daily schedule off the
+            //    legacy root independent of the plan, but only step 5 re-registers it —
+            //    and only when the beacon is selected. Restore it here for the runs step
+            //    5 will never reach, so declining the beacon can never mean "silently
+            //    turn this host's auto-updates off". `dry_run` is false by construction:
+            //    this whole block is gated on `!plan.dry_run`.
+            let rearm = rearm_beacon_after_migration(
+                report.migration.as_ref(),
+                plan.auto_update,
+                &target,
+                &mut |bin| beacon::register(bin, false),
+                log,
+            );
+            report.beacon_rearm = rearm;
             let protected = paths::protected_bin_dir();
             if let Err(e) = secure::ensure_protected_dir(target.os, &protected) {
                 log(&format!(
@@ -3016,6 +3039,68 @@ pub fn uninstall_beacon(
     result
 }
 
+/// Re-arm the auto-update beacon's daily schedule when the #565 legacy-root migration
+/// removed it and nothing later in this run will put it back (dig_ecosystem#1854).
+///
+/// The migration deregisters EVERY privileged registration whose binary resolves under a
+/// legacy user-writable root, INDEPENDENT of the current plan — that is the #565
+/// invariant and it must stay independent. But only the beacon install step
+/// ([`run_report_gated`] step 5) re-registers the schedule, and it runs only when the
+/// plan selects the beacon. So a re-run that DECLINES the beacon removed a working daily
+/// schedule and left nothing behind to restore it: declining the beacon is documented as
+/// "installs nothing", never "uninstall what is already there", so the host lost
+/// auto-updates without anyone asking for that — silently, since the migration log even
+/// claimed the registration would be re-created below.
+///
+/// Re-arming against the PROTECTED root is what makes the restore safe: the legacy
+/// binary is gone (the migration deleted it) and must never be executed anyway, so the
+/// schedule is registered against `<protected root>/dig-updater`. That also clears any
+/// lingering opt-out sentinel, because dig-updater treats an explicit `schedule install`
+/// as the operator asking for the schedule back.
+///
+/// `None` when there is nothing to do; otherwise the outcome — `applied: false` when the
+/// beacon could NOT be restored (typically: this host has no `dig-updater` in the
+/// protected root either, so the schedule is genuinely gone until the next install that
+/// selects the beacon). Never fatal: everything else in the run succeeded, and the state
+/// is REPORTED rather than swallowed.
+fn rearm_beacon_after_migration(
+    migration: Option<&migrate::MigrationResult>,
+    plan_installs_beacon: bool,
+    target: &Target,
+    register: &mut dyn FnMut(&std::path::Path) -> beacon::BeaconResult,
+    log: &mut dyn FnMut(&str),
+) -> Option<beacon::BeaconResult> {
+    if plan_installs_beacon {
+        return None; // step 5 registers it fresh, from the binary it just placed
+    }
+    if !migration_deregistered_the_beacon(migration?) {
+        return None; // this host's schedule was never touched — nothing to restore
+    }
+
+    let bin = paths::protected_bin_dir().join(target.exe_name("dig-updater"));
+    log("Re-arming the auto-update beacon's daily schedule the migration removed (#1854):");
+    let result = register(&bin);
+    if result.applied {
+        log(&format!("    ✓ {}", result.note));
+    } else {
+        log(&format!(
+            "    ! auto-updates are now DISABLED on this host: the daily schedule was removed off \
+             the legacy root and could not be re-armed ({}). Re-run the installer with the \
+             auto-update beacon enabled to restore it.",
+            result.note
+        ));
+    }
+    Some(result)
+}
+
+/// Did the #565 migration deregister the auto-update beacon's schedule, as opposed to
+/// only a service? Pure — compares against the beacon registration's OWN label rather
+/// than a string literal, so renaming the label cannot silently un-match.
+fn migration_deregistered_the_beacon(migration: &migrate::MigrationResult) -> bool {
+    let beacon_label = regaudit::PrivilegedReg::Beacon.label();
+    migration.deregistered.iter().any(|d| d == beacon_label)
+}
+
 /// The production [`uninstall::UninstallActions`] — wires the real per-component
 /// teardown functions behind the injectable action interface so the whole-stack
 /// `uninstall` orchestration ([`uninstall::orchestrate`]) can drive them while
@@ -5099,6 +5184,7 @@ mod tests {
             veneer_links_removed: Vec::new(),
             preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
+            beacon_rearm: None,
             registration_audit: Vec::new(),
             install_manifest: None,
             ready: true,
@@ -6938,5 +7024,150 @@ mod tests {
                 "{app} is exempt from the version probe but is not checked at all"
             );
         }
+    }
+}
+
+/// An installer re-run must never leave a host with auto-updates disabled
+/// (dig_ecosystem#1854).
+///
+/// The #565 migration deregisters the beacon's daily schedule off a legacy root
+/// INDEPENDENT of the current plan, but only the beacon install step re-registers it —
+/// and only when the plan selects the beacon. These tests pin the re-arm that closes
+/// that gap, and pin it against the nearest wrong implementations: re-arming a beacon
+/// the migration never touched, re-arming twice, or re-arming the LEGACY binary the
+/// migration just deleted.
+#[cfg(test)]
+mod beacon_rearm {
+    use super::*;
+
+    /// A migration record that deregistered exactly `labels`.
+    fn migration_deregistering(labels: &[&str]) -> migrate::MigrationResult {
+        migrate::MigrationResult {
+            migrated: true,
+            deregistered: labels.iter().map(|l| (*l).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The beacon registration's own label — never a literal, so a label change can
+    /// not silently make these tests match nothing.
+    fn beacon_label() -> &'static str {
+        regaudit::PrivilegedReg::Beacon.label()
+    }
+
+    /// A `dig-node` service label — a truthful control actor: a migration that
+    /// deregistered a SERVICE must not make the installer arm a schedule that was
+    /// never there.
+    const SERVICE_LABEL: &str = "dig-node service";
+
+    /// Drive [`rearm_beacon_after_migration`], recording every path `register` was
+    /// asked to arm.
+    fn rearm(
+        migration: Option<&migrate::MigrationResult>,
+        plan_installs_beacon: bool,
+        outcome: bool,
+    ) -> (Option<beacon::BeaconResult>, Vec<PathBuf>, Vec<String>) {
+        let target = Target::current().expect("a supported host target");
+        let mut armed = Vec::new();
+        let mut lines = Vec::new();
+        let result = rearm_beacon_after_migration(
+            migration,
+            plan_installs_beacon,
+            &target,
+            &mut |bin| {
+                armed.push(bin.to_path_buf());
+                beacon::BeaconResult {
+                    applied: outcome,
+                    note: if outcome {
+                        "registered the daily update-check scheduler".to_string()
+                    } else {
+                        "could not run `dig-updater schedule install`: not found".to_string()
+                    },
+                }
+            },
+            &mut |line| lines.push(line.to_string()),
+        );
+        (result, armed, lines)
+    }
+
+    /// THE regression: a re-run that declines the beacon, on a host whose schedule the
+    /// migration just deregistered off the legacy root, must re-arm it — the user asked
+    /// for an upgrade, not for auto-updates to be turned off.
+    #[test]
+    fn a_declining_rerun_rearms_the_schedule_the_migration_removed() {
+        let migration = migration_deregistering(&[SERVICE_LABEL, beacon_label()]);
+        let (result, armed, _) = rearm(Some(&migration), false, true);
+        assert_eq!(
+            armed.len(),
+            1,
+            "the removed daily schedule must be re-armed exactly once: {armed:?}"
+        );
+        assert!(
+            result.is_some_and(|r| r.applied),
+            "the re-arm outcome must be reported, never silent"
+        );
+    }
+
+    /// The re-arm targets the PROTECTED root — never the legacy binary the migration
+    /// just deleted, and never executes it (#565's cardinal rule).
+    #[test]
+    fn the_rearm_registers_the_protected_root_binary() {
+        let migration = migration_deregistering(&[beacon_label()]);
+        let (_, armed, _) = rearm(Some(&migration), false, true);
+        let expected = paths::protected_bin_dir()
+            .join(Target::current().expect("target").exe_name("dig-updater"));
+        assert_eq!(armed, vec![expected], "the re-arm must use the protected root");
+    }
+
+    /// A migration that deregistered only a SERVICE must not arm a schedule this host
+    /// never had — the truthful control that separates the real fix from "always arm
+    /// the beacon when the plan declines it".
+    #[test]
+    fn a_migration_that_never_touched_the_beacon_arms_nothing() {
+        let migration = migration_deregistering(&[SERVICE_LABEL]);
+        let (result, armed, _) = rearm(Some(&migration), false, true);
+        assert!(armed.is_empty(), "nothing to restore: {armed:?}");
+        assert!(result.is_none());
+    }
+
+    /// When the plan DOES install the beacon, the install step registers it fresh —
+    /// arming it here too would be a double registration from a path that may not hold
+    /// the freshly-downloaded binary yet.
+    #[test]
+    fn a_run_that_installs_the_beacon_leaves_the_registration_to_the_install_step() {
+        let migration = migration_deregistering(&[beacon_label()]);
+        let (result, armed, _) = rearm(Some(&migration), true, true);
+        assert!(armed.is_empty(), "the install step owns this: {armed:?}");
+        assert!(result.is_none());
+    }
+
+    /// No migration at all → nothing was removed, so nothing is re-armed.
+    #[test]
+    fn no_migration_arms_nothing() {
+        let (result, armed, _) = rearm(None, false, true);
+        assert!(armed.is_empty());
+        assert!(result.is_none());
+    }
+
+    /// A re-arm that FAILS (no dig-updater in the protected root either) is reported
+    /// LOUDLY and tells the user how to restore auto-updates — the whole defect was
+    /// that this state was silent.
+    #[test]
+    fn a_failed_rearm_says_auto_updates_are_disabled_and_how_to_restore_them() {
+        let migration = migration_deregistering(&[beacon_label()]);
+        let (result, _, lines) = rearm(Some(&migration), false, false);
+        assert!(
+            result.is_some_and(|r| !r.applied),
+            "a failed re-arm must still be reported"
+        );
+        let log = lines.join("\n");
+        assert!(
+            log.contains("auto-updates are now DISABLED"),
+            "the user must be told: {log}"
+        );
+        assert!(
+            log.contains("Re-run the installer"),
+            "the user must be told how to restore it: {log}"
+        );
     }
 }
