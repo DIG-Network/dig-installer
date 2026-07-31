@@ -10,7 +10,14 @@
 //! The install runs on a background thread so the UI stays responsive while it
 //! streams `install://progress` / `install://error` / `install://done`.
 
+pub mod cli;
 mod install;
+mod uninstall_entry;
+
+/// The headless whole-stack teardown the Add/Remove Programs Uninstall button
+/// runs (#854). Re-exported so `main.rs` can dispatch to it — BEFORE any Tauri
+/// WebView is created — when this executable is invoked with `--uninstall`.
+pub use uninstall_entry::run_uninstall;
 
 /// The headless privileged-install entrypoint the root `pkexec` child runs on
 /// Linux (#638). Re-exported so `main.rs` can dispatch to it — BEFORE any Tauri
