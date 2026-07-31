@@ -638,3 +638,4 @@ Litmus, and the thing to check before touching either side: **does the assertion
 behaviour the guard was written to catch?** Here, against v0.30.0's shape (everything in `/root/.dig/bin`,
 no `reachability` field) it goes red twice over — the unconditional placement assertion fails and the
 fail-closed arm fires. If retargeting a guard cannot be shown to preserve that, it is a weakening.
+
