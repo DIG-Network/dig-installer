@@ -633,6 +633,11 @@ pub struct RelayResult {
     pub survives_reboot: bool,
     /// Human-readable detail behind [`Self::survives_reboot`] — never silent.
     pub scope_note: String,
+    /// Per-user units this run REMOVED because they would shadow the system-scope registration
+    /// (dig_ecosystem#526), mirroring [`ServiceResult::shadowing_units_removed`]. The relay has the
+    /// same collision the node does: a leftover `systemd --user` unit starts a second relay at the
+    /// next login, competing for the relay's port.
+    pub shadowing_units_removed: Vec<String>,
 }
 
 /// The `--json` schema version. Bump on a breaking change to the payload shape.
@@ -1810,7 +1815,7 @@ fn retract_service_rearm_claims(
         }
         record.applied = false;
         record.note = format!(
-            "{} — then REMOVED again by the rollback of this failed install, so {} is unregistered              on this host; restore it with `{}`",
+            "{} — then REMOVED again by the rollback of this failed install, so {} is \n             unregistered on this host; restore it with `{}`",
             record.note, service.label, service.restore_command
         );
         log(&format!("    ↩ {}", record.note));
@@ -2066,7 +2071,7 @@ fn link_protected_clis(
             let removed = paths::remove_veneer_links(&names, target.os);
             if removed.is_empty() {
                 log(&format!(
-                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the                      protected root is on PATH directly instead",
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, \n                     so the protected root is on PATH directly instead",
                     paths::UNIX_MACHINE_BIN_DIR
                 ));
             } else {
@@ -2671,6 +2676,7 @@ fn register_relay(
         scope,
         survives_reboot: false,
         scope_note: String::new(),
+        shadowing_units_removed: Vec::new(),
     };
 
     if plan.dry_run {
@@ -2695,6 +2701,16 @@ fn register_relay(
             result.scope_note = reboot_survival_note("dig-relay", &outcome);
             log(&format!("    · {}", result.scope_note));
             result.note = outcome.note;
+            // Same sweep the node path owes: registering the system unit does not stop a leftover
+            // per-user relay unit from being started at the next login (#526 review, finding 2).
+            let existing =
+                units::existing_units(target.os, svc::DIG_RELAY_SERVICE_ID, &user_config_homes());
+            result.shadowing_units_removed = remove_shadowing_units(
+                target.os,
+                svcscope::settled_scope(scope, svcscope::RegistrationConclusion::Registered),
+                &existing,
+                log,
+            );
         }
         Err(e) => {
             // Service install can need elevation (Windows SCM). Best-effort: surface it, do NOT
@@ -2999,6 +3015,11 @@ fn register_dig_node(
     }
 
     let existing = units::existing_units(target.os, svc::DIG_NODE_SERVICE_ID, &user_config_homes());
+    // How this run ends up with a registration in place. Every arm below sets it, and the shadowing
+    // sweep is performed ONCE afterwards from this single value — so an arm cannot conclude "a
+    // registration is in place" and silently skip the sweep, which is how adoption came to leave a
+    // colliding per-user unit behind (#526 review, finding 2).
+    let mut conclusion: Option<svcscope::RegistrationConclusion> = None;
     if svcscope::engine_registration(target.os, scope, &existing)
         == svcscope::EngineRegistration::AdoptPackaged
     {
@@ -3014,6 +3035,7 @@ fn register_dig_node(
             .to_string();
         result.note = result.scope_note.clone();
         log(&format!("    · {}", result.scope_note));
+        conclusion = Some(svcscope::RegistrationConclusion::AdoptedPackaged);
     } else if decision.action == update::UpdateAction::Skip {
         // Already up to date: leave the registered service exactly as it is
         // rather than bouncing it via a needless `install`/`start`. The
@@ -3026,6 +3048,7 @@ fn register_dig_node(
             decision.latest_version
         );
         log(&format!("    · {}", result.note));
+        conclusion = Some(svcscope::RegistrationConclusion::LeftAsIs);
     } else {
         match service::install_service(dig_node_path, &plan.service, target.os, scope) {
             Ok(outcome) => {
@@ -3036,8 +3059,7 @@ fn register_dig_node(
                 result.scope_note = reboot_survival_note("dig-node", &outcome);
                 log(&format!("    · {}", result.scope_note));
                 result.note = outcome.note;
-                result.shadowing_units_removed =
-                    remove_shadowing_units(target.os, outcome.requested_scope, &existing, log);
+                conclusion = Some(svcscope::RegistrationConclusion::Registered);
             }
             Err(e) => {
                 // Service install can need elevation (Windows SCM). Best-effort:
@@ -3050,6 +3072,17 @@ fn register_dig_node(
                 result.note = e;
             }
         }
+    }
+
+    // The single sweep, for whichever way the run concluded. A failed install sets no conclusion, so
+    // nothing is deleted on the strength of a registration that was never established.
+    if let Some(conclusion) = conclusion {
+        result.shadowing_units_removed = remove_shadowing_units(
+            target.os,
+            svcscope::settled_scope(scope, conclusion),
+            &existing,
+            log,
+        );
     }
 
     // dig.local hosts entry — best-effort, never aborts (task #91, installer

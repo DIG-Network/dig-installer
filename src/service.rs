@@ -157,8 +157,13 @@ pub fn install_service(
 /// real service manager.
 type Runner<'a> = dyn FnMut(&[String], &BTreeMap<String, String>) -> Result<(), String> + 'a;
 
-/// A scope-explicit "is anything registered here?" probe.
-type ScopeProbe<'a> = dyn FnMut(ServiceScope) -> svc::Presence + 'a;
+/// A scope-explicit "is anything registered here, and will anything start it?" probe.
+///
+/// It yields a [`svc::ScopeRegistration`] rather than a bare boolean because the probe is FALLIBLE:
+/// `systemctl --user` under `sudo` cannot reach a session bus at all, and collapsing that into
+/// "nothing is registered here" is what let an uninstall claim it had cleared a scope it never
+/// managed to ask (dig_ecosystem#526 review, A5).
+type ScopeProbe<'a> = dyn FnMut(ServiceScope) -> svc::ScopeRegistration + 'a;
 
 /// The shared scoped registration for the engine components (dig-node,
 /// dig-relay) — one implementation of the scope contract, the compat fallback
@@ -201,12 +206,15 @@ fn install_engine_service(
     let reboot_survival = svcscope::survives_reboot_without_login(os, effective_scope);
     if !scope_flag_accepted && effective_scope != scope {
         note.push_str(&format!(
-            " — but this {label} build does not understand `--scope`, so it registered in {}              instead, which only starts once someone LOGS IN. The service will NOT come back on its              own after a reboot until {label} is updated",
+            " — but this {label} build does not understand `--scope`, so it registered in {} \
+             instead, which only starts once someone LOGS IN. The service will NOT come back on \
+             its own after a reboot until {label} is updated",
             effective_scope.describe()
         ));
     } else if !scope_flag_accepted {
         note.push_str(&format!(
-            " (this {label} build does not understand `--scope`; on this OS its own default is the              same {}, so the registration is unaffected)",
+            " (this {label} build does not understand `--scope`; on this OS its own default is the \
+             same {}, so the registration is unaffected)",
             effective_scope.describe()
         ));
     }
@@ -256,18 +264,22 @@ fn tolerate_install_failure_only_if_already_registered(
     probe: &mut ScopeProbe<'_>,
 ) -> Result<String, String> {
     let existing = probe(scope);
-    match existing {
+    match existing.presence {
         svc::Presence::Present => Ok(format!(
             "{label} install did not complete cleanly ({error}); tolerated because a registration \
-             already exists in {} ({})",
+             already exists in {} ({}; {})",
             scope.describe(),
-            existing.describe(label)
+            existing.presence.describe(label),
+            existing.detail
         )),
+        // Unknown is refused for the same reason Absent is: tolerating the failure requires POSITIVE
+        // evidence of an existing registration, and "I could not ask" is not that.
         svc::Presence::Absent | svc::Presence::Unknown => Err(format!(
             "{label} could not be registered in {} ({error}), and no existing registration was \
-             found there ({}). {label} will NOT start on this machine",
+             found there ({}; {}). {label} will NOT start on this machine",
             scope.describe(),
-            existing.describe(label)
+            existing.presence.describe(label),
+            existing.detail
         )),
     }
 }
@@ -414,11 +426,28 @@ fn uninstall_engine_service(
     let mut residual = Vec::new();
     let mut unverified = Vec::new();
     for scope in &scopes {
-        match probe(*scope) {
-            svc::Presence::Present => residual.push(scope.describe().to_string()),
+        let reading = probe(*scope);
+        match reading.presence {
+            // A leftover that is `masked`/`disabled` is still a failed uninstall — the registration
+            // is there — but the operator is told whether it will actually START again, because
+            // "still registered and enabled" and "still registered but inert" are very different
+            // amounts of trouble.
+            svc::Presence::Present => residual.push(format!(
+                "{} ({}{})",
+                scope.describe(),
+                reading.detail,
+                if reading.starts_without_login() {
+                    ", and it WILL start again"
+                } else {
+                    ""
+                }
+            )),
             // Reported, never silently counted as removed — but not a failure either: the attempt
-            // succeeded and the scope simply could not be read back.
-            svc::Presence::Unknown => unverified.push(scope.describe().to_string()),
+            // succeeded and the scope simply could not be read back. The detail is carried so the
+            // operator learns WHY (a missing session bus reads very differently from a timeout).
+            svc::Presence::Unknown => {
+                unverified.push(format!("{} ({})", scope.describe(), reading.detail))
+            }
             svc::Presence::Absent => {}
         }
     }
@@ -910,7 +939,7 @@ mod tests {
             ServiceScope::System,
             &BTreeMap::new(),
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::Presence::Absent,
+            &mut |_| svc::ScopeRegistration::absent("test: no registration in this scope"),
         )
         .unwrap_err();
 
@@ -949,8 +978,12 @@ mod tests {
             &mut |scope| {
                 probed.push(scope);
                 match scope {
-                    ServiceScope::System => svc::Presence::Absent,
-                    ServiceScope::User => svc::Presence::Present,
+                    ServiceScope::System => {
+                        svc::ScopeRegistration::absent("test: no registration in this scope")
+                    }
+                    ServiceScope::User => {
+                        svc::ScopeRegistration::enabled("test: an enabled registration is here")
+                    }
                 }
             },
         )
@@ -988,7 +1021,7 @@ mod tests {
             ServiceScope::System,
             &BTreeMap::new(),
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::Presence::Present,
+            &mut |_| svc::ScopeRegistration::enabled("test: an enabled registration is here"),
         )
         .expect("an existing registration at the requested scope tolerates the failure");
         assert!(outcome
@@ -1016,7 +1049,7 @@ mod tests {
             ServiceScope::System,
             &BTreeMap::new(),
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::Presence::Unknown,
+            &mut |_| svc::ScopeRegistration::unknown("test: this scope could not be queried"),
         )
         .unwrap_err();
         assert!(
@@ -1055,7 +1088,7 @@ mod tests {
             let mut node = MockComponent::ok();
             let note =
                 uninstall_engine_service("dig-node", os, &mut |a, e| node.run(a, e), &mut |_| {
-                    svc::Presence::Absent
+                    svc::ScopeRegistration::absent("test: no registration in this scope")
                 })
                 .expect("nothing left registered ⇒ Ok");
             let issued: Vec<Vec<String>> =
@@ -1081,6 +1114,57 @@ mod tests {
         }
     }
 
+    /// Finding 3, end to end: a scope the uninstall could NOT ASK must never be reported as cleared.
+    ///
+    /// The probe here runs the REAL classifier over the REAL message `systemctl --user is-enabled`
+    /// prints under `sudo` — the composition is the point. A hand-built `Unknown` would keep passing
+    /// if [`svc::classify_systemctl_is_enabled`] regressed to substring-matching "No such file or
+    /// directory" back into `Absent`, which is the exact bug: that phrase appears in BOTH the
+    /// missing-unit reply and the bus failure.
+    ///
+    /// Only the USER scope is made unaskable; the system scope answers honestly absent. That control
+    /// matters — if BOTH scopes were unaskable the run would take the "could not deregister from ANY
+    /// scope" early return and the test would never reach the reporting code under test.
+    #[test]
+    fn a_scope_that_could_not_be_queried_is_reported_unverified_never_as_cleared() {
+        const BUS_FAILURE: &str = "Failed to connect to bus: No such file or directory";
+        let mut node = MockComponent::ok();
+        let note = uninstall_engine_service(
+            "dig-node",
+            Os::Linux,
+            &mut |a, e| node.run(a, e),
+            &mut |scope| match scope {
+                // Unaskable: no session bus under sudo. Classified by production code, not by hand.
+                ServiceScope::User => svc::classify_systemctl_is_enabled("", BUS_FAILURE, false),
+                // The honest control: this scope really did answer, and really is empty.
+                ServiceScope::System => svc::classify_systemctl_is_enabled(
+                    "",
+                    "Failed to get unit file state for dignetwork-dig-node.service: No such file \
+                     or directory",
+                    false,
+                ),
+            },
+        )
+        .expect("an unverifiable scope is not a failure — the uninstall attempt itself succeeded");
+
+        assert!(
+            note.contains("could not verify"),
+            "the scope that could not be asked must be named as unverified, got: {note}"
+        );
+        assert!(
+            note.contains("per-user scope"),
+            "the unverified scope must be named specifically, got: {note}"
+        );
+        assert!(
+            !note.contains("machine-wide"),
+            "the scope that DID answer must not be listed as unverified, got: {note}"
+        );
+        assert!(
+            note.contains("Failed to connect to bus"),
+            "the reason must reach the operator, got: {note}"
+        );
+    }
+
     #[test]
     fn a_scope_that_still_holds_a_registration_fails_the_uninstall_and_is_named() {
         // The end STATE is authoritative, not the verbs' exit codes — and only ONE scope is dirty
@@ -1093,8 +1177,14 @@ mod tests {
             &mut |a, e| node.run(a, e),
             &mut |scope| match scope {
                 // A DISABLED unit is still a registration — the arm a run-state probe got wrong.
-                ServiceScope::User => svc::Presence::Present,
-                ServiceScope::System => svc::Presence::Absent,
+                ServiceScope::User => svc::ScopeRegistration {
+                    presence: svc::Presence::Present,
+                    boot_enabled: svc::BootEnablement::NotEnabled,
+                    detail: "test: systemd reports `disabled`".to_string(),
+                },
+                ServiceScope::System => {
+                    svc::ScopeRegistration::absent("test: no registration in this scope")
+                }
             },
         )
         .unwrap_err();
@@ -1121,7 +1211,7 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::Presence::Absent,
+            &mut |_| svc::ScopeRegistration::absent("test: no registration in this scope"),
         )
         .expect("a clean end state is Ok despite the tool's exit code");
         assert!(note.contains("per-scope command errors"), "got: {note}");
@@ -1143,7 +1233,7 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::Presence::Absent,
+            &mut |_| svc::ScopeRegistration::absent("test: no registration in this scope"),
         )
         .unwrap_err();
         assert!(err.contains("state is UNKNOWN"), "got: {err}");
@@ -1168,7 +1258,7 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::Presence::Absent,
+            &mut |_| svc::ScopeRegistration::absent("test: no registration in this scope"),
         )
         .expect("the unflagged retries succeed");
         let unflagged = node

@@ -595,7 +595,7 @@ mod tests {",
                 let argument = line.split(AMBIENT).nth(1).unwrap_or_default();
                 assert!(
                     argument.contains("is_root"),
-                    "{file} decides a privilege boundary with `{}` instead of reading the effective                      uid. A literal (or any value not derived from `is_root()`) hardcodes the answer,                      which is precisely the defect #1748 fixed - the old predicate returned `false` in                      the macOS GUI's root child while running as uid 0.",
+                    "{file} decides a privilege boundary with `{}` instead of reading the effective \n                     uid. A literal (or any value not derived from `is_root()`) hardcodes the \n                     answer, which is precisely the defect #1748 fixed - the old predicate \n                     returned `false` in the macOS GUI's root child while running as uid 0.",
                     argument.trim()
                 );
                 wired.push(file);
@@ -620,7 +620,7 @@ mod tests {",
             let found = wired.iter().filter(|f| **f == file).count();
             assert_eq!(
                 found, count,
-                "{file} should read the effective uid at {count} decision point(s), found {found}.                  Removing one silently reverts that site to assuming it is unelevated; adding one means                  this list needs updating deliberately."
+                "{file} should read the effective uid at {count} decision point(s), found {found}. \n                 Removing one silently reverts that site to assuming it is unelevated; adding \n                 one means this list needs updating deliberately."
             );
         }
         assert_eq!(

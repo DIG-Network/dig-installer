@@ -261,6 +261,40 @@ pub fn shadowing_units_to_remove(
         .collect()
 }
 
+/// How a run ended up with an engine registration in place.
+///
+/// The three routes look very different in the log and are IDENTICAL in the one way that matters
+/// here: none of them removes a per-user unit that was already on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationConclusion {
+    /// This run delegated to the component's own `install` and created the registration.
+    Registered,
+    /// This run adopted an already-enabled packaged system unit ([`EngineRegistration::AdoptPackaged`]).
+    AdoptedPackaged,
+    /// The component was already up to date, so the existing registration was left untouched.
+    LeftAsIs,
+}
+
+/// The scope whose registration will actually SERVE this host once the run concludes.
+///
+/// # Why every conclusion owes the same shadowing sweep
+///
+/// Adopting a packaged system unit — or leaving an up-to-date one alone — settles on a registration
+/// just as firmly as creating one, and NEITHER makes a leftover `~/.config/systemd/user` unit stop
+/// existing. `systemd --user` still starts it at the next login, alongside the system unit, and both
+/// bind the node's port. Concluding "the right unit is now in place" is not the same as concluding
+/// "the right unit WINS": precedence has to be established positionally, by clearing what outranks
+/// the settled registration in a user session (dig_ecosystem#526 review, finding 2).
+///
+/// Adoption only ever happens at system scope ([`engine_registration`]), so that is the scope it
+/// settles on regardless of what the run originally requested.
+pub fn settled_scope(requested: ServiceScope, conclusion: RegistrationConclusion) -> ServiceScope {
+    match conclusion {
+        RegistrationConclusion::AdoptedPackaged => ServiceScope::System,
+        RegistrationConclusion::Registered | RegistrationConclusion::LeftAsIs => requested,
+    }
+}
+
 /// Adopt an already-ENABLED packaged system unit rather than registering a second one.
 ///
 /// apt.dig.net's `.deb` ships `net.dignetwork.dig-node.service` and enables it. Delegating
@@ -579,6 +613,77 @@ mod tests {
         assert!(
             shadowing_units_to_remove(Os::Windows, ServiceScope::System, &mixed_units()).is_empty()
         );
+    }
+
+    // -- settled_scope: adopting/skipping still owes the sweep ---------------------------------
+
+    /// Finding 2: the host the reviewer described — the apt.dig.net `.deb`'s ENABLED packaged system
+    /// unit PLUS a leftover `~/.config/systemd/user` unit. That is exactly `mixed_units()`, and it is
+    /// the fixture that can see the bug: adoption concludes "a system registration is in place" while
+    /// two per-user units remain, so `systemd --user` starts a second dig-node at the next login and
+    /// both bind the node's port.
+    ///
+    /// The property under test is that ADOPTING and LEAVING-AS-IS settle on a scope whose shadowers
+    /// are still owed a sweep — not merely that some sweep exists somewhere.
+    #[test]
+    fn adopting_or_leaving_a_registration_still_owes_the_shadowing_sweep() {
+        let units = mixed_units();
+        // Precondition: this fixture really is the adopt case, so the test cannot pass vacuously by
+        // exercising the ordinary Delegate path.
+        assert_eq!(
+            engine_registration(Os::Linux, ServiceScope::System, &units),
+            EngineRegistration::AdoptPackaged,
+            "fixture must exhibit the adopt case for this test to mean anything"
+        );
+
+        for conclusion in [
+            RegistrationConclusion::Registered,
+            RegistrationConclusion::AdoptedPackaged,
+            RegistrationConclusion::LeftAsIs,
+        ] {
+            let settled = settled_scope(ServiceScope::System, conclusion);
+            assert_eq!(settled, ServiceScope::System, "{conclusion:?}");
+            assert_eq!(
+                shadowing_units_to_remove(Os::Linux, settled, &units),
+                vec![
+                    PathBuf::from("/home/alice/.config/systemd/user/dignetwork-dig-node.service"),
+                    PathBuf::from("/root/.config/systemd/user/dignetwork-dig-node.service"),
+                ],
+                "{conclusion:?}: a settled system registration does not make a per-user unit stop \
+                 winning the user session — it must be cleared positionally"
+            );
+        }
+    }
+
+    /// Adoption is a SYSTEM-scope conclusion even though the run may have asked for something else,
+    /// because that is the only scope a packaged unit is ever adopted at. The control keeps the
+    /// mapping honest: a plain user-scope registration must NOT be promoted to system, or the sweep
+    /// would delete the very unit that run just wrote.
+    #[test]
+    fn adoption_settles_on_system_while_a_user_registration_stays_user() {
+        assert_eq!(
+            settled_scope(ServiceScope::User, RegistrationConclusion::AdoptedPackaged),
+            ServiceScope::System
+        );
+        for conclusion in [
+            RegistrationConclusion::Registered,
+            RegistrationConclusion::LeftAsIs,
+        ] {
+            assert_eq!(
+                settled_scope(ServiceScope::User, conclusion),
+                ServiceScope::User,
+                "{conclusion:?}"
+            );
+            assert!(
+                shadowing_units_to_remove(
+                    Os::Linux,
+                    settled_scope(ServiceScope::User, conclusion),
+                    &mixed_units()
+                )
+                .is_empty(),
+                "{conclusion:?}: a user-scope run must never sweep the unit it just wrote"
+            );
+        }
     }
 
     // -- engine_registration: adopt the packaged unit ------------------------------------------

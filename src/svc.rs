@@ -247,6 +247,72 @@ impl Presence {
     }
 }
 
+/// Will a registration be STARTED without a login — the boot/login enablement, which is a DIFFERENT
+/// fact from presence.
+///
+/// Conflating the two is how a `masked` unit — one that can never start at all — came to be reported
+/// as "will start again on its own after a reboot". Presence answers "does a registration exist
+/// here?"; this answers "will anything start it?". Reboot survival is derived from THIS, never from
+/// presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootEnablement {
+    /// Linked for automatic start (systemd `enabled`, SCM `AUTO_START`, a loaded system LaunchDaemon).
+    Enabled,
+    /// The registration exists but nothing will start it automatically — systemd `disabled`,
+    /// `static`, `indirect`, or `masked` (which can never start at all); SCM `DEMAND_START`/
+    /// `DISABLED`.
+    NotEnabled,
+    /// Could not be determined. Never silently treated as either — a claim of reboot survival
+    /// requires positive evidence.
+    Unknown,
+}
+
+/// A scope-explicit registration reading: does it exist here, and will anything start it?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRegistration {
+    /// Does a registration exist in this scope?
+    pub presence: Presence,
+    /// Will it be started without a login?
+    pub boot_enabled: BootEnablement,
+    /// The raw verdict this was read from (`enabled`, `masked`, `AUTO_START`, the error text) —
+    /// carried so every note can say WHY rather than only what.
+    pub detail: String,
+}
+
+impl ScopeRegistration {
+    /// A reading that could not be taken at all.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        ScopeRegistration {
+            presence: Presence::Unknown,
+            boot_enabled: BootEnablement::Unknown,
+            detail: detail.into(),
+        }
+    }
+
+    /// A definitively-present reading for a registration that WILL start on its own.
+    pub fn enabled(detail: impl Into<String>) -> Self {
+        ScopeRegistration {
+            presence: Presence::Present,
+            boot_enabled: BootEnablement::Enabled,
+            detail: detail.into(),
+        }
+    }
+
+    /// A definitively-absent reading.
+    pub fn absent(detail: impl Into<String>) -> Self {
+        ScopeRegistration {
+            presence: Presence::Absent,
+            boot_enabled: BootEnablement::NotEnabled,
+            detail: detail.into(),
+        }
+    }
+
+    /// Is this registration one that will start on its own, positively established?
+    pub fn starts_without_login(&self) -> bool {
+        self.boot_enabled == BootEnablement::Enabled
+    }
+}
+
 /// Is service `id` REGISTERED in one explicit scope, on the current host?
 ///
 /// The scope-blind [`service_run_state`] answers "is it running ANYWHERE?", which is right for a
@@ -263,16 +329,22 @@ impl Presence {
 /// completed uninstall as residual. Linux therefore asks `is-enabled`, whose vocabulary distinguishes
 /// an existing unit (`enabled`/`disabled`/`static`/`masked`/…) from a missing one ("No such file or
 /// directory"). Found by the installer-e2e on ubuntu, run 30645063625.
-pub fn registration_in_scope(id: &str, scope: ServiceScope) -> Presence {
+pub fn registration_in_scope(id: &str, scope: ServiceScope) -> ScopeRegistration {
     let Ok(target) = crate::target::Target::current() else {
-        return Presence::Unknown;
+        return ScopeRegistration::unknown("this host's OS/arch target could not be detected");
     };
     let uid = crate::invoker::target_user().uid;
     match scope_query(target.os, scope, id, uid) {
-        ScopeQuery::NoSuchDomain => Presence::Absent,
-        ScopeQuery::Unaddressable => Presence::Unknown,
+        // The Windows SCM has no per-user domain, so "nothing is registered here" is a FACT, not a
+        // failure to look.
+        ScopeQuery::NoSuchDomain => {
+            ScopeRegistration::absent("this OS has no per-user service domain")
+        }
+        ScopeQuery::Unaddressable => ScopeRegistration::unknown(
+            "the per-user domain could not be addressed (no resolvable uid)",
+        ),
         ScopeQuery::Systemctl(args) => {
-            // Same scope + unit, different verb: presence, not activity.
+            // Same scope + unit, different verb: registration + enablement, not activity.
             let enabled_args: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -284,74 +356,205 @@ pub fn registration_in_scope(id: &str, scope: ServiceScope) -> Presence {
                 })
                 .collect();
             let borrowed: Vec<&str> = enabled_args.iter().map(String::as_str).collect();
-            query_systemctl_presence(&borrowed)
+            query_systemctl_registration(&borrowed)
         }
-        ScopeQuery::LaunchctlPrint(target) => launchctl_presence(&target),
-        ScopeQuery::ScQuery(id) => parse_sc_query_presence(&sc_query_text(&id)),
+        ScopeQuery::LaunchctlPrint(target) => launchctl_registration(&target, scope),
+        ScopeQuery::ScQuery(id) => {
+            classify_sc_registration(&sc_query_text(&id), &sc_config_text(&id))
+        }
     }
 }
 
-/// Classify `systemctl [--user] is-enabled <unit>` output. Pure.
+/// Classify a `systemctl [--user] is-enabled <unit>` invocation. Pure.
 ///
-/// Every state word systemd uses for a unit that EXISTS maps to `Present` — including `disabled`,
-/// `static` and `masked`, none of which mean "not registered". A missing unit is reported as
-/// "No such file or directory" (or an empty answer on some versions), which is `Absent`. Anything
-/// unrecognised is `Unknown` rather than guessed at.
-pub fn parse_systemctl_is_enabled(text: &str) -> Presence {
-    let trimmed = text.trim();
-    let lower = trimmed.to_lowercase();
-    if lower.contains("no such file")
-        || lower.contains("does not exist")
-        || lower.contains("not found")
-    {
-        return Presence::Absent;
+/// # The verdict comes from the TOKEN on stdout, never from a substring of an error
+///
+/// `is-enabled` prints exactly one state word on stdout for a unit it can read. Everything else is
+/// an error on stderr, and errors must NOT be pattern-matched into a verdict:
+///
+/// * `Failed to connect to bus: No such file or directory` is what `--user` prints under `sudo`,
+///   where root has no session bus. It contains "No such file or directory" — so a substring match
+///   for that phrase classified a scope it could not even ASK as definitively `Absent`, and an
+///   uninstall then reported "removed from every scope" for a scope it never reached. That is
+///   `Unknown` (dig_ecosystem#526 review, A5).
+/// * A missing unit is reported by systemd as a failure to get the unit file state, together with an
+///   EMPTY stdout and a non-zero exit — which is `Absent`.
+///
+/// `masked`, `static`, `indirect` and `disabled` all describe a unit that EXISTS but that nothing
+/// will start automatically, so they are `Present` + [`BootEnablement::NotEnabled`] — never
+/// `Enabled`. `masked` cannot start at all, which the detail says out loud.
+pub fn classify_systemctl_is_enabled(
+    stdout: &str,
+    stderr: &str,
+    exited_zero: bool,
+) -> ScopeRegistration {
+    let token = stdout.trim();
+    let present = |boot_enabled: BootEnablement, detail: String| ScopeRegistration {
+        presence: Presence::Present,
+        boot_enabled,
+        detail,
+    };
+    match token {
+        "enabled" | "enabled-runtime" | "alias" => {
+            return present(BootEnablement::Enabled, format!("systemd reports `{token}`"))
+        }
+        "masked" | "masked-runtime" => {
+            return present(
+                BootEnablement::NotEnabled,
+                format!("systemd reports `{token}` — this unit can NEVER start until it is unmasked"),
+            )
+        }
+        "disabled" | "static" | "indirect" | "generated" | "transient" | "linked"
+        | "linked-runtime" => {
+            return present(
+                BootEnablement::NotEnabled,
+                format!("systemd reports `{token}` — the unit exists but nothing starts it"),
+            )
+        }
+        _ => {}
     }
-    match trimmed {
-        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "masked"
-        | "masked-runtime" | "static" | "indirect" | "generated" | "transient" | "alias"
-        | "disabled" => Presence::Present,
-        "" => Presence::Absent,
-        _ => Presence::Unknown,
+
+    // No state token, so the answer is in the error — and the only error that means "absent" is one
+    // about the UNIT FILE, with nothing on stdout.
+    let err = stderr.to_lowercase();
+    let bus_failure = err.contains("failed to connect to bus")
+        || err.contains("failed to get d-bus connection")
+        || err.contains("no medium found")
+        || err.contains("host is down");
+    if bus_failure {
+        return ScopeRegistration::unknown(format!(
+            "the scope could not be queried at all: {}",
+            stderr.trim()
+        ));
+    }
+    let unit_file_missing = (err.contains("unit file") || err.contains("no such unit"))
+        && (err.contains("no such file") || err.contains("does not exist") || err.contains("not found"));
+    if unit_file_missing && token.is_empty() {
+        return ScopeRegistration::absent(format!("systemd reports no such unit: {}", stderr.trim()));
+    }
+    // An empty answer WITH a zero exit is systemd saying nothing at all, which is not evidence of
+    // absence; a non-empty unrecognised token is a systemd we do not know. Both are Unknown.
+    let detail = if token.is_empty() {
+        format!("systemctl gave no verdict: {}", stderr.trim())
+    } else {
+        format!("unrecognised systemd verdict `{token}`")
+    };
+    let _ = exited_zero;
+    ScopeRegistration::unknown(detail)
+}
+
+/// Classify Windows `sc query <id>` + `sc qc <id>` output. Pure.
+///
+/// `sc query` answers presence (a `1060`/"does not exist" reply is definitively absent); `sc qc`
+/// answers enablement, because the SCM's `START_TYPE` is what decides whether the service comes up at
+/// boot — a `DEMAND_START` service is registered and will NOT start on its own.
+pub fn classify_sc_registration(query_text: &str, config_text: &str) -> ScopeRegistration {
+    match parse_sc_query(query_text) {
+        ServiceRunState::NotFound => {
+            ScopeRegistration::absent("`sc query` reports no such service (1060)")
+        }
+        ServiceRunState::Running | ServiceRunState::Stopped => {
+            let (boot_enabled, detail) = parse_sc_start_type(config_text);
+            ScopeRegistration {
+                presence: Presence::Present,
+                boot_enabled,
+                detail,
+            }
+        }
+        ServiceRunState::Unknown => {
+            ScopeRegistration::unknown("`sc query` gave no recognisable answer")
+        }
     }
 }
 
-/// Classify Windows `sc query <id>` output as presence. Pure. A `1060`/"does not exist" reply is
-/// definitively absent; any reported STATE means the service exists; anything else is unknown.
-pub fn parse_sc_query_presence(text: &str) -> Presence {
-    match parse_sc_query(text) {
-        ServiceRunState::NotFound => Presence::Absent,
-        ServiceRunState::Running | ServiceRunState::Stopped => Presence::Present,
-        ServiceRunState::Unknown => Presence::Unknown,
+/// Read the SCM `START_TYPE` from `sc qc <id>` output. Pure.
+///
+/// `AUTO_START` (2) is the only value that comes up at boot; `DEMAND_START` (3) and `DISABLED` (4)
+/// do not. An unreadable config is `Unknown`, never assumed enabled.
+pub fn parse_sc_start_type(text: &str) -> (BootEnablement, String) {
+    for line in text.lines() {
+        let upper = line.to_uppercase();
+        if !upper.contains("START_TYPE") {
+            continue;
+        }
+        if upper.contains("AUTO_START") {
+            return (
+                BootEnablement::Enabled,
+                "the SCM reports START_TYPE AUTO_START".to_string(),
+            );
+        }
+        if upper.contains("DEMAND_START") || upper.contains("DISABLED") || upper.contains("BOOT")
+            || upper.contains("SYSTEM")
+        {
+            return (
+                BootEnablement::NotEnabled,
+                format!("the SCM reports {}", line.trim()),
+            );
+        }
     }
+    (
+        BootEnablement::Unknown,
+        "the SCM's START_TYPE could not be read".to_string(),
+    )
 }
 
-/// Spawn `systemctl <args>` and classify its combined output as presence.
-fn query_systemctl_presence(args: &[&str]) -> Presence {
+/// Spawn `systemctl <args>` and classify it, keeping the exit status rather than discarding it.
+fn query_systemctl_registration(args: &[&str]) -> ScopeRegistration {
     match std::process::Command::new("systemctl")
         .args(args)
         .hide_console()
         .output()
     {
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            parse_systemctl_is_enabled(&text)
-        }
-        Err(_) => Presence::Unknown,
+        Ok(o) => classify_systemctl_is_enabled(
+            &String::from_utf8_lossy(&o.stdout),
+            &String::from_utf8_lossy(&o.stderr),
+            o.status.success(),
+        ),
+        // The tool itself could not be run — the one thing that is certainly not evidence of absence.
+        Err(e) => ScopeRegistration::unknown(format!("systemctl could not be run: {e}")),
     }
 }
 
 /// `launchctl print <target>` succeeds only for a label loaded in that domain.
-fn launchctl_presence(target: &str) -> Presence {
+///
+/// Enablement follows the DOMAIN, which is what launchd's boot behaviour actually turns on: a job
+/// loaded in the SYSTEM domain is bootstrapped by launchd at boot, while one in `gui/<uid>` is
+/// bootstrapped when that user's GUI session starts — by definition a login. A domain that could not
+/// be printed is `Unknown`, never absent.
+fn launchctl_registration(target: &str, scope: ServiceScope) -> ScopeRegistration {
     match std::process::Command::new("launchctl")
         .arg("print")
         .arg(target)
         .hide_console()
         .output()
     {
-        Ok(o) if o.status.success() => Presence::Present,
-        Ok(_) => Presence::Absent,
-        Err(_) => Presence::Unknown,
+        Ok(o) if o.status.success() => ScopeRegistration {
+            presence: Presence::Present,
+            boot_enabled: match scope {
+                ServiceScope::System => BootEnablement::Enabled,
+                ServiceScope::User => BootEnablement::NotEnabled,
+            },
+            detail: format!("launchd has `{target}` loaded"),
+        },
+        Ok(_) => ScopeRegistration::absent(format!("launchd has no `{target}` loaded")),
+        Err(e) => ScopeRegistration::unknown(format!("launchctl could not be run: {e}")),
+    }
+}
+
+/// The combined stdout+stderr of `sc qc <id>`, for [`parse_sc_start_type`].
+fn sc_config_text(id: &str) -> String {
+    match std::process::Command::new(crate::proc::system_tool("sc"))
+        .arg("qc")
+        .arg(id)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text
+        }
+        Err(_) => String::new(),
     }
 }
 
@@ -871,65 +1074,135 @@ mod tests {
 
     #[test]
     fn is_enabled_distinguishes_an_existing_unit_from_a_missing_one() {
-        // THE bug this replaced: `is-active` prints `inactive` for a unit that does not exist, and
-        // `parse_systemctl_is_active` maps `inactive` to Stopped — "registered but not running". So a
-        // run-state query cannot answer presence at all.
+        // THE trap this replaced: `is-active` prints `inactive` for a unit that does not exist, and
+        // `parse_systemctl_is_active` maps `inactive` to Stopped — "registered but not running".
         assert_eq!(
             parse_systemctl_is_active("inactive"),
             ServiceRunState::Stopped,
             "documenting the trap: is-active says `inactive` for a unit that is not there"
         );
-        assert_eq!(
-            parse_systemctl_is_enabled(
-                "Failed to get unit file state for dignetwork-dig-node.service: No such file or \
-                 directory"
-            ),
-            Presence::Absent
+        let missing = classify_systemctl_is_enabled(
+            "",
+            "Failed to get unit file state for dignetwork-dig-node.service: No such file or \
+             directory",
+            false,
         );
-        // Every word for a unit that EXISTS is Present — `disabled` and `masked` are registrations.
-        for state in [
-            "enabled",
-            "enabled-runtime",
+        assert_eq!(missing.presence, Presence::Absent);
+        assert_eq!(missing.boot_enabled, BootEnablement::NotEnabled);
+    }
+
+    /// A5: a D-Bus failure is `Unknown`, NEVER `Absent`.
+    ///
+    /// `systemctl --user is-enabled` under `sudo` prints "Failed to connect to bus: No such file or
+    /// directory" — which CONTAINS the missing-unit phrase. A substring match therefore classified a
+    /// scope it could not even ask as definitively empty, and the uninstall reported "removed from
+    /// every scope" with nothing listed as unverified. The fixture is the real message, because a
+    /// synthetic "bus error" string would not exhibit the collision that caused the bug.
+    #[test]
+    fn a_bus_failure_is_unknown_never_absent() {
+        for stderr in [
+            "Failed to connect to bus: No such file or directory",
+            "Failed to get D-Bus connection: Operation not permitted",
+            "Failed to connect to bus: Host is down",
+        ] {
+            let r = classify_systemctl_is_enabled("", stderr, false);
+            assert_eq!(
+                r.presence,
+                Presence::Unknown,
+                "a scope that could not be asked is not empty: {stderr}"
+            );
+            assert_eq!(r.boot_enabled, BootEnablement::Unknown);
+            assert!(r.detail.contains("could not be queried"), "{}", r.detail);
+        }
+    }
+
+    /// A4: presence is not boot-enablement.
+    ///
+    /// A `masked` unit exists and can NEVER start; `disabled`/`static` exist and nothing starts them.
+    /// Reporting any of them as reboot-surviving is the false-ready this PR exists to remove, so the
+    /// two facts are read separately and only `enabled` licenses the claim.
+    #[test]
+    fn presence_does_not_imply_boot_enablement() {
+        for token in ["enabled", "enabled-runtime", "alias"] {
+            let r = classify_systemctl_is_enabled(token, "", true);
+            assert_eq!(r.presence, Presence::Present, "{token}");
+            assert_eq!(r.boot_enabled, BootEnablement::Enabled, "{token}");
+            assert!(r.starts_without_login(), "{token}");
+        }
+        for token in [
+            "masked",
+            "masked-runtime",
             "disabled",
             "static",
-            "masked",
-            "linked",
             "indirect",
             "generated",
             "transient",
+            "linked",
         ] {
+            let r = classify_systemctl_is_enabled(token, "", true);
             assert_eq!(
-                parse_systemctl_is_enabled(state),
+                r.presence,
                 Presence::Present,
-                "`{state}` describes a unit that exists"
+                "`{token}` describes a unit that EXISTS"
             );
+            assert_eq!(
+                r.boot_enabled,
+                BootEnablement::NotEnabled,
+                "`{token}` starts nothing on its own"
+            );
+            assert!(!r.starts_without_login(), "{token}");
         }
-        assert_eq!(parse_systemctl_is_enabled(""), Presence::Absent);
+        // A masked unit says so, because "registered but nothing starts it" understates it.
+        assert!(classify_systemctl_is_enabled("masked", "", true)
+            .detail
+            .contains("NEVER start"));
+    }
+
+    #[test]
+    fn an_unrecognised_or_silent_systemctl_answer_is_unknown() {
+        // A future systemd word, and a zero-exit empty answer: neither is evidence of absence.
         assert_eq!(
-            parse_systemctl_is_enabled("something new"),
+            classify_systemctl_is_enabled("something-new", "", true).presence,
+            Presence::Unknown
+        );
+        assert_eq!(
+            classify_systemctl_is_enabled("", "", true).presence,
             Presence::Unknown
         );
     }
 
     #[test]
-    fn sc_query_presence_separates_absent_from_unreadable() {
+    fn sc_registration_reads_presence_from_query_and_enablement_from_the_config() {
+        let missing = "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\n\r\nThe specified \
+                       service does not exist as an installed service.\r\n";
         assert_eq!(
-            parse_sc_query_presence(
-                "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\n\r\nThe specified \
-                 service does not exist as an installed service.\r\n"
-            ),
+            classify_sc_registration(missing, "").presence,
             Presence::Absent
         );
-        assert_eq!(
-            parse_sc_query_presence("STATE : 1  STOPPED\r\n"),
-            Presence::Present,
-            "a STOPPED service is still REGISTERED"
+
+        // A STOPPED service is still REGISTERED, and AUTO_START is what makes it boot-start.
+        let auto = classify_sc_registration(
+            "STATE : 1  STOPPED\r\n",
+            "        START_TYPE         : 2   AUTO_START\r\n",
         );
-        assert_eq!(
-            parse_sc_query_presence("STATE : 4  RUNNING\r\n"),
-            Presence::Present
+        assert_eq!(auto.presence, Presence::Present);
+        assert!(auto.starts_without_login());
+
+        // The row that separates presence from enablement on Windows: registered, but manual.
+        let demand = classify_sc_registration(
+            "STATE : 4  RUNNING\r\n",
+            "        START_TYPE         : 3   DEMAND_START\r\n",
         );
-        assert_eq!(parse_sc_query_presence("garbage"), Presence::Unknown);
+        assert_eq!(demand.presence, Presence::Present);
+        assert!(
+            !demand.starts_without_login(),
+            "a DEMAND_START service does not come up at boot"
+        );
+
+        // An unreadable config never licenses a survival claim.
+        let unreadable = classify_sc_registration("STATE : 4  RUNNING\r\n", "");
+        assert_eq!(unreadable.presence, Presence::Present);
+        assert_eq!(unreadable.boot_enabled, BootEnablement::Unknown);
     }
 
     #[test]
