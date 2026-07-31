@@ -187,6 +187,15 @@ jobs:
       # step's `XDG_RUNTIME_DIR` at it so both the elevated install AND this
       # job's own verification/uninstall queries can reach it.
       - name: (Linux) bring up a systemd/D-Bus user session for root
+        # This workaround stays HERE and only here, deliberately. This leg passes
+        # `--bin-dir`, which #565 FORCES to user scope, so the unit really is
+        # per-user and reading it really does need root to have a session bus —
+        # the workaround is load-bearing for THIS leg's shape, not a leftover.
+        #
+        # It is the DEFAULT-path install that must never need it, and that is
+        # asserted in the `system-scope-e2e` job below, which carries no linger
+        # and fails if the install turns it on. Removing it here would only break
+        # a leg whose scope is forced, while proving nothing about #526.
         if: runner.os == 'Linux'
         run: |
           sudo loginctl enable-linger root
@@ -1222,3 +1231,162 @@ jobs:
               && cd /tmp \
               && INSTALLER=/tmp/target/release/dig-installer \
                  bash /work/.github/scripts/root-gate-escalation.sh'
+
+  # ---------------------------------------------------------------------------
+  # #526 finding 4: the leg that exercises the path that SHIPS.
+  #
+  # The matrix job above passes `--bin-dir`, which FORCES user scope (#565), and
+  # pins a pre-`--scope` dig-node. Its `scope == "user"` / `survives_reboot ==
+  # false` assertions are therefore satisfied identically by the pre-#526 code —
+  # they confirm a forced downgrade rather than the scope DECISION. Nothing
+  # covered a default-path install, which is the only shape a real user gets.
+  #
+  # This job takes NO `--bin-dir`, so `engine_scope` genuinely decides, and it
+  # carries NO `loginctl enable-linger root` / `user@0.service` workaround — that
+  # workaround IS the thing #526 was filed to remove, so a job that keeps it
+  # cannot show the need has gone.
+  # ---------------------------------------------------------------------------
+  system-scope-e2e:
+    name: "#526 a default-path install decides scope for itself (Linux)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-526-syscope-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-526-syscope-
+
+      - name: Build the installer
+        run: cargo build --release --bin dig-installer
+
+      # The install root's whole ancestor chain must be root-owned for a
+      # default-path install to be permitted at all (#1748) — the same
+      # normalisation the sibling job does, for the same reason.
+      - name: Normalise the runner image's world-writable /opt and veneer chain
+        run: |
+          sudo chmod 755 /opt /usr /usr/local /usr/local/bin
+          sudo chown 0:0 /usr /usr/local /usr/local/bin
+          for level in /opt /usr /usr/local /usr/local/bin; do
+            test "$(stat -c '%U' "$level")" = root \
+              || { echo "FAIL: $level is not root-owned"; exit 1; }
+          done
+
+      # The precondition finding 2 is about: a leftover per-user unit from an
+      # earlier install, sitting in root's own user scope exactly where a
+      # pre-#526 `sudo dig-installer` put it. What must HAPPEN to it depends on
+      # where the component actually registers, which is what the steps below
+      # pin down.
+      - name: Plant the leftover per-user unit an earlier install would have left
+        run: |
+          sudo mkdir -p /root/.config/systemd/user
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=leftover from a pre-#526 install' \
+            '[Service]' \
+            'ExecStart=/bin/true' \
+            '[Install]' \
+            'WantedBy=default.target' \
+            | sudo tee /root/.config/systemd/user/dignetwork-dig-node.service >/dev/null
+          sudo ls -l /root/.config/systemd/user/
+
+      - name: Install with NO --bin-dir, so engine_scope actually decides
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo -H -E "$PWD/target/release/dig-installer" \
+            --no-digstore \
+            --no-dig-app \
+            --no-auto-update \
+            --dig-node-version "$DIG_NODE_VERSION" \
+            --dig-dns-version "$DIG_DNS_VERSION" \
+            --json | tee install.json
+
+      # THE assertion this job exists for. This is the scope the installer
+      # DECIDED on its own for a protected-root install — "system" — which the
+      # --bin-dir leg can never show, because it forces "user" before the
+      # decision is ever reached.
+      - name: The installer decided SYSTEM scope for a default-path install
+        run: |
+          jq -e '.result.service.scope == "system"' install.json \
+            || { echo "FAIL: a default-path elevated install must request machine-wide scope"; exit 1; }
+          jq -e '(.result.service.scope_note | length) > 0' install.json
+
+      # The honest half. No released dig-node accepts `--scope` (v0.69.0 has no
+      # such flag and PREFERS_USER_LEVEL is unconditionally true on unix), so the
+      # compat retry is what runs, the component registers at its own per-user
+      # default, and reboot survival is correctly reported as FALSE with a note
+      # saying why. This asserts the REPORT is truthful about a fallback, rather
+      # than asserting a capability nothing ships.
+      #
+      # When a dig-node release lands `--scope`, THIS is the step that must flip
+      # to `survives_reboot == true`, and it fails loudly until it is updated —
+      # which is the point: the gate tracks the contract instead of drifting.
+      - name: A pre---scope component is reported as a fallback, not as success
+        run: |
+          jq -e '.result.service.survives_reboot == false' install.json \
+            || { echo "A component now honours --scope; flip this gate to require true"; exit 1; }
+          jq -r '.result.service.scope_note' install.json | grep -qi 'scope' \
+            || { echo "FAIL: the fallback must be explained in the note"; exit 1; }
+
+      # Finding 2's positional half, and the assertion the pre-PR code FAILS: the
+      # sweep must act on the scope the component ACTUALLY used. Because the
+      # fallback registered per-user, the planted unit IS the live registration —
+      # deleting it would leave the host with no dig-node while reporting success.
+      - name: The fallback's own per-user registration was NOT swept away
+        run: |
+          jq -e '(.result.service.shadowing_units_removed | length) == 0' install.json \
+            || { echo "FAIL: swept a per-user unit while the component registered per-user"; exit 1; }
+          sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service \
+            || { echo "FAIL: the install deleted the very registration the fallback created"; exit 1; }
+
+      # Reboot survival read from systemd itself rather than from a field the
+      # installer populated. Taken WITHOUT a user bus and WITHOUT enable-linger:
+      # if this leg needed the linger workaround, #526 would not be fixed.
+      - name: Read systemd's own verdict, with no user bus and no linger
+        run: |
+          echo "--- system scope ---"
+          systemctl is-enabled dignetwork-dig-node 2>&1 || true
+          echo "--- user scope, as root, no bus (the #526 host class) ---"
+          sudo systemctl --user is-enabled dignetwork-dig-node 2>&1 || true
+          echo "--- linger must NOT have been enabled by the install ---"
+          if loginctl show-user root -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+            echo "FAIL: the install enabled linger for root - #526 exists to remove that workaround"
+            exit 1
+          fi
+
+      # The uninstall counterpart to finding 3. Run as root with no session bus,
+      # which is precisely the probe failure: `systemctl --user is-enabled` prints
+      # "Failed to connect to bus: No such file or directory". That scope must be
+      # named as UNVERIFIED, never folded into a clean "removed from every scope".
+      - name: An unqueryable scope is named, not silently reported as cleared
+        run: |
+          sudo -H "$PWD/target/release/dig-installer" \
+            --uninstall-dig-node --json | tee uninstall.json
+          jq -e '.result' uninstall.json >/dev/null
+          NOTE=$(jq -r '[.. | strings] | join(" ")' uninstall.json)
+          echo "reported: $NOTE"
+          # A run that could not read a scope must say so. If it DID read every
+          # scope, "every scope" unqualified is the correct report - so this
+          # accepts either, and fails only on the combination that is a lie:
+          # claiming every scope while a bus failure was hit.
+          if echo "$NOTE" | grep -qi 'failed to connect to bus'; then
+            echo "$NOTE" | grep -qi 'could not verify' \
+              || { echo "FAIL: hit a bus failure yet did not report the scope as unverified"; exit 1; }
+          fi

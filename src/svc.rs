@@ -396,12 +396,17 @@ pub fn classify_systemctl_is_enabled(
     };
     match token {
         "enabled" | "enabled-runtime" | "alias" => {
-            return present(BootEnablement::Enabled, format!("systemd reports `{token}`"))
+            return present(
+                BootEnablement::Enabled,
+                format!("systemd reports `{token}`"),
+            )
         }
         "masked" | "masked-runtime" => {
             return present(
                 BootEnablement::NotEnabled,
-                format!("systemd reports `{token}` — this unit can NEVER start until it is unmasked"),
+                format!(
+                    "systemd reports `{token}` — this unit can NEVER start until it is unmasked"
+                ),
             )
         }
         "disabled" | "static" | "indirect" | "generated" | "transient" | "linked"
@@ -428,9 +433,14 @@ pub fn classify_systemctl_is_enabled(
         ));
     }
     let unit_file_missing = (err.contains("unit file") || err.contains("no such unit"))
-        && (err.contains("no such file") || err.contains("does not exist") || err.contains("not found"));
+        && (err.contains("no such file")
+            || err.contains("does not exist")
+            || err.contains("not found"));
     if unit_file_missing && token.is_empty() {
-        return ScopeRegistration::absent(format!("systemd reports no such unit: {}", stderr.trim()));
+        return ScopeRegistration::absent(format!(
+            "systemd reports no such unit: {}",
+            stderr.trim()
+        ));
     }
     // An empty answer WITH a zero exit is systemd saying nothing at all, which is not evidence of
     // absence; a non-empty unrecognised token is a systemd we do not know. Both are Unknown.
@@ -483,7 +493,9 @@ pub fn parse_sc_start_type(text: &str) -> (BootEnablement, String) {
                 "the SCM reports START_TYPE AUTO_START".to_string(),
             );
         }
-        if upper.contains("DEMAND_START") || upper.contains("DISABLED") || upper.contains("BOOT")
+        if upper.contains("DEMAND_START")
+            || upper.contains("DISABLED")
+            || upper.contains("BOOT")
             || upper.contains("SYSTEM")
         {
             return (
