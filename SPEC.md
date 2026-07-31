@@ -140,6 +140,44 @@ treats it unlike every daemon in this catalogue:
   success), so no removed install leaves an agent launching at every login. A mid-install failure
   reverses the registration through `InstallAction::AutostartRegistered` (§3.11).
 
+### 1.11a dig-app — starting it when the install completes (#1831)
+
+An install that selects `dig-app` MUST START it before finishing. Registering a login autostart is NOT
+sufficient: it makes the agent appear at the user's *next* login, so the observable outcome of a
+successful install is an empty system tray.
+
+- **The launch MUST run as the interactive user, never with the installer's authority.** The GUI
+  installer is `requireAdministrator` (§1.9) and `dig-app` is a per-user custody surface, so a launch
+  that inherits elevation seals account state at an integrity level the normal-integrity login autostart
+  cannot read back. On Windows the launched process MUST hold the MEDIUM integrity SID
+  (`S-1-16-8192`); a process at `S-1-16-12288` is a FAILURE of this requirement even though a tray icon
+  appears. Conformance is measured on the launched process's own token, never inferred from the launch
+  returning.
+  - A **direct child** of the elevated installer inherits `S-1-16-12288` and MUST NOT be used.
+  - `Shell.Application` **`ShellExecute` MUST NOT be used**: the object is instantiated inside the
+    elevated process and dispatches in that process's context, so it also yields `S-1-16-12288`.
+  - The mechanism is `explorer.exe <path>` (an already-running, medium-integrity shell), or a scheduled
+    task at `Limited` level.
+  - On unix the launch is delegated to the target user's own shell (`su - <user> -c`, §1.5a), so the
+    kernel enforces the identity.
+- **On unix, starting now and enabling for login are ONE act.** Where this run registered a
+  service-manager artifact, the launch MUST LOAD that artifact — `launchctl bootstrap gui/<uid> <plist>`
+  on macOS, `systemctl --user enable --now dig-app.service` on Linux — rather than starting a process
+  beside an inert file. Writing the artifact alone leaves the unit `inactive` and `disabled` and starts
+  nothing. Windows needs no such step: the `HKCU\…\Run` value is read by the shell at logon.
+- **The launch is NOT conditional on `dig_app_autostart`.** "Start it now" and "start it at every login"
+  are different consents. Declining the login autostart MUST still start the app for this session, and
+  MUST register nothing.
+- **Idempotent by delegation.** Finishing an install while dig-app is already running MUST NOT produce a
+  second instance. The installer MUST NOT test for a running instance — that races its own spawn.
+  Exclusion is `dig-app`'s own per-user OS lock, under which a duplicate launch exits 0 as a no-op.
+- **Best-effort, and never silent.** A launch failure MUST NOT fail an otherwise-complete install and
+  MUST NOT gate `ready` (§4.2). It is recorded on `InstallReport.dig_app_launch` with `launched: false`
+  and a note naming the reason.
+- **Never a privileged exec of an installed binary.** Where the plan puts the installed binary on a
+  command line this process runs — which happens for a root-ACCOUNT install, since no elevation hint
+  names another user to delegate to — that binary MUST first pass `secure::root_exec_guard` (§7.5).
+
 ### 1.2 dig-dns availability gate
 
 `dig-dns` (EPIC #174) may have no published release at all. If `with_dig_dns` is selected and no
@@ -403,11 +441,16 @@ to the copy the run placed. A binary with a command-line surface MUST additional
 command-line surface and on macOS the probe never returns — so resolution alone is all that is proven of
 it.
 
-**Its ability to START is NOT proven, and MUST NOT be claimed.** Nothing in this installer enables or
-starts `dig-app`: the autostart step WRITES a unit/agent file and the enable command is printed as advice,
-so a successful registration is entirely consistent with a binary that cannot load. Resolution therefore
-establishes the §1.5 reachability property and nothing more, and a reimplementation MUST NOT treat a
-`resolved` verdict for a GUI application as an executability guarantee.
+**Its ability to START is NOT proven by `resolved`, and MUST NOT be claimed.** A successful autostart
+registration is entirely consistent with a binary that cannot load, so a reimplementation MUST NOT treat a
+`resolved` verdict for a GUI application as an executability guarantee. Resolution establishes the §1.5
+reachability property and nothing more.
+
+The launch (§1.11a) is a SEPARATE record, `InstallReport.dig_app_launch`, and carries a separate and
+weaker claim: `launched: true` means the launch mechanism was invoked without error, NOT that dig-app is
+still running. On Windows the mechanism is Explorer, which reports only that it accepted the open. A
+reimplementation MUST NOT fold `dig_app_launch` into the readiness verdict, and MUST NOT let a failed
+launch fail an otherwise-complete install.
 
 Every `--version` probe MUST be bounded by a deadline and the child killed on overrun: no single binary
 may hang an install.
