@@ -78,6 +78,7 @@ pub mod secure;
 pub mod service;
 pub mod sources;
 pub mod svc;
+pub mod svcscope;
 pub mod target;
 pub mod uninstall;
 pub mod update;
