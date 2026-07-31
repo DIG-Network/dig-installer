@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.33.0] - 2026-07-31
+
+### Bug Fixes
+- **migrate:** Guard, order and roll back the beacon re-arm; report lost auto-updates (#49)
+
 ## [0.32.0] - 2026-07-31
 
 ### Features
