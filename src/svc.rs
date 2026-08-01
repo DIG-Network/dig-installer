@@ -439,10 +439,17 @@ pub fn classify_systemctl_is_enabled(
             stderr.trim()
         ));
     }
-    let unit_file_missing = (err.contains("unit file") || err.contains("no such unit"))
-        && (err.contains("no such file")
-            || err.contains("does not exist")
-            || err.contains("not found"));
+    // The two phrasings `dig-node`'s own `classify_systemctl_probe` recognises as absence are
+    // accepted verbatim, so the two repos agree on what systemd's not-found reply looks like even
+    // though they invoke different verbs (`dig-node` v0.71.0 service.rs:1391-1400). Both name the
+    // unit file on their own, so neither needs the qualifier below.
+    let unit_missing_verbatim =
+        err.contains("no files found for") || err.contains("could not be found");
+    let unit_file_missing = unit_missing_verbatim
+        || ((err.contains("unit file") || err.contains("no such unit"))
+            && (err.contains("no such file")
+                || err.contains("does not exist")
+                || err.contains("not found")));
     if unit_file_missing && token.is_empty() {
         return ScopeRegistration::absent(format!(
             "systemd reports no such unit: {}",
@@ -534,12 +541,77 @@ fn query_systemctl_registration(args: &[&str]) -> ScopeRegistration {
     }
 }
 
-/// `launchctl print <target>` succeeds only for a label loaded in that domain.
+/// Classify a `launchctl print <target>` invocation. Pure.
+///
+/// # A domain that cannot be bootstrapped is not an absent service
+///
+/// `launchctl print` fails non-zero for two completely different reasons, and collapsing both into
+/// `Absent` is the launchd form of the bus-failure bug [`classify_systemctl_is_enabled`] documents:
+///
+/// * `Could not find service "…" in domain for system` / exit `113` — the recognised NOT-FOUND reply,
+///   and the only thing that means `Absent`;
+/// * `Bootstrap failed: 5: Input/output error` / `Could not find domain for gui/501` — the DOMAIN
+///   itself could not be reached, which is what a `sudo` run with no Aqua session gets for a
+///   `gui/<uid>` target. Nothing was learned about the service, so this is `Unknown` — and an
+///   uninstall that read it as `Absent` reported "removed from every scope" for a scope it never
+///   asked (dig_ecosystem#526 review round 2, finding A3).
+///
+/// The absence signals are byte-identical with `dig-node`'s own `classify_launchctl_probe`
+/// (`dig-node` v0.71.0, `crates/dig-node-service/src/service.rs`): exit `113`, or a case-insensitive
+/// substring match on one of [`LAUNCHD_NOT_FOUND`]. Success is tested BEFORE any absence signal, so a
+/// loaded job whose output happens to contain one of those phrases is still `Present`.
 ///
 /// Enablement follows the DOMAIN, which is what launchd's boot behaviour actually turns on: a job
 /// loaded in the SYSTEM domain is bootstrapped by launchd at boot, while one in `gui/<uid>` is
-/// bootstrapped when that user's GUI session starts — by definition a login. A domain that could not
-/// be printed is `Unknown`, never absent.
+/// bootstrapped when that user's GUI session starts — by definition a login.
+pub fn classify_launchctl_print(
+    target: &str,
+    scope: ServiceScope,
+    stderr: &str,
+    exit_code: Option<i32>,
+    succeeded: bool,
+) -> ScopeRegistration {
+    if succeeded {
+        return ScopeRegistration {
+            presence: Presence::Present,
+            boot_enabled: match scope {
+                ServiceScope::System => BootEnablement::Enabled,
+                ServiceScope::User => BootEnablement::NotEnabled,
+            },
+            detail: format!("launchd has `{target}` loaded"),
+        };
+    }
+    let err = stderr.to_lowercase();
+    let not_found = exit_code == Some(LAUNCHD_NO_SUCH_SERVICE_EXIT)
+        || LAUNCHD_NOT_FOUND.iter().any(|phrase| err.contains(phrase));
+    if not_found {
+        return ScopeRegistration::absent(format!("launchd has no `{target}` loaded"));
+    }
+    ScopeRegistration::unknown(format!(
+        "the `{target}` domain could not be queried at all: {}",
+        first_line_or(stderr, "launchctl gave no reason")
+    ))
+}
+
+/// launchd's exit status for a service that does not exist in the domain
+/// (`kLaunchdNoSuchServiceError`) — byte-identical with `dig-node`'s classifier.
+const LAUNCHD_NO_SUCH_SERVICE_EXIT: i32 = 113;
+
+/// The only `launchctl` messages that mean the SERVICE is absent, as opposed to the DOMAIN being
+/// unreachable. Matched case-insensitively as substrings, byte-identical with `dig-node`'s set.
+const LAUNCHD_NOT_FOUND: &[&str] = &["could not find service", "no such process", "no such file"];
+
+/// The first non-empty line of `text`, or `fallback` — keeps a multi-line tool error from swamping a
+/// one-line report while still carrying the tool's OWN words.
+fn first_line_or(text: &str, fallback: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Spawn `launchctl print <target>` and classify it with [`classify_launchctl_print`].
 fn launchctl_registration(target: &str, scope: ServiceScope) -> ScopeRegistration {
     match std::process::Command::new("launchctl")
         .arg("print")
@@ -547,15 +619,14 @@ fn launchctl_registration(target: &str, scope: ServiceScope) -> ScopeRegistratio
         .hide_console()
         .output()
     {
-        Ok(o) if o.status.success() => ScopeRegistration {
-            presence: Presence::Present,
-            boot_enabled: match scope {
-                ServiceScope::System => BootEnablement::Enabled,
-                ServiceScope::User => BootEnablement::NotEnabled,
-            },
-            detail: format!("launchd has `{target}` loaded"),
-        },
-        Ok(_) => ScopeRegistration::absent(format!("launchd has no `{target}` loaded")),
+        Ok(o) => classify_launchctl_print(
+            target,
+            scope,
+            &String::from_utf8_lossy(&o.stderr),
+            o.status.code(),
+            o.status.success(),
+        ),
+        // The tool itself could not be run — the one thing that is certainly not evidence of absence.
         Err(e) => ScopeRegistration::unknown(format!("launchctl could not be run: {e}")),
     }
 }
@@ -1215,6 +1286,131 @@ mod tests {
             classify_systemctl_is_enabled("", "", true).presence,
             Presence::Unknown
         );
+    }
+
+    /// Finding A3: a launchd DOMAIN that could not be bootstrapped is not an absent SERVICE.
+    ///
+    /// `sudo launchctl print gui/501/<label>` on a host with no Aqua session fails with a bootstrap
+    /// or domain error — the launchd twin of the `systemctl --user` bus failure above, and on exactly
+    /// the host class #526 describes. Collapsing it to `Absent` let an uninstall report "removed from
+    /// every scope" for a domain it never reached, and let an install treat an unaskable scope as
+    /// free.
+    ///
+    /// Every case is driven through the PURE classifier, so all three assertions hold on a Windows
+    /// dev box: a `#[cfg(target_os = "macos")]` test would leave this guard unfalsifiable everywhere
+    /// CI actually runs it (dig_ecosystem#1774).
+    #[test]
+    fn an_unbootstrappable_launchd_domain_is_unknown_never_absent() {
+        for stderr in [
+            "Bootstrap failed: 5: Input/output error",
+            "Could not find domain for gui/501",
+            "Could not find domain for",
+            "launchctl: Couldn't posix_spawn: error 2",
+        ] {
+            let r = classify_launchctl_print(
+                "gui/501/net.dignetwork.dig-node",
+                ServiceScope::User,
+                stderr,
+                Some(1),
+                false,
+            );
+            assert_eq!(
+                r.presence,
+                Presence::Unknown,
+                "a domain that could not be reached says nothing about the service: {stderr}"
+            );
+            assert_eq!(r.boot_enabled, BootEnablement::Unknown, "{stderr}");
+            assert!(
+                r.detail.contains(stderr.lines().next().unwrap()),
+                "launchd's own words must reach the operator, got: {}",
+                r.detail
+            );
+        }
+    }
+
+    /// The control that keeps the fix from becoming "launchd never answers absent": the recognised
+    /// not-found reply, by exit code and by each phrase, is still definitively `Absent`. Byte-aligned
+    /// with `dig-node`'s `classify_launchctl_probe` — exit `113` or one of three substrings,
+    /// case-insensitively.
+    #[test]
+    fn the_recognised_launchd_not_found_reply_is_absent() {
+        let absent = |stderr: &str, code: Option<i32>| {
+            classify_launchctl_print(
+                "system/net.dignetwork.dig-node",
+                ServiceScope::System,
+                stderr,
+                code,
+                false,
+            )
+        };
+        // The exit code alone, with a message this classifier does not recognise.
+        assert_eq!(
+            absent("some future launchd wording", Some(113)).presence,
+            Presence::Absent,
+            "exit 113 is launchd's kLaunchdNoSuchServiceError"
+        );
+        // Each phrase alone, on an exit code that is NOT 113 — so neither signal can be passing for
+        // the other.
+        for stderr in [
+            "Could not find service \"net.dignetwork.dig-node\" in domain for system",
+            "COULD NOT FIND SERVICE in domain for system",
+            "No such process",
+            "No such file or directory",
+        ] {
+            assert_eq!(
+                absent(stderr, Some(1)).presence,
+                Presence::Absent,
+                "the recognised not-found reply: {stderr}"
+            );
+        }
+    }
+
+    /// Success is tested BEFORE any absence signal, and enablement follows the DOMAIN: a job in the
+    /// system domain is bootstrapped at boot, one in `gui/<uid>` only once that user logs in. The
+    /// output deliberately CONTAINS a not-found phrase, so an implementation that pattern-matched
+    /// before checking the exit status would answer `Absent` for a plainly loaded job.
+    #[test]
+    fn a_loaded_launchd_job_is_present_and_its_enablement_follows_the_domain() {
+        let loaded = |scope| {
+            classify_launchctl_print(
+                "system/net.dignetwork.dig-node",
+                scope,
+                "warning: no such file: /etc/dig/optional.conf",
+                Some(0),
+                true,
+            )
+        };
+        let system = loaded(ServiceScope::System);
+        assert_eq!(system.presence, Presence::Present);
+        assert_eq!(system.boot_enabled, BootEnablement::Enabled);
+        assert!(system.starts_without_login());
+
+        let user = loaded(ServiceScope::User);
+        assert_eq!(user.presence, Presence::Present);
+        assert_eq!(
+            user.boot_enabled,
+            BootEnablement::NotEnabled,
+            "a `gui/<uid>` job waits for a login by definition"
+        );
+        assert!(!user.starts_without_login());
+    }
+
+    /// systemd's own not-found phrasings, taken verbatim from `dig-node`'s classifier so the two
+    /// repos agree on what absence looks like. The bus-failure control above is what keeps this from
+    /// widening into "any error is absence".
+    #[test]
+    fn the_systemd_not_found_phrasings_dig_node_recognises_are_absent_here_too() {
+        for stderr in [
+            "Failed to get unit file state for dignetwork-dig-node.service: No files found for \
+             dignetwork-dig-node.service.",
+            "Unit dignetwork-dig-node.service could not be found.",
+        ] {
+            assert_eq!(
+                classify_systemctl_is_enabled("", stderr, false).presence,
+                Presence::Absent,
+                "systemd's recognised not-found reply: {stderr}"
+            );
+        }
     }
 
     #[test]

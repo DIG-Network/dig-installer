@@ -406,6 +406,11 @@ pub fn uninstall_service(bin: &Path, os: Os) -> Result<String, String> {
 /// exit codes: `uninstall` of an absent registration exits non-zero on some
 /// platforms, and that is not a failure. A scope still holding a registration
 /// afterwards IS a failure, and is named — never a silent success.
+///
+/// When EVERY scope's attempt failed, this run deregistered nothing, so the end
+/// state rests entirely on the probe: a scope it could not read back leaves the
+/// state UNKNOWN (an error, never a tick), while a definite absence in every
+/// scope establishes that there was nothing to remove.
 fn uninstall_engine_service(
     label: &str,
     os: Os,
@@ -419,23 +424,17 @@ fn uninstall_engine_service(
             attempt_errors.push(format!("{}: {e}", scope.describe()));
         }
     }
-    if attempt_errors.len() == scopes.len() {
-        // NOT tolerable, and not the same as "already absent": if EVERY scope's attempt failed we
-        // never deregistered anything, so a clean probe cannot distinguish "there was nothing there"
-        // from "we could not act, and could not ask either" (a missing launcher binary is exactly
-        // this state). Reporting an uninstall as complete here is the false-tick this crate refuses
-        // elsewhere too — see `lib.rs`'s launcher-gone branch.
-        return Err(format!(
-            "{label} could not be deregistered from ANY scope, so its state is UNKNOWN rather than \
-             removed{}",
-            format_attempt_errors(&attempt_errors)
-        ));
-    }
+    // Probe FIRST, then judge. The probe asks the SERVICE MANAGER (`systemctl`/`launchctl`/`sc`) and
+    // never the component's own launcher, so it stays authoritative on exactly the hosts where every
+    // `uninstall` attempt failed — including the missing-launcher case. Erroring on the attempts
+    // alone declared "state UNKNOWN" for a host the service manager could answer for definitively,
+    // failing an uninstall that had nothing to remove (#526 review round 2, finding A2).
+    let readings: Vec<(svcscope::ServiceScope, svc::ScopeRegistration)> =
+        scopes.iter().map(|scope| (*scope, probe(*scope))).collect();
 
     let mut residual = Vec::new();
     let mut unverified = Vec::new();
-    for scope in &scopes {
-        let reading = probe(*scope);
+    for (scope, reading) in &readings {
         match reading.presence {
             // A leftover that is `masked`/`disabled` is still a failed uninstall — the registration
             // is there — but the operator is told whether it will actually START again, because
@@ -467,6 +466,20 @@ fn uninstall_engine_service(
             format_attempt_errors(&attempt_errors)
         ));
     }
+    // Nothing was deregistered by us, so the ONLY thing that can establish the end state is the
+    // probe — and it has to have established it for EVERY scope. An `Unknown` here is a scope we
+    // could neither act on nor read: that state is genuinely unknown, and `Unknown` is never
+    // collapsed into "not registered". With every scope answering a definite absence, the state IS
+    // established as removed, and reporting a failure would be its own false claim.
+    if attempt_errors.len() == scopes.len() && !unverified.is_empty() {
+        return Err(format!(
+            "{label} could not be deregistered from ANY scope, and {} could not be read back \
+             either, so its state is UNKNOWN rather than removed{}",
+            unverified.join(" and "),
+            format_attempt_errors(&attempt_errors)
+        ));
+    }
+
     let unverified_note = if unverified.is_empty() {
         String::new()
     } else {
@@ -1292,14 +1305,19 @@ mod tests {
         assert!(note.contains("no such unit"), "got: {note}");
     }
 
-    /// A missing launcher (or any failure that hits EVERY scope) leaves the service's state
-    /// UNKNOWN, not removed — the same stance `lib.rs` takes for a launcher-gone uninstall.
+    /// A failure that hits EVERY scope leaves the state UNKNOWN when the probe could not read a scope
+    /// back either: nothing was deregistered AND nothing could be established, so a tick would be a
+    /// false claim.
     ///
-    /// The probe reports NotFound everywhere, which is exactly the fixture on which the tempting
-    /// implementation ("the end state is clean, so we are done") is wrong: nothing was deregistered,
-    /// and on a host where the binary cannot even be run the probe is not authoritative either.
+    /// The two scopes differ deliberately. Only the per-user one is unaskable (the real `sudo`
+    /// bus-failure message, classified by production code); the system scope answers a definite
+    /// absence. That control is what makes the error attributable — a rule that errored merely
+    /// because the attempts failed would read identically on a fixture where BOTH scopes were
+    /// unaskable, and identically on one where NEITHER was (which is
+    /// [`a_failure_in_every_scope_with_a_readable_absence_is_not_a_failure`]).
     #[test]
     fn a_failure_in_every_scope_is_unknown_state_not_a_clean_uninstall() {
+        const BUS_FAILURE: &str = "Failed to connect to bus: No such file or directory";
         let mut node = MockComponent::new(|_| {
             Err("could not run /opt/dig/bin/dig-node: No such file or directory".to_string())
         });
@@ -1307,14 +1325,63 @@ mod tests {
             "dig-node",
             Os::Linux,
             &mut |a, e| node.run(a, e),
-            &mut |_| svc::ScopeRegistration::absent("test: no registration in this scope"),
+            &mut |scope| match scope {
+                ServiceScope::User => svc::classify_systemctl_is_enabled("", BUS_FAILURE, false),
+                ServiceScope::System => {
+                    svc::ScopeRegistration::absent("test: no registration in this scope")
+                }
+            },
         )
         .unwrap_err();
         assert!(err.contains("state is UNKNOWN"), "got: {err}");
         assert!(
+            err.contains("per-user scope"),
+            "the scope that could not be established must be named, got: {err}"
+        );
+        assert!(
             err.contains("No such file"),
             "the cause must be carried: {err}"
         );
+    }
+
+    /// Finding A2: the error must be reached THROUGH the probe, not instead of it.
+    ///
+    /// The launcher is gone, so every scope's `uninstall` attempt fails — but the probe does not run
+    /// the launcher, it asks the service manager, and here the service manager answers a definite
+    /// absence in every scope. The state is therefore established as removed, and failing the
+    /// uninstall would report trouble on a host that has none. The distinguishing input against the
+    /// sibling above is the ONE varied actor: whether a scope could be read back.
+    #[test]
+    fn a_failure_in_every_scope_with_a_readable_absence_is_not_a_failure() {
+        for os in [Os::Windows, Os::Linux, Os::MacOs] {
+            let mut node = MockComponent::new(|_| {
+                Err("could not run /opt/dig/bin/dig-node: No such file or directory".to_string())
+            });
+            let note = uninstall_engine_service(
+                "dig-node",
+                os,
+                &mut |a, e| node.run(a, e),
+                // A definite not-found reply from the service manager itself, on a SUCCESSFUL query.
+                &mut |_| {
+                    svc::classify_systemctl_is_enabled(
+                        "",
+                        "Failed to get unit file state for dignetwork-dig-node.service: No such \
+                         file or directory",
+                        false,
+                    )
+                },
+            )
+            .expect("every scope definitively answered absent — there was nothing to remove");
+            assert!(note.contains("every scope"), "{os:?}: got {note}");
+            assert!(
+                note.contains("No such file or directory"),
+                "{os:?}: the failed attempts stay disclosed, never swallowed: {note}"
+            );
+            assert!(
+                !note.contains("could not verify"),
+                "{os:?}: nothing was unverifiable here: {note}"
+            );
+        }
     }
 
     #[test]
