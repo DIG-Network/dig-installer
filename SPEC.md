@@ -520,6 +520,25 @@ therefore places binaries into two roots, chosen per component:
     those owners; a level left owned by the installing admin USER's own SID would make dig-node
     false-reject the tree and silently disable self-heal, local-HTTPS provisioning, and system-service
     install (`secure::force_system_ownership` / `secure::windows_created_root_levels`).
+
+    Every FILE the installer places in that root is adopted the same way, and for the same reason. An
+    elevated process's token default owner is the invoking admin USER, and the Program Files DACL the
+    root inherits carries a `CREATOR OWNER` full-control entry, so a freshly created file is owned by
+    that user AND grants them FullControl — which dig-node correctly refuses to run as SYSTEM. After
+    each placement the installer therefore sets the file's owner to SYSTEM and re-derives its DACL from
+    the parent (`secure::adopt_placed_file`), then READS IT BACK and requires a privileged owner with no
+    write grant to any other principal (`secure::parse_placed_binary_acl`). The read-back bar is
+    STRICTER than the install-root check, which rejects only well-known broad principals: the grant here
+    is to a single named account, whose SID is not well-known. A file placed OUTSIDE the protected root
+    (a `--bin-dir` override) is never re-owned. The outcome is REPORTED, never silent.
+
+    Every ACL read-back MUST bind the security object through .NET
+    (`secure::acl_object_expression`) rather than the `Get-Acl` cmdlet, and PowerShell children MUST be
+    spawned with `PSModulePath` cleared (`proc::powershell`). `Get-Acl` is reached by module
+    autoloading through the INHERITED `PSModulePath`, which a pwsh 7 session shadows with a Core-only
+    module — the read then fails, the install fails closed, and the user gets a silently degraded
+    install. Clearing the variable also denies an elevated PowerShell child any caller-supplied module
+    directory.
   - **macOS/Linux:** `/opt/dig/bin`, root-owned `0755` (owner root writes; group/other read+execute).
     DIG deliberately roots PRIVILEGED binaries here, NOT under a Homebrew-style `/usr/local` prefix,
     which is group-writable on an Intel Mac (`<user>:admin`, mode `0775`) — a group-writable install
@@ -917,6 +936,13 @@ For the two components this installer registers as OS services with their OWN `i
    service reports this on re-install; the registration still points at the same on-disk path, so
    the next step still picks up the binary just written), then, if the plan requests it,
    `<dest> start`. Only a `start` failure is a hard error (`SERVICE_START_FAILED`).
+
+   A registration that fails with the Windows SCM's TRANSIENT post-delete state is RETRIED before it
+   is tolerated: after an uninstall the SCM keeps the deleted record until its last handle closes, and
+   a registration in that window reports `ERROR_SERVICE_DOES_NOT_EXIST` (1060) or
+   `ERROR_SERVICE_MARKED_FOR_DELETE` (1072). The installer retries those two codes — and ONLY those
+   two, recognised by the code rather than by an English phrase a spawn failure shares — on a bounded
+   1s/2s backoff (`service::with_scm_retry`). Every other failure is reported at once.
 
 This restores the prior running state: a service that was running before the install is running
 again after it (now serving the new binary); a service that was never installed/running is
