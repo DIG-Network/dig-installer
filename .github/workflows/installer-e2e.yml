@@ -1258,10 +1258,39 @@ jobs:
   # workaround IS the thing #526 was filed to remove, so a job that keeps it
   # cannot show the need has gone.
   # ---------------------------------------------------------------------------
+  # Two legs over the dig-node pin, because the job has to hold two DIFFERENT
+  # contracts that only look like one:
+  #
+  #   current (0.71.0) — `--scope` shipped in dig-node v0.70.0, and `resolve_scope`
+  #     maps `auto` under root to the system domain. So on a pin at or above that,
+  #     a headless elevated install MUST reach a machine-wide, boot-started
+  #     registration. This leg asserts the SUCCESS shape, and it is the leg that
+  #     proves dig_ecosystem#526 is delivered rather than merely reported.
+  #
+  #   legacy (0.29.0) — predates the flag entirely. dig-node rejects `--scope`, the
+  #     installer retries flag-less, and the component reaches for a per-user
+  #     manager that root has no session bus for. The contract there is not that it
+  #     works; it is that the degradation is reported HONESTLY and the run is NEVER
+  #     called ready. Those assertions are the false-ready regression guard and are
+  #     kept verbatim — an operator can still pin an old component, and this is the
+  #     only leg that can observe the false-ready at all.
+  #
+  # Both legs assert a true property of their own pin. Neither asserts an
+  # impossibility, which is what the single-pinned version of this job did.
   system-scope-e2e:
-    name: "#526 a default-path install decides scope for itself (Linux)"
+    name: "#526 a default-path install decides scope for itself (Linux, dig-node ${{ matrix.leg }})"
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      # Each leg is an independent contract: a legacy-leg failure must not hide
+      # whether the current leg delivers, or vice versa.
+      fail-fast: false
+      matrix:
+        include:
+          - leg: current
+            dig_node_version: "0.71.0"
+          - leg: legacy
+            dig_node_version: "0.29.0"
     defaults:
       run:
         shell: bash
@@ -1282,8 +1311,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ubuntu-526-syscope-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ubuntu-526-syscope-
+          key: ubuntu-526-syscope-${{ matrix.leg }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-526-syscope-${{ matrix.leg }}-
 
       - name: Build the installer
         run: cargo build --release --bin dig-installer
@@ -1318,23 +1347,40 @@ jobs:
             | sudo tee /root/.config/systemd/user/dignetwork-dig-node.service >/dev/null
           sudo ls -l /root/.config/systemd/user/
 
-      # `|| true` on the installer itself: on this host class the install
-      # currently FAILS, and that failure is the subject of the assertions below
-      # rather than a reason to abort. The steps that follow decide pass/fail.
-      - name: Install with NO --bin-dir, so engine_scope actually decides
+      # The current leg has NO tolerance: on a pin that understands `--scope`, a
+      # headless elevated install is required to succeed, so a non-zero exit is a
+      # failure of the acceptance criterion and must fail the step here rather
+      # than be re-interpreted by a later assertion.
+      - name: Install with NO --bin-dir, so engine_scope actually decides (current)
+        if: matrix.leg == 'current'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo -H -E "$PWD/target/release/dig-installer" \
+            --no-digstore --no-dig-app --no-auto-update \
+            --dig-node-version "${{ matrix.dig_node_version }}" \
+            --dig-dns-version "$DIG_DNS_VERSION" \
+            --json > install.json
+          # No pipe into `head`: this job runs with `-o pipefail`, and `head`
+          # closing the pipe early SIGPIPEs `jq`, which would fail the step for a
+          # diagnostic line.
+          jq -r '{ready: .result.ready, scope: .result.service.scope}' install.json
+
+      # The legacy leg DOES tolerate a non-zero exit: on a pre-`--scope` pin the
+      # install genuinely cannot register on this host class, and that failure is
+      # the subject of the assertions below rather than a reason to abort.
+      - name: Install with NO --bin-dir, so engine_scope actually decides (legacy)
+        if: matrix.leg == 'legacy'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           sudo -H -E "$PWD/target/release/dig-installer" \
             --no-digstore --no-dig-app --no-auto-update \
-            --dig-node-version "$DIG_NODE_VERSION" \
+            --dig-node-version "${{ matrix.dig_node_version }}" \
             --dig-dns-version "$DIG_DNS_VERSION" \
             --json > install.json
           echo "installer exit: $?"
-          # No pipe into `head`: this job runs with `-o pipefail`, and `head`
-          # closing the pipe early SIGPIPEs `jq`, which would fail the step for a
-          # diagnostic line. The assertions below are what decide this job.
           jq -r '{ready: .result.ready, scope: .result.service.scope}' install.json
           true
 
@@ -1349,21 +1395,94 @@ jobs:
             exit 1
           }
 
-      # THE #526 ACCEPTANCE PROPERTY, and the one this PR actually delivers.
+      # THE #526 ACCEPTANCE PROPERTY: on a pin that understands `--scope`, a
+      # headless elevated install reaches a machine-wide registration that comes
+      # back after a reboot with nobody logged in.
+      - name: The install reports a boot-surviving system registration (current)
+        if: matrix.leg == 'current'
+        run: |
+          jq -e '.result.ready == true' install.json || {
+            echo "FAIL: a supported dig-node pin must reach a ready install"
+            exit 1
+          }
+          jq -e '.result.service.installed == true' install.json
+          jq -e '.result.service.survives_reboot == true' install.json
+
+      # `survives_reboot: true` above is the installer's OWN report, so on its own
+      # it is the installer grading its own homework. This step asks the OS the
+      # same question independently: a SYSTEM-scope systemd unit exists on disk
+      # under /etc/systemd/system, and systemd itself reports it enabled — which is
+      # precisely what "starts after a reboot with nobody logged in" means.
       #
-      # No released dig-node accepts `--scope` (v0.69.0 has no such flag and
-      # PREFERS_USER_LEVEL is unconditionally true on unix), so on this headless
-      # host `dig-node install` reaches for a per-user manager, finds root has no
-      # session bus, and fails. That is #526 itself, and it is NOT fixed by this
-      # installer — it is fixed by the dig-node side (DIG-Network/dig-node#123).
+      # `is-enabled` is run WITHOUT `--user`, so a per-user registration cannot
+      # satisfy it, and the unit is discovered by glob rather than by a hardcoded
+      # name — but the glob is required to match EXACTLY ONE unit, so a glob that
+      # matches nothing fails loudly instead of passing vacuously.
+      - name: systemd itself confirms a boot-started system unit (current)
+        if: matrix.leg == 'current'
+        run: |
+          sudo ls -l /etc/systemd/system/ || true
+          mapfile -t UNITS < <(sudo find /etc/systemd/system -maxdepth 1 \
+            -name '*dig-node*.service' -printf '%f\n' | sort)
+          echo "system units found: ${UNITS[*]:-<none>}"
+          if [ "${#UNITS[@]}" -ne 1 ]; then
+            echo "FAIL: expected exactly one dig-node unit in the SYSTEM scope," \
+                 "found ${#UNITS[@]} — a machine-wide registration was not made"
+            exit 1
+          fi
+          UNIT="${UNITS[0]}"
+
+          # The unit must be enabled in the SYSTEM manager. `is-enabled` exits
+          # non-zero for a disabled unit, so its exit status is captured rather
+          # than allowed to abort the step before the state can be reported.
+          set +e
+          STATE=$(sudo systemctl is-enabled "$UNIT" 2>&1)
+          set -e
+          echo "systemctl is-enabled $UNIT -> $STATE"
+          case "$STATE" in
+            enabled|enabled-runtime|alias|static|indirect)
+              echo "OK: $UNIT is wired to start at boot" ;;
+            *)
+              echo "FAIL: $UNIT is present but systemd reports '$STATE', so it will" \
+                   "NOT come back after a reboot"
+              exit 1 ;;
+          esac
+
+      # The positional counterpart to the legacy leg's "a failed registration
+      # sweeps nothing", against the SAME planted fixture. A sweep keyed off the
+      # REQUESTED scope would delete the planted unit on both legs; a sweep keyed
+      # off what was actually SETTLED deletes it only here, where a system
+      # registration really happened. Asserting only one leg could not tell those
+      # two implementations apart — the pair is what pins the behaviour.
+      - name: A successful system registration DOES sweep the shadowing user unit (current)
+        if: matrix.leg == 'current'
+        run: |
+          jq -r '.result.service.shadowing_units_removed' install.json
+          jq -e '(.result.service.shadowing_units_removed | length) >= 1' install.json || {
+            echo "FAIL: a system registration succeeded, yet the leftover per-user unit" \
+                 "that would shadow it was left in place"
+            exit 1
+          }
+          # The removal must be real on disk, not merely claimed in the report.
+          if sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service; then
+            echo "FAIL: the report claims a sweep, but the per-user unit is still on disk"
+            exit 1
+          fi
+
+      # THE FALSE-READY REGRESSION GUARD, on the pre-`--scope` pin.
       #
-      # What this installer must guarantee TODAY is that such a host is never
-      # told it is ready. The pre-#526 code reported `ready: true` here, because
-      # nothing asked whether a registration existed WHERE the run needed one.
-      # That is the regression this step pins, and it is the assertion the
-      # --bin-dir leg cannot make: there the scope is forced to user, the unit
-      # registers, and the false-ready never arises.
+      # dig-node gained `--scope` in v0.70.0, so this leg's 0.29.0 pin predates the
+      # flag: `dig-node install` has the flag rejected, the installer retries
+      # flag-less, the component reaches for a per-user manager, finds root has no
+      # session bus, and fails. An operator can still pin a component this old, so
+      # what the installer must guarantee is that such a host is never told it is
+      # ready. The pre-#526 code reported `ready: true` here, because nothing asked
+      # whether a registration existed WHERE the run needed one. That is the
+      # regression these assertions pin, and it is the assertion the --bin-dir leg
+      # cannot make: there the scope is forced to user, the unit registers, and the
+      # false-ready never arises.
       - name: A host where the service could not register is NEVER reported ready
+        if: matrix.leg == 'legacy'
         run: |
           jq -e '.result.ready == false' install.json || {
             echo "FAIL: false-ready — the service did not register, yet the run claims ready"
@@ -1397,6 +1516,7 @@ jobs:
       # A sweep driven by the REQUESTED scope would have deleted the planted unit
       # on the strength of a system registration that never happened.
       - name: A failed registration sweeps nothing
+        if: matrix.leg == 'legacy'
         run: |
           jq -e '(.result.service.shadowing_units_removed | length) == 0' install.json || {
             echo "FAIL: swept per-user units although no registration was made"
