@@ -373,17 +373,24 @@ pub fn webview_lockdown_grant_args(dir: &str) -> Vec<String> {
 
 /// The PowerShell one-liner that emits the dir's owner + each access ACE as
 /// SID-based lines (`OWNER;<sid>` / `ACE;<sid>;<isInherited>`) for the read-back
-/// verification. SID-based (not name-based) so parsing is locale-independent.
-/// Pure (single-quotes in the path are doubled for PS literal safety).
+/// verification. SID-based (not name-based) so parsing is locale-independent, and
+/// module-free ([`crate::secure::acl_object_expression`]) so an inherited
+/// `PSModulePath` cannot fail the read outright (#1910).
+///
+/// The rules are enumerated ALREADY IN SID FORM rather than by translating each
+/// ACE's identity name, for the #565 reason recorded on
+/// [`crate::secure::acl_write_probe_ps_command`]: one untranslatable ACE otherwise
+/// aborts the whole probe under `$ErrorActionPreference='Stop'`.
+///
+/// Pure.
 pub fn acl_verify_ps_command(dir: &str) -> String {
-    let dir = dir.replace('\'', "''");
     format!(
-        "$ErrorActionPreference='Stop'; \
-         $acl = Get-Acl -LiteralPath '{dir}'; \
+        "$ErrorActionPreference='Stop'; {bind}\
          'OWNER;' + $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; \
-         foreach ($a in $acl.Access) {{ \
-           'ACE;' + $a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value + ';' + $a.IsInherited \
-         }}"
+         foreach ($a in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {{ \
+           'ACE;' + $a.IdentityReference.Value + ';' + $a.IsInherited \
+         }}",
+        bind = crate::secure::acl_object_expression(dir)
     )
 }
 
@@ -489,16 +496,17 @@ fn current_user_sid() -> Result<String, String> {
     Ok(sid)
 }
 
-/// The dir's current owner SID via `Get-Acl`, or `None` if it can't be read.
+/// The dir's current owner SID, or `None` if it can't be read. Module-free
+/// ([`crate::secure::acl_object_expression`]), so an inherited `PSModulePath`
+/// cannot turn the read into a false "unknown owner" (#1910).
 #[cfg(windows)]
 pub(crate) fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
-    let dir = path.to_string_lossy().replace('\'', "''");
+    let dir = path.to_string_lossy();
     let ps = format!(
-        "(Get-Acl -LiteralPath '{dir}').GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
+        "{bind}$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+        bind = crate::secure::acl_object_expression(&dir)
     );
-    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .hide_console()
+    let out = crate::proc::powershell(&ps)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -538,9 +546,7 @@ pub(crate) fn run_icacls(args: &[String]) -> Result<(), String> {
 #[cfg(windows)]
 fn read_and_verify_acl(path: &std::path::Path, user_sid: &str) -> Result<(), String> {
     let ps = acl_verify_ps_command(&path.to_string_lossy());
-    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .hide_console()
+    let out = crate::proc::powershell(&ps)
         .output()
         .map_err(|e| format!("Get-Acl read-back failed to run: {e}"))?;
     if !out.status.success() {
@@ -588,9 +594,7 @@ fn any_component_is_reparse_point(path: &std::path::Path) -> bool {
 #[cfg(windows)]
 fn read_and_verify_webview_acl(path: &std::path::Path) -> Result<(), String> {
     let ps = acl_verify_ps_command(&path.to_string_lossy());
-    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .hide_console()
+    let out = crate::proc::powershell(&ps)
         .output()
         .map_err(|e| format!("Get-Acl read-back failed to run: {e}"))?;
     if !out.status.success() {

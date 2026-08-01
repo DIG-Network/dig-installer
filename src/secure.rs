@@ -59,8 +59,51 @@ pub fn grants_write(rights: i64) -> bool {
     rights & WRITE_MASK != 0
 }
 
-/// The PowerShell one-liner that emits the directory's access ACEs as SID-based
-/// `ACE;<sid>;<rightsInt>;<Allow|Deny>` lines for [`parse_acl_write_grants`].
+/// The PowerShell expression that binds the ACL of `path` **without invoking a
+/// cmdlet** — `[System.Security.AccessControl.{Directory,File}Security]::new(…)`
+/// selected by a `[System.IO.Directory]::Exists` test, so the same expression
+/// serves a directory and a file.
+///
+/// # Why not `Get-Acl` (#1910)
+///
+/// `Get-Acl` lives in the `Microsoft.PowerShell.Security` MODULE and is reached
+/// only by module autoloading, which resolves through the INHERITED
+/// `%PSModulePath%`. A pwsh 7 / Git Bash session exports a `PSModulePath` whose
+/// entries are the pwsh ones, and Windows PowerShell then fails the autoload
+/// outright:
+///
+/// ```text
+/// Get-Acl : The 'Get-Acl' command was found in the module
+/// 'Microsoft.PowerShell.Security', but the module could not be loaded.
+/// ```
+///
+/// Every ACL read-back in this crate then returns "could not read" — which is
+/// fail-CLOSED, but the closed behaviour is a silently degraded install (the ARP
+/// entry skipped, the hardened state dirs removed) for a user whose only mistake
+/// was the shell they launched from. Constructing the .NET security object
+/// directly needs no module, no autoload, and no `PSModulePath` at all.
+///
+/// It also removes an elevated-child hijack surface of the same shape as #657: an
+/// inherited `PSModulePath` entry that an unprivileged account can write is a
+/// module an ELEVATED PowerShell child would autoload. [`crate::proc::powershell`]
+/// clears the variable for the same reason; this expression makes the read
+/// independent of it either way.
+///
+/// Pure (single quotes in `path` are doubled for PowerShell literal safety).
+pub fn acl_object_expression(path: &str) -> String {
+    let path = path.replace('\'', "''");
+    format!(
+        "$p = '{path}'; \
+         $acl = if ([System.IO.Directory]::Exists($p)) \
+           {{ [System.Security.AccessControl.DirectorySecurity]::new($p, 'Owner,Access') }} \
+           else {{ [System.Security.AccessControl.FileSecurity]::new($p, 'Owner,Access') }}; "
+    )
+}
+
+/// The PowerShell one-liner that emits the path's owner as `OWNER;<sid>` and its
+/// access ACEs as SID-based `ACE;<sid>;<rightsInt>;<Allow|Deny>` lines, for
+/// [`parse_acl_write_grants`] (a directory, #565) and
+/// [`parse_placed_binary_acl`] (a placed file, #1910).
 ///
 /// SID-based (so parsing is locale-independent — never the localized
 /// `BUILTIN\Users` display name), read DIRECTLY in SID form via
@@ -78,15 +121,25 @@ pub fn grants_write(rights: i64) -> bool {
 ///
 /// Pure (single quotes in `dir` are doubled for PowerShell literal safety).
 pub fn acl_write_probe_ps_command(dir: &str) -> String {
-    let dir = dir.replace('\'', "''");
     format!(
-        "$ErrorActionPreference='Stop'; \
-         $acl = Get-Acl -LiteralPath '{dir}'; \
+        "$ErrorActionPreference='Stop'; {bind}\
+         'OWNER;' + $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; \
          foreach ($a in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {{ \
            'ACE;' + $a.IdentityReference.Value \
              + ';' + [int64]$a.FileSystemRights + ';' + $a.AccessControlType \
-         }}"
+         }}",
+        bind = acl_object_expression(dir)
     )
+}
+
+/// The owner SID reported by [`acl_write_probe_ps_command`], if the read produced
+/// one. Pure.
+pub fn parse_acl_owner(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("OWNER;"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("S-1-"))
 }
 
 /// Count the well-formed `ACE;<sid>;<rights>;<kind>` lines in
@@ -338,12 +391,8 @@ pub fn verify_install_root(os: Os, root: &std::path::Path) -> InstallRootSecurit
 
 #[cfg(windows)]
 fn verify_windows(root_str: &str, root: &std::path::Path) -> InstallRootSecurity {
-    use crate::proc::HideConsole;
     let ps = acl_write_probe_ps_command(&root.to_string_lossy());
-    let out = std::process::Command::new(crate::proc::system_tool("powershell"))
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .hide_console()
-        .output();
+    let out = crate::proc::powershell(&ps).output();
     match out {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
@@ -556,6 +605,158 @@ fn force_system_ownership(root: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+// -- #1910: own the FILES the elevated installer creates, not just the dirs ----
+//
+// #732 (above) forces owner = SYSTEM on every DIRECTORY level the installer
+// creates. The FILES placed into those levels were left to Windows' defaults, and
+// the defaults do not hold:
+//
+//   * an elevated process's token default owner is the invoking admin USER, not
+//     SYSTEM, so a freshly created file is owned by that user — and an owner holds
+//     `WRITE_DAC` implicitly, i.e. can grant itself write whatever the DACL says;
+//   * the Program Files DACL that `DIG\bin` inherits carries a
+//     `CREATOR OWNER:(OI)(CI)(IO)(F)` ACE, which MATERIALISES on each newly
+//     created file as an explicit FullControl grant to that same user.
+//
+// Observed verbatim on a real machine, on a file created in the default root by an
+// elevated shell:
+//
+//   C:\Program Files\DIG\bin\<new file>  NT AUTHORITY\SYSTEM:(I)(F)
+//                                        BUILTIN\Administrators:(I)(F)
+//                                        BUILTIN\Users:(I)(RX)
+//                                        TDS1\micha:(I)(F)          <-- #1910
+//
+// dig-node's #565 guard then REFUSES to point a SYSTEM service at that binary,
+// which is exactly what it is for: a principal that is not SYSTEM/Administrators
+// can rewrite the image a SYSTEM service executes. The guard is right; the
+// installer is what is wrong, so the fix is here and the guard is untouched.
+//
+// The repair is the same two icacls calls the directory levels already use, in the
+// same order and for the same reason: `/setowner` to SYSTEM FIRST, so that the
+// `/reset` which follows re-derives the inherited DACL with CREATOR OWNER
+// resolving to SYSTEM rather than back to the user.
+
+/// Should a file placed at `dest` have privileged ownership forced onto it?
+///
+/// Only when it lies inside `protected_root`. A `--bin-dir` override installs into
+/// a directory the CALLER chose, which may be their own home: re-owning a file
+/// there to SYSTEM would take a user's own file away from them, and it buys
+/// nothing — a user-writable root is refused by [`verify_install_root`] and
+/// [`root_exec_guard`] regardless of who owns the individual file.
+///
+/// Pure, so the boundary is asserted without a protected directory to write into.
+pub fn needs_privileged_ownership(dest: &std::path::Path, protected_root: &std::path::Path) -> bool {
+    dest.starts_with(protected_root)
+}
+
+/// Classify [`acl_write_probe_ps_command`] output for a FILE the installer placed
+/// in the protected root: `Err` unless the owner is a privileged principal
+/// ([`is_privileged_owner_sid`]) **and** no Allow ACE grants a write-capable right
+/// ([`grants_write`]) to anything else.
+///
+/// This is deliberately STRICTER than [`parse_acl_write_grants`], which rejects
+/// only the well-known broad principals (`Users`, `Everyone`, …). #1910's grant is
+/// to a single named user account, whose SID is not well-known — so the broad-group
+/// check passes it, and the defect reached a real machine. The bar for a file a
+/// SYSTEM service executes is the one dig-node's #565 guard applies: nobody but
+/// SYSTEM/Administrators/TrustedInstaller may write it.
+///
+/// A read that produced no owner line is `Err` (indeterminate, never a silent
+/// pass) — the caller reports it rather than claiming the file was adopted.
+pub fn parse_placed_binary_acl(output: &str) -> Result<(), String> {
+    let owner = parse_acl_owner(output)
+        .ok_or_else(|| "could not read the file's owner back".to_string())?;
+    if !is_privileged_owner_sid(&owner) {
+        return Err(format!(
+            "owner is {owner}, expected SYSTEM/Administrators/TrustedInstaller — an owner holds \
+             WRITE_DAC implicitly, so a non-privileged owner can grant itself write on a binary a \
+             SYSTEM service executes"
+        ));
+    }
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix("ACE;") else {
+            continue;
+        };
+        let mut parts = rest.split(';');
+        let sid = parts.next().unwrap_or("").trim();
+        let rights = parts
+            .next()
+            .and_then(|r| r.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let kind = parts.next().unwrap_or("").trim();
+        if !kind.eq_ignore_ascii_case("Allow") {
+            continue;
+        }
+        if grants_write(rights) && !is_privileged_owner_sid(sid) {
+            return Err(format!(
+                "an Allow ACE grants WRITE to {sid}, which is not SYSTEM/Administrators/\
+                 TrustedInstaller — dig-node refuses to point a SYSTEM service at a binary a \
+                 non-SYSTEM principal can rewrite (#565)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Force privileged ownership + a clean inherited DACL on a file the elevated
+/// installer just created in the protected root, then READ IT BACK and confirm
+/// ([`parse_placed_binary_acl`]) — the #1910 fix.
+///
+/// A no-op for a `dest` outside the protected root ([`needs_privileged_ownership`])
+/// and on every non-Windows target. `Err` carries a reportable reason; the caller
+/// logs it and continues, because the authoritative gate is dig-node's own refusal
+/// rather than a claim made here.
+pub fn adopt_placed_file(dest: &std::path::Path) -> Result<(), String> {
+    if !needs_privileged_ownership(dest, &crate::paths::protected_bin_dir()) {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        force_privileged_ownership(dest)
+    }
+    #[cfg(not(windows))]
+    {
+        // unix placement already creates the file as root under a root-owned tree
+        // (`crate::rootchain`), which `verify_install_root` verifies level by level.
+        Ok(())
+    }
+}
+
+/// The MECHANISM behind [`adopt_placed_file`], on any path: owner → SYSTEM, DACL
+/// → the parent's inheritance, then a read-back that must satisfy
+/// [`parse_placed_binary_acl`].
+///
+/// Separate from the policy gate so the repair can be exercised on a temporary
+/// directory in a test, rather than only on the one machine-wide root a test must
+/// not touch.
+#[cfg(windows)]
+pub(crate) fn force_privileged_ownership(path: &std::path::Path) -> Result<(), String> {
+    use crate::daemon_dir::{reset_dacl_args_here, run_icacls, setowner_system_args_here};
+    let s = path.to_string_lossy().into_owned();
+    // Owner FIRST: the `/reset` that follows re-derives the inherited DACL, and the
+    // inherited `CREATOR OWNER` entry resolves to whoever owns the file at that
+    // moment. Reversed, the user's FullControl ACE comes straight back.
+    run_icacls(&setowner_system_args_here(&s))?;
+    run_icacls(&reset_dacl_args_here(&s))?;
+    parse_placed_binary_acl(&read_acl(&s)?)
+}
+
+/// Read `path`'s owner + DACL back in the `OWNER;`/`ACE;` form the pure parsers
+/// consume. Windows-only I/O; `Err` when the read did not run or produced nothing.
+#[cfg(windows)]
+fn read_acl(path: &str) -> Result<String, String> {
+    let out = crate::proc::powershell(&acl_write_probe_ps_command(path))
+        .output()
+        .map_err(|e| format!("the ACL read-back failed to run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "the ACL read-back exited non-zero: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,7 +883,10 @@ mod tests {
     #[test]
     fn acl_write_probe_ps_command_targets_the_dir_and_emits_sids() {
         let cmd = acl_write_probe_ps_command(r"C:\Program Files\DIG\bin");
-        assert!(cmd.contains("Get-Acl"));
+        // #1910 amended this from `contains("Get-Acl")`: the probe now binds the ACL
+        // through .NET, so it no longer depends on module autoloading. What the probe
+        // must EMIT is unchanged, and that is what the rest of this test pins.
+        assert!(!cmd.contains("Get-Acl"));
         assert!(cmd.contains(r"C:\Program Files\DIG\bin"));
         assert!(cmd.contains("SecurityIdentifier"));
         assert!(cmd.contains("FileSystemRights"));
@@ -731,14 +935,18 @@ mod tests {
             return; // extraordinarily rare, but never fail on a nonstandard box
         }
         let v = verify_install_root(Os::Windows, dir);
+        // These two assertions were INVERTED (`is_blocking()` / `!is_established_safe()`)
+        // and passed only because the read-back was failing on the developer machine —
+        // #1910's `Get-Acl` autoload failure, keeping green a test whose own doc comment
+        // says the read must SUCCEED. Corrected here to assert the stated property.
         assert!(
-            v.is_blocking(),
+            !v.is_blocking(),
             "the ACL read-back must run on a Program Files dir (inherited \
              AppContainer ACEs must not abort it): {}",
             v.note
         );
         assert!(
-            !v.is_established_safe(),
+            v.is_established_safe(),
             "Program Files denies unprivileged write, so it must verify secure: {}",
             v.note
         );
@@ -1180,5 +1388,295 @@ mod tests {
                 pair[0]
             );
         }
+    }
+
+    // -- #1910: the file the elevated installer creates -----------------------
+
+    /// A file created by an elevated ADMIN USER in `%ProgramFiles%\DIG\bin`, read
+    /// back verbatim from a real machine. The `S-1-5-21-...-1002` lines are the
+    /// defect: that account owns the file AND holds FullControl (2032127) on it,
+    /// because the Program Files DACL the directory inherits carries a
+    /// `CREATOR OWNER` full-control entry that materialises for the creator.
+    const ELEVATED_USER_CREATED_FILE_ACL: &str = "\
+OWNER;S-1-5-21-447225562-1852780552-4040414075-1002
+ACE;S-1-5-18;2032127;Allow
+ACE;S-1-5-32-544;2032127;Allow
+ACE;S-1-5-32-545;1179817;Allow
+ACE;S-1-5-21-447225562-1852780552-4040414075-1002;2032127;Allow
+ACE;S-1-15-2-1;1179817;Allow
+ACE;S-1-15-2-2;1179817;Allow
+";
+
+    /// The SAME file after the repair, read back from the same machine: owner is a
+    /// privileged principal and the user's ACE is gone, while `Users` keeps the
+    /// read+execute (1179817) that makes the CLI runnable by a non-admin.
+    const ADOPTED_FILE_ACL: &str = "\
+OWNER;S-1-5-18
+ACE;S-1-5-18;2032127;Allow
+ACE;S-1-5-32-544;2032127;Allow
+ACE;S-1-5-32-545;1179817;Allow
+ACE;S-1-15-2-1;1179817;Allow
+ACE;S-1-15-2-2;1179817;Allow
+";
+
+    #[test]
+    fn a_file_the_elevated_installer_created_is_rejected_until_it_is_adopted() {
+        // The #1910 defect and its repair, on real captured ACLs. Both arms matter:
+        // the first is the state a reinstall actually produced (and dig-node's #565
+        // guard refused), the second is what the fix must leave behind.
+        let before = parse_placed_binary_acl(ELEVATED_USER_CREATED_FILE_ACL)
+            .expect_err("a user-owned, user-writable binary must be rejected");
+        assert!(
+            before.contains("S-1-5-21-447225562-1852780552-4040414075-1002"),
+            "the rejection must name the offending principal: {before}"
+        );
+        parse_placed_binary_acl(ADOPTED_FILE_ACL).expect("the adopted file must pass");
+    }
+
+    #[test]
+    fn a_privileged_owner_does_not_excuse_a_user_write_ace() {
+        // The nearest wrong implementation checks only the OWNER -- which the repair
+        // fixes first, and which alone would make this input pass. A binary a named
+        // user can still REWRITE is exactly what dig-node refuses to run as SYSTEM,
+        // however it is owned.
+        let system_owned_but_user_writable = "\
+OWNER;S-1-5-18
+ACE;S-1-5-18;2032127;Allow
+ACE;S-1-5-21-447225562-1852780552-4040414075-1002;2032127;Allow
+";
+        parse_placed_binary_acl(system_owned_but_user_writable)
+            .expect_err("a user write ACE must be rejected even under a privileged owner");
+    }
+
+    #[test]
+    fn the_broad_group_check_alone_would_have_passed_the_defect() {
+        // Why #1910 needed its own classifier, stated as a test: the #565 install-root
+        // check rejects only WELL-KNOWN broad principals, and the offending grant is to
+        // a single named account whose SID is not well-known. It passes that check --
+        // so a fix that reused it would have shipped the defect a second time.
+        parse_acl_write_grants(ELEVATED_USER_CREATED_FILE_ACL)
+            .expect("the broad-group check does not see a named-account grant");
+    }
+
+    #[test]
+    fn the_guard_still_refuses_a_genuinely_user_writable_file() {
+        // The CONTROL. "Fixed" must not mean "the check was weakened": every
+        // unprivileged shape a placed binary can take is still refused.
+        for (why, acl) in [
+            (
+                "Users:(F)",
+                "OWNER;S-1-5-18\nACE;S-1-5-32-545;2032127;Allow\n",
+            ),
+            (
+                "Everyone:(M)",
+                "OWNER;S-1-5-18\nACE;S-1-1-0;1245631;Allow\n",
+            ),
+            (
+                "Authenticated Users:(W)",
+                "OWNER;S-1-5-18\nACE;S-1-5-11;278;Allow\n",
+            ),
+            (
+                "owned by a named user",
+                "OWNER;S-1-5-21-447225562-1852780552-4040414075-1002\nACE;S-1-5-18;2032127;Allow\n",
+            ),
+            ("no owner could be read", "ACE;S-1-5-18;2032127;Allow\n"),
+        ] {
+            parse_placed_binary_acl(acl)
+                .expect_err(&format!("{why} must still be refused"));
+        }
+    }
+
+    #[test]
+    fn a_deny_ace_and_a_read_execute_ace_are_not_write_grants() {
+        // The other direction: the classifier must not refuse a healthy file, or the
+        // fix would break every install instead of only the broken ones. `Users:(RX)`
+        // is what Program Files inheritance gives, and a Deny ACE only restricts.
+        parse_placed_binary_acl(
+            "OWNER;S-1-5-32-544\nACE;S-1-5-32-545;1179817;Allow\nACE;S-1-5-32-545;2032127;Deny\n",
+        )
+        .expect("read+execute for Users, and a Deny, are both fine");
+    }
+
+    #[test]
+    fn only_a_file_inside_the_protected_root_is_re_owned() {
+        // A `--bin-dir` override installs where the CALLER chose, possibly their own
+        // home: taking their file away from them buys nothing, because a user-writable
+        // root is refused wholesale by `verify_install_root` / `root_exec_guard`.
+        let protected = std::path::Path::new("C_drive")
+            .join("Program Files")
+            .join("DIG")
+            .join("bin");
+        assert!(needs_privileged_ownership(
+            &protected.join("dig-node.exe"),
+            &protected
+        ));
+        let in_a_home = std::path::Path::new("C_drive")
+            .join("Users")
+            .join("alice")
+            .join("bin")
+            .join("dig-node.exe");
+        assert!(!needs_privileged_ownership(&in_a_home, &protected));
+        // A sibling directory whose name merely STARTS with the root's is outside it.
+        let sibling = std::path::Path::new("C_drive")
+            .join("Program Files")
+            .join("DIG")
+            .join("bin-old")
+            .join("dig-node.exe");
+        assert!(!needs_privileged_ownership(&sibling, &protected));
+    }
+
+    /// The repair, end to end, on the real operating system: reproduce the defect in
+    /// a temporary directory that inherits a `CREATOR OWNER` full-control entry the
+    /// way Program Files does, prove the created file is refused, then adopt it and
+    /// prove it passes.
+    ///
+    /// The REPRODUCTION half is unconditional -- it needs no privilege, so it fails
+    /// loudly if Windows ever stops creating files this way and the fix stops being
+    /// load-bearing. Only the repair half needs `SeTakeOwnership`, and a host without
+    /// it says so rather than passing quietly.
+    #[cfg(windows)]
+    #[test]
+    fn the_defect_reproduces_on_a_real_directory_and_the_repair_clears_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        // Give the directory the Program Files SHAPE, which is what makes this fixture
+        // able to see the defect: SYSTEM + Administrators full, Users read+execute, and
+        // the inherit-only CREATOR OWNER full-control entry that materialises for
+        // whoever creates a file. `/inheritance:r` is load-bearing — a plain temp dir
+        // sits under the user profile and grants that user write by INHERITANCE, so the
+        // repair could never clear a user write ACE there and the test would report a
+        // failure of this fixture as a failure of the fix.
+        crate::daemon_dir::run_icacls(&[
+            dir_str,
+            "/inheritance:r".to_string(),
+            "/grant".to_string(),
+            "*S-1-5-18:(OI)(CI)F".to_string(),
+            "/grant".to_string(),
+            "*S-1-5-32-544:(OI)(CI)F".to_string(),
+            "/grant".to_string(),
+            "*S-1-5-32-545:(OI)(CI)RX".to_string(),
+            "/grant".to_string(),
+            "*S-1-3-0:(OI)(CI)(IO)F".to_string(),
+            "/C".to_string(),
+            "/Q".to_string(),
+        ])
+        .expect("re-shaping the DACL of our own temp dir must work unprivileged");
+
+        let file = dir.path().join("dig-node.exe");
+        std::fs::write(&file, b"MZ").expect("create the file the way an install does");
+        let file_str = file.to_string_lossy().into_owned();
+
+        let before = read_acl(&file_str).expect("read the ACL back");
+        assert!(
+            parse_placed_binary_acl(&before).is_err(),
+            "a freshly created file must carry its creator's ownership/grant -- if this \
+             ever passes, #1910's premise no longer holds and the repair below is no \
+             longer proving anything. ACL was:\n{before}"
+        );
+
+        match force_privileged_ownership(&file) {
+            Ok(()) => {
+                let after = read_acl(&file_str).expect("read the ACL back after the repair");
+                parse_placed_binary_acl(&after).unwrap_or_else(|e| {
+                    panic!("the adopted file must satisfy the #565 bar: {e}\n{after}")
+                });
+            }
+            Err(e) => {
+                // Setting an owner to SYSTEM needs SeTakeOwnership/SeRestore. Report it;
+                // never let a missing privilege read as a pass.
+                assert!(
+                    e.contains("icacls"),
+                    "an unprivileged host may fail the /setowner, but only there: {e}"
+                );
+                eprintln!("SKIPPED the repair half -- this host cannot set an owner: {e}");
+            }
+        }
+    }
+
+    /// The ACL read-back must not depend on module autoloading (#1910).
+    ///
+    /// Both arms run under the SAME poisoned `PSModulePath`, which is the point: the
+    /// second proves the poison is genuinely hostile (a `Get-Acl` read really does
+    /// fail under it), so the first arm's success is the module-free expression
+    /// working rather than a poison that never bit.
+    #[cfg(windows)]
+    #[test]
+    fn the_acl_read_survives_an_inherited_psmodulepath() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().to_string_lossy().into_owned();
+        let poison = shadowing_psmodulepath(dir.path());
+        let poison = poison.as_str();
+
+        let mut ours = crate::proc::powershell(&acl_write_probe_ps_command(&path));
+        let out = ours
+            .env("PSModulePath", poison)
+            .output()
+            .expect("the probe should run");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success() && count_aces(&stdout) > 0,
+            "the module-free probe must still read the ACL under a poisoned PSModulePath: \
+             {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            parse_acl_owner(&stdout).is_some(),
+            "and it must still report an owner: {stdout}"
+        );
+
+        let mut cmdlet = crate::proc::powershell(&format!(
+            "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath '{path}').Owner"
+        ));
+        let control = cmdlet
+            .env("PSModulePath", poison)
+            .output()
+            .expect("the control should run");
+        assert!(
+            !control.status.success(),
+            "the control must FAIL, or the poisoned PSModulePath is not reproducing the \
+             reported condition and the arm above proves nothing"
+        );
+    }
+
+    /// Build a `PSModulePath` that reproduces the REPORTED failure: a directory
+    /// holding a `Microsoft.PowerShell.Security` module manifest marked
+    /// `CompatiblePSEditions = 'Core'`, which Windows PowerShell finds first and
+    /// refuses to load — leaving `Get-Acl` unavailable.
+    ///
+    /// A merely NON-EXISTENT path is not a usable poison and was tried first: Windows
+    /// PowerShell appends `$PSHOME\Modules` when the variable does not name it, so
+    /// `Get-Acl` still autoloads and the control arm passes, which would have made the
+    /// whole test vacuous. The observed condition is a pwsh 7 / Git Bash session
+    /// exporting ITS module directories, i.e. a SHADOWING module — so that is what this
+    /// builds.
+    #[cfg(windows)]
+    fn shadowing_psmodulepath(base: &std::path::Path) -> String {
+        let modules = base.join("psmodules");
+        let shadow = modules.join("Microsoft.PowerShell.Security");
+        std::fs::create_dir_all(&shadow).expect("create the shadow module dir");
+        std::fs::write(
+            shadow.join("Microsoft.PowerShell.Security.psd1"),
+            "@{ ModuleVersion = '7.0.0.0'; \
+                GUID = 'a94c8c7e-9810-47c0-b8af-65089c13a35a'; \
+                CompatiblePSEditions = @('Core'); \
+                CmdletsToExport = @('Get-Acl') }",
+        )
+        .expect("write the shadow module manifest");
+        modules.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_probe_reads_the_acl_without_a_cmdlet() {
+        // `Get-Acl` is a module-backed cmdlet; reaching it depends on `PSModulePath`.
+        let cmd = acl_write_probe_ps_command(r"C:\Program Files\DIG\bin");
+        assert!(!cmd.contains("Get-Acl"), "must not depend on a module: {cmd}");
+        assert!(cmd.contains("FileSecurity") && cmd.contains("DirectorySecurity"));
+        assert!(cmd.contains(r"C:\Program Files\DIG\bin"));
+    }
+
+    #[test]
+    fn the_acl_expression_escapes_a_quote_in_the_path() {
+        let cmd = acl_object_expression("C:\\od'd");
+        assert!(cmd.contains("'C:\\od''d'"), "{cmd}");
     }
 }
