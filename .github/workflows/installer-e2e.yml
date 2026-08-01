@@ -1450,24 +1450,43 @@ jobs:
 
       # The positional counterpart to the legacy leg's "a failed registration
       # sweeps nothing", against the SAME planted fixture. A sweep keyed off the
-      # REQUESTED scope would delete the planted unit on both legs; a sweep keyed
-      # off what was actually SETTLED deletes it only here, where a system
+      # REQUESTED scope would clear the planted unit on both legs; a sweep keyed
+      # off what was actually SETTLED clears it only here, where a system
       # registration really happened. Asserting only one leg could not tell those
       # two implementations apart — the pair is what pins the behaviour.
-      - name: A successful system registration DOES sweep the shadowing user unit (current)
+      #
+      # The GATE is the on-disk outcome, not the installer's own list: SPEC's rule
+      # is that no unit may SHADOW a system registration, and `systemd --user`
+      # starts a leftover user unit at the next login regardless of what the report
+      # says. Asserting the report's `shadowing_units_removed` alone would pin the
+      # MECHANISM, and would pass for a run that named a removal it did not make.
+      - name: A successful system registration clears the shadowing user unit (current)
         if: matrix.leg == 'current'
         run: |
+          echo "--- the run's own report ---"
           jq -r '.result.service.shadowing_units_removed' install.json
-          jq -e '(.result.service.shadowing_units_removed | length) >= 1' install.json || {
-            echo "FAIL: a system registration succeeded, yet the leftover per-user unit" \
-                 "that would shadow it was left in place"
-            exit 1
-          }
-          # The removal must be real on disk, not merely claimed in the report.
+          echo "--- root's user-unit directory, after the install ---"
+          sudo ls -la /root/.config/systemd/user/ || echo "(directory is gone)"
+
+          # THE GATE: the planted unit must not survive a successful machine-wide
+          # registration, or it starts a SECOND dig-node at the next login and both
+          # bind the node's port.
           if sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service; then
-            echo "FAIL: the report claims a sweep, but the per-user unit is still on disk"
+            echo "FAIL: a system registration succeeded, yet the leftover per-user unit is" \
+                 "STILL on disk — systemd --user will start a second dig-node at the next" \
+                 "login and both will bind the node's port"
             exit 1
           fi
+          echo "OK: the shadowing per-user unit is gone, so the system unit wins positionally"
+
+          # And the run must not be SILENT about having cleared it: SPEC requires the
+          # removed units be NAMED in the report, because an operator cannot audit a
+          # deletion that was never reported.
+          jq -e '(.result.service.shadowing_units_removed | length) >= 1' install.json || {
+            echo "FAIL: the shadowing unit was cleared but the report names no removal," \
+                 "so the deletion is unauditable"
+            exit 1
+          }
 
       # THE FALSE-READY REGRESSION GUARD, on the pre-`--scope` pin.
       #
