@@ -286,12 +286,60 @@ fn replace_binary_with(
             // afterwards (#1748, F4).
             Ok(WriteOutcome::Replaced)
         }
-        Err(e) if is_sharing_violation(&e) => {
+        Err(e) if is_sharing_violation(&e) || destination_is_a_running_image(&e, dest) => {
             schedule_on_reboot(dest, bytes)?;
             Ok(WriteOutcome::ScheduledForReboot)
         }
         Err(e) => Err(format!("write {}: {e}", dest.display())),
     }
+}
+
+/// Is `e` an `ERROR_ACCESS_DENIED` raised by UNLINKING a destination that is a
+/// currently RUNNING executable — the same recoverable case as
+/// [`is_sharing_violation`], reached through the other door?
+///
+/// # Why this exists (#1911, found on a real reinstall)
+///
+/// The #1748 rewrite made every write UNLINK the destination before creating it,
+/// which closed a symlink-redirect hole. It also changed which error a running
+/// destination produces. Opening a running image for write yields
+/// `ERROR_SHARING_VIOLATION` (32), which the reboot-replace fallback recognises —
+/// but DELETING one yields `ERROR_ACCESS_DENIED` (5), which it did not. So the
+/// fallback silently stopped covering the case it was built for, for any binary
+/// nothing stops first.
+///
+/// It is not hypothetical: a reinstall over an existing install failed at
+/// `dig-app.exe` (a tray app the installer itself launches and never stops) with
+/// `write …: Access is denied. (os error 5)`, and the rollback that followed
+/// deleted the dig-store, digs and dign binaries the machine already had. The
+/// service binaries were unaffected only because they are stopped by id first.
+///
+/// # It must not swallow a genuine permission failure
+///
+/// Error 5 is also what an ACL problem looks like, and staging a reboot-time
+/// replace for one would report a success that never happens. So the code is not
+/// trusted on its own: the destination is PROBED by opening it for write. A
+/// running image refuses that with a sharing violation (its image section denies
+/// write sharing); a merely unwritable file refuses with access-denied again, and
+/// a writable one opens. Only the sharing violation is the running-image answer.
+#[cfg(windows)]
+fn destination_is_a_running_image(e: &std::io::Error, dest: &Path) -> bool {
+    if e.raw_os_error() != Some(5) {
+        return false;
+    }
+    match std::fs::OpenOptions::new().write(true).open(dest) {
+        Ok(_) => false,
+        Err(probe) => is_sharing_violation(&probe),
+    }
+}
+
+/// Never true off Windows: neither the unlink-time access-denied nor the
+/// image-section lock this discriminates exists there (a running binary fails
+/// with `ETXTBSY` at open, which is a hard failure by design).
+#[cfg(not(windows))]
+fn destination_is_a_running_image(e: &std::io::Error, dest: &Path) -> bool {
+    let _ = (e, dest);
+    false
 }
 
 /// Write `bytes` to `dest` without ever following a symlink that is already there.
@@ -1018,5 +1066,88 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Replaced);
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW BINARY");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- #1911: a RUNNING destination, reached through the unlink -------------
+
+    /// A running executable must fall back to the reboot-time replace, not fail the
+    /// install.
+    ///
+    /// The fixture is a REAL running process, because the property under test is the
+    /// operating system's answer: since #1748 the write UNLINKS first, and unlinking a
+    /// running image reports `ERROR_ACCESS_DENIED` rather than the sharing violation
+    /// the fallback recognised. A mock returning error 5 would pass against a naive
+    /// "treat every error 5 as running" implementation, which the control below
+    /// forbids -- so the two tests are only meaningful together.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_destination_is_staged_for_the_next_reboot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("running.exe");
+        // A single ping at a black-holed address with a long timeout: the process is
+        // alive (so its image section exists) but does essentially nothing, so it
+        // cannot perturb the timing-sensitive tests running beside it.
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &dest).expect("copy a real exe");
+        let mut child = {
+            #[allow(clippy::disallowed_methods)]
+            std::process::Command::new(&dest)
+                .args(["-n", "1", "-w", "60000", "192.0.2.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run it")
+        };
+        // Give the image section time to exist before the unlink is attempted.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let staged = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let outcome = replace_binary_with(&dest, b"NEW BINARY", |_, bytes| {
+            staged.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        });
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            outcome,
+            Ok(WriteOutcome::ScheduledForReboot),
+            "a running destination must be staged, not reported as a failed write"
+        );
+        assert_eq!(staged.into_inner(), vec![b"NEW BINARY".to_vec()]);
+    }
+
+    /// The CONTROL: error 5 ALONE must not be read as "the destination is running".
+    ///
+    /// The nearest wrong implementation is the one-liner — treat every
+    /// `ERROR_ACCESS_DENIED` from the unlink as a running image — and it passes the
+    /// test above identically. It is also wrong in the expensive direction: a genuine
+    /// permission failure would be staged for a reboot-time replace and REPORTED AS
+    /// SUCCESS for a write that never happens. So the discriminator is asserted
+    /// directly, on a destination that is demonstrably not running.
+    ///
+    /// (Two outcome-level fixtures were tried first and neither can express this: a
+    /// read-only file is deleted anyway, because Rust's `remove_file` clears
+    /// `FILE_ATTRIBUTE_READONLY`; and a `Deny` on the file's own DELETE is bypassed by
+    /// the parent directory's delete-child right. Both simply wrote, so both would
+    /// have pinned a coincidence.)
+    #[cfg(windows)]
+    #[test]
+    fn access_denied_alone_does_not_mean_the_destination_is_running() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ordinary = dir.path().join("not-running.exe");
+        std::fs::write(&ordinary, b"OLD").expect("write it");
+        assert!(
+            !destination_is_a_running_image(&std::io::Error::from_raw_os_error(5), &ordinary),
+            "an ordinary file that merely reported error 5 is not a running image"
+        );
+        // And a code that is not 5 is never this case, whatever the destination is.
+        assert!(!destination_is_a_running_image(
+            &std::io::Error::from_raw_os_error(32),
+            &ordinary
+        ));
+        assert!(!destination_is_a_running_image(
+            &std::io::Error::from_raw_os_error(5),
+            &dir.path().join("absent.exe")
+        ));
     }
 }
