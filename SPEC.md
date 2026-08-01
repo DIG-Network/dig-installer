@@ -1137,10 +1137,19 @@ clear. On the #526 host class — root with no session bus — the per-user scop
 cannot be read, so an unqualified "removed from every scope" was false precisely where an operator
 most needed it to be true. If any scope is `Unknown`, removal-completeness MUST NOT be asserted.
 
-**No unit may shadow a system registration.** After a system-scope register, every unpackaged
-per-user unit for that service — the invoking user's AND root's own, which a pre-#526 `sudo` install
-wrote — MUST be removed and NAMED in `ServiceResult.shadowing_units_removed`. `systemd --user` starts
-such a unit at the next login alongside the system unit, and both bind the node's port.
+**No unit may shadow a system registration.** After a system-scope register, no unpackaged per-user
+unit for that service — the invoking user's, or root's own, which a pre-#526 `sudo` install wrote —
+may remain on disk. `systemd --user` starts such a unit at the next login alongside the system unit,
+and both bind the node's port. The normative requirement is the POSITIONAL outcome: the shadowing
+unit is gone.
+
+`ServiceResult.shadowing_units_removed` names every unit **this installer's own sweep** removed, and
+MUST name each one it removed. It MAY legitimately be EMPTY even though a shadowing unit was cleared
+during the run: the installer enumerates the units on disk BEFORE delegating to the component's
+`install`, and a component at v0.70.0 or later clears the stale per-user unit itself while registering
+machine-wide, leaving the sweep nothing to do. An empty list is therefore not evidence that a shadow
+survived — the disk is — and the field MUST NOT be populated with a removal the installer did not
+perform.
 
 **The sweep is licensed by the registration that SERVES, never by the scope that was requested.** A
 run that registered nothing — the already-up-to-date path, which leaves the existing registration

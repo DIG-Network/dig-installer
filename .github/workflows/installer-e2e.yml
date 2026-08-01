@@ -1479,14 +1479,32 @@ jobs:
           fi
           echo "OK: the shadowing per-user unit is gone, so the system unit wins positionally"
 
-          # And the run must not be SILENT about having cleared it: SPEC requires the
-          # removed units be NAMED in the report, because an operator cannot audit a
-          # deletion that was never reported.
-          jq -e '(.result.service.shadowing_units_removed | length) >= 1' install.json || {
-            echo "FAIL: the shadowing unit was cleared but the report names no removal," \
-                 "so the deletion is unauditable"
-            exit 1
-          }
+          # `shadowing_units_removed` is NOT asserted non-empty here, and that is
+          # deliberate rather than an oversight. It records the INSTALLER'S OWN sweep,
+          # and the installer enumerates the units on disk BEFORE delegating to
+          # `dig-node install`. On a component at v0.70.0 or later the component
+          # itself clears the stale per-user unit while registering machine-wide, so
+          # by the time the sweep runs there is legitimately nothing left to remove
+          # and an empty list is the honest report. Requiring an entry here would
+          # demand the installer claim credit for a deletion another process
+          # performed, and the only way to satisfy it would be to fabricate one.
+          #
+          # The installer's own sweep is pinned where it can be observed truthfully:
+          # the `legacy` leg asserts it removes NOTHING when no registration was
+          # established, and `units::a_user_scope_unit_is_found_under_each_config_home_that_has_one`
+          # asserts both config homes' units are found and proposed for removal.
+          # What matters on THIS leg is the positional outcome, which is gated above.
+          if [ "$(jq -r '.result.service.shadowing_units_removed | length' install.json)" != "0" ]; then
+            echo "the installer also swept units of its own:"
+            jq -r '.result.service.shadowing_units_removed[]' install.json
+            # Anything it CLAIMS to have removed must really be gone.
+            while read -r swept; do
+              if sudo test -e "$swept"; then
+                echo "FAIL: the report claims it removed $swept, but it is still on disk"
+                exit 1
+              fi
+            done < <(jq -r '.result.service.shadowing_units_removed[]' install.json)
+          fi
 
       # THE FALSE-READY REGRESSION GUARD, on the pre-`--scope` pin.
       #
