@@ -572,13 +572,35 @@ fn uninstall_engine_service(
         ));
     }
 
-    let unverified_note = if unverified.is_empty() {
-        String::new()
+    // The removal claim covers exactly the scopes whose absence was ESTABLISHED. "Every scope" is
+    // what an operator acts on, so it may only be said when every scope actually answered — otherwise
+    // the sentence asserted removal over a scope it never reached and then admitted, parenthetically,
+    // that it had not reached it. On the #526 host class (root with no session bus) the per-user scope
+    // is precisely the one that cannot be read, so the unqualified claim was false exactly where it
+    // mattered most.
+    let verified_removed: Vec<&str> = readings
+        .iter()
+        .filter(|(_, reading)| reading.presence == svc::Presence::Absent)
+        .map(|(scope, _)| scope.describe())
+        .collect();
+    let outcome = if unverified.is_empty() {
+        format!("{label} service uninstalled from every scope")
+    } else if verified_removed.is_empty() {
+        // Nothing was established anywhere. The attempts did not fail, so this is not the UNKNOWN
+        // error above, but there is no scope this run may claim to have cleared either.
+        format!(
+            "{label} service uninstall ran, but could not verify {}, so no scope is confirmed clear",
+            unverified.join(" and ")
+        )
     } else {
-        format!(" (could not verify {})", unverified.join(" and "))
+        format!(
+            "{label} service uninstalled from {} (could not verify {})",
+            verified_removed.join(" and "),
+            unverified.join(" and ")
+        )
     };
     Ok(format!(
-        "{label} service uninstalled from every scope{unverified_note}{}",
+        "{outcome}{}",
         format_attempt_errors(&attempt_errors)
     ))
 }
@@ -1333,9 +1355,20 @@ mod tests {
             note.contains("per-user scope"),
             "the unverified scope must be named specifically, got: {note}"
         );
+        // The scope that DID answer must not be listed as UNVERIFIED. Asserted against the
+        // unverified clause specifically rather than against the whole note: the note now also names
+        // the scopes it verified as REMOVED, so a bare "machine-wide is absent from the note" check
+        // would forbid the very report this test wants.
+        let (cleared, unverified) = note
+            .split_once("(could not verify ")
+            .expect("the note must carry an unverified clause");
         assert!(
-            !note.contains("machine-wide"),
+            !unverified.contains("machine-wide"),
             "the scope that DID answer must not be listed as unverified, got: {note}"
+        );
+        assert!(
+            cleared.contains("machine-wide"),
+            "the scope that answered a definite absence must be named as cleared, got: {note}"
         );
         assert!(
             note.contains("Failed to connect to bus"),
@@ -1394,6 +1427,74 @@ mod tests {
         .expect("a clean end state is Ok despite the tool's exit code");
         assert!(note.contains("per-scope command errors"), "got: {note}");
         assert!(note.contains("no such unit"), "got: {note}");
+    }
+
+    /// A scope that could not be READ must not be inside the set the report claims to have cleared.
+    ///
+    /// The success string said "uninstalled from every scope (could not verify …)", which asserts
+    /// removal over a scope it never managed to ask and then parenthetically admits it did not ask.
+    /// "Every scope" is the claim an operator acts on, and on the #526 host class — root with no
+    /// session bus — the per-user scope is exactly the one that cannot be read, so the false half of
+    /// the sentence is load-bearing precisely where it matters.
+    ///
+    /// The fixture varies ONE scope's readability and keeps the other as a truthful control: the
+    /// system scope answers a definite absence and so IS verified removed, while the per-user scope is
+    /// unaskable via the real `sudo` bus-failure message run through production classification. A
+    /// report that named neither, or that named both the same way, would be indistinguishable from one
+    /// that simply dropped the phrase.
+    #[test]
+    fn an_unreadable_scope_is_excluded_from_the_set_the_report_claims_to_have_cleared() {
+        const BUS_FAILURE: &str = "Failed to connect to bus: No such file or directory";
+        // Every attempt SUCCEEDS here, so this is the clean-uninstall path rather than the
+        // all-attempts-failed error above: the only defect under test is the CLAIM.
+        let mut node = MockComponent::ok();
+        let note = uninstall_engine_service(
+            "dig-node",
+            Os::Linux,
+            &mut |a, e| node.run(a, e),
+            &mut |scope| match scope {
+                ServiceScope::User => svc::classify_systemctl_is_enabled("", BUS_FAILURE, false),
+                ServiceScope::System => {
+                    svc::ScopeRegistration::absent("test: no registration in this scope")
+                }
+            },
+        )
+        .expect("the attempts succeeded and nothing was left registered");
+        assert!(
+            !note.contains("every scope"),
+            "removal was not established for every scope, so it must not be claimed: {note}"
+        );
+        assert!(
+            note.contains("machine-wide (system) scope"),
+            "the scope that WAS verified removed must be named: {note}"
+        );
+        assert!(
+            note.contains("per-user scope") && note.contains("could not verify"),
+            "the scope that could not be read must be named as unverified: {note}"
+        );
+    }
+
+    /// The control for the test above: when EVERY scope answers a definite absence, removal really is
+    /// established everywhere, and the report must still say so plainly. Without this, dropping the
+    /// "every scope" phrase unconditionally would pass.
+    #[test]
+    fn a_uninstall_verified_in_every_scope_still_says_so() {
+        let mut node = MockComponent::ok();
+        let note = uninstall_engine_service(
+            "dig-node",
+            Os::Linux,
+            &mut |a, e| node.run(a, e),
+            &mut |_| svc::ScopeRegistration::absent("test: no registration in this scope"),
+        )
+        .expect("nothing was left registered");
+        assert!(
+            note.contains("every scope"),
+            "an absence established in every scope IS a removal from every scope: {note}"
+        );
+        assert!(
+            !note.contains("could not verify"),
+            "nothing was unverified: {note}"
+        );
     }
 
     /// A failure that hits EVERY scope leaves the state UNKNOWN when the probe could not read a scope

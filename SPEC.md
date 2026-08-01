@@ -1056,20 +1056,21 @@ A `--bin-dir` run is FORCED to user scope: a machine-wide daemon pointed at a ca
 the §7.5 escalation itself. The forced downgrade MUST be reported
 (`ServiceResult.survives_reboot: false` + `scope_note`), never silent.
 
-**The argument surface — REQUIRED of the component, not yet provided by one.** The installer passes
-`--scope <system|user>` to the component's `install`/`start`/`uninstall` verbs, as two tokens. This
-is the surface dig-installer REQUIRES of a future component release; the value set is specified to be
-byte-identical with the `--scope <auto|system|user>` proposed in DIG-Network/dig-node#123. The
-installer never passes `auto`, because "whatever the component defaults to" is the defect this closes.
+**The argument surface.** The installer passes `--scope <system|user>` to the component's
+`install`/`start`/`uninstall` verbs, as two tokens. The value set is byte-identical with the
+`--scope <auto|system|user>` the component accepts. The installer never passes `auto`, because
+"whatever the component defaults to" is the defect this closes.
 
-> **Status.** No released dig-node implements `--scope`. As of dig-node v0.69.0 the flag does not
-> exist and `PREFERS_USER_LEVEL` is unconditionally `true` on unix, so every unix install today takes
-> the compat path below and registers at USER scope. A reimplementation MUST NOT assume the flag is
-> accepted: the compat fallback is not a legacy branch, it is the branch that currently runs. This
-> paragraph becomes present-tense only once a dig-node release ships the flag.
+> **Status.** `--scope` exists as of **dig-node v0.70.0**, on all four service verbs, and its
+> `resolve_scope` maps `auto` under root to the system domain. dig-installer therefore requires
+> **dig-node v0.70.0 or later for machine-wide registration**, and ships **v0.71.0** as its floor.
+> On any such component an elevated protected-root install reaches a system-scope, boot-started
+> registration with nobody logged in, which is the acceptance criterion of dig_ecosystem#526.
 
-**Compat with a pre-`--scope` build.** dig-installer installs the LATEST component release with no
-version pin, so an older binary is a real state. clap rejects an unknown flag with a non-zero exit
+**Compat with a build older than v0.70.0.** dig-installer installs the LATEST component release with no
+version pin, so a real user receives v0.71.0 and the system path automatically. An older binary is
+reachable only when an operator EXPLICITLY pins below v0.70.0, and that state is still specified
+because such a pin must degrade honestly rather than silently. clap rejects an unknown flag with a non-zero exit
 BEFORE running any subcommand body, so that failure is side-effect-free: the installer retries the
 verb WITHOUT the flag and records `reboot_survival: false` with a plain-language note. The retry MUST
 be gated on a message naming `--scope` specifically (`svcscope::is_unknown_scope_flag_rejection`) —
@@ -1081,6 +1082,14 @@ which is `svcscope::legacy_default_scope(os)` — **System on Windows** (the SCM
 and `install` sets `start= auto` there), **User on Linux/macOS** (dig-node's pre-`--scope` `install`
 preferred a user-level unit regardless of privilege, which is this whole defect). A fallback is
 therefore NOT a downgrade on Windows and MUST NOT be warned about as one; it is disclosed either way.
+
+`legacy_default_scope(Linux) == User` is truthful ONLY of a component older than v0.70.0. From
+v0.70.0 the flag is accepted, so the fallback is unreachable and this value is never consulted. The
+distinction is normative rather than incidental: the value is correct only under the condition that
+the flag was REJECTED, so it MUST stay gated on `scope_flag_accepted == false` and MUST NOT become a
+general "what does this OS default to" answer. Were the retry predicate ever widened past a
+`--scope`-specific rejection, this value would be reported for a component that does understand the
+flag, and the report would be wrong.
 
 **An `install` failure is tolerated ONLY at the requested scope.** `install` is not idempotent, so a
 re-install over a live registration can hard-fail while the registration is perfectly usable — that
@@ -1097,7 +1106,7 @@ like:
 
 | backend | classifier | `Absent` iff |
 |---|---|---|
-| systemd | `svc::classify_systemctl_is_enabled` | the `not-found` state token on stdout, or a stderr naming the missing unit file — including dig-node's verbatim `no files found for` / `could not be found` |
+| systemd | `svc::classify_systemctl_is_enabled` | the `not-found` state token on stdout, or a stderr naming the missing unit file — including dig-node's verbatim `no files found for` / `could not be found` — with an EMPTY stdout and a NON-ZERO exit |
 | launchd | `svc::classify_launchctl_print` | exit `113` (`kLaunchdNoSuchServiceError`), or stderr containing `could not find service` / `no such process` / `no such file` |
 | Windows SCM | `svc::classify_sc_registration` | `sc query` reporting `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) |
 
@@ -1108,6 +1117,25 @@ failures this rules out are the ones that reach exactly the host class #526 desc
 --user is-enabled` under `sudo` printing `Failed to connect to bus: No such file or directory`, and
 `launchctl print gui/<uid>/<label>` with no Aqua session failing `Bootstrap failed` / `Could not find
 domain for` — both of which are a scope that could not be ASKED, not an empty one.
+
+The systemd absence rule is stated over the CLASS of replies, not over a list of phrasings.
+dig-installer recognises a SUPERSET of dig-node's two verbatim phrasings, because the two invoke
+different verbs (`is-enabled` here, `cat` there) and systemd words their not-found replies
+differently. The widening is bounded by three simultaneous conditions, ALL required: the stderr names
+a unit (`unit file` or `no such unit`), AND it says that thing was not found (`no such file` /
+`does not exist` / `not found`), AND the invocation exited NON-ZERO with an empty stdout. A not-found
+word alone MUST NOT yield `Absent` — a missing `systemctl` binary, an unreadable config and a refused
+path all contain one — and a reply that exited ZERO cannot establish absence, because a query
+reporting success has not failed to find anything. `Absent` is what licenses the uninstall's removal
+claim below, so each condition is a precondition of that claim rather than a hint toward it.
+
+**An uninstall claims removal ONLY from the scopes whose absence it ESTABLISHED.** The success report
+MUST name the scopes verified removed, and MUST name any scope it could not read as unverified
+(`could not verify <scope> (<reason>)`). It MUST NOT say "every scope" unless every scope answered a
+definite absence. When NO scope could be read back, the report MUST state that no scope is confirmed
+clear. On the #526 host class — root with no session bus — the per-user scope is exactly the one that
+cannot be read, so an unqualified "removed from every scope" was false precisely where an operator
+most needed it to be true. If any scope is `Unknown`, removal-completeness MUST NOT be asserted.
 
 **No unit may shadow a system registration.** After a system-scope register, every unpackaged
 per-user unit for that service — the invoking user's AND root's own, which a pre-#526 `sudo` install

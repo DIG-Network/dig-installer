@@ -439,18 +439,30 @@ pub fn classify_systemctl_is_enabled(
             stderr.trim()
         ));
     }
-    // The two phrasings `dig-node`'s own `classify_systemctl_probe` recognises as absence are
-    // accepted verbatim, so the two repos agree on what systemd's not-found reply looks like even
-    // though they invoke different verbs (`dig-node` v0.71.0 service.rs:1391-1400). Both name the
-    // unit file on their own, so neither needs the qualifier below.
+    // Absence is recognised from a SUPERSET of the two phrasings `dig-node`'s own
+    // `classify_systemctl_probe` accepts (`dig-node` v0.71.0 service.rs:1391-1400). The superset is
+    // deliberate, not accidental drift: the two repos invoke different verbs — `is-enabled` here,
+    // `cat` there — and systemd words their not-found replies differently, so recognising only
+    // dig-node's two literals would read a plainly-answered absence as indeterminate. dig-node's two
+    // phrasings name the unit file themselves and so are accepted unqualified.
+    //
+    // What keeps the widening from becoming a fail-open is that it is stated over the CLASS rather
+    // than over a phrasing: an error qualifies as absence only when it names A UNIT (`unit file` /
+    // `no such unit`) AND says that thing was not found. A not-found word on its own belongs to a
+    // large class of unrelated failures — a missing systemctl binary, an unreadable config, a refused
+    // path — and every one of them would otherwise be read as "the unit is gone".
+    //
+    // The non-zero exit is required for the same reason. systemd reports a unit it cannot read with an
+    // empty stdout AND a failing exit status; a reply that claims success cannot simultaneously prove
+    // the unit is absent. `Absent` is what licenses an uninstall to report "removed from every
+    // scope", so every condition here is a precondition of that claim rather than a hint toward it.
     let unit_missing_verbatim =
         err.contains("no files found for") || err.contains("could not be found");
-    let unit_file_missing = unit_missing_verbatim
-        || ((err.contains("unit file") || err.contains("no such unit"))
-            && (err.contains("no such file")
-                || err.contains("does not exist")
-                || err.contains("not found")));
-    if unit_file_missing && token.is_empty() {
+    let names_a_unit = err.contains("unit file") || err.contains("no such unit");
+    let says_not_found =
+        err.contains("no such file") || err.contains("does not exist") || err.contains("not found");
+    let unit_file_missing = unit_missing_verbatim || (names_a_unit && says_not_found);
+    if unit_file_missing && token.is_empty() && !exited_zero {
         return ScopeRegistration::absent(format!(
             "systemd reports no such unit: {}",
             stderr.trim()
@@ -463,7 +475,6 @@ pub fn classify_systemctl_is_enabled(
     } else {
         format!("unrecognised systemd verdict `{token}`")
     };
-    let _ = exited_zero;
     ScopeRegistration::unknown(detail)
 }
 
@@ -1203,6 +1214,55 @@ mod tests {
             );
             assert_eq!(r.boot_enabled, BootEnablement::Unknown);
             assert!(r.detail.contains("could not be queried"), "{}", r.detail);
+        }
+    }
+
+    /// An absence claim requires the NON-ZERO exit systemd actually gives for a unit it cannot read.
+    ///
+    /// The doc contract for this classifier states that a missing unit comes with an empty stdout AND
+    /// a non-zero exit. The exit status was accepted as a parameter and then discarded, so a zero-exit
+    /// reply carrying a missing-unit phrase was read as definitively `Absent` — an absence concluded
+    /// from a query that, by its own exit status, did not fail. On a privileged teardown that is
+    /// fail-open in the expensive direction: `Absent` is what licenses "removed from every scope".
+    ///
+    /// The fixture varies ONLY the exit status against the exact stderr the recognised-absence test
+    /// above uses, so the two differ in one bit and nothing else can explain a divergence.
+    #[test]
+    fn a_missing_unit_phrase_with_a_zero_exit_is_unknown_not_absent() {
+        const MISSING: &str = "Failed to get unit file state for dignetwork-dig-node.service: \
+                               No such file or directory";
+        assert_eq!(
+            classify_systemctl_is_enabled("", MISSING, false).presence,
+            Presence::Absent,
+            "the control: the same stderr WITH systemd's non-zero exit is recognised absence"
+        );
+        let r = classify_systemctl_is_enabled("", MISSING, true);
+        assert_eq!(
+            r.presence,
+            Presence::Unknown,
+            "a query that reports success cannot also prove the unit is gone"
+        );
+        assert_eq!(r.boot_enabled, BootEnablement::Unknown);
+    }
+
+    /// The widened absence arm must stay qualified: a not-found token ALONE is not absence.
+    ///
+    /// This repo recognises a SUPERSET of dig-node's two verbatim phrasings, because `is-enabled` and
+    /// `cat` word their not-found replies differently. A widening is only safe while it stays
+    /// qualified, so the class of errors that merely CONTAIN a not-found word — a missing binary, an
+    /// unreadable config, a refused path — must not collapse into `Absent`.
+    #[test]
+    fn a_not_found_word_without_a_unit_qualifier_is_unknown() {
+        for stderr in [
+            "Failed to execute /usr/bin/systemctl: No such file or directory",
+            "Interactive authentication required: not found",
+            "error: configuration does not exist",
+        ] {
+            assert_eq!(
+                classify_systemctl_is_enabled("", stderr, false).presence,
+                Presence::Unknown,
+                "a not-found word that names no unit is not evidence of absence: {stderr}"
+            );
         }
     }
 
