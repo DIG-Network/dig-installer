@@ -77,6 +77,84 @@ pub fn install_env(cfg: &ServiceConfig) -> BTreeMap<String, String> {
     env
 }
 
+/// Is `err` the Windows SCM's TRANSIENT post-delete state rather than a real
+/// failure (#1910)?
+///
+/// A service that has just been uninstalled is not gone the moment `sc delete`
+/// returns: the SCM keeps the record until the last open handle to it closes, and
+/// until then a re-registration reports `ERROR_SERVICE_MARKED_FOR_DELETE` (1072)
+/// or the name lookup reports `ERROR_SERVICE_DOES_NOT_EXIST` (1060) —
+/// `[SC] OpenService FAILED 1060` verbatim. Both are states the SCM leaves on its
+/// own within a second or two, and reporting them as a hard failure is what makes
+/// an uninstall → reinstall look intermittently broken.
+///
+/// Deliberately narrow: the two documented SCM error CODES, and the phrase
+/// Windows prints for 1072. Retrying an arbitrary install failure would turn a
+/// real, permanent error — a refused binary (#565), a missing privilege, a binary
+/// that could not be spawned at all — into the same error reported three seconds
+/// later, which is strictly worse than reporting it at once.
+///
+/// The bare phrase "does not exist" is deliberately NOT matched, only the code
+/// that accompanies it: a spawn failure or a missing file can say "does not
+/// exist" about something that will never appear, and a retry class must be
+/// recognised by the state it names rather than by an English phrase it shares.
+///
+/// Pure.
+pub fn is_scm_transient_post_delete(err: &str) -> bool {
+    let upper = err.to_uppercase();
+    upper.contains("1072")
+        || upper.contains("MARKED FOR DELETE")
+        || upper.contains("MARKED FOR DELETION")
+        || upper.contains("1060")
+}
+
+/// How long to wait before each retry of a service registration that hit the
+/// SCM's transient post-delete state — a short, bounded, escalating backoff.
+///
+/// Three attempts over ~3s: long enough for the SCM to release a record whose
+/// handles are closing, short enough that a genuinely permanent failure is still
+/// reported promptly. Pure, so the schedule is asserted rather than slept through.
+pub fn scm_retry_backoff() -> Vec<std::time::Duration> {
+    vec![
+        std::time::Duration::from_millis(1000),
+        std::time::Duration::from_millis(2000),
+    ]
+}
+
+/// Run `register`, retrying while it fails with the SCM's transient post-delete
+/// state ([`is_scm_transient_post_delete`]) and the backoff
+/// ([`scm_retry_backoff`]) has attempts left.
+///
+/// `sleep` is injected so the retry LOGIC is tested without the wall-clock waits;
+/// production passes `std::thread::sleep`. The final `Err` is the last attempt's,
+/// with the retries appended, so a genuinely stuck SCM says so instead of
+/// pretending the first error was the whole story.
+fn with_scm_retry(
+    sleep: &mut dyn FnMut(std::time::Duration),
+    register: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let backoff = scm_retry_backoff();
+    let mut attempted = 1;
+    loop {
+        match register() {
+            Ok(()) => return Ok(()),
+            Err(e) if !is_scm_transient_post_delete(&e) => return Err(e),
+            Err(e) => {
+                let Some(wait) = backoff.get(attempted - 1) else {
+                    return Err(format!(
+                        "{e} (still reported after {attempted} attempts over \
+                         {}ms — the service manager has not released the previous \
+                         registration)",
+                        backoff.iter().map(|d| d.as_millis()).sum::<u128>()
+                    ));
+                };
+                sleep(*wait);
+                attempted += 1;
+            }
+        }
+    }
+}
+
 /// Run `dig-node install` (and, if `cfg.start`, `dig-node start`) using the
 /// downloaded binary at `bin`. Returns a human note on success.
 ///
@@ -92,8 +170,15 @@ pub fn install_env(cfg: &ServiceConfig) -> BTreeMap<String, String> {
 /// failure is tolerated (recorded in the note) and `start` is still attempted
 /// when `cfg.start` is set. Only a `start` failure is a hard error: that is
 /// the actual "the service isn't running" outcome the caller cares about.
+///
+/// A registration that fails with the SCM's transient post-delete state is
+/// RETRIED first ([`with_scm_retry`]) rather than tolerated-and-forgotten: right
+/// after an uninstall it means "not yet", not "no", and treating it as a failure
+/// is what made an uninstall -> reinstall look intermittently broken (#1910).
 pub fn install_service(bin: &Path, cfg: &ServiceConfig) -> Result<String, String> {
-    let mut note = match run_dig_node(bin, &install_args(), &install_env(cfg)) {
+    let mut note = match with_scm_retry(&mut std::thread::sleep, &mut || {
+        run_dig_node(bin, &install_args(), &install_env(cfg))
+    }) {
         Ok(()) => String::from("dig-node installed as an OS service"),
         Err(e) => format!(
             "dig-node install did not complete cleanly ({e}); continuing since a service may \
@@ -265,7 +350,9 @@ pub fn relay_install_env(cfg: &RelayServiceConfig) -> BTreeMap<String, String> {
 /// this run just wrote, so a failed re-`install` does not block `start` from
 /// picking up the new binary. Only a `start` failure is a hard error.
 pub fn install_relay_service(bin: &Path, cfg: &RelayServiceConfig) -> Result<String, String> {
-    let mut note = match run_relay(bin, &install_args(), &relay_install_env(cfg)) {
+    let mut note = match with_scm_retry(&mut std::thread::sleep, &mut || {
+        run_relay(bin, &install_args(), &relay_install_env(cfg))
+    }) {
         Ok(()) => String::from("dig-relay installed as an OS service"),
         Err(e) => format!(
             "dig-relay install did not complete cleanly ({e}); continuing since a service may \
@@ -840,5 +927,98 @@ mod tests {
         // inherits — so nothing the child prints ever reaches OUR stdout; a
         // zero exit is Ok regardless of what it printed.
         run_capturing(&bin, &args, &BTreeMap::new()).expect("zero exit is Ok");
+    }
+
+    // -- #1910: the SCM's transient post-delete state -------------------------
+
+    /// The verbatim error a user hit reinstalling right after an uninstall.
+    const SCM_POST_DELETE_ERROR: &str =
+        "dig-node install exited 1: [SC] OpenService FAILED 1060:\r\n\r\n\
+         The specified service does not exist as an installed service.\r\n";
+
+    /// A permanent failure that must NOT be retried: retrying it would report the
+    /// same error three seconds later and nothing else. This is the truthful
+    /// control for the retry tests below.
+    const REFUSED_BINARY_ERROR: &str =
+        "dig-node install exited 1: refusing to register a service whose binary can be \
+         written by a non-SYSTEM principal";
+
+    #[test]
+    fn the_scm_post_delete_state_is_transient_and_a_refusal_is_not() {
+        assert!(is_scm_transient_post_delete(SCM_POST_DELETE_ERROR));
+        assert!(is_scm_transient_post_delete(
+            "CreateService FAILED 1072: The specified service has been marked for deletion."
+        ));
+        assert!(
+            !is_scm_transient_post_delete(REFUSED_BINARY_ERROR),
+            "a refusal is permanent — retrying it only delays the report"
+        );
+        assert!(!is_scm_transient_post_delete(
+            "Access is denied. (os error 5)"
+        ));
+        // A failure to SPAWN the binary at all shares the English phrase but names no
+        // SCM state, and no amount of waiting will make a missing file appear.
+        assert!(!is_scm_transient_post_delete(
+            "could not run dig-node: the file does not exist (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn a_registration_that_is_only_waiting_on_the_scm_succeeds_on_a_retry() {
+        // The user-facing flake: the SCM has not yet released the record an uninstall
+        // deleted, so the first attempt fails and a later one works.
+        let mut attempts = 0;
+        let mut slept: Vec<std::time::Duration> = Vec::new();
+        let out = with_scm_retry(&mut |d| slept.push(d), &mut || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(SCM_POST_DELETE_ERROR.to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(out, Ok(()));
+        assert_eq!(
+            attempts, 3,
+            "it must keep trying while the SCM says 'not yet'"
+        );
+        assert_eq!(
+            slept,
+            scm_retry_backoff()[..2].to_vec(),
+            "and wait between attempts, escalating"
+        );
+    }
+
+    #[test]
+    fn a_permanent_failure_is_reported_at_once_and_never_retried() {
+        // The control. A retry loop that retried EVERYTHING would pass the test above
+        // identically, so this is the assertion that distinguishes the two.
+        let mut attempts = 0;
+        let mut slept = 0;
+        let out = with_scm_retry(&mut |_| slept += 1, &mut || {
+            attempts += 1;
+            Err(REFUSED_BINARY_ERROR.to_string())
+        });
+        assert_eq!(out, Err(REFUSED_BINARY_ERROR.to_string()));
+        assert_eq!(attempts, 1, "a permanent error must not be retried");
+        assert_eq!(slept, 0, "and must not delay the report");
+    }
+
+    #[test]
+    fn a_stuck_service_manager_is_reported_after_a_bounded_number_of_attempts() {
+        // Bounded: an SCM that never releases the record must not hang the install.
+        let mut attempts = 0;
+        let mut slept: Vec<std::time::Duration> = Vec::new();
+        let err = with_scm_retry(&mut |d| slept.push(d), &mut || {
+            attempts += 1;
+            Err(SCM_POST_DELETE_ERROR.to_string())
+        })
+        .expect_err("a permanently stuck SCM must still fail");
+        assert_eq!(attempts, scm_retry_backoff().len() + 1);
+        assert_eq!(slept, scm_retry_backoff());
+        assert!(
+            err.contains("1060") && err.contains("attempts"),
+            "the report must keep the original error AND say it was retried: {err}"
+        );
     }
 }

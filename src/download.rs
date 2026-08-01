@@ -286,12 +286,60 @@ fn replace_binary_with(
             // afterwards (#1748, F4).
             Ok(WriteOutcome::Replaced)
         }
-        Err(e) if is_sharing_violation(&e) => {
+        Err(e) if is_sharing_violation(&e) || destination_is_a_running_image(&e, dest) => {
             schedule_on_reboot(dest, bytes)?;
             Ok(WriteOutcome::ScheduledForReboot)
         }
         Err(e) => Err(format!("write {}: {e}", dest.display())),
     }
+}
+
+/// Is `e` an `ERROR_ACCESS_DENIED` raised by UNLINKING a destination that is a
+/// currently RUNNING executable — the same recoverable case as
+/// [`is_sharing_violation`], reached through the other door?
+///
+/// # Why this exists (#1911, found on a real reinstall)
+///
+/// The #1748 rewrite made every write UNLINK the destination before creating it,
+/// which closed a symlink-redirect hole. It also changed which error a running
+/// destination produces. Opening a running image for write yields
+/// `ERROR_SHARING_VIOLATION` (32), which the reboot-replace fallback recognises —
+/// but DELETING one yields `ERROR_ACCESS_DENIED` (5), which it did not. So the
+/// fallback silently stopped covering the case it was built for, for any binary
+/// nothing stops first.
+///
+/// It is not hypothetical: a reinstall over an existing install failed at
+/// `dig-app.exe` (a tray app the installer itself launches and never stops) with
+/// `write …: Access is denied. (os error 5)`, and the rollback that followed
+/// deleted the dig-store, digs and dign binaries the machine already had. The
+/// service binaries were unaffected only because they are stopped by id first.
+///
+/// # It must not swallow a genuine permission failure
+///
+/// Error 5 is also what an ACL problem looks like, and staging a reboot-time
+/// replace for one would report a success that never happens. So the code is not
+/// trusted on its own: the destination is PROBED by opening it for write. A
+/// running image refuses that with a sharing violation (its image section denies
+/// write sharing); a merely unwritable file refuses with access-denied again, and
+/// a writable one opens. Only the sharing violation is the running-image answer.
+#[cfg(windows)]
+fn destination_is_a_running_image(e: &std::io::Error, dest: &Path) -> bool {
+    if e.raw_os_error() != Some(5) {
+        return false;
+    }
+    match std::fs::OpenOptions::new().write(true).open(dest) {
+        Ok(_) => false,
+        Err(probe) => is_sharing_violation(&probe),
+    }
+}
+
+/// Never true off Windows: neither the unlink-time access-denied nor the
+/// image-section lock this discriminates exists there (a running binary fails
+/// with `ETXTBSY` at open, which is a hard failure by design).
+#[cfg(not(windows))]
+fn destination_is_a_running_image(e: &std::io::Error, dest: &Path) -> bool {
+    let _ = (e, dest);
+    false
 }
 
 /// Write `bytes` to `dest` without ever following a symlink that is already there.
@@ -407,14 +455,59 @@ fn staging_path(dest: &Path) -> std::path::PathBuf {
 /// under `HKLM\SYSTEM\…\PendingFileRenameOperations`).
 #[cfg(windows)]
 fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    schedule_replace_on_reboot_with(
+        dest,
+        bytes,
+        &crate::secure::adopt_placed_file,
+        &move_on_reboot,
+    )
+}
+
+/// [`schedule_replace_on_reboot`] with the two effects injected, so the ORDER they
+/// happen in is assertable without touching the machine's pending-rename registry.
+///
+/// # The staged file is the file that will EXIST after the reboot (#1910)
+///
+/// The staging file is created by the elevated installer, so it carries the
+/// invoking admin user as owner and the `CREATOR OWNER` grant that comes with it —
+/// and `MoveFileEx` MOVES it, security descriptor and all, onto `dest`. Adopting
+/// only `dest` at install time therefore leaves the reboot path re-introducing the
+/// exact defect, days later and invisibly: this was observed on a real machine as
+/// `.dig-app.exe.pending-76024  owner=TDS1\micha  userACEs=1` sitting in the
+/// protected root, staged to become `dig-app.exe`.
+///
+/// The adoption must precede the schedule, not follow it, so the file is never
+/// queued for promotion while still user-owned. A failure to adopt is REPORTED by
+/// the caller, never silent, and does not abort the update.
+#[cfg(windows)]
+fn schedule_replace_on_reboot_with(
+    dest: &Path,
+    bytes: &[u8],
+    adopt: &dyn Fn(&Path) -> Result<(), String>,
+    schedule: &dyn Fn(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let staging = staging_path(dest);
+    std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
+    if let Err(e) = adopt(&staging) {
+        return Err(format!(
+            "staged {} but could not give it privileged ownership ({e}) — promoting it at              reboot would leave a binary a non-SYSTEM principal can rewrite",
+            staging.display()
+        ));
+    }
+    schedule(&staging, dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staging);
+    })
+}
+
+/// `MoveFileExW(staging, dest, REPLACE_EXISTING | DELAY_UNTIL_REBOOT)` — the OS
+/// swaps in the new binary before any process can re-open the still-running old one.
+#[cfg(windows)]
+fn move_on_reboot(staging: &Path, dest: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING,
     };
-
-    let staging = staging_path(dest);
-    std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
 
     let wide = |p: &Path| -> Vec<u16> {
         p.as_os_str()
@@ -422,7 +515,7 @@ fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
             .chain(std::iter::once(0))
             .collect()
     };
-    let existing = wide(&staging);
+    let existing = wide(staging);
     let target = wide(dest);
     // SAFETY: both pointers are NUL-terminated UTF-16 buffers kept alive across
     // the call; the flags are the documented reboot-replace pair.
@@ -435,7 +528,6 @@ fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     };
     if ok == 0 {
         let code = unsafe { GetLastError() };
-        let _ = std::fs::remove_file(&staging);
         return Err(format!(
             "could not schedule the reboot-time replace of {} (Win32 error {code})",
             dest.display()
@@ -1018,5 +1110,166 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Replaced);
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW BINARY");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- #1911: a RUNNING destination, reached through the unlink -------------
+
+    /// A running executable must fall back to the reboot-time replace, not fail the
+    /// install.
+    ///
+    /// The fixture is a REAL running process, because the property under test is the
+    /// operating system's answer: since #1748 the write UNLINKS first, and unlinking a
+    /// running image reports `ERROR_ACCESS_DENIED` rather than the sharing violation
+    /// the fallback recognised. A mock returning error 5 would pass against a naive
+    /// "treat every error 5 as running" implementation, which the control below
+    /// forbids -- so the two tests are only meaningful together.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_destination_is_staged_for_the_next_reboot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("running.exe");
+        // A single ping at a black-holed address with a long timeout: the process is
+        // alive (so its image section exists) but does essentially nothing, so it
+        // cannot perturb the timing-sensitive tests running beside it.
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &dest).expect("copy a real exe");
+        let mut child = {
+            #[allow(clippy::disallowed_methods)]
+            std::process::Command::new(&dest)
+                .args(["-n", "1", "-w", "60000", "192.0.2.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run it")
+        };
+        // Give the image section time to exist before the unlink is attempted.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let staged = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let outcome = replace_binary_with(&dest, b"NEW BINARY", |_, bytes| {
+            staged.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        });
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            outcome,
+            Ok(WriteOutcome::ScheduledForReboot),
+            "a running destination must be staged, not reported as a failed write"
+        );
+        assert_eq!(staged.into_inner(), vec![b"NEW BINARY".to_vec()]);
+    }
+
+    /// The CONTROL: error 5 ALONE must not be read as "the destination is running".
+    ///
+    /// The nearest wrong implementation is the one-liner — treat every
+    /// `ERROR_ACCESS_DENIED` from the unlink as a running image — and it passes the
+    /// test above identically. It is also wrong in the expensive direction: a genuine
+    /// permission failure would be staged for a reboot-time replace and REPORTED AS
+    /// SUCCESS for a write that never happens. So the discriminator is asserted
+    /// directly, on a destination that is demonstrably not running.
+    ///
+    /// (Two outcome-level fixtures were tried first and neither can express this: a
+    /// read-only file is deleted anyway, because Rust's `remove_file` clears
+    /// `FILE_ATTRIBUTE_READONLY`; and a `Deny` on the file's own DELETE is bypassed by
+    /// the parent directory's delete-child right. Both simply wrote, so both would
+    /// have pinned a coincidence.)
+    #[cfg(windows)]
+    #[test]
+    fn access_denied_alone_does_not_mean_the_destination_is_running() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ordinary = dir.path().join("not-running.exe");
+        std::fs::write(&ordinary, b"OLD").expect("write it");
+        assert!(
+            !destination_is_a_running_image(&std::io::Error::from_raw_os_error(5), &ordinary),
+            "an ordinary file that merely reported error 5 is not a running image"
+        );
+        // And a code that is not 5 is never this case, whatever the destination is.
+        assert!(!destination_is_a_running_image(
+            &std::io::Error::from_raw_os_error(32),
+            &ordinary
+        ));
+        assert!(!destination_is_a_running_image(
+            &std::io::Error::from_raw_os_error(5),
+            &dir.path().join("absent.exe")
+        ));
+    }
+
+    /// The staged file is the file that will EXIST after the reboot, so it must be
+    /// adopted into privileged ownership BEFORE the promotion is queued (#1910).
+    ///
+    /// Observed as a live defect on a real machine: `.dig-app.exe.pending-76024`
+    /// sitting in the protected root owned by the installing user, scheduled to
+    /// become `dig-app.exe`. Fixing only the direct write leaves the reboot path
+    /// re-introducing the same defect days later, which is precisely the shape of
+    /// recovery-path defect that stays invisible to a clean-machine test.
+    ///
+    /// The ORDER is asserted, not merely the fact: a run that scheduled first and
+    /// adopted afterwards would satisfy a "both happened" assertion while still
+    /// queueing a user-owned binary for promotion.
+    #[cfg(windows)]
+    #[test]
+    fn the_staged_file_is_adopted_before_the_reboot_replace_is_queued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("dig-app.exe");
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+
+        let outcome = schedule_replace_on_reboot_with(
+            &dest,
+            b"NEW BINARY",
+            &|p| {
+                events.borrow_mut().push(format!("adopt {}", p.display()));
+                Ok(())
+            },
+            &|staging, target| {
+                events.borrow_mut().push(format!(
+                    "schedule {} -> {}",
+                    staging.display(),
+                    target.display()
+                ));
+                Ok(())
+            },
+        );
+
+        assert_eq!(outcome, Ok(()));
+        let events = events.into_inner();
+        let staging = staging_path(&dest);
+        assert_eq!(
+            events,
+            vec![
+                format!("adopt {}", staging.display()),
+                format!("schedule {} -> {}", staging.display(), dest.display()),
+            ],
+            "the staged file must be adopted first, and by its STAGING path"
+        );
+        assert_eq!(
+            std::fs::read(&staging).expect("the staged bytes"),
+            b"NEW BINARY"
+        );
+    }
+
+    /// If the staged file cannot be adopted, the promotion must NOT be queued: a
+    /// binary a non-SYSTEM principal can rewrite is worse in the protected root than
+    /// an update that did not happen, and the reboot would install it silently.
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_file_that_cannot_be_adopted_is_never_queued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("dig-app.exe");
+        let scheduled = std::cell::Cell::new(0);
+
+        let err = schedule_replace_on_reboot_with(
+            &dest,
+            b"NEW",
+            &|_| Err("owner is still the installing user".to_string()),
+            &|_, _| {
+                scheduled.set(scheduled.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("an un-adoptable staged file must fail");
+
+        assert_eq!(scheduled.get(), 0, "nothing may be queued for the reboot");
+        assert!(err.contains("privileged ownership"), "got: {err}");
     }
 }

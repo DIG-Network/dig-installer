@@ -742,13 +742,46 @@ fn apply_update_decision(
 /// the binary was written ([`download::WriteOutcome`]) so a service component's
 /// caller can LOUDLY flag the rare locked-destination reboot-replace fallback
 /// (#544); most callers simply propagate errors with `?` and ignore the Ok.
+///
+/// This is the ONE place every component binary is placed, so it is also where a
+/// freshly created file in the protected root is adopted into privileged ownership
+/// ([`secure::adopt_placed_file`], #1910) — see [`adopt_placed_file_step`] for why
+/// a failure is reported rather than fatal.
 fn download_component(
     c: &ComponentResult,
     dry_run: bool,
+    log: &mut dyn FnMut(&str),
 ) -> Result<download::WriteOutcome, InstallError> {
     if dry_run {
         return Ok(download::WriteOutcome::Replaced);
     }
+    let outcome = download_binary_to_dest(c)?;
+    adopt_placed_file_step(std::path::Path::new(&c.dest), log);
+    Ok(outcome)
+}
+
+/// Adopt a file the elevated installer just created in the protected root into
+/// privileged ownership, LOGGING rather than failing when that cannot be done.
+///
+/// Reported-not-fatal is deliberate. The authoritative gate on "may a SYSTEM
+/// service execute this binary" is dig-node's own #565 refusal, which is loud and
+/// stops the registration; a second hard failure here would turn an ACL quirk on
+/// an unusual host into a failed install for a file that may be perfectly fine.
+/// What must never happen is SILENCE — #1910 reached a real machine precisely
+/// because nothing in the install said whose file it had just created.
+fn adopt_placed_file_step(dest: &std::path::Path, log: &mut dyn FnMut(&str)) {
+    if let Err(e) = secure::adopt_placed_file(dest) {
+        log(&format!(
+            "    ! could not give {} privileged ownership ({e}); a service that must run this \
+             binary as SYSTEM may refuse to register it",
+            dest.display()
+        ));
+    }
+}
+
+/// Fetch `c` to its dest, mapping the transport/disk failure modes onto
+/// [`InstallError`] variants.
+fn download_binary_to_dest(c: &ComponentResult) -> Result<download::WriteOutcome, InstallError> {
     download::download_binary(&c.url, std::path::Path::new(&c.dest), None).map_err(|e| {
         // Distinguish a 404 (asset gone) from a transport error from a disk error.
         if e.contains("404") || e.contains("Not Found") {
@@ -938,7 +971,7 @@ fn run_report_gated(
             // decide Install/Update/Skip against the version just resolved above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
             if decision.action != update::UpdateAction::Skip {
-                let outcome = download_component(&c, plan.dry_run)?;
+                let outcome = download_component(&c, plan.dry_run, log)?;
                 report.restart_required |= log_write_outcome(log, "dig-store", outcome);
             } else {
                 log("    · already up to date — skipping the download");
@@ -958,7 +991,7 @@ fn run_report_gated(
                 &plan.bin_dir_for("digs", target.os),
             )?;
             log_component(log, &digs);
-            let outcome = download_component(&digs, plan.dry_run)?;
+            let outcome = download_component(&digs, plan.dry_run, log)?;
             report.restart_required |= log_write_outcome(log, "digs", outcome);
             if !plan.dry_run {
                 note_binary_written(report, guard, &digs.dest);
@@ -1086,7 +1119,7 @@ fn run_report_gated(
                         stop.note
                     ));
                 }
-                let outcome = download_component(&c, plan.dry_run)?;
+                let outcome = download_component(&c, plan.dry_run, log)?;
                 report.restart_required |= log_write_outcome(log, "dig-node", outcome);
             }
             if !plan.dry_run {
@@ -1120,7 +1153,7 @@ fn run_report_gated(
             ) {
                 Ok(dign) => {
                     log_component(log, &dign);
-                    let outcome = download_component(&dign, plan.dry_run)?;
+                    let outcome = download_component(&dign, plan.dry_run, log)?;
                     report.restart_required |= log_write_outcome(log, "dign", outcome);
                     if !plan.dry_run {
                         note_binary_written(report, guard, &dign.dest);
@@ -1193,7 +1226,7 @@ fn run_report_gated(
                     // version pin), so a re-run skips a download that would change nothing.
                     let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
                     if decision.action != update::UpdateAction::Skip {
-                        let outcome = download_component(&c, plan.dry_run)?;
+                        let outcome = download_component(&c, plan.dry_run, log)?;
                         report.restart_required |= log_write_outcome(log, "dig-app", outcome);
                     } else {
                         log("    · already up to date — skipping the download");
@@ -1300,7 +1333,7 @@ fn run_report_gated(
                                 stop.note
                             ));
                         }
-                        let outcome = download_component(&c, plan.dry_run)?;
+                        let outcome = download_component(&c, plan.dry_run, log)?;
                         report.restart_required |= log_write_outcome(log, "dig-dns", outcome);
                     }
                     if !plan.dry_run {
@@ -1333,7 +1366,7 @@ fn run_report_gated(
                         &plan.bin_dir_for("digd", target.os),
                     )?;
                     log_component(log, &digd);
-                    let outcome = download_component(&digd, plan.dry_run)?;
+                    let outcome = download_component(&digd, plan.dry_run, log)?;
                     report.restart_required |= log_write_outcome(log, "digd", outcome);
                     if !plan.dry_run {
                         note_binary_written(report, guard, &digd.dest);
@@ -1417,7 +1450,7 @@ fn run_report_gated(
             // decide-before-touch convention as dig-store/dig-node/dig-dns above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
             if decision.action != update::UpdateAction::Skip {
-                let outcome = download_component(&c, plan.dry_run)?;
+                let outcome = download_component(&c, plan.dry_run, log)?;
                 report.restart_required |= log_write_outcome(log, "dig-updater", outcome);
             } else {
                 log("    · already up to date — skipping the download");
@@ -1438,7 +1471,7 @@ fn run_report_gated(
                 &plan.bin_dir_for("dig-updater-worker", target.os),
             )?;
             log_component(log, &worker);
-            let outcome = download_component(&worker, plan.dry_run)?;
+            let outcome = download_component(&worker, plan.dry_run, log)?;
             report.restart_required |= log_write_outcome(log, "dig-updater-worker", outcome);
             if !plan.dry_run {
                 note_binary_written(report, guard, &worker.dest);
@@ -1481,7 +1514,7 @@ fn run_report_gated(
                     stop.note
                 ));
             }
-            let outcome = download_component(&c, plan.dry_run)?;
+            let outcome = download_component(&c, plan.dry_run, log)?;
             report.restart_required |= log_write_outcome(log, "dig-relay", outcome);
             if !plan.dry_run {
                 note_binary_written(report, guard, &c.dest);
@@ -1511,7 +1544,7 @@ fn run_report_gated(
                 &plan.bin_dir_for("browser", target.os),
             )?;
             log_component(log, &c);
-            download_component(&c, plan.dry_run)?;
+            download_component(&c, plan.dry_run, log)?;
             if !plan.dry_run {
                 log(&format!("    run the installer to finish: {}", c.dest));
                 note_binary_written(report, guard, &c.dest);
@@ -1820,7 +1853,13 @@ fn apply_windows_hardening(
                 if let Some(parent) = installer_bin.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::copy(&current, &installer_bin);
+                if std::fs::copy(&current, &installer_bin).is_ok() {
+                    // Freshly created in the protected root, so it carries the
+                    // creating admin USER as owner (#1910) just like a downloaded
+                    // component does — and this one is the target of a machine-wide
+                    // elevated `UninstallString`.
+                    adopt_placed_file_step(&installer_bin, log);
+                }
             }
         }
 
