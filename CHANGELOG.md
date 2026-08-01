@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.35.0] - 2026-08-01
+
+### Features
+- **uninstall:** Remove MSI-installed products with msiexec and complete the teardown (#53)
+
 ## [0.34.1] - 2026-07-31
 
 ### Bug Fixes

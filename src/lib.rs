@@ -67,6 +67,7 @@ pub mod invoker;
 pub mod launch;
 pub mod manifest;
 pub mod migrate;
+pub mod msi;
 pub mod pathcheck;
 pub mod paths;
 pub mod proc;
@@ -74,6 +75,7 @@ pub mod rearm;
 pub mod regaudit;
 pub mod release;
 pub mod rootchain;
+pub mod running;
 pub mod scheme;
 pub mod secure;
 pub mod service;
@@ -776,13 +778,46 @@ fn apply_update_decision(
 /// the binary was written ([`download::WriteOutcome`]) so a service component's
 /// caller can LOUDLY flag the rare locked-destination reboot-replace fallback
 /// (#544); most callers simply propagate errors with `?` and ignore the Ok.
+///
+/// This is the ONE place every component binary is placed, so it is also where a
+/// freshly created file in the protected root is adopted into privileged ownership
+/// ([`secure::adopt_placed_file`], #1910) — see [`adopt_placed_file_step`] for why
+/// a failure is reported rather than fatal.
 fn download_component(
     c: &ComponentResult,
     dry_run: bool,
+    log: &mut dyn FnMut(&str),
 ) -> Result<download::WriteOutcome, InstallError> {
     if dry_run {
         return Ok(download::WriteOutcome::Replaced);
     }
+    let outcome = download_binary_to_dest(c)?;
+    adopt_placed_file_step(std::path::Path::new(&c.dest), log);
+    Ok(outcome)
+}
+
+/// Adopt a file the elevated installer just created in the protected root into
+/// privileged ownership, LOGGING rather than failing when that cannot be done.
+///
+/// Reported-not-fatal is deliberate. The authoritative gate on "may a SYSTEM
+/// service execute this binary" is dig-node's own #565 refusal, which is loud and
+/// stops the registration; a second hard failure here would turn an ACL quirk on
+/// an unusual host into a failed install for a file that may be perfectly fine.
+/// What must never happen is SILENCE — #1910 reached a real machine precisely
+/// because nothing in the install said whose file it had just created.
+fn adopt_placed_file_step(dest: &std::path::Path, log: &mut dyn FnMut(&str)) {
+    if let Err(e) = secure::adopt_placed_file(dest) {
+        log(&format!(
+            "    ! could not give {} privileged ownership ({e}); a service that must run this \
+             binary as SYSTEM may refuse to register it",
+            dest.display()
+        ));
+    }
+}
+
+/// Fetch `c` to its dest, mapping the transport/disk failure modes onto
+/// [`InstallError`] variants.
+fn download_binary_to_dest(c: &ComponentResult) -> Result<download::WriteOutcome, InstallError> {
     download::download_binary(&c.url, std::path::Path::new(&c.dest), None).map_err(|e| {
         // Distinguish a 404 (asset gone) from a transport error from a disk error.
         if e.contains("404") || e.contains("Not Found") {
@@ -973,7 +1008,7 @@ fn run_report_gated(
             // decide Install/Update/Skip against the version just resolved above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
             if decision.action != update::UpdateAction::Skip {
-                let outcome = download_component(&c, plan.dry_run)?;
+                let outcome = download_component(&c, plan.dry_run, log)?;
                 report.restart_required |= log_write_outcome(log, "dig-store", outcome);
             } else {
                 log("    · already up to date — skipping the download");
@@ -993,7 +1028,7 @@ fn run_report_gated(
                 &plan.bin_dir_for("digs", target.os),
             )?;
             log_component(log, &digs);
-            let outcome = download_component(&digs, plan.dry_run)?;
+            let outcome = download_component(&digs, plan.dry_run, log)?;
             report.restart_required |= log_write_outcome(log, "digs", outcome);
             if !plan.dry_run {
                 note_binary_written(report, guard, &digs.dest);
@@ -1121,7 +1156,7 @@ fn run_report_gated(
                         stop.note
                     ));
                 }
-                let outcome = download_component(&c, plan.dry_run)?;
+                let outcome = download_component(&c, plan.dry_run, log)?;
                 report.restart_required |= log_write_outcome(log, "dig-node", outcome);
             }
             if !plan.dry_run {
@@ -1155,7 +1190,7 @@ fn run_report_gated(
             ) {
                 Ok(dign) => {
                     log_component(log, &dign);
-                    let outcome = download_component(&dign, plan.dry_run)?;
+                    let outcome = download_component(&dign, plan.dry_run, log)?;
                     report.restart_required |= log_write_outcome(log, "dign", outcome);
                     if !plan.dry_run {
                         note_binary_written(report, guard, &dign.dest);
@@ -1234,7 +1269,7 @@ fn run_report_gated(
                     // version pin), so a re-run skips a download that would change nothing.
                     let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
                     if decision.action != update::UpdateAction::Skip {
-                        let outcome = download_component(&c, plan.dry_run)?;
+                        let outcome = download_component(&c, plan.dry_run, log)?;
                         report.restart_required |= log_write_outcome(log, "dig-app", outcome);
                     } else {
                         log("    · already up to date — skipping the download");
@@ -1341,7 +1376,7 @@ fn run_report_gated(
                                 stop.note
                             ));
                         }
-                        let outcome = download_component(&c, plan.dry_run)?;
+                        let outcome = download_component(&c, plan.dry_run, log)?;
                         report.restart_required |= log_write_outcome(log, "dig-dns", outcome);
                     }
                     if !plan.dry_run {
@@ -1374,7 +1409,7 @@ fn run_report_gated(
                         &plan.bin_dir_for("digd", target.os),
                     )?;
                     log_component(log, &digd);
-                    let outcome = download_component(&digd, plan.dry_run)?;
+                    let outcome = download_component(&digd, plan.dry_run, log)?;
                     report.restart_required |= log_write_outcome(log, "digd", outcome);
                     if !plan.dry_run {
                         note_binary_written(report, guard, &digd.dest);
@@ -1458,7 +1493,7 @@ fn run_report_gated(
             // decide-before-touch convention as dig-store/dig-node/dig-dns above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
             if decision.action != update::UpdateAction::Skip {
-                let outcome = download_component(&c, plan.dry_run)?;
+                let outcome = download_component(&c, plan.dry_run, log)?;
                 report.restart_required |= log_write_outcome(log, "dig-updater", outcome);
             } else {
                 log("    · already up to date — skipping the download");
@@ -1479,7 +1514,7 @@ fn run_report_gated(
                 &plan.bin_dir_for("dig-updater-worker", target.os),
             )?;
             log_component(log, &worker);
-            let outcome = download_component(&worker, plan.dry_run)?;
+            let outcome = download_component(&worker, plan.dry_run, log)?;
             report.restart_required |= log_write_outcome(log, "dig-updater-worker", outcome);
             if !plan.dry_run {
                 note_binary_written(report, guard, &worker.dest);
@@ -1522,7 +1557,7 @@ fn run_report_gated(
                     stop.note
                 ));
             }
-            let outcome = download_component(&c, plan.dry_run)?;
+            let outcome = download_component(&c, plan.dry_run, log)?;
             report.restart_required |= log_write_outcome(log, "dig-relay", outcome);
             if !plan.dry_run {
                 note_binary_written(report, guard, &c.dest);
@@ -1552,7 +1587,7 @@ fn run_report_gated(
                 &plan.bin_dir_for("browser", target.os),
             )?;
             log_component(log, &c);
-            download_component(&c, plan.dry_run)?;
+            download_component(&c, plan.dry_run, log)?;
             if !plan.dry_run {
                 log(&format!("    run the installer to finish: {}", c.dest));
                 note_binary_written(report, guard, &c.dest);
@@ -1892,7 +1927,13 @@ fn apply_windows_hardening(
                 if let Some(parent) = installer_bin.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::copy(&current, &installer_bin);
+                if std::fs::copy(&current, &installer_bin).is_ok() {
+                    // Freshly created in the protected root, so it carries the
+                    // creating admin USER as owner (#1910) just like a downloaded
+                    // component does — and this one is the target of a machine-wide
+                    // elevated `UninstallString`.
+                    adopt_placed_file_step(&installer_bin, log);
+                }
             }
         }
 
@@ -3804,6 +3845,51 @@ fn dns_service_teardown_failed(dns: &dns::DnsUninstallResult) -> bool {
     !dns.service_removed
 }
 
+/// The OS service id a component stem registers under, for the components whose service is
+/// registered by delegating to their own `install` verb. `None` for a stem that registers no service.
+/// Pure.
+fn service_id_for_stem(stem: &str) -> Option<&'static str> {
+    match stem {
+        "dig-node" => Some(svc::DIG_NODE_SERVICE_ID),
+        "dig-relay" => Some(svc::DIG_RELAY_SERVICE_ID),
+        _ => None,
+    }
+}
+
+/// Tear a service down BY ID, for the case where the component's launcher binary is not present.
+///
+/// # Why "the launcher is missing" is not a failure (#854)
+///
+/// `dig-relay` is opt-in: on the overwhelmingly common install it was never placed at all, and the
+/// teardown reported "launcher binary missing — cannot deregister its service" as a FAILURE. That
+/// alone made a perfectly clean uninstall exit non-zero, and — worse — the false failure put the
+/// component on the skip list, suppressing the deletion of binaries it did have.
+///
+/// The launcher was only ever needed to run the component's own `remove` verb. The service manager
+/// answers by ID without it: a service that is not registered is the desired end state, and one that
+/// IS registered can be deregistered directly (`svc::deregister_service`, which never executes the
+/// service binary — #565). Only a registration we could neither confirm gone nor remove is a failure.
+///
+/// The service-manager query and the deregistration are injected so both arms are exercised without a
+/// service manager.
+fn teardown_service_by_id(
+    id: &str,
+    state: &mut dyn FnMut(&str) -> svc::ServiceRunState,
+    deregister: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    if state(id) == svc::ServiceRunState::NotFound {
+        return Ok(format!("not installed — no '{id}' service registered"));
+    }
+    deregister(id).map_err(|e| format!("service '{id}': {e}"))?;
+    match state(id) {
+        svc::ServiceRunState::NotFound => Ok(format!("deregistered the '{id}' service by id")),
+        other => Err(format!(
+            "{} after deregistering by id (its launcher binary is gone; remove the service manually)",
+            other.describe(id)
+        )),
+    }
+}
+
 /// Does a service-teardown `Err` indicate the LAUNCHER BINARY could not be run
 /// (missing/unspawnable), rather than the service manager replying? A spawn
 /// failure surfaces through [`service::run_capturing`]'s stable `"could not run
@@ -3873,11 +3959,25 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             // "already absent". Its binary is gone anyway; mark it failed so the
             // run is not falsely reported complete.
             if !bin.exists() {
-                ok = false;
-                failed.push(stem.to_string());
-                notes.push(format!(
-                    "{stem}: launcher binary missing — cannot deregister its service (re-run after reinstall, or remove the service manually)"
-                ));
+                // No launcher to run the component's own `remove` verb — but the service manager
+                // still answers by id, and "no such service" is the desired end state, not a failure
+                // (#854: an opt-in dig-relay that was never installed used to fail the whole run).
+                let Some(id) = service_id_for_stem(stem) else {
+                    notes.push(format!("{stem}: not installed"));
+                    continue;
+                };
+                match teardown_service_by_id(
+                    id,
+                    &mut svc::service_run_state,
+                    &mut svc::deregister_service,
+                ) {
+                    Ok(n) => notes.push(format!("{stem}: {n}")),
+                    Err(e) => {
+                        ok = false;
+                        failed.push(stem.to_string());
+                        notes.push(format!("{stem}: {e}"));
+                    }
+                }
                 continue;
             }
             match service::uninstall_service(&bin, target.os) {
@@ -3916,6 +4016,44 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             note: notes.join("; "),
             failed_components: failed,
         }
+    }
+
+    fn stop_user_agent(&mut self) -> (bool, String) {
+        let target = match Target::current() {
+            Ok(t) => t,
+            Err(e) => return (false, format!("could not detect target: {e}")),
+        };
+        if self.dry_run {
+            return (
+                true,
+                "would stop dig-app + dign and remove dig-app's login autostart".into(),
+            );
+        }
+        // Both user-session images. `dign` is a short-lived CLI, but an open `dign` shell holds its
+        // binary just as firmly as the tray agent holds its own.
+        let stops: Vec<(String, running::StopOutcome)> = ["dig-app", "dign"]
+            .iter()
+            .map(|stem| {
+                let image = target.exe_name(stem);
+                let outcome = running::stop_image(&image);
+                (image, outcome)
+            })
+            .collect();
+        let (mut ok, mut note) = running::summarise(&stops);
+        // The login autostart is machine state that outlives every binary: left behind it points at a
+        // deleted dig-app at the user's next login. Absent is success (`autostart::deregister`).
+        match autostart::deregister(target.os) {
+            Ok(()) => note.push_str("; login autostart removed"),
+            Err(e) => {
+                ok = false;
+                note.push_str(&format!("; login autostart: {e}"));
+            }
+        }
+        (ok, note)
+    }
+
+    fn remove_msi_products(&mut self) -> (bool, String) {
+        msi::summarise(&msi::remove_all_dig_products(self.dry_run))
     }
 
     fn remove_beacon(&mut self) -> (bool, String) {
@@ -3961,12 +4099,13 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             Err(e) => return (false, format!("could not detect target: {e}")),
         };
         let current = std::env::current_exe().ok();
-        let roots = [self.bin_dir.clone(), paths::protected_bin_dir()];
+        let roots = distinct_roots(&[self.bin_dir.clone(), paths::protected_bin_dir()]);
         if self.dry_run {
             return (true, "would delete all installed DIG binaries".into());
         }
         let mut ok = true;
         let mut removed = 0usize;
+        let mut deferred = Vec::new();
         let mut errs = Vec::new();
         for stem in uninstall::COMPONENT_STEMS {
             // Blocker #4: never delete a binary whose service could not be
@@ -3980,9 +4119,17 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 if !path.exists() {
                     continue;
                 }
-                // The running installer cannot delete its own image on Windows;
-                // leave it for OS cleanup rather than fail the whole uninstall.
+                // A process cannot delete its own image on Windows, so the uninstall used to simply
+                // leave `dig-installer.exe` behind in a directory it claims to have emptied. The OS
+                // will finish the job at the next reboot instead (#854).
                 if current.as_deref() == Some(path.as_path()) {
+                    match download::schedule_delete_on_reboot(&path) {
+                        Ok(()) => deferred.push(path.display().to_string()),
+                        Err(e) => {
+                            ok = false;
+                            errs.push(e);
+                        }
+                    }
                     continue;
                 }
                 match std::fs::remove_file(&path) {
@@ -4024,10 +4171,21 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         };
         #[cfg(not(windows))]
         let note_extra = String::new();
-        let note = if errs.is_empty() {
-            format!("deleted {removed} binary(ies){note_extra}")
+        let deferred_note = if deferred.is_empty() {
+            String::new()
         } else {
-            format!("deleted {removed}; failed: {}{note_extra}", errs.join(", "))
+            format!(
+                "; scheduled for deletion at the next reboot (in use): {}",
+                deferred.join(", ")
+            )
+        };
+        let note = if errs.is_empty() {
+            format!("deleted {removed} binary(ies){deferred_note}{note_extra}")
+        } else {
+            format!(
+                "deleted {removed}; failed: {}{deferred_note}{note_extra}",
+                errs.join(", ")
+            )
         };
         (ok, note)
     }
@@ -4091,7 +4249,17 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             Err(_) => return Vec::new(),
         };
         let current = std::env::current_exe().ok();
-        residue_in(&residue_roots(&self.bin_dir), &target, current.as_deref())
+        let mut residue = residue_in(&residue_roots(&self.bin_dir), &target, current.as_deref());
+        // A Windows Installer product that is still REGISTERED is residue even when not one of its
+        // files remains — that registration is what leaves the ghost ARP entry and misleads the next
+        // upgrade. Checking it here is also the only honest proof the `msi` step did its job: it asks
+        // the Windows Installer database, not the step's own report of itself.
+        residue.extend(
+            msi::installed_dig_products()
+                .into_iter()
+                .map(|(stem, code)| format!("MSI product still registered: {stem} {code}")),
+        );
+        residue
     }
 }
 
@@ -4114,7 +4282,25 @@ fn residue_roots(bin_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut roots = vec![bin_dir.to_path_buf(), paths::protected_bin_dir()];
     #[cfg(unix)]
     roots.push(std::path::PathBuf::from(paths::UNIX_MACHINE_BIN_DIR));
-    roots
+    distinct_roots(&roots)
+}
+
+/// `roots` with duplicates removed, order preserved.
+///
+/// The default bin dir and the protected bin dir are THE SAME DIRECTORY on a default Windows install
+/// (`C:\Program Files\DIG\bin`). Walking the list as given therefore visited every path twice, which
+/// reported each leftover binary twice in the residue and attempted each deletion twice — the second
+/// attempt on an already-deleted path. Comparison is on the paths as written: a root reached by two
+/// different spellings is a different problem, and canonicalising here would silently drop a root that
+/// does not exist yet. Pure.
+fn distinct_roots(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !out.contains(root) {
+            out.push(root.clone());
+        }
+    }
+    out
 }
 
 /// The DIG-named entries still present under `roots`, i.e. what an uninstall failed to take.
@@ -6497,6 +6683,124 @@ mod tests {
             "the veneer holds links rather than binaries, so it is neither bin root and must be scanned \
              explicitly or its stale entries are invisible: {roots:?}"
         );
+    }
+
+    /// The scan must visit each directory ONCE (#854).
+    ///
+    /// On Windows `default_bin_dir()` IS `protected_bin_dir()` — the whole stack lives in one
+    /// admin-only root — so the root list held the same directory twice and every leftover binary was
+    /// reported twice, and every deletion attempted twice. The fixture is that real configuration
+    /// (`bin_dir == protected_bin_dir`), not an invented duplicate: an implementation that deduped
+    /// only literal repeats of an argument would still pass a two-different-paths fixture.
+    #[test]
+    fn the_residue_scan_visits_each_root_once_even_when_two_roots_are_the_same_directory() {
+        let roots = residue_roots(&paths::protected_bin_dir());
+        let mut unique = roots.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            roots.len(),
+            unique.len(),
+            "a directory that is both the run's bin dir and the protected root must be scanned once, \
+             or every leftover is reported twice: {roots:?}"
+        );
+        assert!(roots.contains(&paths::protected_bin_dir()));
+    }
+
+    /// A component that was NEVER INSTALLED is already in the desired end state (#854).
+    ///
+    /// `dig-relay` is opt-in, so on the ordinary install its launcher is absent — and the teardown
+    /// reported that as "cannot deregister its service", failing the whole uninstall and (via the skip
+    /// list) suppressing deletions it should have made. The service manager answers by id without the
+    /// launcher, so absence is now confirmed, not guessed.
+    #[test]
+    fn a_never_installed_component_is_absent_not_a_failure() {
+        let mut deregisters: Vec<String> = Vec::new();
+        let outcome = teardown_service_by_id(
+            "net.dignetwork.dig-relay",
+            &mut |_| svc::ServiceRunState::NotFound,
+            &mut |id| {
+                deregisters.push(id.to_string());
+                Ok(())
+            },
+        );
+        assert!(outcome.is_ok(), "absent must be success: {outcome:?}");
+        assert!(
+            deregisters.is_empty(),
+            "nothing should be deregistered when no service is registered"
+        );
+    }
+
+    /// A REGISTERED service whose launcher is gone is removed by id rather than abandoned — otherwise
+    /// the uninstall leaves an orphaned registration it had every means to remove.
+    #[test]
+    fn a_registered_service_with_no_launcher_is_deregistered_by_id() {
+        let mut deregisters: Vec<String> = Vec::new();
+        // Registered on the first query, gone after the deregistration — the honest sequence.
+        let mut states = vec![
+            svc::ServiceRunState::NotFound,
+            svc::ServiceRunState::Stopped,
+        ];
+        let outcome = teardown_service_by_id(
+            "net.dignetwork.dig-node",
+            &mut |_| states.pop().unwrap_or(svc::ServiceRunState::NotFound),
+            &mut |id| {
+                deregisters.push(id.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(deregisters, vec!["net.dignetwork.dig-node".to_string()]);
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// The end state is read back from the service manager, never taken from the deregistration's own
+    /// return value. Without this arm an implementation that trusted `Ok(())` would report a service
+    /// that is STILL RUNNING as cleanly removed — and the orchestrator would then delete its binary,
+    /// producing the orphan (a live registration pointing at a missing ImagePath) that the skip list
+    /// exists to prevent.
+    #[test]
+    fn a_deregistration_that_claims_success_but_leaves_the_service_running_is_a_failure() {
+        let outcome = teardown_service_by_id(
+            "net.dignetwork.dig-node",
+            &mut |_| svc::ServiceRunState::Running,
+            &mut |_| Ok(()),
+        );
+        assert!(
+            outcome.is_err(),
+            "a still-running service is not a successful teardown: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_deregistration_is_reported_as_a_failure() {
+        let outcome = teardown_service_by_id(
+            "net.dignetwork.dig-node",
+            &mut |_| svc::ServiceRunState::Stopped,
+            &mut |_| Err("access is denied".to_string()),
+        );
+        assert!(outcome.is_err());
+        assert!(outcome.unwrap_err().contains("access is denied"));
+    }
+
+    /// Only the components that actually register a service map to a service id — a stem that does not
+    /// must never be handed to the service manager under some invented name.
+    #[test]
+    fn only_service_backed_stems_have_a_service_id() {
+        assert_eq!(
+            service_id_for_stem("dig-node"),
+            Some(svc::DIG_NODE_SERVICE_ID)
+        );
+        assert_eq!(
+            service_id_for_stem("dig-relay"),
+            Some(svc::DIG_RELAY_SERVICE_ID)
+        );
+        for stem in ["digstore", "digs", "dign", "dig-app", "dig-installer"] {
+            assert_eq!(
+                service_id_for_stem(stem),
+                None,
+                "{stem} registers no service"
+            );
+        }
     }
 
     /// A directory that merely PRECEDES ours on root's `PATH` fails an elevated install (#1748 F2).

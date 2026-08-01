@@ -552,6 +552,25 @@ therefore places binaries into two roots, chosen per component:
     those owners; a level left owned by the installing admin USER's own SID would make dig-node
     false-reject the tree and silently disable self-heal, local-HTTPS provisioning, and system-service
     install (`secure::force_system_ownership` / `secure::windows_created_root_levels`).
+
+    Every FILE the installer places in that root is adopted the same way, and for the same reason. An
+    elevated process's token default owner is the invoking admin USER, and the Program Files DACL the
+    root inherits carries a `CREATOR OWNER` full-control entry, so a freshly created file is owned by
+    that user AND grants them FullControl — which dig-node correctly refuses to run as SYSTEM. After
+    each placement the installer therefore sets the file's owner to SYSTEM and re-derives its DACL from
+    the parent (`secure::adopt_placed_file`), then READS IT BACK and requires a privileged owner with no
+    write grant to any other principal (`secure::parse_placed_binary_acl`). The read-back bar is
+    STRICTER than the install-root check, which rejects only well-known broad principals: the grant here
+    is to a single named account, whose SID is not well-known. A file placed OUTSIDE the protected root
+    (a `--bin-dir` override) is never re-owned. The outcome is REPORTED, never silent.
+
+    Every ACL read-back MUST bind the security object through .NET
+    (`secure::acl_object_expression`) rather than the `Get-Acl` cmdlet, and PowerShell children MUST be
+    spawned with `PSModulePath` cleared (`proc::powershell`). `Get-Acl` is reached by module
+    autoloading through the INHERITED `PSModulePath`, which a pwsh 7 session shadows with a Core-only
+    module — the read then fails, the install fails closed, and the user gets a silently degraded
+    install. Clearing the variable also denies an elevated PowerShell child any caller-supplied module
+    directory.
   - **macOS/Linux:** `/opt/dig/bin`, root-owned `0755` (owner root writes; group/other read+execute).
     DIG deliberately roots PRIVILEGED binaries here, NOT under a Homebrew-style `/usr/local` prefix,
     which is group-writable on an Intel Mac (`<user>:admin`, mode `0775`) — a group-writable install
@@ -949,6 +968,13 @@ For the two components this installer registers as OS services with their OWN `i
    service reports this on re-install; the registration still points at the same on-disk path, so
    the next step still picks up the binary just written), then, if the plan requests it,
    `<dest> start`. Only a `start` failure is a hard error (`SERVICE_START_FAILED`).
+
+   A registration that fails with the Windows SCM's TRANSIENT post-delete state is RETRIED before it
+   is tolerated: after an uninstall the SCM keeps the deleted record until its last handle closes, and
+   a registration in that window reports `ERROR_SERVICE_DOES_NOT_EXIST` (1060) or
+   `ERROR_SERVICE_MARKED_FOR_DELETE` (1072). The installer retries those two codes — and ONLY those
+   two, recognised by the code rather than by an English phrase a spawn failure shares — on a bounded
+   1s/2s backoff (`service::with_scm_retry`). Every other failure is reported at once.
 
 This restores the prior running state: a service that was running before the install is running
 again after it (now serving the new binary); a service that was never installed/running is
@@ -1460,13 +1486,48 @@ ONLY, keeping the WebView unelevated:
 **zero residue** — one orchestration over the previously-piecemeal teardown flags. It runs the fixed
 ordered sequence (services/schedulers first so a live service never points at a deleted binary):
 
-1. **services** — stop + deregister dig-node, dig-relay, dig-dns;
-2. **beacon** — remove the auto-update scheduler registration;
-3. **scheme** — unregister the dig/chia/urn handlers (DIG-owned only);
-4. **network** — remove the `dig.local` hosts entry + the peer firewall rule;
-5. **binaries** — delete ALL installed binaries across both bin roots (the running installer image is
-   exempt — self-delete is impossible while running; OS cleanup handles it) + the Windows ARP entry;
-6. **forcelist** — unconfigure the browser-extension forcelist (DIG entry only).
+1. **services** — stop + deregister dig-node, dig-relay, dig-dns. A component whose LAUNCHER binary is
+   absent is not a failure: the service manager is queried BY ID, so "no such service" is confirmed
+   absence (the desired end state) and a service that IS registered is deregistered by id;
+2. **user-agent** — stop the running user-session processes (`dig-app`, `dign`) and remove dig-app's
+   per-user login autostart. It precedes every deletion because Windows refuses to delete a running
+   image (`os error 5`). A process that is not running is success;
+3. **beacon** — remove the auto-update scheduler registration;
+4. **scheme** — unregister the dig/chia/urn handlers (DIG-owned only);
+5. **network** — remove the `dig.local` hosts entry + the peer firewall rule;
+6. **login-path** — remove the system-wide login-`PATH` fragment;
+7. **msi** — remove every MSI-installed DIG product (§3.10.1). Before the binaries, because
+   `msiexec /x` runs the product's own uninstall sequence from the product's own files;
+8. **binaries** — delete ALL installed binaries across the (deduplicated) bin roots + the Windows ARP
+   entry. The running installer image cannot delete itself, so it is scheduled for deletion at the
+   next reboot with `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`;
+9. **forcelist** — unconfigure the browser-extension forcelist (DIG entry only).
+
+The bin roots are deduplicated before the walk: on Windows the default bin dir IS the protected bin
+dir, so an undeduplicated list visits every path twice and reports every leftover twice.
+
+### 3.10.1 MSI-installed products (`msiexec`)
+
+A DIG component may be installed from a Windows Installer package (dig-node publishes
+`dig-node-<ver>-windows-x64.msi`). Such a product MUST NOT be removed by deleting its files: the
+Windows Installer registration outlives them, leaving a ghost Add/Remove-Programs entry, a broken
+repair/modify, and an upgrade that believes an older version is still present.
+
+- **Discovery.** The ProductCode is resolved from the package's **stable UpgradeCode** — a DIG-owned
+  constant compiled into the package (`dig-node`: `{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}`) — via the
+  Windows Installer `UpgradeCodes` index under `HKLM\SOFTWARE\Classes\Installer\UpgradeCodes`, whose
+  per-UpgradeCode subkey holds the packed ProductCodes installed for it. Matching by `DisplayName` is
+  NOT the primary mechanism; a conjunctive Add/Remove-Programs scan (DIG publisher AND a known DIG
+  display name AND `WindowsInstaller=1` AND a GUID-shaped key name) is a fallback only.
+- **Removal.** `msiexec.exe /x <ProductCode> /qn /norestart`, with `msiexec.exe` resolved to its
+  absolute `System32` path (never `PATH`) and the arguments passed as an argv (never a shell string).
+  The ProductCode is a parsed type that can only hold a canonical braced GUID, so a value carrying a
+  path or a second command cannot reach the command line.
+- **Exit codes.** `0` removed; **`1605` (product not installed) is SUCCESS** — the desired end state,
+  and what an idempotent second run sees; `3010`/`1641` removed with a reboot required (success, and
+  reported as such); anything else is a failure.
+- **Proof.** A product still registered with Windows Installer after the step is reported as
+  **residue**, so completeness is judged against the Installer database rather than the step's own log.
 
 It then re-scans and reports any residue. The result is a structured `UninstallReport { steps:
 [{id, ok, note}], residue: [..], dry_run }`; `complete()` is true iff every step reached its
@@ -1484,7 +1545,8 @@ The install behaves like a well-behaved native package:
 - **Add/Remove Programs (Windows).** An `HKLM\…\Uninstall\DIG_Network` entry (`DisplayName` = "DIG
   Network", `DisplayVersion`, `Publisher`, `InstallLocation`, `NoModify=1`, `NoRepair=1`) whose
   `UninstallString` = `"<installer>" --uninstall` — the ARP Uninstall button runs the §3.10
-  whole-stack uninstall. The entry is removed as part of `--uninstall`. The persisted installer and
+  whole-stack uninstall. `QuietUninstallString` mirrors it: the teardown is fully
+  non-interactive, so winget/PowerShell/MDM can drive it unattended. The entry is removed as part of `--uninstall`. The persisted installer and
   the `UninstallString` are an elevated-exec pointer, so both are pinned to the admin-only protected
   install root (never a user-chosen `--bin-dir`), and the machine-wide entry is written ONLY when
   that root is verified owner-secure — never planting an elevated pointer where an unprivileged user

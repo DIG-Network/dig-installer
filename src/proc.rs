@@ -103,6 +103,41 @@ pub fn system_tool(name: &str) -> std::ffi::OsString {
     }
 }
 
+/// The environment variables an inherited shell can set that change how a
+/// PowerShell child RESOLVES CODE, and which [`powershell`] therefore clears.
+///
+/// `PSModulePath` is the whole list today, and it is not a theoretical concern
+/// (#1910): a pwsh 7 / Git Bash session exports its own `PSModulePath`, Windows
+/// PowerShell inherits it, and every module-backed cmdlet then fails to autoload —
+/// observed as `Get-Acl : … the module could not be loaded`, which turned every
+/// ACL read-back in this crate into "could not read" and silently degraded the
+/// install. Cleared rather than overwritten, because PowerShell computes the
+/// correct default for itself when the variable is absent.
+///
+/// It is a hardening measure as much as a correctness one, of the same shape as
+/// [`system_tool`]'s #657 search-order fix: a `PSModulePath` entry an unprivileged
+/// account can write is a module an ELEVATED PowerShell child would autoload and
+/// execute.
+pub fn inherited_powershell_env_to_clear() -> &'static [&'static str] {
+    &["PSModulePath"]
+}
+
+/// A `powershell -NoProfile -NonInteractive -Command <script>` child with the
+/// console hidden ([`HideConsole`]), the executable resolved absolutely
+/// ([`system_tool`]), and the inherited variables that steer code resolution
+/// cleared ([`inherited_powershell_env_to_clear`]).
+///
+/// The single way this crate spawns PowerShell, so no call site can be missed.
+pub fn powershell(script: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(system_tool("powershell"));
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    for var in inherited_powershell_env_to_clear() {
+        cmd.env_remove(var);
+    }
+    cmd.hide_console();
+    cmd
+}
+
 /// Join a resolved System32 directory and a tool `name` into an absolute
 /// executable path. Appends `.exe` when absent, normalises the trailing
 /// separator, and maps the tools that do NOT live directly in System32 to their
