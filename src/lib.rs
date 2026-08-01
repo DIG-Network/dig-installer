@@ -2711,6 +2711,7 @@ fn register_relay(
                 svcscope::settled_scope(
                     outcome_scope,
                     svcscope::RegistrationConclusion::Registered,
+                    &existing,
                 ),
                 &existing,
                 log,
@@ -3090,7 +3091,7 @@ fn register_dig_node(
         let scope = settled.unwrap_or(scope);
         result.shadowing_units_removed = remove_shadowing_units(
             target.os,
-            svcscope::settled_scope(scope, conclusion),
+            svcscope::settled_scope(scope, conclusion, &existing),
             &existing,
             log,
         );

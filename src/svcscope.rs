@@ -288,10 +288,44 @@ pub enum RegistrationConclusion {
 ///
 /// Adoption only ever happens at system scope ([`engine_registration`]), so that is the scope it
 /// settles on regardless of what the run originally requested.
-pub fn settled_scope(requested: ServiceScope, conclusion: RegistrationConclusion) -> ServiceScope {
+///
+/// # Why a LEFT-AS-IS run must answer from the DISK, not from the request
+///
+/// The requested scope is what this run WOULD have registered. `LeftAsIs` is precisely the arm that
+/// registered nothing, so on that path the request is a hypothesis and the only registration in
+/// existence is whatever was already on the host. Settling `LeftAsIs` on the REQUEST let an elevated
+/// (system-scope) run over an up-to-date binary sweep away a per-user unit that was the host's ONLY
+/// registration — and then report `installed: true`, because the sweep is silent and the health check
+/// passes against the still-RUNNING service. The loss first becomes visible at the next reboot, when
+/// nothing starts. `existing` is therefore consulted: a system registration that will actually be
+/// started is what makes clearing the shadowers safe (dig_ecosystem#526 review round 2, finding A1).
+pub fn settled_scope(
+    requested: ServiceScope,
+    conclusion: RegistrationConclusion,
+    existing: &[UnitRecord],
+) -> ServiceScope {
     match conclusion {
         RegistrationConclusion::AdoptedPackaged => ServiceScope::System,
-        RegistrationConclusion::Registered | RegistrationConclusion::LeftAsIs => requested,
+        RegistrationConclusion::Registered => requested,
+        RegistrationConclusion::LeftAsIs => serving_scope(existing),
+    }
+}
+
+/// Which scope actually serves a host that this run did not register into.
+///
+/// A system unit only serves if it will be STARTED: a present-but-not-enabled one starts nothing, so
+/// it cannot justify deleting the per-user unit that does (the same reasoning
+/// [`engine_registration`] applies to a packaged unit). With no such unit, the answer is `User` —
+/// which makes [`shadowing_units_to_remove`] propose nothing, because the units it would delete are
+/// the registration itself.
+fn serving_scope(existing: &[UnitRecord]) -> ServiceScope {
+    let system_serves = existing
+        .iter()
+        .any(|u| u.scope == ServiceScope::System && u.enabled);
+    if system_serves {
+        ServiceScope::System
+    } else {
+        ServiceScope::User
     }
 }
 
@@ -625,6 +659,14 @@ mod tests {
     ///
     /// The property under test is that ADOPTING and LEAVING-AS-IS settle on a scope whose shadowers
     /// are still owed a sweep — not merely that some sweep exists somewhere.
+    ///
+    /// # What this fixture CANNOT see (round 2, finding A1)
+    ///
+    /// It carries an ENABLED packaged system unit, so a `LeftAsIs` run that settles on System is
+    /// sweeping shadowers of a registration that genuinely exists — the deletion is harmless here and
+    /// the arm reads correct. On the COMMONEST host there is no packaged unit at all, and the same
+    /// code deletes the only registration; that case is
+    /// [`leaving_an_up_to_date_registration_as_is_never_sweeps_the_only_registration`].
     #[test]
     fn adopting_or_leaving_a_registration_still_owes_the_shadowing_sweep() {
         let units = mixed_units();
@@ -641,7 +683,7 @@ mod tests {
             RegistrationConclusion::AdoptedPackaged,
             RegistrationConclusion::LeftAsIs,
         ] {
-            let settled = settled_scope(ServiceScope::System, conclusion);
+            let settled = settled_scope(ServiceScope::System, conclusion, &units);
             assert_eq!(settled, ServiceScope::System, "{conclusion:?}");
             assert_eq!(
                 shadowing_units_to_remove(Os::Linux, settled, &units),
@@ -661,8 +703,13 @@ mod tests {
     /// would delete the very unit that run just wrote.
     #[test]
     fn adoption_settles_on_system_while_a_user_registration_stays_user() {
+        let units = mixed_units();
         assert_eq!(
-            settled_scope(ServiceScope::User, RegistrationConclusion::AdoptedPackaged),
+            settled_scope(
+                ServiceScope::User,
+                RegistrationConclusion::AdoptedPackaged,
+                &units
+            ),
             ServiceScope::System
         );
         for conclusion in [
@@ -670,20 +717,110 @@ mod tests {
             RegistrationConclusion::LeftAsIs,
         ] {
             assert_eq!(
-                settled_scope(ServiceScope::User, conclusion),
+                settled_scope(ServiceScope::User, conclusion, &[]),
                 ServiceScope::User,
                 "{conclusion:?}"
             );
             assert!(
                 shadowing_units_to_remove(
                     Os::Linux,
-                    settled_scope(ServiceScope::User, conclusion),
+                    settled_scope(ServiceScope::User, conclusion, &[]),
                     &mixed_units()
                 )
                 .is_empty(),
                 "{conclusion:?}: a user-scope run must never sweep the unit it just wrote"
             );
         }
+    }
+
+    /// The host with a pre-#526 registration and NOTHING else: one unpackaged `~/.config/systemd/user`
+    /// unit, no packaged unit, no system unit. That is the commonest shape on the machine class #526
+    /// is about, and it is the shape the adopt-fixture above cannot exhibit.
+    fn only_a_user_unit() -> Vec<UnitRecord> {
+        vec![UnitRecord::new(
+            "/home/alice/.config/systemd/user/dignetwork-dig-node.service",
+            ServiceScope::User,
+        )]
+    }
+    /// Finding A1: an elevated run over an ALREADY-UP-TO-DATE binary registers nothing, so the
+    /// per-user unit it would otherwise shadow is the host's only registration — and deleting it
+    /// leaves the machine with no service at all while the run still reports success.
+    ///
+    /// The fixture varies exactly one actor from the adopt fixture: the packaged unit is gone. The
+    /// pre-fix implementation (`LeftAsIs` settles on the REQUESTED scope) answers System here and
+    /// proposes the only registration for deletion; both the requested scope and the conclusion are
+    /// identical to the passing adopt case, so nothing but the disk facts can distinguish them.
+    #[test]
+    fn leaving_an_up_to_date_registration_as_is_never_sweeps_the_only_registration() {
+        let units = only_a_user_unit();
+        // Precondition: this really is the no-packaged-unit path, so the test cannot pass by
+        // accidentally exercising adoption (whose own arm hard-codes System).
+        assert_eq!(
+            engine_registration(Os::Linux, ServiceScope::System, &units),
+            EngineRegistration::Delegate,
+            "fixture must have no adoptable packaged unit for this test to mean anything"
+        );
+        for os in [Os::Linux, Os::MacOs] {
+            let settled = settled_scope(
+                ServiceScope::System,
+                RegistrationConclusion::LeftAsIs,
+                &units,
+            );
+            assert_eq!(
+                settled,
+                ServiceScope::User,
+                "{os:?}: a run that registered NOTHING is served by what is on the disk, not by the \
+                 scope it would have asked for"
+            );
+            assert!(
+                shadowing_units_to_remove(os, settled, &units).is_empty(),
+                "{os:?}: the sole registration must never be swept — deleting it reports success \
+                 and leaves nothing running after a reboot"
+            );
+        }
+    }
+
+    /// The control that keeps the fix from becoming "never sweep on LeftAsIs": once a system unit is
+    /// ENABLED it really will start at boot, so the per-user unit is a genuine collision and is
+    /// cleared. A present-but-DISABLED system unit starts nothing and buys no such licence — the row
+    /// that separates "a system unit exists" from "a system unit serves".
+    #[test]
+    fn a_left_as_is_run_sweeps_only_once_a_system_unit_will_actually_start() {
+        let user_unit = only_a_user_unit();
+        let mut disabled = user_unit.clone();
+        disabled.push(UnitRecord::new(
+            "/etc/systemd/system/dignetwork-dig-node.service",
+            ServiceScope::System,
+        ));
+        let mut enabled = user_unit.clone();
+        enabled.push(UnitRecord {
+            path: PathBuf::from("/etc/systemd/system/dignetwork-dig-node.service"),
+            scope: ServiceScope::System,
+            packaged: false,
+            enabled: true,
+        });
+
+        let settle = |units: &[UnitRecord]| {
+            settled_scope(
+                ServiceScope::System,
+                RegistrationConclusion::LeftAsIs,
+                units,
+            )
+        };
+        assert_eq!(
+            settle(&disabled),
+            ServiceScope::User,
+            "a disabled system unit starts nothing, so it cannot justify the deletion"
+        );
+        assert!(shadowing_units_to_remove(Os::Linux, settle(&disabled), &disabled).is_empty());
+        assert_eq!(settle(&enabled), ServiceScope::System);
+        assert_eq!(
+            shadowing_units_to_remove(Os::Linux, settle(&enabled), &enabled),
+            vec![PathBuf::from(
+                "/home/alice/.config/systemd/user/dignetwork-dig-node.service"
+            )],
+            "an enabled system unit DOES serve, so the per-user unit is a live collision"
+        );
     }
 
     // -- engine_registration: adopt the packaged unit ------------------------------------------

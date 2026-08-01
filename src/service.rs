@@ -946,6 +946,7 @@ mod tests {
                 svcscope::settled_scope(
                     outcome.effective_scope,
                     svcscope::RegistrationConclusion::Registered,
+                    &planted,
                 ),
                 &planted,
             );
