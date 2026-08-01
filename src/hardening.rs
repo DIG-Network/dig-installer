@@ -50,6 +50,14 @@ pub struct ArpEntry {
     /// `uninstall` on this installer's persisted binary. Quoted so a spaced path
     /// (Program Files) is one argument; no shell wrapper.
     pub uninstall_string: String,
+    /// The command a NON-INTERACTIVE caller runs — winget, an MDM, `Get-Package | Uninstall-Package`.
+    ///
+    /// Windows treats an empty `QuietUninstallString` as "this product cannot be removed without a
+    /// user", which is now simply untrue: the teardown asks nothing and reports its outcome through
+    /// the exit code. It MIRRORS `uninstall_string` because the uninstall has no interactive mode to
+    /// suppress — a divergence between the two would mean two teardown paths, which is exactly what
+    /// #854 is removing.
+    pub quiet_uninstall_string: String,
     /// The install root shown as `InstallLocation`.
     pub install_location: String,
     /// ARP flags: DIG has no in-place modify/repair UI, so both are 1.
@@ -66,11 +74,13 @@ pub fn arp_entry(
     installer_bin: &std::path::Path,
     install_root: &std::path::Path,
 ) -> ArpEntry {
+    let uninstall_string = format!("\"{}\" --uninstall", installer_bin.display());
     ArpEntry {
         display_name: ARP_DISPLAY_NAME.to_string(),
         display_version: version.to_string(),
         publisher: ARP_PUBLISHER.to_string(),
-        uninstall_string: format!("\"{}\" --uninstall", installer_bin.display()),
+        quiet_uninstall_string: uninstall_string.clone(),
+        uninstall_string,
         install_location: install_root.display().to_string(),
         no_modify: 1,
         no_repair: 1,
@@ -241,6 +251,7 @@ pub fn write_arp_entry(entry: &ArpEntry) -> Result<String, String> {
         .and_then(|_| key.set_value("DisplayVersion", &entry.display_version))
         .and_then(|_| key.set_value("Publisher", &entry.publisher))
         .and_then(|_| key.set_value("UninstallString", &entry.uninstall_string))
+        .and_then(|_| key.set_value("QuietUninstallString", &entry.quiet_uninstall_string))
         .and_then(|_| key.set_value("InstallLocation", &entry.install_location))
         .and_then(|_| key.set_value("NoModify", &entry.no_modify))
         .and_then(|_| key.set_value("NoRepair", &entry.no_repair))

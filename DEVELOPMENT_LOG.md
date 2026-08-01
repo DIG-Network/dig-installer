@@ -679,3 +679,50 @@ blameless failure in an unrelated later step rolled the host into auto-updates p
 rollback is also LIFO, and the schedule was recorded BEFORE the binaries, so the undo spawned a
 `dig-updater` the same rollback had already unlinked. Prefer the binary-free OS-tool path for an undo,
 and retract the report's claim when a reversal takes the state away again.
+
+## An MSI-installed product survives having its files deleted (#854)
+
+A product installed by Windows Installer stays registered in the Installer database no matter what
+happens to its files: deleting them leaves a ghost Add/Remove-Programs entry, a repair/modify that
+fails, and an upgrade that believes an older version is still present. `msiexec /x <ProductCode>` is
+the only removal, and it needs the product's own files, so it must run BEFORE any file deletion.
+
+The ProductCode changes with nearly every build, so it cannot be hardcoded, and matching Add/Remove
+Programs by `DisplayName` is how an uninstaller ends up removing somebody else's product. The stable
+anchor is the **UpgradeCode**, compiled into the package and DIG-owned: Windows Installer indexes it
+under `HKLM\SOFTWARE\Classes\Installer\UpgradeCodes`, where the per-UpgradeCode subkey's value names
+are the packed ProductCodes installed for it. The "packed" form reverses the GUID's first three
+fields whole and swaps the hex digits of the remaining eight bytes — verified against this machine's
+own registry before it was trusted, and then again against a real dig-node MSI install
+(`{7E9B1C2D-…}` → `D2C1B9E7F4A3C5B4D8E6F1A2B3C4D5E6`).
+
+`1605` (ERROR_UNKNOWN_PRODUCT) is msiexec saying the product is not installed. That is the state an
+uninstall is TRYING to reach, so reading it as a failure fails every idempotent second run. `3010`
+means removed-with-a-reboot-pending: a success that must still be reported.
+
+## A deletion walk and a residue scan that share one list cannot see their own omission (#854)
+
+`COMPONENT_STEMS` carried the pre-rename `digstore` but not the `dig-store` the installer actually
+places, so `dig-store.exe` was never deleted — and the post-run scan, which walks the SAME list,
+reported `residue: []` next to the file it had just failed to take. A real install-then-uninstall on
+Windows found it in minutes; no unit test could, because both sides agreed with each other.
+
+The same run found the residue roots doubled: on Windows `default_bin_dir()` IS `protected_bin_dir()`,
+so every root was visited twice and every leftover reported twice.
+
+## An elevated hosts-file write can be denied once and succeed a moment later (#854)
+
+An elevated uninstall failed the atomic replace of the system hosts file with `Access is denied
+(os error 5)` and left `dig.local` behind; the next run, with identical privileges, succeeded. The
+hosts file is scanned on every write, so a momentary lock on the freshly written temp file — not a
+permission problem — is what fails it. A bounded retry gets the outcome the privileges actually allow,
+and a genuine permission failure still fails.
+
+## A binary written by an elevated install is owned by the invoking USER, not Administrators
+
+Observed while restoring this machine after an uninstall: the install root is SYSTEM-owned, but a file
+the elevated installer freshly CREATES in it is owned by the invoking admin USER with an explicit
+`FullControl` ACE — an elevated token's default object owner is the user. dig-node's #565 guard then
+refuses to register its service ("the program file itself is not owned by root/SYSTEM"), so an install
+that FOLLOWS an uninstall leaves dig-node unregisterable until the ownership is repaired. It is
+invisible on a first install, where the file already existed with the right owner.
