@@ -1064,10 +1064,39 @@ unit that does not exist, so a run-state query cannot answer "is anything regist
 failure with nothing registered at the requested scope is an ERROR and fails readiness (§4.2); an
 `Unknown` probe result is NOT tolerance, because "could not ask" is not "it is there".
 
+**Presence has exactly three values, and only a RECOGNISED not-found reply is `Absent`.** The
+classification is byte-identical with dig-node's own service probe (v0.71.0,
+`crates/dig-node-service/src/service.rs`), so the two implementations agree on what absence looks
+like:
+
+| backend | classifier | `Absent` iff |
+|---|---|---|
+| systemd | `svc::classify_systemctl_is_enabled` | the `not-found` state token on stdout, or a stderr naming the missing unit file — including dig-node's verbatim `no files found for` / `could not be found` |
+| launchd | `svc::classify_launchctl_print` | exit `113` (`kLaunchdNoSuchServiceError`), or stderr containing `could not find service` / `no such process` / `no such file` |
+| Windows SCM | `svc::classify_sc_registration` | `sc query` reporting `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) |
+
+A successful query is `Present`, tested BEFORE any absence signal. Everything else is
+`Unknown(reason)` carrying the tool's own message: there is no fourth outcome, stderr is matched
+case-insensitively as a SUBSTRING, and `Unknown` is NEVER collapsed into "not registered". The two
+failures this rules out are the ones that reach exactly the host class #526 describes — `systemctl
+--user is-enabled` under `sudo` printing `Failed to connect to bus: No such file or directory`, and
+`launchctl print gui/<uid>/<label>` with no Aqua session failing `Bootstrap failed` / `Could not find
+domain for` — both of which are a scope that could not be ASKED, not an empty one.
+
 **No unit may shadow a system registration.** After a system-scope register, every unpackaged
 per-user unit for that service — the invoking user's AND root's own, which a pre-#526 `sudo` install
 wrote — MUST be removed and NAMED in `ServiceResult.shadowing_units_removed`. `systemd --user` starts
 such a unit at the next login alongside the system unit, and both bind the node's port.
+
+**The sweep is licensed by the registration that SERVES, never by the scope that was requested.** A
+run that registered nothing — the already-up-to-date path, which leaves the existing registration
+untouched — MUST take its settled scope from the units observed on disk
+(`svcscope::settled_scope` with the observed `UnitRecord`s): System only when a system unit is present
+AND enabled, else User. On the commonest host the sole registration is a pre-#526 per-user unit and
+there is no system unit at all, so sweeping on the REQUESTED system scope deletes the only
+registration while still reporting `installed: true` — a loss first observable at the next reboot.
+That path MUST also report the scope it is actually served from, and `survives_reboot: false` with the
+login-gated warning when that is per-user.
 
 **An enabled packaged unit is ADOPTED, not duplicated.** When the apt.dig.net `.deb`'s
 `net.dignetwork.dig-node.service` is present AND enabled in the system domain, the installer skips
@@ -1080,7 +1109,17 @@ earlier run's registration starting a service the user believes they removed. On
 booting out BOTH `system/<id>` and `gui/<uid>/<id>`. The authoritative signal is the scope-explicit
 END STATE, never the verbs' exit codes (an `uninstall` of an absent registration exits non-zero on
 some platforms); a scope still holding a registration afterwards is a REPORTED failure, and a scope
-that could not be reached is reported even when the end state is clean. Per-user artifacts resolve
+that could not be reached is reported even when the end state is clean.
+
+**When EVERY scope's attempt failed, the probe decides — and it MUST be consulted before the error.**
+The presence probe queries the SERVICE MANAGER (`systemctl` / `launchctl` / `sc`), never the
+component's own launcher, so it remains authoritative precisely on the hosts where every `uninstall`
+invocation failed (a missing launcher binary among them). A scope that could not be read back leaves
+the state UNKNOWN and MUST be an error naming that scope; a definite absence in EVERY scope
+establishes that there was nothing to remove and MUST be reported as success, with every failed
+attempt disclosed. Erroring on the failed attempts alone reports trouble on a host that has none.
+
+Per-user artifacts resolve
 through the target user (§1.5a); when no target user can be determined under elevation this is
 reported loudly rather than cleaned silently.
 
