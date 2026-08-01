@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.37.0] - 2026-08-01
+
+### Features
+- **service:** Register engines at an explicit scope, with reboot survival reported (#51)
+
+### Bug Fixes
+- **secure:** Own the files the elevated installer creates, so a reinstall can register dig-node (#54)
+
 ## [0.35.0] - 2026-08-01
 
 ### Features
