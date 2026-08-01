@@ -455,14 +455,59 @@ fn staging_path(dest: &Path) -> std::path::PathBuf {
 /// under `HKLM\SYSTEM\…\PendingFileRenameOperations`).
 #[cfg(windows)]
 fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    schedule_replace_on_reboot_with(
+        dest,
+        bytes,
+        &crate::secure::adopt_placed_file,
+        &move_on_reboot,
+    )
+}
+
+/// [`schedule_replace_on_reboot`] with the two effects injected, so the ORDER they
+/// happen in is assertable without touching the machine's pending-rename registry.
+///
+/// # The staged file is the file that will EXIST after the reboot (#1910)
+///
+/// The staging file is created by the elevated installer, so it carries the
+/// invoking admin user as owner and the `CREATOR OWNER` grant that comes with it —
+/// and `MoveFileEx` MOVES it, security descriptor and all, onto `dest`. Adopting
+/// only `dest` at install time therefore leaves the reboot path re-introducing the
+/// exact defect, days later and invisibly: this was observed on a real machine as
+/// `.dig-app.exe.pending-76024  owner=TDS1\micha  userACEs=1` sitting in the
+/// protected root, staged to become `dig-app.exe`.
+///
+/// The adoption must precede the schedule, not follow it, so the file is never
+/// queued for promotion while still user-owned. A failure to adopt is REPORTED by
+/// the caller, never silent, and does not abort the update.
+#[cfg(windows)]
+fn schedule_replace_on_reboot_with(
+    dest: &Path,
+    bytes: &[u8],
+    adopt: &dyn Fn(&Path) -> Result<(), String>,
+    schedule: &dyn Fn(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let staging = staging_path(dest);
+    std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
+    if let Err(e) = adopt(&staging) {
+        return Err(format!(
+            "staged {} but could not give it privileged ownership ({e}) — promoting it at              reboot would leave a binary a non-SYSTEM principal can rewrite",
+            staging.display()
+        ));
+    }
+    schedule(&staging, dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staging);
+    })
+}
+
+/// `MoveFileExW(staging, dest, REPLACE_EXISTING | DELAY_UNTIL_REBOOT)` — the OS
+/// swaps in the new binary before any process can re-open the still-running old one.
+#[cfg(windows)]
+fn move_on_reboot(staging: &Path, dest: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING,
     };
-
-    let staging = staging_path(dest);
-    std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
 
     let wide = |p: &Path| -> Vec<u16> {
         p.as_os_str()
@@ -470,7 +515,7 @@ fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
             .chain(std::iter::once(0))
             .collect()
     };
-    let existing = wide(&staging);
+    let existing = wide(staging);
     let target = wide(dest);
     // SAFETY: both pointers are NUL-terminated UTF-16 buffers kept alive across
     // the call; the flags are the documented reboot-replace pair.
@@ -483,7 +528,6 @@ fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     };
     if ok == 0 {
         let code = unsafe { GetLastError() };
-        let _ = std::fs::remove_file(&staging);
         return Err(format!(
             "could not schedule the reboot-time replace of {} (Win32 error {code})",
             dest.display()
@@ -1149,5 +1193,83 @@ mod tests {
             &std::io::Error::from_raw_os_error(5),
             &dir.path().join("absent.exe")
         ));
+    }
+
+    /// The staged file is the file that will EXIST after the reboot, so it must be
+    /// adopted into privileged ownership BEFORE the promotion is queued (#1910).
+    ///
+    /// Observed as a live defect on a real machine: `.dig-app.exe.pending-76024`
+    /// sitting in the protected root owned by the installing user, scheduled to
+    /// become `dig-app.exe`. Fixing only the direct write leaves the reboot path
+    /// re-introducing the same defect days later, which is precisely the shape of
+    /// recovery-path defect that stays invisible to a clean-machine test.
+    ///
+    /// The ORDER is asserted, not merely the fact: a run that scheduled first and
+    /// adopted afterwards would satisfy a "both happened" assertion while still
+    /// queueing a user-owned binary for promotion.
+    #[cfg(windows)]
+    #[test]
+    fn the_staged_file_is_adopted_before_the_reboot_replace_is_queued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("dig-app.exe");
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+
+        let outcome = schedule_replace_on_reboot_with(
+            &dest,
+            b"NEW BINARY",
+            &|p| {
+                events.borrow_mut().push(format!("adopt {}", p.display()));
+                Ok(())
+            },
+            &|staging, target| {
+                events.borrow_mut().push(format!(
+                    "schedule {} -> {}",
+                    staging.display(),
+                    target.display()
+                ));
+                Ok(())
+            },
+        );
+
+        assert_eq!(outcome, Ok(()));
+        let events = events.into_inner();
+        let staging = staging_path(&dest);
+        assert_eq!(
+            events,
+            vec![
+                format!("adopt {}", staging.display()),
+                format!("schedule {} -> {}", staging.display(), dest.display()),
+            ],
+            "the staged file must be adopted first, and by its STAGING path"
+        );
+        assert_eq!(
+            std::fs::read(&staging).expect("the staged bytes"),
+            b"NEW BINARY"
+        );
+    }
+
+    /// If the staged file cannot be adopted, the promotion must NOT be queued: a
+    /// binary a non-SYSTEM principal can rewrite is worse in the protected root than
+    /// an update that did not happen, and the reboot would install it silently.
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_file_that_cannot_be_adopted_is_never_queued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("dig-app.exe");
+        let scheduled = std::cell::Cell::new(0);
+
+        let err = schedule_replace_on_reboot_with(
+            &dest,
+            b"NEW",
+            &|_| Err("owner is still the installing user".to_string()),
+            &|_, _| {
+                scheduled.set(scheduled.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("an un-adoptable staged file must fail");
+
+        assert_eq!(scheduled.get(), 0, "nothing may be queued for the reboot");
+        assert!(err.contains("privileged ownership"), "got: {err}");
     }
 }
