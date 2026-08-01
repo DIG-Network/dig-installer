@@ -645,7 +645,10 @@ fn force_system_ownership(root: &std::path::Path) -> Result<(), String> {
 /// [`root_exec_guard`] regardless of who owns the individual file.
 ///
 /// Pure, so the boundary is asserted without a protected directory to write into.
-pub fn needs_privileged_ownership(dest: &std::path::Path, protected_root: &std::path::Path) -> bool {
+pub fn needs_privileged_ownership(
+    dest: &std::path::Path,
+    protected_root: &std::path::Path,
+) -> bool {
     dest.starts_with(protected_root)
 }
 
@@ -1481,8 +1484,7 @@ ACE;S-1-5-21-447225562-1852780552-4040414075-1002;2032127;Allow
             ),
             ("no owner could be read", "ACE;S-1-5-18;2032127;Allow\n"),
         ] {
-            parse_placed_binary_acl(acl)
-                .expect_err(&format!("{why} must still be refused"));
+            parse_placed_binary_acl(acl).expect_err(&format!("{why} must still be refused"));
         }
     }
 
@@ -1669,7 +1671,10 @@ ACE;S-1-5-21-447225562-1852780552-4040414075-1002;2032127;Allow
     fn the_probe_reads_the_acl_without_a_cmdlet() {
         // `Get-Acl` is a module-backed cmdlet; reaching it depends on `PSModulePath`.
         let cmd = acl_write_probe_ps_command(r"C:\Program Files\DIG\bin");
-        assert!(!cmd.contains("Get-Acl"), "must not depend on a module: {cmd}");
+        assert!(
+            !cmd.contains("Get-Acl"),
+            "must not depend on a module: {cmd}"
+        );
         assert!(cmd.contains("FileSecurity") && cmd.contains("DirectorySecurity"));
         assert!(cmd.contains(r"C:\Program Files\DIG\bin"));
     }

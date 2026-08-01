@@ -506,9 +506,7 @@ pub(crate) fn dir_owner_sid(path: &std::path::Path) -> Option<String> {
         "{bind}$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
         bind = crate::secure::acl_object_expression(&dir)
     );
-    let out = crate::proc::powershell(&ps)
-        .output()
-        .ok()?;
+    let out = crate::proc::powershell(&ps).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1128,7 +1126,10 @@ mod tests {
     #[test]
     fn acl_verify_ps_command_targets_the_dir_and_emits_sids() {
         let cmd = acl_verify_ps_command(r"C:\ProgramData\DigNode");
-        assert!(cmd.contains("Get-Acl"));
+        // #1910 amended this from `contains("Get-Acl")`: the ACL is now bound through
+        // .NET, so the read no longer depends on module autoloading. What the command
+        // must EMIT is unchanged, and that is what the rest of this test pins.
+        assert!(!cmd.contains("Get-Acl"));
         assert!(cmd.contains(r"C:\ProgramData\DigNode"));
         assert!(cmd.contains("SecurityIdentifier"));
         assert!(cmd.contains("OWNER;"));
