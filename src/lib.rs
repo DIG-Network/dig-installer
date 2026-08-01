@@ -3057,6 +3057,29 @@ fn register_dig_node(
         );
         log(&format!("    · {}", result.note));
         conclusion = Some(svcscope::RegistrationConclusion::LeftAsIs);
+        // This arm registered NOTHING, so the scope it reports is the one the untouched host is
+        // actually served from — never the one this run would have asked for. An up-to-date binary
+        // whose only registration is a pre-#526 per-user unit still does not come back after a
+        // reboot, and that has to be said NOW rather than discovered at the next boot (#526 review
+        // round 2, finding A1).
+        let serving =
+            svcscope::settled_scope(scope, svcscope::RegistrationConclusion::LeftAsIs, &existing);
+        settled = Some(serving);
+        result.scope = serving;
+        result.survives_reboot = svcscope::survives_reboot_without_login(target.os, serving);
+        result.scope_note = if result.survives_reboot {
+            format!(
+                "the existing registration is in {} and starts on boot with nobody logged in",
+                serving.describe()
+            )
+        } else {
+            format!(
+                "the existing registration is in {} — it starts at LOGIN and will NOT survive a \
+                 reboot; re-run the installer after `dig-node uninstall` to move it machine-wide",
+                serving.describe()
+            )
+        };
+        log(&format!("    · {}", result.scope_note));
     } else {
         match service::install_service(dig_node_path, &plan.service, target.os, scope) {
             Ok(outcome) => {
@@ -3249,17 +3272,33 @@ pub fn uninstall_dig_node(
 
     log("Uninstalling the dig-node OS service:");
     let mut notes: Vec<String> = Vec::new();
-    let uninstalled = match service::uninstall_service(&bin, target.os) {
-        Ok(n) => {
-            log(&format!("    ✓ {n}"));
-            notes.push(n);
-            true
+    // Launcher gone ⇒ no uninstall was PERFORMED, whatever the service manager currently reports.
+    // The same structured signal `SystemActions::stop_services` raises, and it belongs here rather
+    // than inside the deregister: the probe there answers "is anything registered", which is a
+    // different question from "did this run deregister it", and an absence on a host we could not
+    // even ask to act is no licence to tick the box.
+    let uninstalled = if bin.exists() {
+        match service::uninstall_service(&bin, target.os) {
+            Ok(n) => {
+                log(&format!("    ✓ {n}"));
+                notes.push(n);
+                true
+            }
+            Err(e) => {
+                log(&format!("    ! {e}"));
+                notes.push(e);
+                false
+            }
         }
-        Err(e) => {
-            log(&format!("    ! {e}"));
-            notes.push(e);
-            false
-        }
+    } else {
+        let note = format!(
+            "the dig-node launcher is missing at {} — its service could not be deregistered (re-run \
+             after a reinstall, or remove the service manually)",
+            bin.display()
+        );
+        log(&format!("    ! {note}"));
+        notes.push(note);
+        false
     };
 
     log("Removing the dig.local hosts entry:");
@@ -5632,13 +5671,27 @@ mod tests {
         // No `--with-dig-node` was ever run against this bin_dir, so the
         // binary is missing — the failure must be recorded, not panic/abort,
         // and the note must be non-empty (never silent, task #140).
+        //
+        // The launcher's absence is DETECTED, ahead of any deregister attempt, so this holds on every
+        // host: whether the service manager happens to have a `net.dignetwork.dig-node` registration
+        // on the machine running the test cannot change the answer. Reading the outcome off the
+        // service manager instead made this test host-dependent — green on a Windows box whose probe
+        // answered `Unknown`, red on a Linux runner whose systemd answered a definite absence.
         let bin_dir = crate::sources::fixture_root().join(format!(
             "dig-installer-test-no-node-bin-{}",
             std::process::id()
         ));
         let result = uninstall_dig_node(&bin_dir, false, &mut |_| {});
-        assert!(!result.uninstalled);
-        assert!(!result.note.is_empty());
+        assert!(
+            !result.uninstalled,
+            "no uninstall was PERFORMED, so it must not be reported as one: {}",
+            result.note
+        );
+        assert!(
+            result.note.contains("launcher is missing"),
+            "the reason must reach the operator, got: {}",
+            result.note
+        );
     }
 
     #[test]
