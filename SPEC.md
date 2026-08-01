@@ -1276,13 +1276,48 @@ ONLY, keeping the WebView unelevated:
 **zero residue** — one orchestration over the previously-piecemeal teardown flags. It runs the fixed
 ordered sequence (services/schedulers first so a live service never points at a deleted binary):
 
-1. **services** — stop + deregister dig-node, dig-relay, dig-dns;
-2. **beacon** — remove the auto-update scheduler registration;
-3. **scheme** — unregister the dig/chia/urn handlers (DIG-owned only);
-4. **network** — remove the `dig.local` hosts entry + the peer firewall rule;
-5. **binaries** — delete ALL installed binaries across both bin roots (the running installer image is
-   exempt — self-delete is impossible while running; OS cleanup handles it) + the Windows ARP entry;
-6. **forcelist** — unconfigure the browser-extension forcelist (DIG entry only).
+1. **services** — stop + deregister dig-node, dig-relay, dig-dns. A component whose LAUNCHER binary is
+   absent is not a failure: the service manager is queried BY ID, so "no such service" is confirmed
+   absence (the desired end state) and a service that IS registered is deregistered by id;
+2. **user-agent** — stop the running user-session processes (`dig-app`, `dign`) and remove dig-app's
+   per-user login autostart. It precedes every deletion because Windows refuses to delete a running
+   image (`os error 5`). A process that is not running is success;
+3. **beacon** — remove the auto-update scheduler registration;
+4. **scheme** — unregister the dig/chia/urn handlers (DIG-owned only);
+5. **network** — remove the `dig.local` hosts entry + the peer firewall rule;
+6. **login-path** — remove the system-wide login-`PATH` fragment;
+7. **msi** — remove every MSI-installed DIG product (§3.10.1). Before the binaries, because
+   `msiexec /x` runs the product's own uninstall sequence from the product's own files;
+8. **binaries** — delete ALL installed binaries across the (deduplicated) bin roots + the Windows ARP
+   entry. The running installer image cannot delete itself, so it is scheduled for deletion at the
+   next reboot with `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`;
+9. **forcelist** — unconfigure the browser-extension forcelist (DIG entry only).
+
+The bin roots are deduplicated before the walk: on Windows the default bin dir IS the protected bin
+dir, so an undeduplicated list visits every path twice and reports every leftover twice.
+
+### 3.10.1 MSI-installed products (`msiexec`)
+
+A DIG component may be installed from a Windows Installer package (dig-node publishes
+`dig-node-<ver>-windows-x64.msi`). Such a product MUST NOT be removed by deleting its files: the
+Windows Installer registration outlives them, leaving a ghost Add/Remove-Programs entry, a broken
+repair/modify, and an upgrade that believes an older version is still present.
+
+- **Discovery.** The ProductCode is resolved from the package's **stable UpgradeCode** — a DIG-owned
+  constant compiled into the package (`dig-node`: `{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}`) — via the
+  Windows Installer `UpgradeCodes` index under `HKLM\SOFTWARE\Classes\Installer\UpgradeCodes`, whose
+  per-UpgradeCode subkey holds the packed ProductCodes installed for it. Matching by `DisplayName` is
+  NOT the primary mechanism; a conjunctive Add/Remove-Programs scan (DIG publisher AND a known DIG
+  display name AND `WindowsInstaller=1` AND a GUID-shaped key name) is a fallback only.
+- **Removal.** `msiexec.exe /x <ProductCode> /qn /norestart`, with `msiexec.exe` resolved to its
+  absolute `System32` path (never `PATH`) and the arguments passed as an argv (never a shell string).
+  The ProductCode is a parsed type that can only hold a canonical braced GUID, so a value carrying a
+  path or a second command cannot reach the command line.
+- **Exit codes.** `0` removed; **`1605` (product not installed) is SUCCESS** — the desired end state,
+  and what an idempotent second run sees; `3010`/`1641` removed with a reboot required (success, and
+  reported as such); anything else is a failure.
+- **Proof.** A product still registered with Windows Installer after the step is reported as
+  **residue**, so completeness is judged against the Installer database rather than the step's own log.
 
 It then re-scans and reports any residue. The result is a structured `UninstallReport { steps:
 [{id, ok, note}], residue: [..], dry_run }`; `complete()` is true iff every step reached its
@@ -1300,7 +1335,8 @@ The install behaves like a well-behaved native package:
 - **Add/Remove Programs (Windows).** An `HKLM\…\Uninstall\DIG_Network` entry (`DisplayName` = "DIG
   Network", `DisplayVersion`, `Publisher`, `InstallLocation`, `NoModify=1`, `NoRepair=1`) whose
   `UninstallString` = `"<installer>" --uninstall` — the ARP Uninstall button runs the §3.10
-  whole-stack uninstall. The entry is removed as part of `--uninstall`. The persisted installer and
+  whole-stack uninstall. `QuietUninstallString` mirrors it: the teardown is fully
+  non-interactive, so winget/PowerShell/MDM can drive it unattended. The entry is removed as part of `--uninstall`. The persisted installer and
   the `UninstallString` are an elevated-exec pointer, so both are pinned to the admin-only protected
   install root (never a user-chosen `--bin-dir`), and the machine-wide entry is written ONLY when
   that root is verified owner-secure — never planting an elevated pointer where an unprivileged user

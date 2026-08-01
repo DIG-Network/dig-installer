@@ -444,6 +444,53 @@ fn schedule_replace_on_reboot(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Schedule `path` to be DELETED at the next reboot, for a file that cannot be deleted now because a
+/// running process holds it open.
+///
+/// The uninstall's one unavoidable case is the installer's own image: a process cannot delete itself
+/// on Windows, so the teardown used to simply leave `dig-installer.exe` behind — a file the user did
+/// not ask to keep, in a directory the uninstall claims to have emptied.
+/// `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)` records the deletion under
+/// `HKLM\SYSTEM\…\PendingFileRenameOperations` and the OS performs it before anything can open the
+/// file again. Nothing is staged and nothing is written, so this adds no exec-from-writable-path
+/// exposure (the #1748 class). Requires the elevation the uninstall already holds.
+#[cfg(windows)]
+pub fn schedule_delete_on_reboot(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+
+    let existing: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `existing` is a NUL-terminated UTF-16 buffer kept alive across the call. A NULL
+    // destination with MOVEFILE_DELAY_UNTIL_REBOOT is the documented "delete at reboot" form.
+    let ok = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            std::ptr::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+    };
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(format!(
+            "could not schedule the reboot-time deletion of {} (Win32 error {code})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Off Windows a running binary CAN be unlinked, so nothing ever needs deferring to a reboot; this
+/// exists only so the call site compiles on every platform.
+#[cfg(not(windows))]
+pub fn schedule_delete_on_reboot(path: &Path) -> Result<(), String> {
+    std::fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))
+}
+
 /// Non-Windows never reaches the delayed-replace fallback ([`is_sharing_violation`]
 /// is always `false` off Windows, where the open-time sharing-violation lock does
 /// not occur — a busy-binary write instead fails hard at open with `ETXTBSY`), so

@@ -183,6 +183,12 @@ exit 0
             "paths.rs",
             "userwrite.rs",
             "pathcheck.rs",
+            // `msiexec.exe` and `taskkill.exe`/`pkill` — trusted system tools resolved absolutely
+            // (`proc::system_tool` / `elevation::resolve_system_tool`). Neither ever spawns an
+            // INSTALLED binary: msiexec is handed a validated ProductCode (`msi::ProductCode`, which
+            // cannot hold a path) and the killers are handed an image NAME, not a path to execute.
+            "msi.rs",
+            "running.rs",
             // Spawns `explorer.exe` / `su` / `sh` to start dig-app in the USER's session (#1831). The
             // tool is trusted; the binary it goes on to run is put through `secure::root_exec_guard`
             // by `launch::carry_out`, which covers the one arrangement (a root-ACCOUNT install, so no

@@ -250,18 +250,59 @@ pub fn without_dig_local_entry(contents: &str) -> Option<String> {
 /// write leaves a window where the hosts file is empty/partial, which would break
 /// name resolution system-wide). The temp file lives in the SAME directory so the
 /// rename stays on one filesystem (a cross-device rename is not atomic).
+///
+/// # The rename is RETRIED (#854)
+///
+/// An elevated uninstall was observed failing this rename with `Access is denied (os error 5)` and
+/// leaving the `dig.local` entry behind — while the very next run, with identical privileges,
+/// succeeded. The hosts file is one of the most heavily watched paths on Windows (real-time AV scans
+/// it on every write), so a momentary lock on the freshly-written temp file, not a permission
+/// problem, is what fails the operation. A bounded retry converts that into the outcome the
+/// privileges actually allow; a genuine permission failure still fails, just a second later.
 fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    atomic_write_with(
+        path,
+        contents,
+        |from: &std::path::Path, to: &std::path::Path| std::fs::rename(from, to),
+        std::thread::sleep,
+    )
+}
+
+/// How many times the replace is attempted before giving up, and the pause between attempts.
+/// Deliberately short: the whole point is to outlast a scanner's handle, not to hang an uninstall.
+const REPLACE_ATTEMPTS: u32 = 5;
+const REPLACE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// [`atomic_write`] with the replace and the sleep injected, so the retry behaviour is provable
+/// without a real AV lock (and without a test that actually sleeps).
+fn atomic_write_with(
+    path: &std::path::Path,
+    contents: &str,
+    mut replace: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    mut pause: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("hosts");
     let tmp = dir.join(format!(".{stem}.dig-installer.tmp.{}", std::process::id()));
     std::fs::write(&tmp, contents)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+    let mut last = None;
+    for attempt in 0..REPLACE_ATTEMPTS {
+        match replace(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < REPLACE_ATTEMPTS {
+                    pause(REPLACE_RETRY_PAUSE);
+                }
+            }
         }
     }
+    // The temp file must never outlive a failed write: it sits in `%SystemRoot%\System32\drivers\etc`
+    // and would otherwise accumulate one dotted file per failed run.
+    let _ = std::fs::remove_file(&tmp);
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::other("the hosts-file replace was never attempted".to_string())
+    }))
 }
 
 /// Best-effort: ensure `127.0.0.2 dig.local` is in the system hosts file.
@@ -663,5 +704,96 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["resolves"], true);
         assert!(v["note"].is_string());
+    }
+
+    /// A transient lock on the replace must not lose the write (#854).
+    ///
+    /// Observed live: an elevated uninstall failed the hosts replace with `Access is denied` and left
+    /// `dig.local` behind, then the next run with identical privileges succeeded. The fixture is that
+    /// exact shape - fail, fail, succeed - and the assertion is on the FILE's contents, so an
+    /// implementation that "retried" by reporting success without replacing anything fails here.
+    #[test]
+    fn a_transient_replace_failure_is_retried_until_it_lands() {
+        let dir = std::env::temp_dir().join(format!("dig-hosts-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        std::fs::write(
+            &path, "before
+",
+        )
+        .unwrap();
+
+        let mut attempts = 0u32;
+        let mut pauses = 0u32;
+        let outcome = atomic_write_with(
+            &path,
+            "after
+",
+            |from, to| {
+                attempts += 1;
+                if attempts < 3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Access is denied",
+                    ));
+                }
+                std::fs::rename(from, to)
+            },
+            |_| pauses += 1,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(attempts, 3, "it must keep trying while attempts remain");
+        assert_eq!(pauses, 2, "it must pause between attempts, not spin");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "after
+"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PERMANENT failure still fails - the retry must not turn a real permission problem into a
+    /// silent success - and it must not leave its temp file in `%SystemRoot%\System32\drivers\etc`.
+    #[test]
+    fn a_permanent_replace_failure_still_fails_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("dig-hosts-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        std::fs::write(
+            &path, "before
+",
+        )
+        .unwrap();
+
+        let mut attempts = 0u32;
+        let outcome = atomic_write_with(
+            &path,
+            "after
+",
+            |_, _| {
+                attempts += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Access is denied",
+                ))
+            },
+            |_| {},
+        );
+        assert!(outcome.is_err(), "a real permission failure must surface");
+        assert_eq!(attempts, REPLACE_ATTEMPTS, "every attempt must be used");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before
+",
+            "a failed write must leave the hosts file untouched"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "hosts")
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

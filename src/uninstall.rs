@@ -7,11 +7,17 @@
 //! composes them into a single ordered, idempotent orchestration that:
 //!
 //!   1. stops + deregisters ALL services (dig-node, dig-relay, dig-dns),
-//!   2. removes the auto-update beacon's scheduler registration,
-//!   3. unregisters the dig/chia/urn URL-scheme handlers,
-//!   4. removes the dig.local hosts entry + the peer firewall rule,
-//!   5. deletes ALL installed binaries (both bin roots),
-//!   6. asks the GUI backend to unconfigure the browser extension forcelist
+//!   2. stops the user-session processes (dig-app, dign) + removes dig-app's
+//!      login autostart — before any deletion, because a running image cannot be
+//!      deleted on Windows,
+//!   3. removes the auto-update beacon's scheduler registration,
+//!   4. unregisters the dig/chia/urn URL-scheme handlers,
+//!   5. removes the dig.local hosts entry + the peer firewall rule,
+//!   6. removes the system-wide login-`PATH` fragment,
+//!   7. removes every MSI-installed DIG product with `msiexec /x` — before the
+//!      binaries, since that removal needs the product's own files ([`crate::msi`]),
+//!   8. deletes ALL installed binaries (both bin roots),
+//!   9. asks the GUI backend to unconfigure the browser extension forcelist
 //!      (#612/#648) where a GUI install configured it,
 //!
 //! then re-scans and reports any residue.
@@ -45,6 +51,11 @@ pub const COMPONENT_STEMS: &[&str] = &[
     "dig-dns",
     "dig-updater",
     "dig-updater-worker",
+    // The store CLI under BOTH spellings. `dig-store` is what the installer places today; `digstore`
+    // is the pre-rename name (epic #703) that older installs left on disk. Listing only `digstore`
+    // meant `dig-store.exe` was neither deleted NOR scanned for — an uninstall left it in
+    // `C:\Program Files\DIG\bin` and still reported `residue: []` (#854).
+    "dig-store",
     "digstore",
     "digs",
     "digd",
@@ -115,6 +126,19 @@ impl UninstallReport {
 pub trait UninstallActions {
     /// Stop + deregister all DIG services (dig-node, dig-relay, dig-dns).
     fn stop_services(&mut self) -> ServiceTeardown;
+    /// Stop the running user-session processes (`dig-app`, `dign`) and remove dig-app's per-user
+    /// login autostart.
+    ///
+    /// These have no service registration, so nothing else stops them — and on Windows a running
+    /// image cannot be deleted, so leaving `dig-app` up makes the binary deletion fail with
+    /// `os error 5` and the whole uninstall exit non-zero (#854).
+    fn stop_user_agent(&mut self) -> (bool, String);
+    /// Remove every MSI-installed DIG product via `msiexec /x <ProductCode>`.
+    ///
+    /// Its own step because deleting an MSI product's FILES is not an uninstall: the product stays
+    /// registered in the Windows Installer database, leaving a ghost Add/Remove-Programs entry and a
+    /// later upgrade that believes an older version is still present (see [`crate::msi`]).
+    fn remove_msi_products(&mut self) -> (bool, String);
     /// Remove the auto-update beacon's scheduler registration.
     fn remove_beacon(&mut self) -> (bool, String);
     /// Unregister the dig/chia/urn URL-scheme handlers (DIG-owned only).
@@ -169,6 +193,11 @@ pub fn orchestrate(actions: &mut dyn UninstallActions, dry_run: bool) -> Uninsta
     let services = actions.stop_services();
     report.record("services", services.ok, services.note);
 
+    // Immediately after the services, and long before any deletion: from here on nothing DIG is
+    // running, so no image is held open when `delete_binaries` reaches it.
+    let (ok, note) = actions.stop_user_agent();
+    report.record("user-agent", ok, note);
+
     let (ok, note) = actions.remove_beacon();
     report.record("beacon", ok, note);
 
@@ -183,6 +212,12 @@ pub fn orchestrate(actions: &mut dyn UninstallActions, dry_run: bool) -> Uninsta
     // somebody else could re-create.
     let (ok, note) = actions.remove_login_path_fragment();
     report.record("login-path", ok, note);
+
+    // BEFORE the binary deletion, because `msiexec /x` needs the product's own files to run its
+    // uninstall sequence — deleting them first turns a clean removal into a broken one that leaves
+    // the product registered.
+    let (ok, note) = actions.remove_msi_products();
+    report.record("msi", ok, note);
 
     // Binaries are deleted only AFTER their services/schedulers are gone, so a
     // live service never points at a deleted binary mid-teardown. Crucially, a
@@ -244,6 +279,12 @@ mod tests {
                 note: "services".into(),
                 failed_components: self.service_failed.clone(),
             }
+        }
+        fn stop_user_agent(&mut self) -> (bool, String) {
+            self.outcome("user-agent")
+        }
+        fn remove_msi_products(&mut self) -> (bool, String) {
+            self.outcome("msi")
         }
         fn remove_beacon(&mut self) -> (bool, String) {
             self.outcome("beacon")
@@ -321,6 +362,73 @@ mod tests {
         assert!(!r.complete());
     }
 
+    /// dig-app is a running user process with no service registration, and Windows will not let a
+    /// running image be deleted — so an uninstall that never stops it fails the binary deletion with
+    /// `os error 5` and exits non-zero. The ORDER is the property: stopping it after the deletion
+    /// would leave the same failure, so the assertion is positional, not merely "the step exists".
+    #[test]
+    fn the_user_agent_is_stopped_before_any_binary_is_deleted() {
+        let mut a = FakeActions::default();
+        let r = orchestrate(&mut a, false);
+        let stop = a
+            .calls
+            .iter()
+            .position(|c| c == "user-agent")
+            .expect("the user-session agent must be stopped");
+        let bins = a.calls.iter().position(|c| c == "binaries").unwrap();
+        assert!(
+            stop < bins,
+            "dig-app must be stopped BEFORE its binary is deleted: {:?}",
+            a.calls
+        );
+        assert!(r.steps.iter().any(|s| s.id == "user-agent"));
+    }
+
+    /// `msiexec /x` runs the product's OWN uninstall sequence from the product's OWN files, so it has
+    /// to happen while those files still exist. Deleting the binaries first would leave the product
+    /// registered in the Windows Installer database — the exact ghost this step exists to prevent.
+    #[test]
+    fn msi_products_are_removed_before_the_binaries_are_deleted() {
+        let mut a = FakeActions::default();
+        orchestrate(&mut a, false);
+        let msi = a
+            .calls
+            .iter()
+            .position(|c| c == "msi")
+            .expect("MSI-installed products must be removed");
+        let bins = a.calls.iter().position(|c| c == "binaries").unwrap();
+        assert!(
+            msi < bins,
+            "msiexec must run before the files go: {:?}",
+            a.calls
+        );
+    }
+
+    /// A failed `msiexec /x` leaves a registered product behind, which is precisely the incomplete
+    /// state the report exists to surface — it must not be swallowed into a green run.
+    #[test]
+    fn a_failed_msi_removal_makes_the_run_incomplete() {
+        let mut a = FakeActions {
+            fail_step: Some("msi".to_string()),
+            ..Default::default()
+        };
+        let r = orchestrate(&mut a, false);
+        assert!(!r.complete());
+        assert!(!r.steps.iter().find(|s| s.id == "msi").unwrap().ok);
+    }
+
+    /// Likewise a process we could not stop: its binary cannot be deleted, so reporting the run as
+    /// complete would be a false green.
+    #[test]
+    fn a_failed_user_agent_stop_makes_the_run_incomplete() {
+        let mut a = FakeActions {
+            fail_step: Some("user-agent".to_string()),
+            ..Default::default()
+        };
+        let r = orchestrate(&mut a, false);
+        assert!(!r.complete());
+    }
+
     #[test]
     fn scans_for_residue_last() {
         let mut a = FakeActions::default();
@@ -334,7 +442,7 @@ mod tests {
         let r = orchestrate(&mut a, false);
         assert!(r.complete());
         assert!(r.residue.is_empty());
-        assert_eq!(r.steps.len(), 7);
+        assert_eq!(r.steps.len(), 9);
         assert!(r.steps.iter().all(|s| s.ok));
     }
 
@@ -438,6 +546,37 @@ mod tests {
         assert_eq!(v["steps"][0]["id"], "services");
         assert_eq!(v["residue"][0], "x");
         assert_eq!(v["dry_run"], false);
+    }
+
+    /// Every binary the installer PLACES must be in the teardown list, under the name it is placed
+    /// with. `dig-store.exe` was not: the list carried only the pre-rename `digstore`, so a real
+    /// uninstall left `C:\Program Files\DIG\bin\dig-store.exe` on disk AND reported `residue: []` —
+    /// the deletion walk and the residue scan read the same list, so the omission hid itself.
+    ///
+    /// The names come from the installer's own component set rather than a copy of the list, so a
+    /// future component cannot be added to the installer and forgotten here.
+    #[test]
+    fn every_installed_binary_stem_is_in_the_teardown_list() {
+        for stem in [
+            "dig-node",
+            "dign",
+            "dig-dns",
+            "digd",
+            "dig-updater",
+            "dig-updater-worker",
+            "dig-store",
+            "digs",
+            "dig-app",
+            "dig-relay",
+            "dig-installer",
+        ] {
+            assert!(
+                COMPONENT_STEMS.contains(&stem),
+                "{stem} is installed but would never be deleted or reported as residue"
+            );
+        }
+        // The pre-rename spelling stays, so an older install is still cleaned up.
+        assert!(COMPONENT_STEMS.contains(&"digstore"));
     }
 
     #[test]
