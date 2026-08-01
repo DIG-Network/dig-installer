@@ -71,6 +71,7 @@ pub mod msi;
 pub mod pathcheck;
 pub mod paths;
 pub mod proc;
+pub mod rearm;
 pub mod regaudit;
 pub mod release;
 pub mod rootchain;
@@ -80,8 +81,10 @@ pub mod secure;
 pub mod service;
 pub mod sources;
 pub mod svc;
+pub mod svcscope;
 pub mod target;
 pub mod uninstall;
+pub mod units;
 pub mod update;
 pub mod userwrite;
 
@@ -441,6 +444,20 @@ pub struct ServiceResult {
     pub health_ok: bool,
     /// Human-readable detail behind [`Self::health_ok`].
     pub health_note: String,
+    /// The service-manager domain this run registered the node in
+    /// (dig_ecosystem#526).
+    pub scope: svcscope::ServiceScope,
+    /// Will the registration start after a reboot with NOBODY logged in? `false`
+    /// for every per-user registration BY DESIGN, and `false` when the installed
+    /// `dig-node` predates `--scope` — see [`Self::scope_note`], never silent.
+    pub survives_reboot: bool,
+    /// Human-readable detail behind [`Self::survives_reboot`].
+    pub scope_note: String,
+    /// Per-user units this run REMOVED because they would shadow the system-scope registration
+    /// (dig_ecosystem#526) — `systemd --user` starts such a unit at the next login alongside the
+    /// system one, and both bind the node's port. Empty when there were none. Named, never silent:
+    /// this run deleted a file somebody's earlier install put there.
+    pub shadowing_units_removed: Vec<String>,
 }
 
 /// The result of uninstalling the dig-node service + removing the `dig.local`
@@ -567,6 +584,14 @@ pub struct InstallReport {
     /// silent, but not a readiness failure: the beacon was not part of what this run was
     /// asked to install.
     pub beacon_rearm: Option<beacon::BeaconResult>,
+    /// The record of restoring any of the three ENGINE-SERVICE registrations the #565 migration
+    /// removed off a legacy root on a run that did NOT select that component
+    /// (dig_ecosystem#1863 — the services' half of the beacon defect PR #49 fixed).
+    ///
+    /// Empty when there was nothing to restore. An entry with `applied: false` means that service
+    /// is now UNREGISTERED on this host and this run could not put it back — reported rather than
+    /// silent.
+    pub rearmed_registrations: Vec<rearm::RearmRecord>,
     /// The post-registration binPath audit of every privileged DIG registration
     /// (#565 review — H1 backstop + H2b): each service / the SYSTEM beacon task's
     /// ACTUAL configured binary, read back from the OS, and whether it still
@@ -604,6 +629,17 @@ pub struct RelayResult {
     pub port: u16,
     pub health_port: u16,
     pub note: String,
+    /// The service-manager domain this run registered the relay in (#526).
+    pub scope: svcscope::ServiceScope,
+    /// Will the registration start after a reboot with nobody logged in?
+    pub survives_reboot: bool,
+    /// Human-readable detail behind [`Self::survives_reboot`] — never silent.
+    pub scope_note: String,
+    /// Per-user units this run REMOVED because they would shadow the system-scope registration
+    /// (dig_ecosystem#526), mirroring [`ServiceResult::shadowing_units_removed`]. The relay has the
+    /// same collision the node does: a leftover `systemd --user` unit starts a second relay at the
+    /// next login, competing for the relay's port.
+    pub shadowing_units_removed: Vec<String>,
 }
 
 /// The `--json` schema version. Bump on a breaking change to the payload shape.
@@ -902,6 +938,7 @@ fn run_report_gated(
         preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
         beacon_rearm: None,
+        rearmed_registrations: Vec::new(),
         registration_audit: Vec::new(),
         install_manifest: None,
         ready: true,
@@ -1168,7 +1205,13 @@ fn run_report_gated(
                 Err(e) => return Err(e),
             }
 
-            report.service = Some(register_dig_node(&dig_node_path, plan, &decision, log));
+            report.service = Some(register_dig_node(
+                &dig_node_path,
+                plan,
+                &target,
+                &decision,
+                log,
+            ));
             // Record ONLY a genuinely fresh registration (`Install`) for rollback —
             // never an `Update`/`Skip` of a service the user already had, so a
             // rollback restores the pre-install state without removing what predated
@@ -1522,7 +1565,7 @@ fn run_report_gated(
             let relay_path = PathBuf::from(c.dest.clone());
             report.components.push(c);
 
-            report.relay = Some(register_relay(&relay_path, plan, log));
+            report.relay = Some(register_relay(&relay_path, plan, &target, log));
             // The relay is opt-in + not update-tracked here, so any successful
             // registration this run is fresh and rollback-reversible.
             if report.relay.as_ref().is_some_and(|r| r.installed) {
@@ -1672,6 +1715,7 @@ fn run_report_gated(
         Err(e) => {
             let rollback = rollback_partial_install(&guard, &target, log);
             retract_beacon_rearm_claim(&mut report, &rollback, log);
+            retract_service_rearm_claims(&mut report, &rollback, log);
             return Err(e);
         }
     }
@@ -1781,6 +1825,36 @@ fn retract_beacon_rearm_claim(
         rearm.note
     );
     log(&format!("    ↩ {}", rearm.note));
+}
+
+/// Un-say every engine-service re-arm the rollback just reversed (dig_ecosystem#1863).
+///
+/// The service counterpart of [`retract_beacon_rearm_claim`], and for the same reason: the report is
+/// the contract for what state the host is in, so a claim the rollback undid would tell the operator
+/// a service is registered when this run left it removed.
+fn retract_service_rearm_claims(
+    report: &mut InstallReport,
+    rollback: &hardening::RollbackReport,
+    log: &mut dyn FnMut(&str),
+) {
+    for record in &mut report.rearmed_registrations {
+        let Some(service) = ENGINE_SERVICES.iter().find(|s| s.label == record.label) else {
+            continue;
+        };
+        let reversed = rollback
+            .reversed
+            .iter()
+            .any(|a| matches!(a, InstallAction::ServiceRegistered(id) if id == service.id));
+        if !record.applied || !reversed {
+            continue;
+        }
+        record.applied = false;
+        record.note = format!(
+            "{} — then REMOVED again by the rollback of this failed install, so {} is \n             unregistered on this host; restore it with `{}`",
+            record.note, service.label, service.restore_command
+        );
+        log(&format!("    ↩ {}", record.note));
+    }
 }
 
 /// Reverse the privileged steps a partial-failure install recorded — LIFO,
@@ -2038,7 +2112,7 @@ fn link_protected_clis(
             let removed = paths::remove_veneer_links(&names, target.os);
             if removed.is_empty() {
                 log(&format!(
-                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the                      protected root is on PATH directly instead",
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, \n                     so the protected root is on PATH directly instead",
                     paths::UNIX_MACHINE_BIN_DIR
                 ));
             } else {
@@ -2532,24 +2606,118 @@ fn log_readiness_verdict(report: &InstallReport, log: &mut dyn FnMut(&str)) {
     }
 }
 
+/// The service-manager scope an ENGINE binary placed at `program` must be registered in
+/// (dig_ecosystem#526) — the pure [`svcscope::engine_scope_for_program`] decision, with this
+/// process's real privilege and the real protected root supplied.
+fn engine_scope_for(os: target::Os, program: &std::path::Path) -> svcscope::ServiceScope {
+    svcscope::engine_scope_for_program(
+        os,
+        elevation::is_elevated(),
+        program,
+        &paths::protected_bin_dir(),
+    )
+}
+
+/// The plain-language reboot-survival sentence for a scoped registration — the one thing a
+/// stranger actually needs to know about the scope, said the same way for every component.
+///
+/// Never silent, and never optimistic: an outcome whose `--scope` flag was refused is reported as
+/// not surviving even though the requested scope was `system`, because what the component DID is
+/// what matters (dig_ecosystem#526).
+fn reboot_survival_note(label: &str, outcome: &service::ServiceInstallOutcome) -> String {
+    if outcome.reboot_survival {
+        return format!(
+            "{label} is registered {} and will start again on its own after a reboot, with nobody \
+             logged in",
+            outcome.requested_scope.describe()
+        );
+    }
+    format!(
+        "{label} is registered {} — it starts when you LOG IN, so it will NOT come back on its own \
+         after a reboot until someone logs into this machine",
+        outcome.requested_scope.describe()
+    )
+}
+
+/// The `$XDG_CONFIG_HOME`s (macOS: home directories) whose per-user scope may hold a DIG unit.
+///
+/// The invoking user's AND root's own: a pre-#526 `sudo` install wrote the unit into ROOT's user
+/// scope, where root has no session bus to load it — invisible to the real user and to `systemctl`
+/// alike, and still there to shadow a later system registration.
+fn user_config_homes() -> Vec<std::path::PathBuf> {
+    let user = invoker::target_user();
+    let mut homes = vec![user.home.join(".config"), user.home.clone()];
+    for root_path in [
+        std::path::PathBuf::from("/root/.config"),
+        std::path::PathBuf::from("/root"),
+    ] {
+        if !homes.contains(&root_path) {
+            homes.push(root_path);
+        }
+    }
+    homes
+}
+
+/// Remove every per-user unit that would SHADOW the registration this run just made, returning the
+/// paths removed (for the report) — never silently.
+///
+/// Not tidy-up: `systemd --user` starts a leftover user unit at the next login ALONGSIDE the system
+/// unit, and both bind the node's port; one loses, non-deterministically. macOS has the same
+/// collision between a `gui/<uid>` LaunchAgent and a system LaunchDaemon of the same label. The
+/// decision about WHICH paths qualify is the pure [`svcscope::shadowing_units_to_remove`]; this only
+/// performs it.
+fn remove_shadowing_units(
+    os: target::Os,
+    scope: svcscope::ServiceScope,
+    existing: &[svcscope::UnitRecord],
+    log: &mut dyn FnMut(&str),
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    for path in svcscope::shadowing_units_to_remove(os, scope, existing) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                log(&format!(
+                    "    ✓ removed the per-user unit {} — it would have started a SECOND dig-node \
+                     at the next login, colliding with the machine-wide service on the node's port",
+                    path.display()
+                ));
+                removed.push(path.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log(&format!(
+                "    ! could not remove the per-user unit {} ({e}); if it is enabled, dig-node may \
+                 start twice at the next login — remove it by hand",
+                path.display()
+            )),
+        }
+    }
+    removed
+}
+
 /// Register dig-relay as an OS service by delegating to its own `install`/`start` subcommands.
 /// Never returns `Err` — a service failure is recorded in the result, not propagated (the binary
 /// is already placed). Mirrors [`register_dig_node`].
 fn register_relay(
     relay_path: &std::path::Path,
     plan: &InstallPlan,
+    target: &Target,
     log: &mut dyn FnMut(&str),
 ) -> RelayResult {
     log(&format!(
         "Registering dig-relay as an OS service (relay {}, health {}):",
         plan.relay_service.port, plan.relay_service.health_port
     ));
+    let scope = engine_scope_for(target.os, relay_path);
     let mut result = RelayResult {
         installed: false,
         started: false,
         port: plan.relay_service.port,
         health_port: plan.relay_service.health_port,
         note: String::new(),
+        scope,
+        survives_reboot: false,
+        scope_note: String::new(),
+        shadowing_units_removed: Vec::new(),
     };
 
     if plan.dry_run {
@@ -2565,12 +2733,30 @@ fn register_relay(
         return result;
     }
 
-    match service::install_relay_service(relay_path, &plan.relay_service) {
-        Ok(note) => {
-            log(&format!("    ✓ {note}"));
+    match service::install_relay_service(relay_path, &plan.relay_service, target.os, scope) {
+        Ok(outcome) => {
+            log(&format!("    ✓ {}", outcome.note));
             result.installed = true;
-            result.started = plan.relay_service.start;
-            result.note = note;
+            result.started = outcome.started;
+            result.survives_reboot = outcome.reboot_survival;
+            result.scope_note = reboot_survival_note("dig-relay", &outcome);
+            log(&format!("    · {}", result.scope_note));
+            let outcome_scope = outcome.effective_scope;
+            result.note = outcome.note;
+            // Same sweep the node path owes: registering the system unit does not stop a leftover
+            // per-user relay unit from being started at the next login (#526 review, finding 2).
+            let existing =
+                units::existing_units(target.os, svc::DIG_RELAY_SERVICE_ID, &user_config_homes());
+            result.shadowing_units_removed = remove_shadowing_units(
+                target.os,
+                svcscope::settled_scope(
+                    outcome_scope,
+                    svcscope::RegistrationConclusion::Registered,
+                    &existing,
+                ),
+                &existing,
+                log,
+            );
         }
         Err(e) => {
             // Service install can need elevation (Windows SCM). Best-effort: surface it, do NOT
@@ -2826,9 +3012,11 @@ fn resolve_dig_node(
 fn register_dig_node(
     dig_node_path: &std::path::Path,
     plan: &InstallPlan,
+    target: &Target,
     decision: &update::UpdateDecision,
     log: &mut dyn FnMut(&str),
 ) -> ServiceResult {
+    let scope = engine_scope_for(target.os, dig_node_path);
     log(&format!(
         "Registering dig-node as an OS service (port {}):",
         plan.service.port
@@ -2838,6 +3026,10 @@ fn register_dig_node(
         started: false,
         port: plan.service.port,
         note: String::new(),
+        scope,
+        survives_reboot: false,
+        scope_note: String::new(),
+        shadowing_units_removed: Vec::new(),
         dig_local: String::new(),
         dig_local_resolves: false,
         dig_local_resolve_note: String::new(),
@@ -2868,7 +3060,32 @@ fn register_dig_node(
         return result;
     }
 
-    if decision.action == update::UpdateAction::Skip {
+    let existing = units::existing_units(target.os, svc::DIG_NODE_SERVICE_ID, &user_config_homes());
+    // How this run ends up with a registration in place. Every arm below sets it, and the shadowing
+    // sweep is performed ONCE afterwards from this single value — so an arm cannot conclude "a
+    // registration is in place" and silently skip the sweep, which is how adoption came to leave a
+    // colliding per-user unit behind (#526 review, finding 2).
+    let mut conclusion: Option<svcscope::RegistrationConclusion> = None;
+    // Set only by the delegate arm, which is the only one that can learn the component chose a
+    // different scope than the one requested. `None` means the requested scope stands.
+    let mut settled: Option<svcscope::ServiceScope> = None;
+    if svcscope::engine_registration(target.os, scope, &existing)
+        == svcscope::EngineRegistration::AdoptPackaged
+    {
+        // The apt.dig.net `.deb` already ships and ENABLES `net.dignetwork.dig-node.service`.
+        // Delegating `install` on top of it produces a SECOND enabled unit for one service, both
+        // binding the node's port — and the second is the one this installer would then report as
+        // healthy. Adopting is not a shortcut; it is the only non-colliding outcome.
+        result.installed = true;
+        result.survives_reboot = true;
+        result.scope_note = "adopted the packaged system service already installed on this host \
+                             (it starts on boot with nobody logged in); registering a second unit \
+                             would collide on the node's port"
+            .to_string();
+        result.note = result.scope_note.clone();
+        log(&format!("    · {}", result.scope_note));
+        conclusion = Some(svcscope::RegistrationConclusion::AdoptedPackaged);
+    } else if decision.action == update::UpdateAction::Skip {
         // Already up to date: leave the registered service exactly as it is
         // rather than bouncing it via a needless `install`/`start`. The
         // health check below still independently confirms it is genuinely
@@ -2880,13 +3097,44 @@ fn register_dig_node(
             decision.latest_version
         );
         log(&format!("    · {}", result.note));
+        conclusion = Some(svcscope::RegistrationConclusion::LeftAsIs);
+        // This arm registered NOTHING, so the scope it reports is the one the untouched host is
+        // actually served from — never the one this run would have asked for. An up-to-date binary
+        // whose only registration is a pre-#526 per-user unit still does not come back after a
+        // reboot, and that has to be said NOW rather than discovered at the next boot (#526 review
+        // round 2, finding A1).
+        let serving =
+            svcscope::settled_scope(scope, svcscope::RegistrationConclusion::LeftAsIs, &existing);
+        settled = Some(serving);
+        result.scope = serving;
+        result.survives_reboot = svcscope::survives_reboot_without_login(target.os, serving);
+        result.scope_note = if result.survives_reboot {
+            format!(
+                "the existing registration is in {} and starts on boot with nobody logged in",
+                serving.describe()
+            )
+        } else {
+            format!(
+                "the existing registration is in {} — it starts at LOGIN and will NOT survive a \
+                 reboot; re-run the installer after `dig-node uninstall` to move it machine-wide",
+                serving.describe()
+            )
+        };
+        log(&format!("    · {}", result.scope_note));
     } else {
-        match service::install_service(dig_node_path, &plan.service) {
-            Ok(note) => {
-                log(&format!("    ✓ {note}"));
+        match service::install_service(dig_node_path, &plan.service, target.os, scope) {
+            Ok(outcome) => {
+                log(&format!("    ✓ {}", outcome.note));
                 result.installed = true;
-                result.started = plan.service.start;
-                result.note = note;
+                result.started = outcome.started;
+                result.survives_reboot = outcome.reboot_survival;
+                result.scope_note = reboot_survival_note("dig-node", &outcome);
+                log(&format!("    · {}", result.scope_note));
+                // The scope the component ACTUALLY used, never the one we asked for: a pre-`--scope`
+                // build falls back to a per-user unit, and sweeping on the request would delete it.
+                settled = Some(outcome.effective_scope);
+                result.note = outcome.note;
+                conclusion = Some(svcscope::RegistrationConclusion::Registered);
             }
             Err(e) => {
                 // Service install can need elevation (Windows SCM). Best-effort:
@@ -2899,6 +3147,18 @@ fn register_dig_node(
                 result.note = e;
             }
         }
+    }
+
+    // The single sweep, for whichever way the run concluded. A failed install sets no conclusion, so
+    // nothing is deleted on the strength of a registration that was never established.
+    if let Some(conclusion) = conclusion {
+        let scope = settled.unwrap_or(scope);
+        result.shadowing_units_removed = remove_shadowing_units(
+            target.os,
+            svcscope::settled_scope(scope, conclusion, &existing),
+            &existing,
+            log,
+        );
     }
 
     // dig.local hosts entry — best-effort, never aborts (task #91, installer
@@ -3053,17 +3313,33 @@ pub fn uninstall_dig_node(
 
     log("Uninstalling the dig-node OS service:");
     let mut notes: Vec<String> = Vec::new();
-    let uninstalled = match service::uninstall_service(&bin) {
-        Ok(n) => {
-            log(&format!("    ✓ {n}"));
-            notes.push(n);
-            true
+    // Launcher gone ⇒ no uninstall was PERFORMED, whatever the service manager currently reports.
+    // The same structured signal `SystemActions::stop_services` raises, and it belongs here rather
+    // than inside the deregister: the probe there answers "is anything registered", which is a
+    // different question from "did this run deregister it", and an absence on a host we could not
+    // even ask to act is no licence to tick the box.
+    let uninstalled = if bin.exists() {
+        match service::uninstall_service(&bin, target.os) {
+            Ok(n) => {
+                log(&format!("    ✓ {n}"));
+                notes.push(n);
+                true
+            }
+            Err(e) => {
+                log(&format!("    ! {e}"));
+                notes.push(e);
+                false
+            }
         }
-        Err(e) => {
-            log(&format!("    ! {e}"));
-            notes.push(e);
-            false
-        }
+    } else {
+        let note = format!(
+            "the dig-node launcher is missing at {} — its service could not be deregistered (re-run \
+             after a reinstall, or remove the service manually)",
+            bin.display()
+        );
+        log(&format!("    ! {note}"));
+        notes.push(note);
+        false
     };
 
     log("Removing the dig.local hosts entry:");
@@ -3155,6 +3431,10 @@ struct MigrationStepHooks<'a> {
     ensure_protected_dir: Box<EnsureProtectedDirFn<'a>>,
     /// Register the beacon's daily schedule against this `dig-updater` binary.
     register_beacon: Box<RegisterBeaconFn<'a>>,
+    /// Re-register ONE engine service (dig-node/dig-relay/dig-dns) from the protected root
+    /// (dig_ecosystem#1863) — the boundary that lets the re-arm's guard table be asserted
+    /// without registering a real service.
+    register_service: Box<RegisterServiceFn<'a>>,
 }
 
 /// [`migrate::migrate_from_legacy_roots`], as an injectable boundary.
@@ -3166,6 +3446,10 @@ type EnsureProtectedDirFn<'a> = dyn FnMut(target::Os, &std::path::Path) -> Resul
 /// [`beacon::register`] (never dry-run), as an injectable boundary.
 type RegisterBeaconFn<'a> = dyn FnMut(&std::path::Path) -> beacon::BeaconResult + 'a;
 
+/// Re-register one engine service, given the component and the protected root it lives in.
+type RegisterServiceFn<'a> =
+    dyn FnMut(&EngineService, &std::path::Path) -> rearm::RearmOutcome + 'a;
+
 impl MigrationStepHooks<'_> {
     /// The real OS boundaries.
     fn production() -> Self {
@@ -3173,7 +3457,140 @@ impl MigrationStepHooks<'_> {
             migrate: Box::new(migrate::migrate_from_legacy_roots),
             ensure_protected_dir: Box::new(secure::ensure_protected_dir),
             register_beacon: Box::new(|bin| beacon::register(bin, false)),
+            register_service: Box::new(reregister_engine_service),
         }
+    }
+}
+
+/// An engine service the legacy-root migration may have deregistered, and which this run must put
+/// back when the plan does not select it (dig_ecosystem#1863).
+///
+/// The three are grouped as data rather than as three code paths because they differ only in their
+/// label, their canonical id and how they are registered — and three near-identical code paths is
+/// precisely how #1863 came to exist for the services after PR #49 fixed it for the beacon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineService {
+    /// [`regaudit::PrivilegedReg::label`] — the string the migration reports deregistering, so the
+    /// two halves match by construction rather than by a duplicated literal.
+    pub label: &'static str,
+    /// The canonical reverse-DNS service id, for the rollback's deregistration.
+    pub id: &'static str,
+    /// The binary stem to resolve under the protected root.
+    pub stem: &'static str,
+    /// The EXACT command that re-installs this component, for the failed-re-arm advice — a command,
+    /// never a procedure (SPEC §5).
+    pub restore_command: &'static str,
+}
+
+/// The engine services whose privileged registrations the migration vacates, in a stable order.
+pub const ENGINE_SERVICES: [EngineService; 3] = [
+    EngineService {
+        label: "dig-node",
+        id: svc::DIG_NODE_SERVICE_ID,
+        stem: "dig-node",
+        restore_command: "dig-installer",
+    },
+    EngineService {
+        label: "dig-relay",
+        id: svc::DIG_RELAY_SERVICE_ID,
+        stem: "dig-relay",
+        restore_command: "dig-installer --with-relay",
+    },
+    EngineService {
+        label: "dig-dns",
+        id: svc::DIG_DNS_SERVICE_ID,
+        stem: "dig-dns",
+        restore_command: "dig-installer",
+    },
+];
+
+/// Does this plan SELECT `service` — i.e. will this run's own install step register it, making a
+/// re-arm a double registration? Pure.
+fn plan_selects_engine_service(plan: &InstallPlan, service: &EngineService) -> bool {
+    match service.stem {
+        "dig-node" => plan.with_dig_node,
+        "dig-relay" => plan.with_relay,
+        _ => plan.with_dig_dns,
+    }
+}
+
+/// Re-register one engine service from the PROTECTED root — the production
+/// [`RegisterServiceFn`].
+///
+/// dig-node and dig-relay register themselves through their own `install` verb (at the
+/// machine-wide scope, since the protected root is the only root this is ever reached with);
+/// dig-dns ships no such verb, so the installer owns its wiring ([`dns::install`]). Every
+/// delegation still goes through [`guardedcmd::GuardedCommand::for_installed_binary`] via
+/// [`service::install_service`] — a privileged binary is never executed from anywhere else (#565).
+fn reregister_engine_service(
+    service: &EngineService,
+    protected_root: &std::path::Path,
+) -> rearm::RearmOutcome {
+    let Ok(target) = Target::current() else {
+        return rearm::RearmOutcome {
+            applied: false,
+            note: "could not detect this host's OS/arch target".to_string(),
+        };
+    };
+    let bin = protected_root.join(target.exe_name(service.stem));
+    if !bin.exists() {
+        return rearm::RearmOutcome {
+            applied: false,
+            note: format!("no {} in the protected root", bin.display()),
+        };
+    }
+    // `start: false` — the re-arm restores the REGISTRATION the migration removed; whether the
+    // service was running is the running service's own business, and starting one the user did not
+    // ask this run to install would be a second decision made on their behalf.
+    match service.stem {
+        "dig-dns" => {
+            let result = dns::install(&bin, &dns::DnsInstallConfig::default(), false);
+            rearm::RearmOutcome {
+                applied: result.installed,
+                note: result.note,
+            }
+        }
+        "dig-relay" => {
+            let cfg = service::RelayServiceConfig {
+                start: false,
+                ..service::RelayServiceConfig::default()
+            };
+            engine_rearm_outcome(service::install_relay_service(
+                &bin,
+                &cfg,
+                target.os,
+                svcscope::ServiceScope::System,
+            ))
+        }
+        _ => {
+            let cfg = service::ServiceConfig {
+                start: false,
+                ..service::ServiceConfig::default()
+            };
+            engine_rearm_outcome(service::install_service(
+                &bin,
+                &cfg,
+                target.os,
+                svcscope::ServiceScope::System,
+            ))
+        }
+    }
+}
+
+/// Fold a scoped registration result into a [`rearm::RearmOutcome`] — one conversion, so dig-node
+/// and dig-relay report a restored registration identically.
+fn engine_rearm_outcome(
+    result: Result<service::ServiceInstallOutcome, String>,
+) -> rearm::RearmOutcome {
+    match result {
+        Ok(outcome) => rearm::RearmOutcome {
+            applied: true,
+            note: outcome.note,
+        },
+        Err(e) => rearm::RearmOutcome {
+            applied: false,
+            note: e,
+        },
     }
 }
 
@@ -3229,6 +3646,62 @@ fn migrate_legacy_roots_step(
     if report.beacon_rearm.as_ref().is_some_and(|r| r.applied) {
         guard.record(InstallAction::BeaconRearmed);
     }
+
+    rearm_engine_services_after_migration(plan, report, guard, &expected_root, hooks, log);
+}
+
+/// Restore any of the three engine-service registrations the migration vacated that this run will
+/// not re-register (dig_ecosystem#1863) — the services' half of the same defect PR #49 fixed for the
+/// beacon.
+///
+/// Each restored registration is recorded in `guard` as an [`InstallAction::ServiceRegistered`], so
+/// the existing LIFO rollback deregisters it rather than leaving a privileged registration pointing
+/// into a root the rollback reverts — and [`retract_rearm_claims`] un-says the report's claim when
+/// that happens.
+fn rearm_engine_services_after_migration(
+    plan: &InstallPlan,
+    report: &mut InstallReport,
+    guard: &mut RollbackGuard,
+    expected_root: &std::path::Path,
+    hooks: &mut MigrationStepHooks<'_>,
+    log: &mut dyn FnMut(&str),
+) {
+    let Some(deregistered) = report.migration.as_ref().map(|m| m.deregistered.clone()) else {
+        return; // no migration ran, so nothing was vacated
+    };
+    let protected = paths::protected_bin_dir();
+    for service in ENGINE_SERVICES {
+        let advice = rearm::RearmAdvice {
+            consequence: format!(
+                "the {} service is now UNREGISTERED on this host: it was removed off the legacy \
+                 root and could not be re-registered",
+                service.label
+            ),
+            restore: format!(
+                "Re-run the installer with {} enabled to restore it: `{}`",
+                service.label, service.restore_command
+            ),
+        };
+        let outcome = rearm::rearm_after_migration(
+            &rearm::RearmRequest {
+                label: service.label,
+                deregistered: &deregistered,
+                plan_selects: plan_selects_engine_service(plan, &service),
+                expected_root,
+                protected_root: &protected,
+                advice: &advice,
+            },
+            &mut |root| (hooks.register_service)(&service, root),
+            log,
+        );
+        let Some(outcome) = outcome else { continue };
+        if outcome.applied {
+            guard.record(InstallAction::ServiceRegistered(service.id.to_string()));
+        }
+        report
+            .rearmed_registrations
+            .push(rearm::RearmRecord::new(service.label, &outcome));
+    }
 }
 
 /// Re-arm the auto-update beacon's daily schedule when the #565 legacy-root migration
@@ -3265,6 +3738,21 @@ fn migrate_legacy_roots_step(
 /// protected root either, so the schedule is genuinely gone until the next install that
 /// selects the beacon). Never fatal: everything else in the run succeeded, and the state
 /// is REPORTED rather than swallowed.
+/// The beacon's failed-re-arm advice — verbatim the wording PR #49 shipped.
+///
+/// A generic sentence would be a regression: the operator has to learn that AUTO-UPDATES are now off
+/// and the EXACT command that restores them (SPEC §5 requires a command, not a procedure).
+fn beacon_rearm_advice() -> rearm::RearmAdvice {
+    rearm::RearmAdvice {
+        consequence: "auto-updates are now DISABLED on this host: the daily schedule was removed \
+                      off the legacy root and could not be re-armed"
+            .to_string(),
+        restore: "Re-run the installer with the auto-update beacon enabled to restore it: \
+                  `dig-installer --auto-update`"
+            .to_string(),
+    }
+}
+
 fn rearm_beacon_after_migration(
     migration: Option<&migrate::MigrationResult>,
     plan_installs_beacon: bool,
@@ -3273,49 +3761,33 @@ fn rearm_beacon_after_migration(
     register: &mut dyn FnMut(&std::path::Path) -> beacon::BeaconResult,
     log: &mut dyn FnMut(&str),
 ) -> Option<beacon::BeaconResult> {
-    if plan_installs_beacon {
-        return None; // step 5 registers it fresh, from the binary it just placed
-    }
-    if !migration_deregistered_the_beacon(migration?) {
-        return None; // this host's schedule was never touched — nothing to restore
-    }
-
-    let protected = paths::protected_bin_dir();
-    if expected_root != protected {
-        log(&format!(
-            "Not re-arming the auto-update beacon's daily schedule the migration removed (#1854): \
-             this run's privileged install root is {}, not the protected root {}, and a \
-             machine-wide privileged schedule must never be registered at a caller-selected path \
-             (#565). Auto-updates stay off on this host; restore them with a default-root \
-             `dig-installer --auto-update`.",
-            expected_root.display(),
-            protected.display()
-        ));
-        return None;
-    }
-
-    let bin = protected.join(target.exe_name("dig-updater"));
-    log("Re-arming the auto-update beacon's daily schedule the migration removed (#1854):");
-    let result = register(&bin);
-    if result.applied {
-        log(&format!("    ✓ {}", result.note));
-    } else {
-        log(&format!(
-            "    ! auto-updates are now DISABLED on this host: the daily schedule was removed off \
-             the legacy root and could not be re-armed ({}). Re-run the installer with the \
-             auto-update beacon enabled to restore it: `dig-installer --auto-update`",
-            result.note
-        ));
-    }
-    Some(result)
-}
-
-/// Did the #565 migration deregister the auto-update beacon's schedule, as opposed to
-/// only a service? Pure — compares against the beacon registration's OWN label rather
-/// than a string literal, so renaming the label cannot silently un-match.
-fn migration_deregistered_the_beacon(migration: &migrate::MigrationResult) -> bool {
-    let beacon_label = regaudit::PrivilegedReg::Beacon.label();
-    migration.deregistered.iter().any(|d| d == beacon_label)
+    let deregistered = migration
+        .map(|m| m.deregistered.clone())
+        .unwrap_or_default();
+    // The beacon's own result type is what the report carries, so capture exactly what `register`
+    // returned rather than reconstructing it from the generic outcome.
+    let mut registered = None;
+    rearm::rearm_after_migration(
+        &rearm::RearmRequest {
+            label: regaudit::PrivilegedReg::Beacon.label(),
+            deregistered: &deregistered,
+            plan_selects: plan_installs_beacon,
+            expected_root,
+            protected_root: &paths::protected_bin_dir(),
+            advice: &beacon_rearm_advice(),
+        },
+        &mut |protected| {
+            let result = register(&protected.join(target.exe_name("dig-updater")));
+            let outcome = rearm::RearmOutcome {
+                applied: result.applied,
+                note: result.note.clone(),
+            };
+            registered = Some(result);
+            outcome
+        },
+        log,
+    )?;
+    registered
 }
 
 /// The production [`uninstall::UninstallActions`] — wires the real per-component
@@ -3508,7 +3980,7 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
                 continue;
             }
-            match service::uninstall_service(&bin) {
+            match service::uninstall_service(&bin, target.os) {
                 Ok(n) => notes.push(format!("{stem}: {n}")),
                 Err(e) if service_absent_is_ok(&e) => notes.push(format!("{stem}: already absent")),
                 Err(e) => {
@@ -5385,13 +5857,27 @@ mod tests {
         // No `--with-dig-node` was ever run against this bin_dir, so the
         // binary is missing — the failure must be recorded, not panic/abort,
         // and the note must be non-empty (never silent, task #140).
+        //
+        // The launcher's absence is DETECTED, ahead of any deregister attempt, so this holds on every
+        // host: whether the service manager happens to have a `net.dignetwork.dig-node` registration
+        // on the machine running the test cannot change the answer. Reading the outcome off the
+        // service manager instead made this test host-dependent — green on a Windows box whose probe
+        // answered `Unknown`, red on a Linux runner whose systemd answered a definite absence.
         let bin_dir = crate::sources::fixture_root().join(format!(
             "dig-installer-test-no-node-bin-{}",
             std::process::id()
         ));
         let result = uninstall_dig_node(&bin_dir, false, &mut |_| {});
-        assert!(!result.uninstalled);
-        assert!(!result.note.is_empty());
+        assert!(
+            !result.uninstalled,
+            "no uninstall was PERFORMED, so it must not be reported as one: {}",
+            result.note
+        );
+        assert!(
+            result.note.contains("launcher is missing"),
+            "the reason must reach the operator, got: {}",
+            result.note
+        );
     }
 
     #[test]
@@ -5548,6 +6034,7 @@ mod tests {
             preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
             beacon_rearm: None,
+            rearmed_registrations: Vec::new(),
             registration_audit: Vec::new(),
             install_manifest: None,
             ready: true,
@@ -5639,6 +6126,10 @@ mod tests {
             health_checked: true,
             health_ok: true,
             health_note: "service 'net.dignetwork.dig-node' is RUNNING".to_string(),
+            scope: svcscope::ServiceScope::System,
+            survives_reboot: true,
+            scope_note: "starts on boot".to_string(),
+            shadowing_units_removed: Vec::new(),
         }
     }
 
@@ -7766,8 +8257,10 @@ mod beacon_rearm {
     struct StepRecorder {
         /// `"migrate"` / `"ensure_protected_dir"` / `"register"`, in the order called.
         calls: Vec<&'static str>,
-        /// Every `dig-updater` path the step asked the scheduler to arm.
+        /// Every path the step asked a re-arm to register against.
         armed: Vec<PathBuf>,
+        /// Every ENGINE SERVICE label the step re-armed, in order (dig_ecosystem#1863).
+        services_rearmed: Vec<&'static str>,
     }
 
     /// Run the step exactly as the install path does — the plan supplies BOTH the
@@ -7796,6 +8289,16 @@ mod beacon_rearm {
                     r.calls.push("register");
                     r.armed.push(bin.to_path_buf());
                     beacon::BeaconResult {
+                        applied: arm_succeeds,
+                        note: "stub".to_string(),
+                    }
+                }),
+                register_service: Box::new(|service, root| {
+                    let mut r = rec.borrow_mut();
+                    r.calls.push("register_service");
+                    r.services_rearmed.push(service.label);
+                    r.armed.push(root.to_path_buf());
+                    rearm::RearmOutcome {
                         applied: arm_succeeds,
                         note: "stub".to_string(),
                     }
@@ -7835,6 +8338,175 @@ mod beacon_rearm {
                 .any(|a| matches!(a, InstallAction::BeaconRearmed)),
             "a later-step failure must deregister the re-armed schedule: {reversed:?}"
         );
+    }
+
+    // -- dig_ecosystem#1863: the SERVICES' half of the same defect -------------------------------
+
+    /// A plan that DECLINES all three engine services but still places a privileged binary (the
+    /// beacon), which is the shape that reaches the re-arm at all.
+    fn declining_all_services_plan() -> InstallPlan {
+        InstallPlan {
+            with_dig_node: false,
+            with_relay: false,
+            with_dig_dns: false,
+            auto_update: true,
+            ..InstallPlan::default()
+        }
+    }
+
+    /// THE #1863 regression, per component: a re-run that DECLINES a component, on a host whose
+    /// registration the migration just vacated off the legacy root, must put it back — declining a
+    /// component is documented as "installs nothing", never "uninstall what is already there".
+    ///
+    /// Driven through the STEP the install path actually runs, so this proves the CALL SITE exists
+    /// (the thing that was missing) rather than only that the generic works.
+    #[test]
+    fn a_declining_rerun_restores_each_engine_service_the_migration_removed() {
+        for service in ENGINE_SERVICES {
+            let migration = migration_deregistering(&[service.label]);
+            let (report, _, rec) = run_step(&declining_all_services_plan(), &migration, true);
+            assert_eq!(
+                rec.services_rearmed,
+                vec![service.label],
+                "declining {} must restore exactly its own registration",
+                service.label
+            );
+            let record = report
+                .rearmed_registrations
+                .iter()
+                .find(|r| r.label == service.label)
+                .unwrap_or_else(|| panic!("{} must be reported, never silent", service.label));
+            assert!(record.applied);
+        }
+    }
+
+    /// The full (plan_selects x was_deregistered) table at the step, per component: a SELECTED
+    /// component's own install step registers it fresh, and a registration the migration never
+    /// touched is not one this host ever had. The third axis — root-is-protected — is driven by
+    /// [`a_custom_bin_dir_plan_restores_no_service`].
+    #[test]
+    fn only_a_declined_and_deregistered_service_is_restored_by_the_step() {
+        for service in ENGINE_SERVICES {
+            for plan_selects in [true, false] {
+                for was_deregistered in [true, false] {
+                    let plan = InstallPlan {
+                        with_dig_node: plan_selects && service.stem == "dig-node",
+                        with_relay: plan_selects && service.stem == "dig-relay",
+                        with_dig_dns: plan_selects && service.stem == "dig-dns",
+                        ..declining_all_services_plan()
+                    };
+                    let labels: Vec<&str> = if was_deregistered {
+                        vec![service.label]
+                    } else {
+                        Vec::new()
+                    };
+                    let migration = migration_deregistering(&labels);
+                    let (report, _, rec) = run_step(&plan, &migration, true);
+                    let expected = !plan_selects && was_deregistered;
+                    assert_eq!(
+                        rec.services_rearmed.contains(&service.label),
+                        expected,
+                        "{}: plan_selects {plan_selects}, deregistered {was_deregistered}",
+                        service.label
+                    );
+                    assert_eq!(
+                        report
+                            .rearmed_registrations
+                            .iter()
+                            .any(|r| r.label == service.label),
+                        expected,
+                        "{}: the report must name exactly what was restored",
+                        service.label
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `--bin-dir`/GUI-redirected run restores NOTHING: creating a machine-wide privileged
+    /// registration at a CALLER-SELECTED path is the #565 escalation this migration exists to close.
+    #[test]
+    fn a_custom_bin_dir_plan_restores_no_service() {
+        let custom = std::env::temp_dir().join("dig-1863-custom-bin-dir");
+        let plan = InstallPlan {
+            bin_dir: custom.clone(),
+            ..declining_all_services_plan()
+        };
+        let target = Target::current().expect("target");
+        assert_eq!(
+            plan.privileged_install_root(target.os).as_deref(),
+            Some(custom.as_path()),
+            "the fixture must actually redirect the privileged root, or nothing is tested"
+        );
+        let labels: Vec<&str> = ENGINE_SERVICES.iter().map(|s| s.label).collect();
+        let migration = migration_deregistering(&labels);
+        let (report, _, rec) = run_step(&plan, &migration, true);
+        assert!(
+            rec.services_rearmed.is_empty(),
+            "a caller-selected privileged root must never be registered: {:?}",
+            rec.services_rearmed
+        );
+        assert!(report.rearmed_registrations.is_empty());
+    }
+
+    /// A restored registration is a REVERSIBLE privileged action: a later step's failure must
+    /// deregister it by canonical id rather than leave it pointing into a root the rollback reverts,
+    /// and the report must stop claiming it (#573's rollback contract + #1863's reporting contract).
+    #[test]
+    fn a_restored_service_is_rolled_back_and_its_claim_retracted() {
+        let service = ENGINE_SERVICES[0];
+        let migration = migration_deregistering(&[service.label]);
+        let (mut report, guard, _) = run_step(&declining_all_services_plan(), &migration, true);
+
+        let mut reversed = Vec::new();
+        let rollback = guard.rollback(&mut |action| {
+            reversed.push(action.clone());
+            Ok(())
+        });
+        assert!(
+            reversed
+                .iter()
+                .any(|a| matches!(a, InstallAction::ServiceRegistered(id) if id == service.id)),
+            "the restored registration must be recorded for rollback BY canonical id: {reversed:?}"
+        );
+
+        let mut lines = Vec::new();
+        retract_service_rearm_claims(&mut report, &rollback, &mut |l| lines.push(l.to_string()));
+        let record = &report.rearmed_registrations[0];
+        assert!(
+            !record.applied,
+            "a reversed restore must not still read as applied"
+        );
+        assert!(
+            record.note.contains("REMOVED again by the rollback"),
+            "{record:?}"
+        );
+        assert!(
+            record.note.contains(service.restore_command),
+            "the retraction must carry the EXACT restoring command: {record:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("REMOVED again")),
+            "{lines:?}"
+        );
+    }
+
+    /// An unrelated rollback leaves a restore's claim standing — the control that separates
+    /// "retract when reversed" from "always retract".
+    #[test]
+    fn an_unrelated_rollback_leaves_a_restored_service_claim_standing() {
+        let mut report = crate::tests::report_shell();
+        report.rearmed_registrations.push(rearm::RearmRecord {
+            label: ENGINE_SERVICES[0].label.to_string(),
+            applied: true,
+            note: "re-registered".to_string(),
+        });
+        let unrelated = hardening::RollbackReport {
+            reversed: vec![InstallAction::SchemeRegistered],
+            failures: Vec::new(),
+        };
+        retract_service_rearm_claims(&mut report, &unrelated, &mut |_| {});
+        assert!(report.rearmed_registrations[0].applied);
     }
 
     /// The re-arm's undo must reverse the schedule WITHOUT the `dig-updater` binary — the

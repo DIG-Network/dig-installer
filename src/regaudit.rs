@@ -110,30 +110,37 @@ impl PrivilegedReg {
     }
 }
 
-/// Every PRIVILEGED DIG registration to audit / vacate on `os` (#565). Windows:
-/// all four — the dig-node/dig-relay/dig-dns LocalSystem services + the SYSTEM
-/// beacon task. unix: only the machine-wide ones — the dig-dns service + the
-/// root-run beacon; the user-level dig-node/dig-relay run AS the user, so a
-/// user-writable binary is not an escalation there (mirrors
-/// [`paths::is_privileged_component`], the single source of the privileged set).
-/// Pure.
-pub fn privileged_regs(os: Os) -> Vec<PrivilegedReg> {
-    let mut regs = vec![PrivilegedReg::Service {
-        id: svc::DIG_DNS_SERVICE_ID,
-        label: "dig-dns",
-    }];
-    if os == Os::Windows {
-        regs.push(PrivilegedReg::Service {
+/// Every PRIVILEGED DIG registration to audit / vacate on `os` (#565) — all four on EVERY OS: the
+/// dig-node/dig-relay/dig-dns services plus the machine-wide beacon task.
+///
+/// # Why dig-node/dig-relay are listed on unix too (dig_ecosystem#1863)
+///
+/// This used to list them on **Windows only**, on the reasoning that a user-level dig-node "runs AS
+/// the user, so a user-writable binary is not an escalation there". Two things are wrong with that.
+/// It was never true for the audit's OTHER half — a plan that declines a component still had that
+/// component's registration vacated by the migration, which is the #1863 defect and was live on
+/// Windows the whole time. And it stops being true at all the moment dig-node registers
+/// machine-wide, which is exactly what dig_ecosystem#526 makes it do: a root-run daemon pointed at
+/// `~/.dig/bin/dig-node` is a textbook user→root escalation.
+///
+/// This now genuinely mirrors [`paths::is_privileged_component`] — which already listed dig-node and
+/// dig-relay on unix — rather than only claiming to. Pure.
+pub fn privileged_regs(_os: Os) -> Vec<PrivilegedReg> {
+    vec![
+        PrivilegedReg::Service {
+            id: svc::DIG_DNS_SERVICE_ID,
+            label: "dig-dns",
+        },
+        PrivilegedReg::Service {
             id: svc::DIG_NODE_SERVICE_ID,
             label: "dig-node",
-        });
-        regs.push(PrivilegedReg::Service {
+        },
+        PrivilegedReg::Service {
             id: svc::DIG_RELAY_SERVICE_ID,
             label: "dig-relay",
-        });
-    }
-    regs.push(PrivilegedReg::Beacon);
-    regs
+        },
+        PrivilegedReg::Beacon,
+    ]
 }
 
 /// The #565 binPath audit of one privileged registration — part of the `--json`
@@ -964,15 +971,42 @@ mod tests {
         );
     }
 
+    /// AMENDED for dig_ecosystem#1863/#526: unix now audits the SAME four registrations Windows
+    /// does. The old expectation ("unix audits only dig-dns + the beacon") rested on dig-node being
+    /// user-level on unix, which #526 changes — an elevated install registers it machine-wide, and a
+    /// root-run daemon whose binary sits in `~/.dig/bin` is a textbook user→root escalation. It also
+    /// left the #1863 defect (a declined component's registration vacated and never restored)
+    /// unreachable on unix by construction.
     #[test]
-    fn unix_audits_only_the_machine_wide_dig_dns_and_beacon() {
-        for os in [Os::Linux, Os::MacOs] {
+    fn every_os_audits_all_three_services_plus_the_beacon() {
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
             let labels: Vec<&str> = privileged_regs(os).iter().map(|r| r.label()).collect();
-            assert!(labels.contains(&"dig-dns"), "{os:?}");
-            assert!(labels.contains(&"dig-updater beacon task"), "{os:?}");
-            // The user-level services run AS the user on unix — not an escalation.
-            assert!(!labels.contains(&"dig-node"), "{os:?}");
-            assert!(!labels.contains(&"dig-relay"), "{os:?}");
+            for expected in [
+                "dig-dns",
+                "dig-node",
+                "dig-relay",
+                "dig-updater beacon task",
+            ] {
+                assert!(
+                    labels.contains(&expected),
+                    "{os:?} must audit {expected}: {labels:?}"
+                );
+            }
+        }
+    }
+
+    /// The audited set MUST agree with [`paths::is_privileged_component`], which this function's doc
+    /// claims to mirror — a claim that was false for two years. Asserted, not asserted-in-prose.
+    #[test]
+    fn the_audited_set_matches_the_privileged_component_set_on_every_os() {
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            for stem in ["dig-node", "dig-relay", "dig-dns"] {
+                assert_eq!(
+                    privileged_regs(os).iter().any(|r| r.label() == stem),
+                    paths::is_privileged_component(os, stem),
+                    "{os:?}/{stem}: the audited set and the privileged-component set disagree"
+                );
+            }
         }
     }
 

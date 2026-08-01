@@ -119,7 +119,7 @@ pub fn open_dir_nofollow(
         // module exists to catch, so they are reported as such - never as "could not read", which every
         // caller treats as an inconclusive pass.
         Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(OpenRefusal::NotADirectory(format!(
-            "{} is a symlink or not a directory - refusing to treat it as a directory, because a              planted link is how a root-side operation is redirected somewhere it must never reach",
+            "{} is a symlink or not a directory - refusing to treat it as a directory, because \n             a planted link is how a root-side operation is redirected somewhere it must never \n             reach",
             name.display()
         ))),
         _ => Err(OpenRefusal::Unreadable(format!(
@@ -300,7 +300,8 @@ mod tests {
         assert!(err.note().contains("symlink"), "got: {err}");
         assert!(
             err.is_definitive(),
-            "a symlink is a POSITIVE DETECTION, not a failure to look - classifying it as \n             indeterminate is what turned it into a silent pass at all three gates (#1748)"
+            "a symlink is a POSITIVE DETECTION, not a failure to look - classifying it as \
+             indeterminate is what turned it into a silent pass at all three gates (#1748)"
         );
 
         // The control: the real directory opens fine, so the refusal is about the LINK and not about

@@ -138,7 +138,7 @@ exit 0
         if crate::invoker::is_root() {
             assert!(
                 outcome.is_err(),
-                "root must not obtain a command for a binary in a world-writable directory - the whole                  point is that there is no way to spawn without the guard having passed"
+                "root must not obtain a command for a binary in a world-writable directory - the \n                 whole point is that there is no way to spawn without the guard having passed"
             );
             // The control, on the SAME binary: tighten only the directory and the guard permits it, so the
             // refusal is about the posture rather than about refusing everything.

@@ -187,6 +187,15 @@ jobs:
       # step's `XDG_RUNTIME_DIR` at it so both the elevated install AND this
       # job's own verification/uninstall queries can reach it.
       - name: (Linux) bring up a systemd/D-Bus user session for root
+        # This workaround stays HERE and only here, deliberately. This leg passes
+        # `--bin-dir`, which #565 FORCES to user scope, so the unit really is
+        # per-user and reading it really does need root to have a session bus —
+        # the workaround is load-bearing for THIS leg's shape, not a leftover.
+        #
+        # It is the DEFAULT-path install that must never need it, and that is
+        # asserted in the `system-scope-e2e` job below, which carries no linger
+        # and fails if the install turns it on. Removing it here would only break
+        # a leg whose scope is forced, while proving nothing about #526.
         if: runner.os == 'Linux'
         run: |
           sudo loginctl enable-linger root
@@ -216,6 +225,21 @@ jobs:
       # digstore is out of THIS contract's scope (it has its own installed-
       # binary integration tests, CLAUDE.md §3.5) — skipped here to keep the
       # run focused on the dig-node + dig-dns service contract #502 tracks.
+      # A CI runner is not an interactive desktop, and dig_ecosystem#919 makes the installer SKIP
+      # dig-app's login autostart on a host with no graphical session — correctly, since a tray agent
+      # has nowhere to appear and an `HKCU\…\Run` value written from Session 0 belongs to nobody who
+      # logs in. Both facts below are the ones the installer reads, named here so this job exercises
+      # the REGISTERING path (the write, its ownership, and the artifact location) rather than the
+      # skip. The skip itself is covered by `autostart::tests` for all three operating systems.
+      - name: Represent an interactive desktop session, so the autostart write path is exercised
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "SESSIONNAME=Console" >> "$GITHUB_ENV"
+          fi
+
       - name: Install (dig-node + dig-dns + the auto-update beacon, pinned versions)
         run: |
           $SUDO "$INSTALLER" \
@@ -253,24 +277,48 @@ jobs:
       # invisible -- autostart is best-effort, so `ready` stayed true while dig-app
       # would never start. A tray agent that installs and never launches is the failure
       # this contract exists to prevent, one layer over.
-      - name: Assert dig-app autostart registered (#1748)
+      - name: Assert dig-app autostart registered (#1748), or a REPORTED skip (#919)
         run: |
-          jq -e '.result.autostart.registered == true' install.json
           jq -c '.result.autostart' install.json
+          # Registered, or skipped for a stated reason — and NEVER "not registered with no reason",
+          # which is what a genuine registration failure looks like. The step above names a session,
+          # so a green run here is the REGISTERED arm; the disjunction exists so a runner image
+          # change surfaces as a legible outcome instead of an unexplained red.
+          jq -e '.result.autostart
+                 | (.registered == true and .disposition == "register")
+                   or (.registered == false
+                       and (.disposition == "skip-headless" or .disposition == "skip-no-target-user"))' install.json
+          # This job names a session, so the registering arm is the one that must be taken.
+          jq -e '.result.autostart.registered == true' install.json
+          jq -e '.result.autostart.disposition == "register"' install.json
 
       # And on Linux the artifact must really exist AND belong to the invoking user --
       # a unit root owns is one `systemd --user` declines to load, so ownership is part
       # of the property, not a nicety.
-      - name: (Linux) Assert the systemd user unit exists and is owned by the invoking user (#1748)
+      - name: (Linux) Assert the XDG autostart entry exists, is owned by the invoking user, and no stale unit remains
         if: runner.os == 'Linux'
         run: |
-          unit=/home/runner/.config/systemd/user/dig-app.service
-          ls -ldn "$unit" /home/runner/.config/systemd/user
-          test -f "$unit"
-          owner=$(stat -c %u "$unit")
-          test "$owner" = "$(id -u runner)"             || { echo "unit is owned by uid $owner, not by runner"; exit 1; }
-          dir_owner=$(stat -c %u /home/runner/.config/systemd/user)
-          test "$dir_owner" = "$(id -u runner)"             || { echo "unit DIR is owned by uid $dir_owner, not by runner"; exit 1; }
+          entry=/home/runner/.config/autostart/dig-app.desktop
+          ls -ldn "$entry" /home/runner/.config/autostart
+          test -f "$entry"
+          owner=$(stat -c %u "$entry")
+          test "$owner" = "$(id -u runner)" || {
+            echo "entry is owned by uid $owner, not by runner"
+            exit 1
+          }
+          dir_owner=$(stat -c %u /home/runner/.config/autostart)
+          test "$dir_owner" = "$(id -u runner)" || {
+            echo "entry DIR is owned by uid $dir_owner, not by runner"
+            exit 1
+          }
+          # #919: the mechanism must be one that STARTS something. A desktop entry is loaded at login
+          # with no enable step; the systemd user unit earlier versions wrote never was, so it must be
+          # gone rather than sitting alongside this and producing two agents at the next login.
+          grep -q '^Exec=' "$entry"
+          test ! -e /home/runner/.config/systemd/user/dig-app.service || {
+            echo "the stale systemd user unit is still present — two autostarts at next login"
+            exit 1
+          }
 
       - name: Assert the #493 fail-loud readiness verdict — both components ready
         run: |
@@ -292,6 +340,27 @@ jobs:
           jq -e '.result.install_root_security.secure == true' install.json
           jq -e '(.result.registration_audit | length) > 0' install.json
           jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
+
+      # dig_ecosystem#526: the registration's SCOPE and its reboot survival are now reported, so the
+      # e2e asserts them rather than only "installed". This leg passes `--bin-dir`, which is FORCED to
+      # user scope (#565: a machine-wide daemon must never be pointed at a caller-selected path), so
+      # the expected verdict here is user scope AND `survives_reboot: false` — stated positively, and
+      # from both sides, so a run that silently registered machine-wide from a caller-chosen root
+      # would FAIL here rather than look like an improvement.
+      - name: Assert the reported service scope matches the --bin-dir contract (#526)
+        if: runner.os != 'Windows'
+        run: |
+          jq -e '.result.service.scope == "user"' install.json
+          jq -e '.result.service.survives_reboot == false' install.json
+          jq -e '(.result.service.scope_note | length) > 0' install.json
+
+      # Windows has no per-user service domain, so the SCM registration is machine-wide and DOES
+      # survive a reboot with nobody logged in.
+      - name: Assert the reported service scope is machine-wide on Windows (#526)
+        if: runner.os == 'Windows'
+        run: |
+          jq -e '.result.service.scope == "system"' install.json
+          jq -e '.result.service.survives_reboot == true' install.json
 
       - name: Assert dig-node registered + RUNNING by canonical id, dig.local resolves
         run: |
@@ -973,7 +1042,10 @@ jobs:
               done
               # 2. The protected root must be the reported PATH dir, and be root-owned.
               jq -e '.result.path.dir == "/opt/dig/bin"' install.json \
-                || { echo "FAIL: report.path.dir must name the protected root under direct_path_entry"; exit 1; }
+              || {
+               echo "FAIL: report.path.dir must name the protected root under direct_path_entry"
+               exit 1
+             }
               jq -e '.result.path.modified == true' install.json \
                 || { echo "FAIL: the fallback must actually wire the protected root onto PATH"; exit 1; }
               # 3. It must be PREPENDED, so a DIG name resolves to the protected root and
@@ -1171,3 +1243,356 @@ jobs:
               && cd /tmp \
               && INSTALLER=/tmp/target/release/dig-installer \
                  bash /work/.github/scripts/root-gate-escalation.sh'
+
+  # ---------------------------------------------------------------------------
+  # #526 finding 4: the leg that exercises the path that SHIPS.
+  #
+  # The matrix job above passes `--bin-dir`, which FORCES user scope (#565), and
+  # pins a pre-`--scope` dig-node. Its `scope == "user"` / `survives_reboot ==
+  # false` assertions are therefore satisfied identically by the pre-#526 code —
+  # they confirm a forced downgrade rather than the scope DECISION. Nothing
+  # covered a default-path install, which is the only shape a real user gets.
+  #
+  # This job takes NO `--bin-dir`, so `engine_scope` genuinely decides, and it
+  # carries NO `loginctl enable-linger root` / `user@0.service` workaround — that
+  # workaround IS the thing #526 was filed to remove, so a job that keeps it
+  # cannot show the need has gone.
+  # ---------------------------------------------------------------------------
+  # Two legs over the dig-node pin, because the job has to hold two DIFFERENT
+  # contracts that only look like one:
+  #
+  #   current (0.71.0) — `--scope` shipped in dig-node v0.70.0, and `resolve_scope`
+  #     maps `auto` under root to the system domain. So on a pin at or above that,
+  #     a headless elevated install MUST reach a machine-wide, boot-started
+  #     registration. This leg asserts the SUCCESS shape, and it is the leg that
+  #     proves dig_ecosystem#526 is delivered rather than merely reported.
+  #
+  #   legacy (0.29.0) — predates the flag entirely. dig-node rejects `--scope`, the
+  #     installer retries flag-less, and the component reaches for a per-user
+  #     manager that root has no session bus for. The contract there is not that it
+  #     works; it is that the degradation is reported HONESTLY and the run is NEVER
+  #     called ready. Those assertions are the false-ready regression guard and are
+  #     kept verbatim — an operator can still pin an old component, and this is the
+  #     only leg that can observe the false-ready at all.
+  #
+  # Both legs assert a true property of their own pin. Neither asserts an
+  # impossibility, which is what the single-pinned version of this job did.
+  system-scope-e2e:
+    name: "#526 a default-path install decides scope for itself (Linux, dig-node ${{ matrix.leg }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Each leg is an independent contract: a legacy-leg failure must not hide
+      # whether the current leg delivers, or vice versa.
+      fail-fast: false
+      matrix:
+        include:
+          - leg: current
+            dig_node_version: "0.71.0"
+          - leg: legacy
+            dig_node_version: "0.29.0"
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-526-syscope-${{ matrix.leg }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-526-syscope-${{ matrix.leg }}-
+
+      - name: Build the installer
+        run: cargo build --release --bin dig-installer
+
+      # The install root's whole ancestor chain must be root-owned for a
+      # default-path install to be permitted at all (#1748) — the same
+      # normalisation the sibling job does, for the same reason.
+      - name: Normalise the runner image's world-writable /opt and veneer chain
+        run: |
+          sudo chmod 755 /opt /usr /usr/local /usr/local/bin
+          sudo chown 0:0 /usr /usr/local /usr/local/bin
+          for level in /opt /usr /usr/local /usr/local/bin; do
+            test "$(stat -c '%U' "$level")" = root \
+              || { echo "FAIL: $level is not root-owned"; exit 1; }
+          done
+
+      # The precondition finding 2 is about: a leftover per-user unit from an
+      # earlier install, sitting in root's own user scope exactly where a
+      # pre-#526 `sudo dig-installer` put it. What must HAPPEN to it depends on
+      # where the component actually registers, which is what the steps below
+      # pin down.
+      - name: Plant the leftover per-user unit an earlier install would have left
+        run: |
+          sudo mkdir -p /root/.config/systemd/user
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=leftover from a pre-#526 install' \
+            '[Service]' \
+            'ExecStart=/bin/true' \
+            '[Install]' \
+            'WantedBy=default.target' \
+            | sudo tee /root/.config/systemd/user/dignetwork-dig-node.service >/dev/null
+          sudo ls -l /root/.config/systemd/user/
+
+      # The current leg has NO tolerance: on a pin that understands `--scope`, a
+      # headless elevated install is required to succeed, so a non-zero exit is a
+      # failure of the acceptance criterion and must fail the step here rather
+      # than be re-interpreted by a later assertion.
+      - name: Install with NO --bin-dir, so engine_scope actually decides (current)
+        if: matrix.leg == 'current'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo -H -E "$PWD/target/release/dig-installer" \
+            --no-digstore --no-dig-app --no-auto-update \
+            --dig-node-version "${{ matrix.dig_node_version }}" \
+            --dig-dns-version "$DIG_DNS_VERSION" \
+            --json > install.json
+          # No pipe into `head`: this job runs with `-o pipefail`, and `head`
+          # closing the pipe early SIGPIPEs `jq`, which would fail the step for a
+          # diagnostic line.
+          jq -r '{ready: .result.ready, scope: .result.service.scope}' install.json
+
+      # The legacy leg DOES tolerate a non-zero exit: on a pre-`--scope` pin the
+      # install genuinely cannot register on this host class, and that failure is
+      # the subject of the assertions below rather than a reason to abort.
+      - name: Install with NO --bin-dir, so engine_scope actually decides (legacy)
+        if: matrix.leg == 'legacy'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          sudo -H -E "$PWD/target/release/dig-installer" \
+            --no-digstore --no-dig-app --no-auto-update \
+            --dig-node-version "${{ matrix.dig_node_version }}" \
+            --dig-dns-version "$DIG_DNS_VERSION" \
+            --json > install.json
+          echo "installer exit: $?"
+          jq -r '{ready: .result.ready, scope: .result.service.scope}' install.json
+          true
+
+      # THE assertion this job exists for. This is the scope the installer
+      # DECIDED on its own for a protected-root install — "system" — which the
+      # --bin-dir leg can never show, because it forces "user" before the
+      # decision is ever reached.
+      - name: The installer decided SYSTEM scope for a default-path install
+        run: |
+          jq -e '.result.service.scope == "system"' install.json || {
+            echo "FAIL: a default-path elevated install must request machine-wide scope"
+            exit 1
+          }
+
+      # THE #526 ACCEPTANCE PROPERTY: on a pin that understands `--scope`, a
+      # headless elevated install reaches a machine-wide registration that comes
+      # back after a reboot with nobody logged in.
+      - name: The install reports a boot-surviving system registration (current)
+        if: matrix.leg == 'current'
+        run: |
+          jq -e '.result.ready == true' install.json || {
+            echo "FAIL: a supported dig-node pin must reach a ready install"
+            exit 1
+          }
+          jq -e '.result.service.installed == true' install.json
+          jq -e '.result.service.survives_reboot == true' install.json
+
+      # `survives_reboot: true` above is the installer's OWN report, so on its own
+      # it is the installer grading its own homework. This step asks the OS the
+      # same question independently: a SYSTEM-scope systemd unit exists on disk
+      # under /etc/systemd/system, and systemd itself reports it enabled — which is
+      # precisely what "starts after a reboot with nobody logged in" means.
+      #
+      # `is-enabled` is run WITHOUT `--user`, so a per-user registration cannot
+      # satisfy it, and the unit is discovered by glob rather than by a hardcoded
+      # name — but the glob is required to match EXACTLY ONE unit, so a glob that
+      # matches nothing fails loudly instead of passing vacuously.
+      - name: systemd itself confirms a boot-started system unit (current)
+        if: matrix.leg == 'current'
+        run: |
+          sudo ls -l /etc/systemd/system/ || true
+          mapfile -t UNITS < <(sudo find /etc/systemd/system -maxdepth 1 \
+            -name '*dig-node*.service' -printf '%f\n' | sort)
+          echo "system units found: ${UNITS[*]:-<none>}"
+          if [ "${#UNITS[@]}" -ne 1 ]; then
+            echo "FAIL: expected exactly one dig-node unit in the SYSTEM scope," \
+                 "found ${#UNITS[@]} — a machine-wide registration was not made"
+            exit 1
+          fi
+          UNIT="${UNITS[0]}"
+
+          # The unit must be enabled in the SYSTEM manager. `is-enabled` exits
+          # non-zero for a disabled unit, so its exit status is captured rather
+          # than allowed to abort the step before the state can be reported.
+          set +e
+          STATE=$(sudo systemctl is-enabled "$UNIT" 2>&1)
+          set -e
+          echo "systemctl is-enabled $UNIT -> $STATE"
+          case "$STATE" in
+            enabled|enabled-runtime|alias|static|indirect)
+              echo "OK: $UNIT is wired to start at boot" ;;
+            *)
+              echo "FAIL: $UNIT is present but systemd reports '$STATE', so it will" \
+                   "NOT come back after a reboot"
+              exit 1 ;;
+          esac
+
+      # The positional counterpart to the legacy leg's "a failed registration
+      # sweeps nothing", against the SAME planted fixture. A sweep keyed off the
+      # REQUESTED scope would clear the planted unit on both legs; a sweep keyed
+      # off what was actually SETTLED clears it only here, where a system
+      # registration really happened. Asserting only one leg could not tell those
+      # two implementations apart — the pair is what pins the behaviour.
+      #
+      # The GATE is the on-disk outcome, not the installer's own list: SPEC's rule
+      # is that no unit may SHADOW a system registration, and `systemd --user`
+      # starts a leftover user unit at the next login regardless of what the report
+      # says. Asserting the report's `shadowing_units_removed` alone would pin the
+      # MECHANISM, and would pass for a run that named a removal it did not make.
+      - name: A successful system registration clears the shadowing user unit (current)
+        if: matrix.leg == 'current'
+        run: |
+          echo "--- the run's own report ---"
+          jq -r '.result.service.shadowing_units_removed' install.json
+          echo "--- root's user-unit directory, after the install ---"
+          sudo ls -la /root/.config/systemd/user/ || echo "(directory is gone)"
+
+          # THE GATE: the planted unit must not survive a successful machine-wide
+          # registration, or it starts a SECOND dig-node at the next login and both
+          # bind the node's port.
+          if sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service; then
+            echo "FAIL: a system registration succeeded, yet the leftover per-user unit is" \
+                 "STILL on disk — systemd --user will start a second dig-node at the next" \
+                 "login and both will bind the node's port"
+            exit 1
+          fi
+          echo "OK: the shadowing per-user unit is gone, so the system unit wins positionally"
+
+          # `shadowing_units_removed` is NOT asserted non-empty here, and that is
+          # deliberate rather than an oversight. It records the INSTALLER'S OWN sweep,
+          # and the installer enumerates the units on disk BEFORE delegating to
+          # `dig-node install`. On a component at v0.70.0 or later the component
+          # itself clears the stale per-user unit while registering machine-wide, so
+          # by the time the sweep runs there is legitimately nothing left to remove
+          # and an empty list is the honest report. Requiring an entry here would
+          # demand the installer claim credit for a deletion another process
+          # performed, and the only way to satisfy it would be to fabricate one.
+          #
+          # The installer's own sweep is pinned where it can be observed truthfully:
+          # the `legacy` leg asserts it removes NOTHING when no registration was
+          # established, and `units::a_user_scope_unit_is_found_under_each_config_home_that_has_one`
+          # asserts both config homes' units are found and proposed for removal.
+          # What matters on THIS leg is the positional outcome, which is gated above.
+          if [ "$(jq -r '.result.service.shadowing_units_removed | length' install.json)" != "0" ]; then
+            echo "the installer also swept units of its own:"
+            jq -r '.result.service.shadowing_units_removed[]' install.json
+            # Anything it CLAIMS to have removed must really be gone.
+            while read -r swept; do
+              if sudo test -e "$swept"; then
+                echo "FAIL: the report claims it removed $swept, but it is still on disk"
+                exit 1
+              fi
+            done < <(jq -r '.result.service.shadowing_units_removed[]' install.json)
+          fi
+
+      # THE FALSE-READY REGRESSION GUARD, on the pre-`--scope` pin.
+      #
+      # dig-node gained `--scope` in v0.70.0, so this leg's 0.29.0 pin predates the
+      # flag: `dig-node install` has the flag rejected, the installer retries
+      # flag-less, the component reaches for a per-user manager, finds root has no
+      # session bus, and fails. An operator can still pin a component this old, so
+      # what the installer must guarantee is that such a host is never told it is
+      # ready. The pre-#526 code reported `ready: true` here, because nothing asked
+      # whether a registration existed WHERE the run needed one. That is the
+      # regression these assertions pin, and it is the assertion the --bin-dir leg
+      # cannot make: there the scope is forced to user, the unit registers, and the
+      # false-ready never arises.
+      - name: A host where the service could not register is NEVER reported ready
+        if: matrix.leg == 'legacy'
+        run: |
+          jq -e '.result.ready == false' install.json || {
+            echo "FAIL: false-ready — the service did not register, yet the run claims ready"
+            exit 1
+          }
+          jq -e '.result.service.installed == false' install.json
+          jq -e '.result.service.survives_reboot == false' install.json
+
+          # The report must name the scope it tried and the real reason, so the
+          # operator is not left guessing. Asserted on content, not merely on
+          # non-emptiness, which any string would satisfy.
+          NOTE=$(jq -r '.result.service.note' install.json)
+          echo "reported: $NOTE"
+          echo "$NOTE" | grep -qi 'machine-wide\|system' || {
+            echo "FAIL: the failure does not name the scope it attempted"
+            exit 1
+          }
+          echo "$NOTE" | grep -qi 'will NOT start' || {
+            echo "FAIL: the failure does not state the consequence"
+            exit 1
+          }
+
+          # And it must NOT have degraded into "could not determine" for a scope
+          # systemd answered plainly about (`not-found` is an answer, #526 e2e).
+          if echo "$NOTE" | grep -qi 'unrecognised systemd verdict'; then
+            echo "FAIL: a plain systemd answer was misread as indeterminate"
+            exit 1
+          fi
+
+      # Finding 2, positional: nothing was registered, so nothing may be swept.
+      # A sweep driven by the REQUESTED scope would have deleted the planted unit
+      # on the strength of a system registration that never happened.
+      - name: A failed registration sweeps nothing
+        if: matrix.leg == 'legacy'
+        run: |
+          jq -e '(.result.service.shadowing_units_removed | length) == 0' install.json || {
+            echo "FAIL: swept per-user units although no registration was made"
+            exit 1
+          }
+          sudo test -f /root/.config/systemd/user/dignetwork-dig-node.service || {
+            echo "FAIL: deleted a per-user unit after a failed system registration"
+            exit 1
+          }
+
+      # #526's workaround must not have crept back in. If the installer had
+      # quietly enabled linger to make its own install work, the bug would be
+      # papered over rather than reported.
+      - name: The install did not enable the linger workaround
+        run: |
+          systemctl is-enabled dignetwork-dig-node 2>&1 || true
+          if loginctl show-user root -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+            echo "FAIL: the install enabled linger for root - #526 exists to remove that workaround"
+            exit 1
+          fi
+
+      # The uninstall counterpart to finding 3, on the host class that produces
+      # the probe failure: root with no session bus. A scope that could not be
+      # READ must be named as unverified, never folded into a clean
+      # "removed from every scope".
+      - name: An unqueryable scope is named, not silently reported as cleared
+        run: |
+          set +e
+          sudo -H "$PWD/target/release/dig-installer" --uninstall-dig-node --json > uninstall.json
+          echo "uninstall exit: $?"
+          NOTE=$(jq -r '[.. | strings] | join(" ")' uninstall.json)
+          echo "reported: $NOTE"
+          if echo "$NOTE" | grep -qi 'failed to connect to bus'; then
+            echo "$NOTE" | grep -qi 'could not verify\|UNKNOWN rather than removed' || {
+              echo "FAIL: hit a bus failure yet reported the scope as cleared"
+              exit 1
+            }
+          fi
+          if echo "$NOTE" | grep -qi 'unrecognised systemd verdict'; then
+            echo "FAIL: a plain systemd answer was misread as indeterminate"
+            exit 1
+          fi

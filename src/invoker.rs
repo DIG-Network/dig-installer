@@ -595,7 +595,7 @@ mod tests {",
                 let argument = line.split(AMBIENT).nth(1).unwrap_or_default();
                 assert!(
                     argument.contains("is_root"),
-                    "{file} decides a privilege boundary with `{}` instead of reading the effective                      uid. A literal (or any value not derived from `is_root()`) hardcodes the answer,                      which is precisely the defect #1748 fixed - the old predicate returned `false` in                      the macOS GUI's root child while running as uid 0.",
+                    "{file} decides a privilege boundary with `{}` instead of reading the effective \n                     uid. A literal (or any value not derived from `is_root()`) hardcodes the \n                     answer, which is precisely the defect #1748 fixed - the old predicate \n                     returned `false` in the macOS GUI's root child while running as uid 0.",
                     argument.trim()
                 );
                 wired.push(file);
@@ -605,7 +605,11 @@ mod tests {",
         // The sites that MUST be wired. Named, so removing the ambient read anywhere fails here rather
         // than passing by finding one fewer call.
         for (file, count) in [
-            ("autostart.rs", 3),
+            // 2, not 3, since dig_ecosystem#919: the third site was `enable_command`, which existed
+            // only to PRINT a `systemctl --user enable` command a human had to run — an autostart
+            // mechanism that never autostarted. Its replacement (an XDG desktop entry) needs no
+            // enable step, so there is no third boundary decision to make.
+            ("autostart.rs", 2),
             // The launch of dig-app decides whether to delegate to `su - <user>` or run directly
             // (#1831). Deciding it wrong runs the user's identity agent as root.
             ("launch.rs", 1),
@@ -616,13 +620,13 @@ mod tests {",
             let found = wired.iter().filter(|f| **f == file).count();
             assert_eq!(
                 found, count,
-                "{file} should read the effective uid at {count} decision point(s), found {found}.                  Removing one silently reverts that site to assuming it is unelevated; adding one means                  this list needs updating deliberately."
+                "{file} should read the effective uid at {count} decision point(s), found {found}. \n                 Removing one silently reverts that site to assuming it is unelevated; adding \n                 one means this list needs updating deliberately."
             );
         }
         assert_eq!(
             wired.len(),
-            8,
-            "the crate has 8 privilege-boundary decision points; found {}: {wired:?}",
+            7,
+            "the crate has 7 privilege-boundary decision points; found {}: {wired:?}",
             wired.len()
         );
     }

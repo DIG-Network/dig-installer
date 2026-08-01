@@ -1,0 +1,17 @@
+# Line endings are normalized in the repository so a Windows checkout can never
+# commit a whole-file CRLF rewrite. A CRLF flip makes GitHub report the file as
+# having no reviewable patch, which silently removes it from code review.
+* text=auto eol=lf
+
+# Windows-native scripts are executed by cmd.exe / PowerShell, which require CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets must never be line-ending processed.
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.woff binary
+*.woff2 binary

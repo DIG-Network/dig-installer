@@ -37,6 +37,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::proc::HideConsole;
+use crate::svcscope::ServiceScope;
 use crate::target::Os;
 
 /// Canonical dig-node service id (reverse-DNS) and human display name (#494).
@@ -148,6 +149,533 @@ pub fn launchctl_system_target(id: &str) -> String {
     format!("system/{id}")
 }
 
+/// The `launchctl` per-user (`gui/<uid>/<id>`) domain target string — the
+/// LaunchAgent domain, where an UNELEVATED `dig-node install` registers. Pure.
+pub fn launchctl_gui_target(uid: u32, id: &str) -> String {
+    format!("gui/{uid}/{id}")
+}
+
+/// Every macOS `launchctl bootout` target that must be visited to deregister
+/// service `id` — BOTH domains, always (dig_ecosystem#526).
+///
+/// Booting out only `system/<id>` was the uninstall-asymmetry defect: an
+/// unelevated (or pre-#526) install registers a `gui/<uid>` LaunchAgent, which a
+/// system-only teardown leaves running and re-launching at every login while the
+/// installer reports a clean uninstall. `uid` is the TARGET user's
+/// ([`crate::invoker::target_user`]) — `None` means the per-user domain could not
+/// be addressed, which the caller must REPORT rather than treat as absent.
+/// Pure.
+pub fn macos_bootout_targets(uid: Option<u32>, id: &str) -> Vec<String> {
+    let mut targets = vec![launchctl_system_target(id)];
+    if let Some(uid) = uid {
+        targets.push(launchctl_gui_target(uid, id));
+    }
+    targets
+}
+
+/// How service `id` is queried at one explicit [`ServiceScope`] on `os`.
+///
+/// Pure, and the reason this is a value rather than a `cfg`-gated branch: the
+/// scope-to-command mapping — including the two arms that ask NOTHING — is then
+/// asserted for all three operating systems from any host. A `#[cfg(unix)]`-only
+/// test cannot falsify the Windows arm, so the mutation stays green
+/// (dig_ecosystem#1774).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeQuery {
+    /// This OS has no such domain, so the answer is definitively "not
+    /// registered here" without asking anything (the Windows SCM has no
+    /// per-user services).
+    NoSuchDomain,
+    /// The domain exists but could not be ADDRESSED (a macOS per-user domain
+    /// with no resolvable uid). Not the same as absent — it resolves to
+    /// [`ServiceRunState::Unknown`] so a caller never reads it as "nothing is
+    /// registered".
+    Unaddressable,
+    /// `systemctl <args>` (already including `--user` for the per-user scope).
+    Systemctl(Vec<String>),
+    /// `launchctl print <target>`.
+    LaunchctlPrint(String),
+    /// `sc query <id>`.
+    ScQuery(String),
+}
+
+/// Plan the scope-explicit query for `id` at `scope` on `os`, given the target
+/// user's `uid` (macOS per-user domain addressing only). Pure — the spawn is
+/// [`registration_in_scope`].
+pub fn scope_query(os: Os, scope: ServiceScope, id: &str, uid: Option<u32>) -> ScopeQuery {
+    match (os, scope) {
+        (Os::Windows, ServiceScope::System) => ScopeQuery::ScQuery(id.to_string()),
+        (Os::Windows, ServiceScope::User) => ScopeQuery::NoSuchDomain,
+        (Os::Linux, ServiceScope::System) => {
+            ScopeQuery::Systemctl(vec!["is-active".to_string(), linux_unit_name(id)])
+        }
+        (Os::Linux, ServiceScope::User) => ScopeQuery::Systemctl(vec![
+            "--user".to_string(),
+            "is-active".to_string(),
+            linux_unit_name(id),
+        ]),
+        (Os::MacOs, ServiceScope::System) => {
+            ScopeQuery::LaunchctlPrint(launchctl_system_target(id))
+        }
+        (Os::MacOs, ServiceScope::User) => match uid {
+            Some(uid) => ScopeQuery::LaunchctlPrint(launchctl_gui_target(uid, id)),
+            None => ScopeQuery::Unaddressable,
+        },
+    }
+}
+
+/// Is a registration PRESENT in one scope — a different question from whether it is RUNNING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// A registration exists in this scope (running or not).
+    Present,
+    /// No registration exists in this scope.
+    Absent,
+    /// The scope could not be asked. NOT the same as absent, and never treated as either
+    /// "registered" or "removed" — the caller REPORTS it.
+    Unknown,
+}
+
+impl Presence {
+    /// A short phrase for a note — never silent.
+    pub fn describe(self, id: &str) -> String {
+        match self {
+            Presence::Present => format!("'{id}' is registered here"),
+            Presence::Absent => format!("no registration for '{id}' here"),
+            Presence::Unknown => format!("could not determine whether '{id}' is registered here"),
+        }
+    }
+}
+
+/// Will a registration be STARTED without a login — the boot/login enablement, which is a DIFFERENT
+/// fact from presence.
+///
+/// Conflating the two is how a `masked` unit — one that can never start at all — came to be reported
+/// as "will start again on its own after a reboot". Presence answers "does a registration exist
+/// here?"; this answers "will anything start it?". Reboot survival is derived from THIS, never from
+/// presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootEnablement {
+    /// Linked for automatic start (systemd `enabled`, SCM `AUTO_START`, a loaded system LaunchDaemon).
+    Enabled,
+    /// The registration exists but nothing will start it automatically — systemd `disabled`,
+    /// `static`, `indirect`, or `masked` (which can never start at all); SCM `DEMAND_START`/
+    /// `DISABLED`.
+    NotEnabled,
+    /// Could not be determined. Never silently treated as either — a claim of reboot survival
+    /// requires positive evidence.
+    Unknown,
+}
+
+/// A scope-explicit registration reading: does it exist here, and will anything start it?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRegistration {
+    /// Does a registration exist in this scope?
+    pub presence: Presence,
+    /// Will it be started without a login?
+    pub boot_enabled: BootEnablement,
+    /// The raw verdict this was read from (`enabled`, `masked`, `AUTO_START`, the error text) —
+    /// carried so every note can say WHY rather than only what.
+    pub detail: String,
+}
+
+impl ScopeRegistration {
+    /// A reading that could not be taken at all.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        ScopeRegistration {
+            presence: Presence::Unknown,
+            boot_enabled: BootEnablement::Unknown,
+            detail: detail.into(),
+        }
+    }
+
+    /// A definitively-present reading for a registration that WILL start on its own.
+    pub fn enabled(detail: impl Into<String>) -> Self {
+        ScopeRegistration {
+            presence: Presence::Present,
+            boot_enabled: BootEnablement::Enabled,
+            detail: detail.into(),
+        }
+    }
+
+    /// A definitively-absent reading.
+    pub fn absent(detail: impl Into<String>) -> Self {
+        ScopeRegistration {
+            presence: Presence::Absent,
+            boot_enabled: BootEnablement::NotEnabled,
+            detail: detail.into(),
+        }
+    }
+
+    /// Is this registration one that will start on its own, positively established?
+    pub fn starts_without_login(&self) -> bool {
+        self.boot_enabled == BootEnablement::Enabled
+    }
+}
+
+/// Is service `id` REGISTERED in one explicit scope, on the current host?
+///
+/// The scope-blind [`service_run_state`] answers "is it running ANYWHERE?", which is right for a
+/// health check and wrong for deciding whether a failed `install` may be tolerated: a leftover
+/// user-scope registration would excuse a system-scope registration that never happened
+/// (dig_ecosystem#526).
+///
+/// # Why this is not a RUN-STATE query
+///
+/// `systemctl is-active <unit>` prints `inactive` for a unit that DOES NOT EXIST, and `inactive`
+/// legitimately means "stopped" for one that does — so a run-state query cannot answer "is anything
+/// registered here?" at all. Reading `Stopped` as presence would tolerate a failed install against a
+/// unit that was never created (the exact false-ready this closes) and would report a successfully
+/// completed uninstall as residual. Linux therefore asks `is-enabled`, whose vocabulary distinguishes
+/// an existing unit (`enabled`/`disabled`/`static`/`masked`/…) from a missing one ("No such file or
+/// directory"). Found by the installer-e2e on ubuntu, run 30645063625.
+pub fn registration_in_scope(id: &str, scope: ServiceScope) -> ScopeRegistration {
+    let Ok(target) = crate::target::Target::current() else {
+        return ScopeRegistration::unknown("this host's OS/arch target could not be detected");
+    };
+    let uid = crate::invoker::target_user().uid;
+    match scope_query(target.os, scope, id, uid) {
+        // The Windows SCM has no per-user domain, so "nothing is registered here" is a FACT, not a
+        // failure to look.
+        ScopeQuery::NoSuchDomain => {
+            ScopeRegistration::absent("this OS has no per-user service domain")
+        }
+        ScopeQuery::Unaddressable => ScopeRegistration::unknown(
+            "the per-user domain could not be addressed (no resolvable uid)",
+        ),
+        ScopeQuery::Systemctl(args) => {
+            // Same scope + unit, different verb: registration + enablement, not activity.
+            let enabled_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a == "is-active" {
+                        "is-enabled".to_string()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            let borrowed: Vec<&str> = enabled_args.iter().map(String::as_str).collect();
+            query_systemctl_registration(&borrowed)
+        }
+        ScopeQuery::LaunchctlPrint(target) => launchctl_registration(&target, scope),
+        ScopeQuery::ScQuery(id) => {
+            classify_sc_registration(&sc_query_text(&id), &sc_config_text(&id))
+        }
+    }
+}
+
+/// Classify a `systemctl [--user] is-enabled <unit>` invocation. Pure.
+///
+/// # The verdict comes from the TOKEN on stdout, never from a substring of an error
+///
+/// `is-enabled` prints exactly one state word on stdout for a unit it can read. Everything else is
+/// an error on stderr, and errors must NOT be pattern-matched into a verdict:
+///
+/// * `Failed to connect to bus: No such file or directory` is what `--user` prints under `sudo`,
+///   where root has no session bus. It contains "No such file or directory" — so a substring match
+///   for that phrase classified a scope it could not even ASK as definitively `Absent`, and an
+///   uninstall then reported "removed from every scope" for a scope it never reached. That is
+///   `Unknown` (dig_ecosystem#526 review, A5).
+/// * A missing unit is reported by systemd as a failure to get the unit file state, together with an
+///   EMPTY stdout and a non-zero exit — which is `Absent`.
+///
+/// `masked`, `static`, `indirect` and `disabled` all describe a unit that EXISTS but that nothing
+/// will start automatically, so they are `Present` + [`BootEnablement::NotEnabled`] — never
+/// `Enabled`. `masked` cannot start at all, which the detail says out loud.
+pub fn classify_systemctl_is_enabled(
+    stdout: &str,
+    stderr: &str,
+    exited_zero: bool,
+) -> ScopeRegistration {
+    let token = stdout.trim();
+    let present = |boot_enabled: BootEnablement, detail: String| ScopeRegistration {
+        presence: Presence::Present,
+        boot_enabled,
+        detail,
+    };
+    match token {
+        // systemd's OWN not-found token, printed on stdout by a query that ran fine. This IS the
+        // recognised not-found reply, so it is the one error-free reading that means Absent. Found by
+        // the #526 system-scope e2e (run 30665680769), where classifying it as an unrecognised
+        // verdict made a plainly-empty scope read "could not determine".
+        "not-found" => {
+            return ScopeRegistration::absent("systemd reports `not-found` — no such unit here")
+        }
+        "enabled" | "enabled-runtime" | "alias" => {
+            return present(
+                BootEnablement::Enabled,
+                format!("systemd reports `{token}`"),
+            )
+        }
+        "masked" | "masked-runtime" => {
+            return present(
+                BootEnablement::NotEnabled,
+                format!(
+                    "systemd reports `{token}` — this unit can NEVER start until it is unmasked"
+                ),
+            )
+        }
+        "disabled" | "static" | "indirect" | "generated" | "transient" | "linked"
+        | "linked-runtime" => {
+            return present(
+                BootEnablement::NotEnabled,
+                format!("systemd reports `{token}` — the unit exists but nothing starts it"),
+            )
+        }
+        _ => {}
+    }
+
+    // No state token, so the answer is in the error — and the only error that means "absent" is one
+    // about the UNIT FILE, with nothing on stdout.
+    let err = stderr.to_lowercase();
+    let bus_failure = err.contains("failed to connect to bus")
+        || err.contains("failed to get d-bus connection")
+        || err.contains("no medium found")
+        || err.contains("host is down");
+    if bus_failure {
+        return ScopeRegistration::unknown(format!(
+            "the scope could not be queried at all: {}",
+            stderr.trim()
+        ));
+    }
+    // Absence is recognised from a SUPERSET of the two phrasings `dig-node`'s own
+    // `classify_systemctl_probe` accepts (`dig-node` v0.71.0 service.rs:1391-1400). The superset is
+    // deliberate, not accidental drift: the two repos invoke different verbs — `is-enabled` here,
+    // `cat` there — and systemd words their not-found replies differently, so recognising only
+    // dig-node's two literals would read a plainly-answered absence as indeterminate. dig-node's two
+    // phrasings name the unit file themselves and so are accepted unqualified.
+    //
+    // What keeps the widening from becoming a fail-open is that it is stated over the CLASS rather
+    // than over a phrasing: an error qualifies as absence only when it names A UNIT (`unit file` /
+    // `no such unit`) AND says that thing was not found. A not-found word on its own belongs to a
+    // large class of unrelated failures — a missing systemctl binary, an unreadable config, a refused
+    // path — and every one of them would otherwise be read as "the unit is gone".
+    //
+    // The non-zero exit is required for the same reason. systemd reports a unit it cannot read with an
+    // empty stdout AND a failing exit status; a reply that claims success cannot simultaneously prove
+    // the unit is absent. `Absent` is what licenses an uninstall to report "removed from every
+    // scope", so every condition here is a precondition of that claim rather than a hint toward it.
+    let unit_missing_verbatim =
+        err.contains("no files found for") || err.contains("could not be found");
+    let names_a_unit = err.contains("unit file") || err.contains("no such unit");
+    let says_not_found =
+        err.contains("no such file") || err.contains("does not exist") || err.contains("not found");
+    let unit_file_missing = unit_missing_verbatim || (names_a_unit && says_not_found);
+    if unit_file_missing && token.is_empty() && !exited_zero {
+        return ScopeRegistration::absent(format!(
+            "systemd reports no such unit: {}",
+            stderr.trim()
+        ));
+    }
+    // An empty answer WITH a zero exit is systemd saying nothing at all, which is not evidence of
+    // absence; a non-empty unrecognised token is a systemd we do not know. Both are Unknown.
+    let detail = if token.is_empty() {
+        format!("systemctl gave no verdict: {}", stderr.trim())
+    } else {
+        format!("unrecognised systemd verdict `{token}`")
+    };
+    ScopeRegistration::unknown(detail)
+}
+
+/// Classify Windows `sc query <id>` + `sc qc <id>` output. Pure.
+///
+/// `sc query` answers presence (a `1060`/"does not exist" reply is definitively absent); `sc qc`
+/// answers enablement, because the SCM's `START_TYPE` is what decides whether the service comes up at
+/// boot — a `DEMAND_START` service is registered and will NOT start on its own.
+pub fn classify_sc_registration(query_text: &str, config_text: &str) -> ScopeRegistration {
+    match parse_sc_query(query_text) {
+        ServiceRunState::NotFound => {
+            ScopeRegistration::absent("`sc query` reports no such service (1060)")
+        }
+        ServiceRunState::Running | ServiceRunState::Stopped => {
+            let (boot_enabled, detail) = parse_sc_start_type(config_text);
+            ScopeRegistration {
+                presence: Presence::Present,
+                boot_enabled,
+                detail,
+            }
+        }
+        ServiceRunState::Unknown => {
+            ScopeRegistration::unknown("`sc query` gave no recognisable answer")
+        }
+    }
+}
+
+/// Read the SCM `START_TYPE` from `sc qc <id>` output. Pure.
+///
+/// `AUTO_START` (2) is the only value that comes up at boot; `DEMAND_START` (3) and `DISABLED` (4)
+/// do not. An unreadable config is `Unknown`, never assumed enabled.
+pub fn parse_sc_start_type(text: &str) -> (BootEnablement, String) {
+    for line in text.lines() {
+        let upper = line.to_uppercase();
+        if !upper.contains("START_TYPE") {
+            continue;
+        }
+        if upper.contains("AUTO_START") {
+            return (
+                BootEnablement::Enabled,
+                "the SCM reports START_TYPE AUTO_START".to_string(),
+            );
+        }
+        if upper.contains("DEMAND_START")
+            || upper.contains("DISABLED")
+            || upper.contains("BOOT")
+            || upper.contains("SYSTEM")
+        {
+            return (
+                BootEnablement::NotEnabled,
+                format!("the SCM reports {}", line.trim()),
+            );
+        }
+    }
+    (
+        BootEnablement::Unknown,
+        "the SCM's START_TYPE could not be read".to_string(),
+    )
+}
+
+/// Spawn `systemctl <args>` and classify it, keeping the exit status rather than discarding it.
+fn query_systemctl_registration(args: &[&str]) -> ScopeRegistration {
+    match std::process::Command::new("systemctl")
+        .args(args)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => classify_systemctl_is_enabled(
+            &String::from_utf8_lossy(&o.stdout),
+            &String::from_utf8_lossy(&o.stderr),
+            o.status.success(),
+        ),
+        // The tool itself could not be run — the one thing that is certainly not evidence of absence.
+        Err(e) => ScopeRegistration::unknown(format!("systemctl could not be run: {e}")),
+    }
+}
+
+/// Classify a `launchctl print <target>` invocation. Pure.
+///
+/// # A domain that cannot be bootstrapped is not an absent service
+///
+/// `launchctl print` fails non-zero for two completely different reasons, and collapsing both into
+/// `Absent` is the launchd form of the bus-failure bug [`classify_systemctl_is_enabled`] documents:
+///
+/// * `Could not find service "…" in domain for system` / exit `113` — the recognised NOT-FOUND reply,
+///   and the only thing that means `Absent`;
+/// * `Bootstrap failed: 5: Input/output error` / `Could not find domain for gui/501` — the DOMAIN
+///   itself could not be reached, which is what a `sudo` run with no Aqua session gets for a
+///   `gui/<uid>` target. Nothing was learned about the service, so this is `Unknown` — and an
+///   uninstall that read it as `Absent` reported "removed from every scope" for a scope it never
+///   asked (dig_ecosystem#526 review round 2, finding A3).
+///
+/// The absence signals are byte-identical with `dig-node`'s own `classify_launchctl_probe`
+/// (`dig-node` v0.71.0, `crates/dig-node-service/src/service.rs`): exit `113`, or a case-insensitive
+/// substring match on one of [`LAUNCHD_NOT_FOUND`]. Success is tested BEFORE any absence signal, so a
+/// loaded job whose output happens to contain one of those phrases is still `Present`.
+///
+/// Enablement follows the DOMAIN, which is what launchd's boot behaviour actually turns on: a job
+/// loaded in the SYSTEM domain is bootstrapped by launchd at boot, while one in `gui/<uid>` is
+/// bootstrapped when that user's GUI session starts — by definition a login.
+pub fn classify_launchctl_print(
+    target: &str,
+    scope: ServiceScope,
+    stderr: &str,
+    exit_code: Option<i32>,
+    succeeded: bool,
+) -> ScopeRegistration {
+    if succeeded {
+        return ScopeRegistration {
+            presence: Presence::Present,
+            boot_enabled: match scope {
+                ServiceScope::System => BootEnablement::Enabled,
+                ServiceScope::User => BootEnablement::NotEnabled,
+            },
+            detail: format!("launchd has `{target}` loaded"),
+        };
+    }
+    let err = stderr.to_lowercase();
+    let not_found = exit_code == Some(LAUNCHD_NO_SUCH_SERVICE_EXIT)
+        || LAUNCHD_NOT_FOUND.iter().any(|phrase| err.contains(phrase));
+    if not_found {
+        return ScopeRegistration::absent(format!("launchd has no `{target}` loaded"));
+    }
+    ScopeRegistration::unknown(format!(
+        "the `{target}` domain could not be queried at all: {}",
+        first_line_or(stderr, "launchctl gave no reason")
+    ))
+}
+
+/// launchd's exit status for a service that does not exist in the domain
+/// (`kLaunchdNoSuchServiceError`) — byte-identical with `dig-node`'s classifier.
+const LAUNCHD_NO_SUCH_SERVICE_EXIT: i32 = 113;
+
+/// The only `launchctl` messages that mean the SERVICE is absent, as opposed to the DOMAIN being
+/// unreachable. Matched case-insensitively as substrings, byte-identical with `dig-node`'s set.
+const LAUNCHD_NOT_FOUND: &[&str] = &["could not find service", "no such process", "no such file"];
+
+/// The first non-empty line of `text`, or `fallback` — keeps a multi-line tool error from swamping a
+/// one-line report while still carrying the tool's OWN words.
+fn first_line_or(text: &str, fallback: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Spawn `launchctl print <target>` and classify it with [`classify_launchctl_print`].
+fn launchctl_registration(target: &str, scope: ServiceScope) -> ScopeRegistration {
+    match std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(target)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => classify_launchctl_print(
+            target,
+            scope,
+            &String::from_utf8_lossy(&o.stderr),
+            o.status.code(),
+            o.status.success(),
+        ),
+        // The tool itself could not be run — the one thing that is certainly not evidence of absence.
+        Err(e) => ScopeRegistration::unknown(format!("launchctl could not be run: {e}")),
+    }
+}
+
+/// The combined stdout+stderr of `sc qc <id>`, for [`parse_sc_start_type`].
+fn sc_config_text(id: &str) -> String {
+    match std::process::Command::new(crate::proc::system_tool("sc"))
+        .arg("qc")
+        .arg(id)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// The combined stdout+stderr of `sc query <id>`, for [`parse_sc_query_presence`].
+fn sc_query_text(id: &str) -> String {
+    match std::process::Command::new(crate::proc::system_tool("sc"))
+        .arg("query")
+        .arg(id)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// STOP the service `id` via the OS service manager — WITHOUT ever executing the
 /// service's own binary (#565: the installer must never elevate-spawn a binary
 /// that a non-admin could have replaced in the legacy user-writable dir). Issues
@@ -202,10 +730,9 @@ fn stop_service_command(id: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = run_svc_tool(
-            "launchctl",
-            &["bootout".into(), launchctl_system_target(id)],
-        );
+        for target in macos_bootout_targets(crate::invoker::target_user().uid, id) {
+            let _ = run_svc_tool("launchctl", &["bootout".into(), target]);
+        }
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -215,7 +742,9 @@ fn stop_service_command(id: &str) {
 
 /// Issue the OS "deregister this service by id" command. Windows `sc delete`;
 /// Linux `systemctl [--user] disable`; macOS `launchctl bootout` (which both
-/// stops AND deregisters). Best-effort — [`deregister_service`] polls the state.
+/// stops AND deregisters) in BOTH the system and `gui/<uid>` domains
+/// ([`macos_bootout_targets`], dig_ecosystem#526). Best-effort —
+/// [`deregister_service`] polls the state.
 fn deregister_service_command(id: &str) {
     #[cfg(windows)]
     {
@@ -237,10 +766,9 @@ fn deregister_service_command(id: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = run_svc_tool(
-            "launchctl",
-            &["bootout".into(), launchctl_system_target(id)],
-        );
+        for target in macos_bootout_targets(crate::invoker::target_user().uid, id) {
+            let _ = run_svc_tool("launchctl", &["bootout".into(), target]);
+        }
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -384,45 +912,48 @@ pub fn parse_sc_qc_display_name(text: &str) -> Option<String> {
 /// [`service_run_state`] for an explicit [`Os`] — spawns the OS-appropriate
 /// query and parses it. Split out so the OS dispatch is explicit.
 fn service_run_state_on(os: Os, id: &str) -> ServiceRunState {
-    use std::process::Command;
     match os {
-        Os::Windows => {
-            let out = Command::new(crate::proc::system_tool("sc"))
-                .arg("query")
-                .arg(id)
-                .hide_console()
-                .output();
-            match out {
-                Ok(o) => {
-                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-                    text.push_str(&String::from_utf8_lossy(&o.stderr));
-                    parse_sc_query(&text)
-                }
-                Err(_) => ServiceRunState::Unknown,
-            }
-        }
+        Os::Windows => query_sc(id),
         Os::Linux => {
             let unit = linux_unit_name(id);
             let user = query_systemctl_is_active(&["--user", "is-active", &unit]);
             let system = query_systemctl_is_active(&["is-active", &unit]);
             combine_systemctl_states(user, system)
         }
-        Os::MacOs => {
-            let out = Command::new("launchctl")
-                .arg("print")
-                .arg(format!("system/{id}"))
-                .hide_console()
-                .output();
-            match out {
-                Ok(o) if o.status.success() => {
-                    parse_launchctl_print(&String::from_utf8_lossy(&o.stdout))
-                }
-                // A non-zero exit from `launchctl print` means the label is not
-                // loaded in the system domain.
-                Ok(_) => ServiceRunState::NotFound,
-                Err(_) => ServiceRunState::Unknown,
-            }
+        Os::MacOs => query_launchctl_print(&launchctl_system_target(id)),
+    }
+}
+
+/// Spawn `sc query <id>` and parse it. Windows-only in effect; the spawn simply
+/// fails elsewhere, resolving to [`ServiceRunState::Unknown`].
+fn query_sc(id: &str) -> ServiceRunState {
+    match std::process::Command::new(crate::proc::system_tool("sc"))
+        .arg("query")
+        .arg(id)
+        .hide_console()
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            parse_sc_query(&text)
         }
+        Err(_) => ServiceRunState::Unknown,
+    }
+}
+
+/// Spawn `launchctl print <target>` (e.g. `system/<id>` or `gui/<uid>/<id>`) and
+/// parse it. A non-zero exit means the label is not loaded in THAT domain.
+fn query_launchctl_print(target: &str) -> ServiceRunState {
+    match std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(target)
+        .hide_console()
+        .output()
+    {
+        Ok(o) if o.status.success() => parse_launchctl_print(&String::from_utf8_lossy(&o.stdout)),
+        Ok(_) => ServiceRunState::NotFound,
+        Err(_) => ServiceRunState::Unknown,
     }
 }
 
@@ -565,6 +1096,423 @@ pub fn parse_launchctl_print(text: &str) -> ServiceRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Scope-explicit addressing (dig_ecosystem#526) ----------------------
+    //
+    // Every assertion below is over the PURE plan, for all three operating
+    // systems, from any host: a `#[cfg(unix)]`-only test would leave the
+    // Windows arms unfalsifiable on CI's Windows runner and on this repo's
+    // dev boxes alike (#1774).
+
+    #[test]
+    fn a_macos_deregister_boots_out_both_the_system_and_the_per_user_domain() {
+        // The uninstall-asymmetry defect: a system-only bootout leaves an
+        // unelevated install's `gui/<uid>` LaunchAgent running and relaunching
+        // at every login while the installer reports a clean uninstall.
+        let targets = macos_bootout_targets(Some(501), DIG_NODE_SERVICE_ID);
+        assert_eq!(
+            targets,
+            vec![
+                "system/net.dignetwork.dig-node".to_string(),
+                "gui/501/net.dignetwork.dig-node".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_uid_still_boots_out_the_system_domain() {
+        // Nothing addressable in the per-user domain, so only the system target
+        // is issued — and the caller REPORTS the unreachable scope rather than
+        // claiming a complete uninstall (`uninstall::scope_report`).
+        assert_eq!(
+            macos_bootout_targets(None, DIG_DNS_SERVICE_ID),
+            vec!["system/net.dignetwork.dig-dns".to_string()]
+        );
+    }
+
+    #[test]
+    fn scope_query_addresses_the_right_domain_on_every_os() {
+        let id = DIG_NODE_SERVICE_ID;
+        let unit = linux_unit_name(id);
+        assert_eq!(
+            scope_query(Os::Windows, ServiceScope::System, id, None),
+            ScopeQuery::ScQuery(id.to_string())
+        );
+        // The Windows SCM has NO per-user services, so the answer is known
+        // without asking — never an Unknown that a caller might read as "maybe".
+        assert_eq!(
+            scope_query(Os::Windows, ServiceScope::User, id, Some(1000)),
+            ScopeQuery::NoSuchDomain
+        );
+        assert_eq!(
+            scope_query(Os::Linux, ServiceScope::System, id, None),
+            ScopeQuery::Systemctl(vec!["is-active".to_string(), unit.clone()])
+        );
+        assert_eq!(
+            scope_query(Os::Linux, ServiceScope::User, id, None),
+            ScopeQuery::Systemctl(vec!["--user".to_string(), "is-active".to_string(), unit])
+        );
+        assert_eq!(
+            scope_query(Os::MacOs, ServiceScope::System, id, Some(501)),
+            ScopeQuery::LaunchctlPrint("system/net.dignetwork.dig-node".to_string())
+        );
+        assert_eq!(
+            scope_query(Os::MacOs, ServiceScope::User, id, Some(501)),
+            ScopeQuery::LaunchctlPrint("gui/501/net.dignetwork.dig-node".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unaddressable_macos_user_domain_is_unknown_not_absent() {
+        // "Could not ask" must never collapse into "nothing is registered":
+        // tolerating a failed install on that answer is exactly the #526
+        // false-ready.
+        assert_eq!(
+            scope_query(Os::MacOs, ServiceScope::User, DIG_NODE_SERVICE_ID, None),
+            ScopeQuery::Unaddressable
+        );
+    }
+
+    #[test]
+    fn is_enabled_distinguishes_an_existing_unit_from_a_missing_one() {
+        // THE trap this replaced: `is-active` prints `inactive` for a unit that does not exist, and
+        // `parse_systemctl_is_active` maps `inactive` to Stopped — "registered but not running".
+        assert_eq!(
+            parse_systemctl_is_active("inactive"),
+            ServiceRunState::Stopped,
+            "documenting the trap: is-active says `inactive` for a unit that is not there"
+        );
+        let missing = classify_systemctl_is_enabled(
+            "",
+            "Failed to get unit file state for dignetwork-dig-node.service: No such file or \
+             directory",
+            false,
+        );
+        assert_eq!(missing.presence, Presence::Absent);
+        assert_eq!(missing.boot_enabled, BootEnablement::NotEnabled);
+    }
+
+    /// A5: a D-Bus failure is `Unknown`, NEVER `Absent`.
+    ///
+    /// `systemctl --user is-enabled` under `sudo` prints "Failed to connect to bus: No such file or
+    /// directory" — which CONTAINS the missing-unit phrase. A substring match therefore classified a
+    /// scope it could not even ask as definitively empty, and the uninstall reported "removed from
+    /// every scope" with nothing listed as unverified. The fixture is the real message, because a
+    /// synthetic "bus error" string would not exhibit the collision that caused the bug.
+    #[test]
+    fn a_bus_failure_is_unknown_never_absent() {
+        for stderr in [
+            "Failed to connect to bus: No such file or directory",
+            "Failed to get D-Bus connection: Operation not permitted",
+            "Failed to connect to bus: Host is down",
+        ] {
+            let r = classify_systemctl_is_enabled("", stderr, false);
+            assert_eq!(
+                r.presence,
+                Presence::Unknown,
+                "a scope that could not be asked is not empty: {stderr}"
+            );
+            assert_eq!(r.boot_enabled, BootEnablement::Unknown);
+            assert!(r.detail.contains("could not be queried"), "{}", r.detail);
+        }
+    }
+
+    /// An absence claim requires the NON-ZERO exit systemd actually gives for a unit it cannot read.
+    ///
+    /// The doc contract for this classifier states that a missing unit comes with an empty stdout AND
+    /// a non-zero exit. The exit status was accepted as a parameter and then discarded, so a zero-exit
+    /// reply carrying a missing-unit phrase was read as definitively `Absent` — an absence concluded
+    /// from a query that, by its own exit status, did not fail. On a privileged teardown that is
+    /// fail-open in the expensive direction: `Absent` is what licenses "removed from every scope".
+    ///
+    /// The fixture varies ONLY the exit status against the exact stderr the recognised-absence test
+    /// above uses, so the two differ in one bit and nothing else can explain a divergence.
+    #[test]
+    fn a_missing_unit_phrase_with_a_zero_exit_is_unknown_not_absent() {
+        const MISSING: &str = "Failed to get unit file state for dignetwork-dig-node.service: \
+                               No such file or directory";
+        assert_eq!(
+            classify_systemctl_is_enabled("", MISSING, false).presence,
+            Presence::Absent,
+            "the control: the same stderr WITH systemd's non-zero exit is recognised absence"
+        );
+        let r = classify_systemctl_is_enabled("", MISSING, true);
+        assert_eq!(
+            r.presence,
+            Presence::Unknown,
+            "a query that reports success cannot also prove the unit is gone"
+        );
+        assert_eq!(r.boot_enabled, BootEnablement::Unknown);
+    }
+
+    /// The widened absence arm must stay qualified: a not-found token ALONE is not absence.
+    ///
+    /// This repo recognises a SUPERSET of dig-node's two verbatim phrasings, because `is-enabled` and
+    /// `cat` word their not-found replies differently. A widening is only safe while it stays
+    /// qualified, so the class of errors that merely CONTAIN a not-found word — a missing binary, an
+    /// unreadable config, a refused path — must not collapse into `Absent`.
+    #[test]
+    fn a_not_found_word_without_a_unit_qualifier_is_unknown() {
+        for stderr in [
+            "Failed to execute /usr/bin/systemctl: No such file or directory",
+            "Interactive authentication required: not found",
+            "error: configuration does not exist",
+        ] {
+            assert_eq!(
+                classify_systemctl_is_enabled("", stderr, false).presence,
+                Presence::Unknown,
+                "a not-found word that names no unit is not evidence of absence: {stderr}"
+            );
+        }
+    }
+
+    /// A4: presence is not boot-enablement.
+    ///
+    /// A `masked` unit exists and can NEVER start; `disabled`/`static` exist and nothing starts them.
+    /// Reporting any of them as reboot-surviving is the false-ready this PR exists to remove, so the
+    /// two facts are read separately and only `enabled` licenses the claim.
+    #[test]
+    fn presence_does_not_imply_boot_enablement() {
+        for token in ["enabled", "enabled-runtime", "alias"] {
+            let r = classify_systemctl_is_enabled(token, "", true);
+            assert_eq!(r.presence, Presence::Present, "{token}");
+            assert_eq!(r.boot_enabled, BootEnablement::Enabled, "{token}");
+            assert!(r.starts_without_login(), "{token}");
+        }
+        for token in [
+            "masked",
+            "masked-runtime",
+            "disabled",
+            "static",
+            "indirect",
+            "generated",
+            "transient",
+            "linked",
+        ] {
+            let r = classify_systemctl_is_enabled(token, "", true);
+            assert_eq!(
+                r.presence,
+                Presence::Present,
+                "`{token}` describes a unit that EXISTS"
+            );
+            assert_eq!(
+                r.boot_enabled,
+                BootEnablement::NotEnabled,
+                "`{token}` starts nothing on its own"
+            );
+            assert!(!r.starts_without_login(), "{token}");
+        }
+        // A masked unit says so, because "registered but nothing starts it" understates it.
+        assert!(classify_systemctl_is_enabled("masked", "", true)
+            .detail
+            .contains("NEVER start"));
+    }
+
+    /// `not-found` on stdout is systemd ANSWERING "there is no such unit", not failing to answer.
+    ///
+    /// Distinguishing it from the two neighbours is the whole point, so all three are asserted
+    /// together: a real state token is Present, `not-found` is Absent, and a token systemd has never
+    /// printed is Unknown. Reading `not-found` as Unknown made an empty scope report "could not
+    /// determine" and turned a clean install failure into an unreadable one (run 30665680769).
+    #[test]
+    fn the_not_found_token_is_a_successful_answer_meaning_absent() {
+        let r = classify_systemctl_is_enabled("not-found", "", false);
+        assert_eq!(r.presence, Presence::Absent);
+        assert_eq!(r.boot_enabled, BootEnablement::NotEnabled);
+        assert!(r.detail.contains("no such unit"), "{}", r.detail);
+
+        // The neighbours, on the same shape of input, so this cannot pass by treating everything
+        // alike.
+        assert_eq!(
+            classify_systemctl_is_enabled("disabled", "", false).presence,
+            Presence::Present,
+            "a real state token is a unit that EXISTS"
+        );
+        assert_eq!(
+            classify_systemctl_is_enabled("not-found-ish", "", false).presence,
+            Presence::Unknown,
+            "only the exact token systemd prints is a verdict"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_or_silent_systemctl_answer_is_unknown() {
+        // A future systemd word, and a zero-exit empty answer: neither is evidence of absence.
+        assert_eq!(
+            classify_systemctl_is_enabled("something-new", "", true).presence,
+            Presence::Unknown
+        );
+        assert_eq!(
+            classify_systemctl_is_enabled("", "", true).presence,
+            Presence::Unknown
+        );
+    }
+
+    /// Finding A3: a launchd DOMAIN that could not be bootstrapped is not an absent SERVICE.
+    ///
+    /// `sudo launchctl print gui/501/<label>` on a host with no Aqua session fails with a bootstrap
+    /// or domain error — the launchd twin of the `systemctl --user` bus failure above, and on exactly
+    /// the host class #526 describes. Collapsing it to `Absent` let an uninstall report "removed from
+    /// every scope" for a domain it never reached, and let an install treat an unaskable scope as
+    /// free.
+    ///
+    /// Every case is driven through the PURE classifier, so all three assertions hold on a Windows
+    /// dev box: a `#[cfg(target_os = "macos")]` test would leave this guard unfalsifiable everywhere
+    /// CI actually runs it (dig_ecosystem#1774).
+    #[test]
+    fn an_unbootstrappable_launchd_domain_is_unknown_never_absent() {
+        for stderr in [
+            "Bootstrap failed: 5: Input/output error",
+            "Could not find domain for gui/501",
+            "Could not find domain for",
+            "launchctl: Couldn't posix_spawn: error 2",
+        ] {
+            let r = classify_launchctl_print(
+                "gui/501/net.dignetwork.dig-node",
+                ServiceScope::User,
+                stderr,
+                Some(1),
+                false,
+            );
+            assert_eq!(
+                r.presence,
+                Presence::Unknown,
+                "a domain that could not be reached says nothing about the service: {stderr}"
+            );
+            assert_eq!(r.boot_enabled, BootEnablement::Unknown, "{stderr}");
+            assert!(
+                r.detail.contains(stderr.lines().next().unwrap()),
+                "launchd's own words must reach the operator, got: {}",
+                r.detail
+            );
+        }
+    }
+
+    /// The control that keeps the fix from becoming "launchd never answers absent": the recognised
+    /// not-found reply, by exit code and by each phrase, is still definitively `Absent`. Byte-aligned
+    /// with `dig-node`'s `classify_launchctl_probe` — exit `113` or one of three substrings,
+    /// case-insensitively.
+    #[test]
+    fn the_recognised_launchd_not_found_reply_is_absent() {
+        let absent = |stderr: &str, code: Option<i32>| {
+            classify_launchctl_print(
+                "system/net.dignetwork.dig-node",
+                ServiceScope::System,
+                stderr,
+                code,
+                false,
+            )
+        };
+        // The exit code alone, with a message this classifier does not recognise.
+        assert_eq!(
+            absent("some future launchd wording", Some(113)).presence,
+            Presence::Absent,
+            "exit 113 is launchd's kLaunchdNoSuchServiceError"
+        );
+        // Each phrase alone, on an exit code that is NOT 113 — so neither signal can be passing for
+        // the other.
+        for stderr in [
+            "Could not find service \"net.dignetwork.dig-node\" in domain for system",
+            "COULD NOT FIND SERVICE in domain for system",
+            "No such process",
+            "No such file or directory",
+        ] {
+            assert_eq!(
+                absent(stderr, Some(1)).presence,
+                Presence::Absent,
+                "the recognised not-found reply: {stderr}"
+            );
+        }
+    }
+
+    /// Success is tested BEFORE any absence signal, and enablement follows the DOMAIN: a job in the
+    /// system domain is bootstrapped at boot, one in `gui/<uid>` only once that user logs in. The
+    /// output deliberately CONTAINS a not-found phrase, so an implementation that pattern-matched
+    /// before checking the exit status would answer `Absent` for a plainly loaded job.
+    #[test]
+    fn a_loaded_launchd_job_is_present_and_its_enablement_follows_the_domain() {
+        let loaded = |scope| {
+            classify_launchctl_print(
+                "system/net.dignetwork.dig-node",
+                scope,
+                "warning: no such file: /etc/dig/optional.conf",
+                Some(0),
+                true,
+            )
+        };
+        let system = loaded(ServiceScope::System);
+        assert_eq!(system.presence, Presence::Present);
+        assert_eq!(system.boot_enabled, BootEnablement::Enabled);
+        assert!(system.starts_without_login());
+
+        let user = loaded(ServiceScope::User);
+        assert_eq!(user.presence, Presence::Present);
+        assert_eq!(
+            user.boot_enabled,
+            BootEnablement::NotEnabled,
+            "a `gui/<uid>` job waits for a login by definition"
+        );
+        assert!(!user.starts_without_login());
+    }
+
+    /// systemd's own not-found phrasings, taken verbatim from `dig-node`'s classifier so the two
+    /// repos agree on what absence looks like. The bus-failure control above is what keeps this from
+    /// widening into "any error is absence".
+    #[test]
+    fn the_systemd_not_found_phrasings_dig_node_recognises_are_absent_here_too() {
+        for stderr in [
+            "Failed to get unit file state for dignetwork-dig-node.service: No files found for \
+             dignetwork-dig-node.service.",
+            "Unit dignetwork-dig-node.service could not be found.",
+        ] {
+            assert_eq!(
+                classify_systemctl_is_enabled("", stderr, false).presence,
+                Presence::Absent,
+                "systemd's recognised not-found reply: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn sc_registration_reads_presence_from_query_and_enablement_from_the_config() {
+        let missing = "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\n\r\nThe specified \
+                       service does not exist as an installed service.\r\n";
+        assert_eq!(
+            classify_sc_registration(missing, "").presence,
+            Presence::Absent
+        );
+
+        // A STOPPED service is still REGISTERED, and AUTO_START is what makes it boot-start.
+        let auto = classify_sc_registration(
+            "STATE : 1  STOPPED\r\n",
+            "        START_TYPE         : 2   AUTO_START\r\n",
+        );
+        assert_eq!(auto.presence, Presence::Present);
+        assert!(auto.starts_without_login());
+
+        // The row that separates presence from enablement on Windows: registered, but manual.
+        let demand = classify_sc_registration(
+            "STATE : 4  RUNNING\r\n",
+            "        START_TYPE         : 3   DEMAND_START\r\n",
+        );
+        assert_eq!(demand.presence, Presence::Present);
+        assert!(
+            !demand.starts_without_login(),
+            "a DEMAND_START service does not come up at boot"
+        );
+
+        // An unreadable config never licenses a survival claim.
+        let unreadable = classify_sc_registration("STATE : 4  RUNNING\r\n", "");
+        assert_eq!(unreadable.presence, Presence::Present);
+        assert_eq!(unreadable.boot_enabled, BootEnablement::Unknown);
+    }
+
+    #[test]
+    fn presence_is_never_silent() {
+        for p in [Presence::Present, Presence::Absent, Presence::Unknown] {
+            assert!(p.describe("net.dignetwork.dig-node").contains("dig-node"));
+        }
+    }
 
     #[test]
     fn canonical_ids_are_reverse_dns_and_stable() {
