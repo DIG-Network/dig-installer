@@ -133,8 +133,14 @@ case "$resolved" in
   *) fail "root resolves digs to [${resolved:-nothing}] - the attacker planted the name earlier on PATH and won (F2)" ;;
 esac
 # And it really is our binary that runs, not merely our path that is printed.
-if ! su - root -c 'digs --version' 2>&1 | grep -q '0\.19\.3'; then
-  fail "root ran something other than the installed digs"
+# Compare against the KNOWN-GOOD installed binary's OWN `--version` output rather
+# than a hardcoded literal: the literal drifts every digs release (it went stale at
+# 0.19.3 while digs shipped 0.20.0 and failed this gate on an unrelated version
+# bump). The attacker's binary reports a different version (99.0.0), so a match
+# still proves root ran OUR binary.
+installed_ver="$(/opt/dig/bin/digs --version 2>&1)"
+if ! su - root -c 'digs --version' 2>&1 | grep -qF "$installed_ver"; then
+  fail "root ran something other than the installed digs (expected '$installed_ver')"
 fi
 # The unsafe veneer is still REPORTED, so an operator is told about a directory they must repair even though
 # the install is usable.
