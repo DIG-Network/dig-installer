@@ -13,7 +13,7 @@ describe("wizard steps render under react-intl (#654)", () => {
   it("Welcome renders its lead and feature copy", () => {
     renderWithIntl(<Welcome meta={{ version: "1.9.0" }} />);
     expect(screen.getByText(/Your front door to the DIG Network/)).toBeInTheDocument();
-    expect(screen.getByText("A Git-shaped workflow")).toBeInTheDocument();
+    expect(screen.getByText("One network, run by everyone")).toBeInTheDocument();
   });
 
   it("License renders the GPL summary and the agreement checkbox label", () => {
