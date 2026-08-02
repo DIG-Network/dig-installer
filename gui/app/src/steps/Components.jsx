@@ -74,7 +74,7 @@ export function Components({ sel, toggle, path, onChange, status }) {
       <p className="lead" style={{ marginBottom: 28 }}>
         <FormattedMessage
           id="components.lead"
-          defaultMessage="The core DIG stack is pre-selected — installing it is the default, one-click path. Check any optional extras you want, or deselect anything you don't; the CLI is required."
+          defaultMessage="The full DIG stack is pre-selected — your node, the desktop app, name resolution and the store tools install together in one click. Add any optional extras, or deselect anything you don't need."
         />
       </p>
       <p className="field-label">

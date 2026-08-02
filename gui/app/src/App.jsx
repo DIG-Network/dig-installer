@@ -334,7 +334,7 @@ export function App() {
               <img src={glowD} alt="DIG" />
             </div>
             <h1>DIG</h1>
-            <div className="tagline">Everything you need for the DIG Network — the digstore CLI, your dig-node, and .dig name resolution.</div>
+            <div className="tagline">Everything you need to join the DIG Network — your node, the desktop app, name resolution, and publishing tools — in one install.</div>
             <div className="ver-pill">
               <span className="dot"></span>digstore v{digstoreVersion}
             </div>

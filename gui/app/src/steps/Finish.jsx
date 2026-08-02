@@ -15,7 +15,7 @@ export function Finish({ path, onCopy, copied, meta, restartRequired = false }) 
       <h2>
         <FormattedMessage
           id="finish.title"
-          defaultMessage="The DIG stack is <gt>installed</gt>"
+          defaultMessage="You're on the <gt>DIG Network</gt>"
           values={{ gt: (chunks) => <span className="gt">{chunks}</span> }}
         />
       </h2>
@@ -31,7 +31,7 @@ export function Finish({ path, onCopy, copied, meta, restartRequired = false }) 
       <p className="lead">
         <FormattedMessage
           id="finish.lead"
-          defaultMessage="The <b>DigStore</b> CLI, your <b>dig-node</b>, and <b>dig-dns</b> are ready. Initialize your first store, then commit a <b>capsule</b> (<code>storeId:rootHash</code> — one immutable generation) and push it to <b>DIGHUb</b>."
+          defaultMessage="Your <b>dig-node</b> is running, the <b>DIG app</b> is in your system tray with your keys, and <b>.dig</b> links resolve on this machine — you're ready to browse the DIG Network right away. To publish your own content, use the <b>DigStore</b> commands below: each commit seals a <b>capsule</b> (<code>storeId:rootHash</code> — one immutable generation) and pushes it to <b>DIGHUb</b>."
           values={{ b: bold, code }}
         />
       </p>
@@ -58,7 +58,7 @@ export function Finish({ path, onCopy, copied, meta, restartRequired = false }) 
       </div>
       <div className="next">
         <div className="nh">
-          <FormattedMessage id="finish.next.heading" defaultMessage="Next steps" />
+          <FormattedMessage id="finish.next.heading" defaultMessage="Publish your first store" />
         </div>
         <div className="cmd">
           <button className="copy" onClick={onCopy}>

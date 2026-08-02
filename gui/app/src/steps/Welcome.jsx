@@ -8,18 +8,23 @@ export function Welcome({ meta }) {
   const intl = useIntl();
   return (
     <div className="fade-key">
-      <div className="eyebrow">DIG Network · digstore · dig-node · dig-dns</div>
+      <div className="eyebrow">
+        <FormattedMessage
+          id="welcome.eyebrow"
+          defaultMessage="DIG Network · node · desktop app · store · name resolution"
+        />
+      </div>
       <h2>
         <FormattedMessage
           id="welcome.title"
-          defaultMessage="Install <gt>DIG</gt>"
+          defaultMessage="Install the <gt>DIG Network</gt>"
           values={{ gt: (chunks) => <span className="gt">{chunks}</span> }}
         />
       </h2>
       <p className="lead">
         <FormattedMessage
           id="welcome.lead"
-          defaultMessage="Your front door to the DIG Network. This installer sets up the full stack in one step — the <b>DigStore</b> CLI, your local <b>dig-node</b>, and <b>dig-dns</b> name resolution. DigStore turns content into a portable, encrypted, self-defending WASM module: each commit is a <b>capsule</b> you publish to <b>DIGHUb</b> (the blind host) and serve through your dig-node. Publishing a capsule costs a small amount of <b>$DIG</b>; reading is free."
+          defaultMessage="Your front door to the DIG Network. One install sets up everything you need — your own <b>dig-node</b>, the <b>DIG app</b> that keeps your keys in your system tray, <b>.dig</b> name resolution, and the <b>DigStore</b> tools for publishing. Reading content is always free; publishing a <b>capsule</b> to <b>DIGHUb</b> moves a little <b>$DIG</b>. Automatic updates keep the whole stack current."
           values={{ b: bold }}
         />
       </p>

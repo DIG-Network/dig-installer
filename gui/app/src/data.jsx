@@ -13,41 +13,44 @@ import { Ic } from "./icons.jsx";
 
 export const STEPS = ["Welcome", "License", "Components", "Install", "Done"];
 
-// Feature-card copy for the Welcome step.
+// Feature-card copy for the Welcome step. The three cards frame the WHOLE DIG
+// Network you're installing — a peer network you join, self-custody keys, and
+// publishing — not just the DigStore CLI (dig_ecosystem#1942). The icons
+// (git/lock/shield) are reused, re-read as network / keys / self-defending.
 const featureMessages = defineMessages({
-  gitHeading: {
-    id: "welcome.feature.git.heading",
-    defaultMessage: "A Git-shaped workflow",
+  networkHeading: {
+    id: "welcome.feature.network.heading",
+    defaultMessage: "One network, run by everyone",
   },
-  gitBody: {
-    id: "welcome.feature.git.body",
+  networkBody: {
+    id: "welcome.feature.network.body",
     defaultMessage:
-      "init, add, commit, log, diff, checkout, clone — the verbs you already know. Each commit advances your store to a new capsule; chunking, encryption and WASM compilation stay under the surface.",
+      "Your dig-node joins a peer-to-peer network and loads content from the nearest copy — often your own machine. Every read it caches helps serve the next person.",
   },
-  lockHeading: {
-    id: "welcome.feature.lock.heading",
-    defaultMessage: "Encrypted at rest, by URN",
+  keysHeading: {
+    id: "welcome.feature.keys.heading",
+    defaultMessage: "Your keys stay yours",
   },
-  lockBody: {
-    id: "welcome.feature.lock.body",
+  keysBody: {
+    id: "welcome.feature.keys.body",
     defaultMessage:
-      "Every URN is a key. Content is chunked, SHA-256 addressed, and sealed with an AES-256-GCM key derived from the URN itself.",
+      "The DIG app lives in your system tray, holding your identity and signing on your behalf the moment a site asks. Self-custody — the keys never leave your machine.",
   },
-  shieldHeading: {
-    id: "welcome.feature.shield.heading",
-    defaultMessage: "Publish to DIGHUb, serve anywhere",
+  publishHeading: {
+    id: "welcome.feature.publish.heading",
+    defaultMessage: "Publish content that defends itself",
   },
-  shieldBody: {
-    id: "welcome.feature.shield.body",
+  publishBody: {
+    id: "welcome.feature.publish.body",
     defaultMessage:
-      "Each capsule compiles to one portable .wasm that defends itself — merkle proofs and host attestation. Push it to DIGHUb (the blind host) and read it back through a local dig-node or any DIG client.",
+      "DigStore seals each commit into a portable, encrypted capsule with merkle proofs, published to DIGHUb and served through your node. Reading is free; publishing moves a little $DIG.",
   },
 });
 
 export const FEATURES = [
-  { ic: Ic.git, h: featureMessages.gitHeading, p: featureMessages.gitBody },
-  { ic: Ic.lock, h: featureMessages.lockHeading, p: featureMessages.lockBody },
-  { ic: Ic.shield, h: featureMessages.shieldHeading, p: featureMessages.shieldBody },
+  { ic: Ic.git, h: featureMessages.networkHeading, p: featureMessages.networkBody },
+  { ic: Ic.lock, h: featureMessages.keysHeading, p: featureMessages.keysBody },
+  { ic: Ic.shield, h: featureMessages.publishHeading, p: featureMessages.publishBody },
 ];
 
 // The REAL DIG component catalogue (task #234) — `id` values map 1:1 to the

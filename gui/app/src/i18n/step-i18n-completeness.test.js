@@ -24,7 +24,6 @@ const STEP_FILES = [
 // Raw JSX text nodes that are intentionally NOT translated — brand/wordmark
 // strings, shell commands, and symbol/format literals.
 const ALLOWED_LITERALS = new Set([
-  "DIG Network · digstore · dig-node · dig-dns",
   "macOS · Linux · Windows",
   "digstore init my-store",
   "digstore add ./site",
