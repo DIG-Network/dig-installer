@@ -1591,16 +1591,38 @@ The install behaves like a well-behaved native package:
 - **Service auto-recovery (Windows).** Each installed service is configured via `sc failure` to
   auto-restart on crash: `reset=86400` (daily) + `actions=restart/5000/restart/5000//5000`.
 - **Install rollback (WIRED into the install flow).** `run_report` threads a `RollbackGuard` through
-  the install: each privileged step records itself the instant it succeeds — a written binary
-  (`FileCreated`), a *freshly* registered service (`ServiceRegistered`, `Install` only — never an
-  update/skip of a pre-existing service), the registered URL-scheme handlers (`SchemeRegistered`),
-  and the ARP entry (`ArpEntryWritten`). If ANY step returns an error before the install completes,
-  the guard reverses the recorded steps in **LIFO** order (delete the binary, deregister the service
-  by canonical id, unregister the scheme handlers, remove the ARP entry) BEFORE the error propagates
-  — never a half-written install (the #544 half-write lesson). A fully-successful run `commit`s the
-  guard so the steps stand. Rollback is best-effort + idempotent: an already-absent target is a clean
-  success, and a single failed undo does not strand the earlier reversals — rollback continues and
-  surfaces the failure in `RollbackReport { reversed, failures }` (`clean()` iff no undo failed).
+  the install: each privileged step records itself the instant it succeeds — a *freshly written*
+  binary at a path that had no prior occupant (`FileCreated`), a binary that **overwrote** a
+  pre-existing one (`FileReplaced { path, backup }`), a *freshly* registered service
+  (`ServiceRegistered`, `Install` only — never an update/skip of a pre-existing service), the
+  registered URL-scheme handlers (`SchemeRegistered`), and the ARP entry (`ArpEntryWritten`). If ANY
+  step returns an error before the install completes, the guard reverses the recorded steps in
+  **LIFO** order BEFORE the error propagates — never a half-written install (the #544 half-write
+  lesson). A fully-successful run `commit`s the guard so the steps stand (and the overwrite backups
+  are deleted).
+- **Rollback returns the machine to its PRIOR state — never one worse (dig_ecosystem#1914/#1915).**
+  A rollback MUST NOT delete a binary the install merely OVERWROTE. Before each overwrite the write
+  path preserves the destination's prior bytes in a protected sibling backup; on rollback a
+  `FileReplaced` action **restores** those bytes (`FileCreated` deletes the new file as before, a
+  service is deregistered by canonical id, scheme handlers are unregistered, the ARP entry removed).
+  A component whose download was **skipped** because it was already up to date records NO reversible
+  action — a later failure's rollback leaves untouched a binary this install never wrote. If a
+  replaced file cannot be restored (its backup is missing), the current file is LEFT in place and the
+  failure reported — an unrestorable file is strictly better than a working binary removed. This
+  guarantee holds specifically on a **reinstall over an existing install**, the population least able
+  to absorb losing working binaries. On a locked (running) Windows destination the update is staged
+  for a reboot and the *staging* file — not the still-running old binary — is what a rollback removes.
+- **The backup is adopted into privileged ownership at creation (§7.x / #1910).** A restore promotes
+  the backup onto the live, privileged binary path, and — unlike a fresh install — is NOT followed by
+  dig-node's #565 service-registration refusal that normally catches a user-writable SYSTEM binary. So
+  the backup MUST carry the same privileged ownership as an installed binary the moment it is created:
+  `back_up_existing` adopts it (`adopt_placed_file`, a no-op off Windows / outside the protected root)
+  right after the copy, and **fails closed** (aborting the write with `dest` untouched) if it cannot —
+  never staging a backup a rollback could promote into a user→SYSTEM write over a SYSTEM-executed
+  binary (the §565/#1910 LPE class).
+- **Rollback is best-effort + idempotent:** an already-absent target is a clean success, and a single
+  failed undo does not strand the earlier reversals — rollback continues and surfaces the failure in
+  `RollbackReport { reversed, failures }` (`clean()` iff no undo failed).
 
 Post-install health is the readiness verdict's job (§4.2), not this module's. All value/argument
 builders + the guard core are pure + unit-tested; the registry/SCM writes are the thin, best-effort

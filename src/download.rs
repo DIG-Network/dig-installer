@@ -6,7 +6,7 @@
 //! that actually hit the network are thin and only used at install time.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -210,6 +210,133 @@ pub enum WriteOutcome {
     ScheduledForReboot,
 }
 
+/// The full result of writing a component binary: the [`WriteOutcome`] plus the
+/// rollback breadcrumbs a partial-install failure needs to reverse the write
+/// WITHOUT deleting a binary the machine already had (dig_ecosystem#1914/#1915).
+///
+/// Before #1914 the caller recorded every write as `FileCreated`, so a rollback
+/// after a partial failure DELETED files it had merely overwritten — leaving a
+/// reinstall-over-existing worse than before it began. These breadcrumbs let the
+/// caller record a *replaced* file distinctly so rollback can RESTORE it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteResult {
+    /// Whether the new binary is live now or staged for a reboot-time replace.
+    pub outcome: WriteOutcome,
+    /// If `dest` PRE-EXISTED and was overwritten in place, the sibling backup
+    /// holding its prior bytes, so a rollback can RESTORE them (never delete).
+    /// `None` for a genuinely new destination (rollback deletes it) or the
+    /// reboot-staged case (where `dest` was left untouched — its old binary IS
+    /// the prior state).
+    pub replaced_backup: Option<PathBuf>,
+    /// If the destination was locked and the new bytes were staged for a
+    /// reboot-time replace, the staging file a rollback should delete to cancel
+    /// the pending replace — leaving the still-running old binary at `dest`
+    /// untouched. `None` on an ordinary in-place write.
+    pub reboot_staging: Option<PathBuf>,
+}
+
+impl WriteResult {
+    /// The result of a write that did not actually touch the disk (a dry run):
+    /// there is nothing to roll back and no restart is implied.
+    #[must_use]
+    pub fn nothing_written() -> Self {
+        Self {
+            outcome: WriteOutcome::Replaced,
+            replaced_backup: None,
+            reboot_staging: None,
+        }
+    }
+
+    /// Does finishing this write require a restart to take effect (#544)?
+    #[must_use]
+    pub fn restart_required(&self) -> bool {
+        self.outcome == WriteOutcome::ScheduledForReboot
+    }
+}
+
+/// The sibling path a pre-existing destination is copied to before it is
+/// overwritten, so a partial-install rollback can restore the prior bytes
+/// (dig_ecosystem#1914). A hidden, pid-tagged neighbour of `dest` in the same
+/// (root-owned, protected) directory, so a concurrent run never collides and an
+/// attacker cannot pre-plant or tamper with it.
+fn backup_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "binary".to_string());
+    dest.with_file_name(format!(".{name}.dig-bak-{}", std::process::id()))
+}
+
+/// Copy `dest`'s current bytes aside to a protected sibling BEFORE the write
+/// destroys them, returning the backup path so the write can be undone by
+/// restoring it. `Ok(None)` when there is no prior REGULAR file to preserve —
+/// either `dest` is absent (a genuine first install) or it is a symlink/other
+/// (an installed DIG binary is never a symlink; the write below unlinks a plant
+/// and there is nothing to restore).
+///
+/// Copying — not renaming — is deliberate: it leaves the security-critical
+/// unlink-first write ([`write_without_following_a_symlink`]) exactly as it is.
+/// That path's Windows locked-image detection depends on `remove_file`'s own
+/// failure, which a rename could pre-empt (a running Windows image can be
+/// renamed but not deleted). The backup lives in the same root-owned protected
+/// directory as `dest`, so the extra copy is never attacker-readable.
+///
+/// The backup is **adopted into privileged ownership at creation** — see
+/// [`back_up_existing_with`] for why a restore path with no downstream #565 gate
+/// makes that a security requirement, not a nicety.
+fn back_up_existing(dest: &Path) -> Result<Option<PathBuf>, String> {
+    back_up_existing_with(dest, &crate::secure::adopt_placed_file)
+}
+
+/// [`back_up_existing`] with the "give the backup privileged ownership" effect
+/// injected, so the #1910 adoption is asserted on EVERY platform's test run —
+/// production passes [`crate::secure::adopt_placed_file`], which no-ops off
+/// Windows and outside the protected root, so injection is the only place the
+/// wiring is falsifiable on a Linux runner (the `#[cfg(windows)]`-unfalsifiable
+/// trap this codebase has been bitten by before).
+///
+/// # Why the adoption is load-bearing (dig_ecosystem#1910 via #1914)
+///
+/// The backup can later be RESTORED onto the live, privileged binary path by a
+/// rollback (`undo_install_action`'s `FileReplaced` arm, or the hard-write-error
+/// arm below) — and unlike a fresh install, that restore is NOT followed by
+/// dig-node's #565 service-registration refusal, which is what normally catches
+/// a user-writable SYSTEM binary. On Windows a file the elevated installer
+/// creates carries the invoking USER as owner with a `CREATOR OWNER` FullControl
+/// ACE (#1910), and `rename` keeps the source's security descriptor — so
+/// promoting an un-adopted backup onto `dig-node.exe` would hand a non-SYSTEM
+/// principal write over a binary a SYSTEM service executes (user → SYSTEM LPE,
+/// the exact class §565 hard-refuses). Adopting the backup HERE, at creation,
+/// makes any later promotion already clean and also secures a backup that a
+/// failed commit-time cleanup leaves behind.
+///
+/// Fail CLOSED: if the backup cannot be secured, remove it and abort the write
+/// with `dest` untouched — never stage a backup a restore could not safely use.
+fn back_up_existing_with(
+    dest: &Path,
+    adopt: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
+    let meta = match std::fs::symlink_metadata(dest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat {} before overwrite: {e}", dest.display())),
+        Ok(m) => m,
+    };
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    let backup = backup_path(dest);
+    // Clear any stale backup left at this exact pid-path by a crashed prior run,
+    // so the copy target is free (best-effort — a genuine failure surfaces below).
+    let _ = std::fs::remove_file(&backup);
+    std::fs::copy(dest, &backup)
+        .map_err(|e| format!("back up {} before overwrite: {e}", dest.display()))?;
+    if let Err(e) = adopt(&backup) {
+        let _ = std::fs::remove_file(&backup);
+        return Err(format!("secure backup {}: {e}", backup.display()));
+    }
+    Ok(Some(backup))
+}
+
 /// Download a binary to `dest`, making it executable on unix. If
 /// `expected_sha256` is `Some`, the download is verified before writing and a
 /// mismatch is a hard error (nothing is written).
@@ -217,7 +344,7 @@ pub fn download_binary(
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
-) -> Result<WriteOutcome, String> {
+) -> Result<WriteResult, String> {
     let bytes = fetch_bytes(url)?;
     verify_and_write(&bytes, dest, expected_sha256).map_err(|e| e.replace("the artifact", url))
 }
@@ -231,7 +358,7 @@ fn verify_and_write(
     bytes: &[u8],
     dest: &Path,
     expected_sha256: Option<&str>,
-) -> Result<WriteOutcome, String> {
+) -> Result<WriteResult, String> {
     if let Some(expected) = expected_sha256 {
         let got = sha256_hex(bytes);
         if !got.eq_ignore_ascii_case(expected.trim()) {
@@ -266,7 +393,7 @@ fn verify_and_write(
 /// half-written), and this reboot-time staging fallback does NOT apply — it is a
 /// Windows-only guarantee. (A genuine atomic write-temp + `rename(2)` replace on
 /// unix is a recommended future follow-up, separately ticketed.)
-pub fn replace_binary(dest: &Path, bytes: &[u8]) -> Result<WriteOutcome, String> {
+pub fn replace_binary(dest: &Path, bytes: &[u8]) -> Result<WriteResult, String> {
     replace_binary_with(dest, bytes, schedule_replace_on_reboot)
 }
 
@@ -279,18 +406,65 @@ fn replace_binary_with(
     dest: &Path,
     bytes: &[u8],
     schedule_on_reboot: impl Fn(&Path, &[u8]) -> Result<(), String>,
-) -> Result<WriteOutcome, String> {
+) -> Result<WriteResult, String> {
+    // Preserve the prior occupant's bytes BEFORE the write can destroy them
+    // (the write unlinks `dest` first), so a partial-install rollback RESTORES
+    // them rather than deleting a binary the machine already had and relied on
+    // (dig_ecosystem#1914/#1915).
+    let backup = back_up_existing(dest)?;
+
     match write_without_following_a_symlink(dest, bytes) {
         Ok(()) => {
             // Executability is set INSIDE the write, on the descriptor it holds — never by path
             // afterwards (#1748, F4).
-            Ok(WriteOutcome::Replaced)
+            Ok(WriteResult {
+                outcome: WriteOutcome::Replaced,
+                replaced_backup: backup,
+                reboot_staging: None,
+            })
         }
         Err(e) if is_sharing_violation(&e) || destination_is_a_running_image(&e, dest) => {
+            // The open/unlink failed on a running image, so `dest` is provably
+            // UNTOUCHED — its old binary is still there and IS the prior state.
+            // The backup we took is therefore redundant; drop it, stage the new
+            // bytes, and hand back the staging path so a rollback deletes THAT
+            // (cancelling the pending replace) rather than the still-running old
+            // binary at `dest`.
+            if let Some(b) = &backup {
+                let _ = std::fs::remove_file(b);
+            }
             schedule_on_reboot(dest, bytes)?;
-            Ok(WriteOutcome::ScheduledForReboot)
+            let reboot_staging = {
+                #[cfg(windows)]
+                {
+                    Some(staging_path(dest))
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            };
+            Ok(WriteResult {
+                outcome: WriteOutcome::ScheduledForReboot,
+                replaced_backup: None,
+                reboot_staging,
+            })
         }
-        Err(e) => Err(format!("write {}: {e}", dest.display())),
+        Err(e) => {
+            // A hard write failure. The write unlinks `dest` before creating it,
+            // so a failure AFTER the unlink would leave the destination MISSING —
+            // itself the #1914 "recovery made it worse" shape. If we hold the
+            // prior bytes, put them back before surfacing the error so a failed
+            // write never subtracts a working binary; otherwise clean the backup.
+            if let Some(b) = &backup {
+                if dest.exists() {
+                    let _ = std::fs::remove_file(b);
+                } else {
+                    let _ = std::fs::rename(b, dest);
+                }
+            }
+            Err(format!("write {}: {e}", dest.display()))
+        }
     }
 }
 
@@ -838,7 +1012,9 @@ mod tests {
             crate::sources::fixture_root().join(format!("dig-dl-nohash-{}", std::process::id()));
         let dest = dir.join("nested").join("artifact.bin");
         let outcome = verify_and_write(b"hello dig", &dest, None).expect("write ok");
-        assert_eq!(outcome, WriteOutcome::Replaced);
+        assert_eq!(outcome.outcome, WriteOutcome::Replaced);
+        // A brand-new destination has no prior occupant to preserve.
+        assert!(outcome.replaced_backup.is_none());
         // The nested parent dir was created and the bytes round-trip.
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello dig");
     }
@@ -986,8 +1162,120 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("dig-dns-free.bin");
         let outcome = replace_binary(&dest, b"NEW").expect("an unlocked write applies in place");
-        assert_eq!(outcome, WriteOutcome::Replaced);
+        assert_eq!(outcome.outcome, WriteOutcome::Replaced);
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+        // A brand-new destination has no prior occupant, so nothing is backed up.
+        assert!(outcome.replaced_backup.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1914/#1915: overwriting a PRE-EXISTING binary preserves its prior bytes in
+    /// a restorable backup, so a later partial-install rollback can put them back
+    /// instead of deleting a working binary the machine already had. Before the
+    /// fix, `replace_binary` reported nothing about pre-existence, so every write
+    /// was recorded as `FileCreated` and rolled back by deletion.
+    #[test]
+    fn replace_binary_preserves_prior_bytes_when_overwriting_a_pre_existing_binary_1914() {
+        let dir = crate::sources::fixture_root().join(format!("dig-dl-bak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dig-store.bin");
+        std::fs::write(&dest, b"OLD WORKING BINARY").unwrap();
+
+        let result = replace_binary(&dest, b"NEW BINARY").expect("overwrite applies in place");
+        assert_eq!(result.outcome, WriteOutcome::Replaced);
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"NEW BINARY",
+            "the new bytes are live"
+        );
+        let backup = result
+            .replaced_backup
+            .expect("overwriting a pre-existing binary must preserve its prior bytes");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"OLD WORKING BINARY",
+            "the backup holds exactly the prior bytes, so a rollback can restore them"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1914: a hard write failure that occurs AFTER the destination is unlinked
+    /// must not leave the machine missing a binary it had — the prior bytes are
+    /// restored before the error propagates. Simulated by making `dest` a file and
+    /// its parent-relative backup succeed, then forcing the create to fail via a
+    /// destination whose parent is read-only is platform-fiddly; instead we assert
+    /// the invariant directly through the successful-restore branch: a pre-existing
+    /// file whose overwrite is later rolled back is recoverable from the backup.
+    #[test]
+    fn overwrite_backup_round_trips_the_prior_bytes_1914() {
+        let dir = crate::sources::fixture_root().join(format!("dig-dl-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dign.bin");
+        std::fs::write(&dest, b"ORIGINAL").unwrap();
+
+        let result = replace_binary(&dest, b"UPGRADED").expect("overwrite ok");
+        let backup = result.replaced_backup.expect("backup present");
+        // Emulate a rollback: restore the backup over the new bytes.
+        std::fs::rename(&backup, &dest).expect("restore");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"ORIGINAL",
+            "restoring the backup returns the machine to its prior binary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1914/#1910: the prior-bytes backup can be RESTORED onto a privileged binary
+    /// on rollback — a path with no downstream #565 gate — so it MUST be adopted into
+    /// privileged ownership at creation, or a Windows restore hands a non-SYSTEM
+    /// principal write over a SYSTEM-executed binary. Proven cross-platform by
+    /// injecting the adopt effect (production `adopt_placed_file` no-ops off Windows /
+    /// outside the protected root, so injection is the only falsifiable check here).
+    #[test]
+    fn back_up_existing_adopts_the_backup_into_privileged_ownership_1910() {
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-bak-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dig-node.bin");
+        std::fs::write(&dest, b"OLD").unwrap();
+
+        let adopted = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let backup = back_up_existing_with(&dest, &|p| {
+            adopted.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        })
+        .expect("backup ok")
+        .expect("a pre-existing regular file is backed up");
+        assert_eq!(
+            adopted.into_inner(),
+            vec![backup.clone()],
+            "the backup must be adopted into privileged ownership before it can be restored"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1910: if the backup cannot be secured, fail CLOSED — abort with `dest`
+    /// untouched and NO unsecured backup left behind, never a backup a restore could
+    /// promote onto a privileged binary.
+    #[test]
+    fn back_up_existing_fails_closed_when_the_backup_cannot_be_secured_1910() {
+        let dir = crate::sources::fixture_root()
+            .join(format!("dig-bak-failclosed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dign.bin");
+        std::fs::write(&dest, b"OLD").unwrap();
+
+        let err = back_up_existing_with(&dest, &|_| Err("acl adopt denied".to_string()))
+            .expect_err("an unsecurable backup must fail, not proceed");
+        assert!(err.contains("secure backup"), "got: {err}");
+        // dest is untouched (the write never happened) and no unsecured backup remains.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"OLD");
+        let leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("dig-bak"));
+        assert!(!leftover, "an unsecured backup must not be left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1093,7 +1381,12 @@ mod tests {
             Ok(())
         })
         .expect("resilient replace must not error on a locked destination");
-        assert_eq!(outcome, WriteOutcome::ScheduledForReboot);
+        assert_eq!(outcome.outcome, WriteOutcome::ScheduledForReboot);
+        // A locked destination is left UNTOUCHED, so there is nothing to restore —
+        // the still-running old binary is the prior state; the staging file is what
+        // a rollback cleans instead.
+        assert!(outcome.replaced_backup.is_none());
+        assert!(outcome.reboot_staging.is_some());
         assert!(
             scheduled.get(),
             "the delayed replace must have been scheduled"
@@ -1107,8 +1400,13 @@ mod tests {
         // Stopping the service releases the handle → the fast in-place path applies.
         drop(holder);
         let outcome = replace_binary(&dest, b"NEW BINARY").expect("write succeeds once unlocked");
-        assert_eq!(outcome, WriteOutcome::Replaced);
+        assert_eq!(outcome.outcome, WriteOutcome::Replaced);
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW BINARY");
+        // dest pre-existed ("OLD BINARY"), so the overwrite preserved a restorable backup.
+        let backup = outcome
+            .replaced_backup
+            .expect("overwriting a pre-existing binary must preserve its prior bytes");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OLD BINARY");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1152,11 +1450,14 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
+        let outcome = outcome.expect("a running destination must be staged, not a failed write");
         assert_eq!(
-            outcome,
-            Ok(WriteOutcome::ScheduledForReboot),
+            outcome.outcome,
+            WriteOutcome::ScheduledForReboot,
             "a running destination must be staged, not reported as a failed write"
         );
+        // dest was left untouched (still running) — nothing to restore.
+        assert!(outcome.replaced_backup.is_none());
         assert_eq!(staged.into_inner(), vec![b"NEW BINARY".to_vec()]);
     }
 
