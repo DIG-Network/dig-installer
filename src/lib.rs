@@ -787,9 +787,9 @@ fn download_component(
     c: &ComponentResult,
     dry_run: bool,
     log: &mut dyn FnMut(&str),
-) -> Result<download::WriteOutcome, InstallError> {
+) -> Result<download::WriteResult, InstallError> {
     if dry_run {
-        return Ok(download::WriteOutcome::Replaced);
+        return Ok(download::WriteResult::nothing_written());
     }
     let outcome = download_binary_to_dest(c)?;
     adopt_placed_file_step(std::path::Path::new(&c.dest), log);
@@ -817,7 +817,7 @@ fn adopt_placed_file_step(dest: &std::path::Path, log: &mut dyn FnMut(&str)) {
 
 /// Fetch `c` to its dest, mapping the transport/disk failure modes onto
 /// [`InstallError`] variants.
-fn download_binary_to_dest(c: &ComponentResult) -> Result<download::WriteOutcome, InstallError> {
+fn download_binary_to_dest(c: &ComponentResult) -> Result<download::WriteResult, InstallError> {
     download::download_binary(&c.url, std::path::Path::new(&c.dest), None).map_err(|e| {
         // Distinguish a 404 (asset gone) from a transport error from a disk error.
         if e.contains("404") || e.contains("Not Found") {
@@ -1007,14 +1007,16 @@ fn run_report_gated(
             // destination — a read-only check, safe under `--dry-run` — and
             // decide Install/Update/Skip against the version just resolved above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-            if decision.action != update::UpdateAction::Skip {
+            let written = if decision.action != update::UpdateAction::Skip {
                 let outcome = download_component(&c, plan.dry_run, log)?;
-                report.restart_required |= log_write_outcome(log, "dig-store", outcome);
+                report.restart_required |= log_write_outcome(log, "dig-store", outcome.outcome);
+                Some(outcome)
             } else {
                 log("    · already up to date — skipping the download");
-            }
+                None
+            };
             if !plan.dry_run {
-                note_binary_written(report, guard, &c.dest);
+                note_binary_written(report, guard, &c.dest, written.as_ref());
             }
             report.components.push(c);
 
@@ -1029,9 +1031,9 @@ fn run_report_gated(
             )?;
             log_component(log, &digs);
             let outcome = download_component(&digs, plan.dry_run, log)?;
-            report.restart_required |= log_write_outcome(log, "digs", outcome);
+            report.restart_required |= log_write_outcome(log, "digs", outcome.outcome);
             if !plan.dry_run {
-                note_binary_written(report, guard, &digs.dest);
+                note_binary_written(report, guard, &digs.dest, Some(&outcome));
             }
             report.components.push(digs);
         }
@@ -1138,7 +1140,7 @@ fn run_report_gated(
             // and its binary untouched (`register_dig_node` re-verifies it below
             // rather than reinstalling it).
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-            if decision.action != update::UpdateAction::Skip {
+            let written = if decision.action != update::UpdateAction::Skip {
                 // Task #232: stop a currently-running dig-node BEFORE overwriting
                 // its binary (Windows locks a running exe's file — overwriting it
                 // in place would fail with a sharing violation, or worse, corrupt
@@ -1157,10 +1159,13 @@ fn run_report_gated(
                     ));
                 }
                 let outcome = download_component(&c, plan.dry_run, log)?;
-                report.restart_required |= log_write_outcome(log, "dig-node", outcome);
-            }
+                report.restart_required |= log_write_outcome(log, "dig-node", outcome.outcome);
+                Some(outcome)
+            } else {
+                None
+            };
             if !plan.dry_run {
-                note_binary_written(report, guard, &c.dest);
+                note_binary_written(report, guard, &c.dest, written.as_ref());
             }
             let dig_node_path = PathBuf::from(c.dest.clone());
             report.components.push(c);
@@ -1191,9 +1196,9 @@ fn run_report_gated(
                 Ok(dign) => {
                     log_component(log, &dign);
                     let outcome = download_component(&dign, plan.dry_run, log)?;
-                    report.restart_required |= log_write_outcome(log, "dign", outcome);
+                    report.restart_required |= log_write_outcome(log, "dign", outcome.outcome);
                     if !plan.dry_run {
-                        note_binary_written(report, guard, &dign.dest);
+                        note_binary_written(report, guard, &dign.dest, Some(&outcome));
                     }
                     report.components.push(dign);
                 }
@@ -1268,14 +1273,17 @@ fn run_report_gated(
                     // first-class installed binary, not an alias sharing another component's
                     // version pin), so a re-run skips a download that would change nothing.
                     let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-                    if decision.action != update::UpdateAction::Skip {
+                    let written = if decision.action != update::UpdateAction::Skip {
                         let outcome = download_component(&c, plan.dry_run, log)?;
-                        report.restart_required |= log_write_outcome(log, "dig-app", outcome);
+                        report.restart_required |=
+                            log_write_outcome(log, "dig-app", outcome.outcome);
+                        Some(outcome)
                     } else {
                         log("    · already up to date — skipping the download");
-                    }
+                        None
+                    };
                     if !plan.dry_run {
-                        note_binary_written(report, guard, &c.dest);
+                        note_binary_written(report, guard, &c.dest, written.as_ref());
                     }
                     let dig_app_path = PathBuf::from(c.dest.clone());
                     report.components.push(c);
@@ -1360,7 +1368,7 @@ fn run_report_gated(
                     // reuses `dns::verify_existing` (a read-only re-check) rather
                     // than the full clean-reinstall path when Skip.
                     let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-                    if decision.action != update::UpdateAction::Skip {
+                    let written = if decision.action != update::UpdateAction::Skip {
                         // #544: stop a running dig-dns service BEFORE overwriting its
                         // binary — parity with dig-node/dig-relay's #232 stop-before-
                         // write. dig-dns has no `stop` verb of its own, so the
@@ -1377,10 +1385,14 @@ fn run_report_gated(
                             ));
                         }
                         let outcome = download_component(&c, plan.dry_run, log)?;
-                        report.restart_required |= log_write_outcome(log, "dig-dns", outcome);
-                    }
+                        report.restart_required |=
+                            log_write_outcome(log, "dig-dns", outcome.outcome);
+                        Some(outcome)
+                    } else {
+                        None
+                    };
                     if !plan.dry_run {
-                        note_binary_written(report, guard, &c.dest);
+                        note_binary_written(report, guard, &c.dest, written.as_ref());
                     }
                     let dig_dns_path = PathBuf::from(c.dest.clone());
                     report.components.push(c);
@@ -1410,9 +1422,9 @@ fn run_report_gated(
                     )?;
                     log_component(log, &digd);
                     let outcome = download_component(&digd, plan.dry_run, log)?;
-                    report.restart_required |= log_write_outcome(log, "digd", outcome);
+                    report.restart_required |= log_write_outcome(log, "digd", outcome.outcome);
                     if !plan.dry_run {
-                        note_binary_written(report, guard, &digd.dest);
+                        note_binary_written(report, guard, &digd.dest, Some(&outcome));
                     }
                     report.components.push(digd);
 
@@ -1492,14 +1504,16 @@ fn run_report_gated(
             // #309 version-aware updater, extended to the beacon (#514): same
             // decide-before-touch convention as dig-store/dig-node/dig-dns above.
             let decision = apply_update_decision(&mut c, plan.force_reinstall, log);
-            if decision.action != update::UpdateAction::Skip {
+            let written = if decision.action != update::UpdateAction::Skip {
                 let outcome = download_component(&c, plan.dry_run, log)?;
-                report.restart_required |= log_write_outcome(log, "dig-updater", outcome);
+                report.restart_required |= log_write_outcome(log, "dig-updater", outcome.outcome);
+                Some(outcome)
             } else {
                 log("    · already up to date — skipping the download");
-            }
+                None
+            };
             if !plan.dry_run {
-                note_binary_written(report, guard, &c.dest);
+                note_binary_written(report, guard, &c.dest, written.as_ref());
             }
             let dig_updater_path = PathBuf::from(c.dest.clone());
             report.components.push(c);
@@ -1515,9 +1529,10 @@ fn run_report_gated(
             )?;
             log_component(log, &worker);
             let outcome = download_component(&worker, plan.dry_run, log)?;
-            report.restart_required |= log_write_outcome(log, "dig-updater-worker", outcome);
+            report.restart_required |=
+                log_write_outcome(log, "dig-updater-worker", outcome.outcome);
             if !plan.dry_run {
-                note_binary_written(report, guard, &worker.dest);
+                note_binary_written(report, guard, &worker.dest, Some(&outcome));
             }
             report.components.push(worker);
 
@@ -1558,9 +1573,9 @@ fn run_report_gated(
                 ));
             }
             let outcome = download_component(&c, plan.dry_run, log)?;
-            report.restart_required |= log_write_outcome(log, "dig-relay", outcome);
+            report.restart_required |= log_write_outcome(log, "dig-relay", outcome.outcome);
             if !plan.dry_run {
-                note_binary_written(report, guard, &c.dest);
+                note_binary_written(report, guard, &c.dest, Some(&outcome));
             }
             let relay_path = PathBuf::from(c.dest.clone());
             report.components.push(c);
@@ -1587,10 +1602,10 @@ fn run_report_gated(
                 &plan.bin_dir_for("browser", target.os),
             )?;
             log_component(log, &c);
-            download_component(&c, plan.dry_run, log)?;
+            let outcome = download_component(&c, plan.dry_run, log)?;
             if !plan.dry_run {
                 log(&format!("    run the installer to finish: {}", c.dest));
-                note_binary_written(report, guard, &c.dest);
+                note_binary_written(report, guard, &c.dest, Some(&outcome));
             }
             report.components.push(c);
         }
@@ -1711,7 +1726,12 @@ fn run_report_gated(
     // privileged steps back (LIFO, best-effort) BEFORE the error propagates, so
     // the guarantee SPEC §3.11 makes — "never a half-written install" — holds.
     match run_steps(&mut report, &mut guard, log) {
-        Ok(()) => guard.commit(),
+        Ok(()) => {
+            guard.commit();
+            // The install stands, so the prior-bytes backups the writes stashed for
+            // a possible rollback are now just clutter — clean them up (#1914).
+            cleanup_committed_backups(&guard, log);
+        }
         Err(e) => {
             let rollback = rollback_partial_install(&guard, &target, log);
             retract_beacon_rearm_claim(&mut report, &rollback, log);
@@ -1730,12 +1750,70 @@ fn run_report_gated(
     Ok(report)
 }
 
-/// Note a freshly written binary: append it to the install report AND record it
-/// for rollback, so a later mid-install failure deletes it rather than leaving a
-/// half-written stack (#573/#544). Called only on a real (non-dry-run) write.
-fn note_binary_written(report: &mut InstallReport, guard: &mut RollbackGuard, dest: &str) {
+/// Note a freshly written binary: append it to the install report AND record the
+/// action a mid-install failure must reverse, so the rollback returns the machine
+/// to its PRIOR state — never one worse than before the install (#573/#544, and
+/// dig_ecosystem#1914/#1915 for the reinstall-over-existing case). Called only on
+/// a real (non-dry-run) write.
+///
+/// The recorded action depends on what the write actually did to the destination:
+///   * it OVERWROTE a pre-existing binary → [`InstallAction::FileReplaced`], so
+///     rollback RESTORES the prior bytes rather than deleting a binary the machine
+///     already had (the #1914 defect: recording every write as `FileCreated` made
+///     a partial-failure rollback delete files it had merely overwritten);
+///   * the old binary was locked and the update was STAGED for a reboot (`dest`
+///     left untouched) → record the STAGING file as the thing to delete on
+///     rollback, so the still-running old binary at `dest` is never removed;
+///   * it created a GENUINELY NEW file → [`InstallAction::FileCreated`], deleted
+///     on rollback exactly as before.
+///
+/// `written` is `None` when the download was SKIPPED because the component was
+/// already up to date (#309): the file at `dest` pre-existed and this install did
+/// not touch it, so it is reported as installed but records NO rollback action —
+/// a later failure's rollback must leave a binary this install never wrote (the
+/// same #1914 "don't delete what you didn't create" guarantee, via the skip path).
+fn note_binary_written(
+    report: &mut InstallReport,
+    guard: &mut RollbackGuard,
+    dest: &str,
+    written: Option<&download::WriteResult>,
+) {
     report.installed.push(dest.to_string());
-    guard.record(InstallAction::FileCreated(dest.to_string()));
+    let Some(written) = written else {
+        // Skipped (already up to date): nothing was written, so nothing to reverse.
+        return;
+    };
+    let action = if let Some(backup) = &written.replaced_backup {
+        InstallAction::FileReplaced {
+            path: dest.to_string(),
+            backup: backup.to_string_lossy().into_owned(),
+        }
+    } else if let Some(staging) = &written.reboot_staging {
+        InstallAction::FileCreated(staging.to_string_lossy().into_owned())
+    } else {
+        InstallAction::FileCreated(dest.to_string())
+    };
+    guard.record(action);
+}
+
+/// After a SUCCESSFUL install, delete the prior-bytes backups the writes stashed
+/// aside for a possible rollback (dig_ecosystem#1914). The install committed, so
+/// the new binaries stand and the backups are just clutter in the protected root.
+/// Best-effort: a leftover backup is a harmless hidden, pid-tagged sibling, so a
+/// deletion failure is logged, never fatal — and an already-absent one is fine.
+fn cleanup_committed_backups(guard: &RollbackGuard, log: &mut dyn FnMut(&str)) {
+    for action in guard.actions() {
+        let InstallAction::FileReplaced { backup, .. } = action else {
+            continue;
+        };
+        match std::fs::remove_file(backup) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log(&format!(
+                "    ! could not clean up the install backup {backup}: {e}"
+            )),
+        }
+    }
 }
 
 /// Reverse ONE recorded privileged install action (#573/#544). Best-effort and
@@ -1745,6 +1823,9 @@ fn note_binary_written(report: &mut InstallReport, guard: &mut RollbackGuard, de
 ///
 /// Each variant maps to the exact inverse of the step that recorded it:
 ///   * [`InstallAction::FileCreated`] → delete the written binary,
+///   * [`InstallAction::FileReplaced`] → RESTORE the prior bytes from the backup
+///     (never delete — an unrestorable file left in place beats a working binary
+///     removed; dig_ecosystem#1914/#1915),
 ///   * [`InstallAction::ServiceRegistered`] → deregister the service by its
 ///     canonical id via the OS service manager,
 ///   * [`InstallAction::SchemeRegistered`] → unregister the `dig://`/`chia://`/
@@ -1759,6 +1840,25 @@ fn undo_install_action(action: &InstallAction) -> Result<(), String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("remove {path}: {e}")),
         },
+        InstallAction::FileReplaced { path, backup } => {
+            // Return the machine to the binary it had before this install by
+            // restoring the prior bytes OVER the file this install wrote — never
+            // deleting, because the destination existed and was in use before the
+            // install began (dig_ecosystem#1914/#1915). `rename` replaces `path`
+            // atomically (MoveFileEx REPLACE_EXISTING on Windows, rename(2) on
+            // unix), so no window exists where `path` is absent.
+            match std::fs::rename(backup, path) {
+                Ok(()) => Ok(()),
+                // The backup is gone (an already-run rollback, or the file was
+                // tampered with). We must NOT delete `path`: leaving the current
+                // binary in place is strictly better than removing a working one.
+                // Report loudly so the rollback is not silently "clean".
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                    "cannot restore {path}: backup {backup} is missing — leaving the current file in place"
+                )),
+                Err(e) => Err(format!("restore {path} from {backup}: {e}")),
+            }
+        }
         InstallAction::ServiceRegistered(id) => svc::deregister_service(id),
         InstallAction::SchemeRegistered => {
             // `unregister` is itself idempotent + best-effort (only ever removes
@@ -4811,6 +4911,149 @@ mod tests {
         assert_eq!(report.reversed.len(), 2, "both writes reversed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// dig_ecosystem#1914/#1915 — the user-visible guarantee: a mid-install failure
+    /// on a REINSTALL over an existing install rolls back to the PRIOR binaries.
+    /// Every pre-existing binary is left present with its ORIGINAL bytes (restored,
+    /// not deleted); a genuinely NEW file the failed install created IS removed (the
+    /// fix is not "stop rolling back"). Asserts on the BYTES at the destinations, not
+    /// the rollback's own report — reported-success and actual-state are independent
+    /// (#1753). Before the fix, every write was recorded as `FileCreated`, so this
+    /// rollback deleted `dig-store` and `dign` — leaving the machine WORSE than
+    /// before the install began.
+    #[test]
+    fn rollback_restores_overwritten_binaries_and_removes_new_ones_1914() {
+        let dir = crate::sources::fixture_root()
+            .join(format!("dig-rollback-1914-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Two binaries the machine ALREADY had, working.
+        let pre_store = dir.join("dig-store.bin");
+        let pre_dign = dir.join("dign.bin");
+        std::fs::write(&pre_store, b"WORKING dig-store").expect("seed store");
+        std::fs::write(&pre_dign, b"WORKING dign").expect("seed dign");
+        // A genuinely new binary this install introduces.
+        let fresh = dir.join("dig-node.bin");
+
+        let mut report = report_shell();
+        let mut guard = RollbackGuard::new();
+
+        // The install overwrites the two pre-existing binaries and creates one new
+        // one, recorded EXACTLY as the real install records each write (from its
+        // WriteResult, through the production `note_binary_written`).
+        let w_store =
+            crate::download::replace_binary(&pre_store, b"NEW dig-store").expect("overwrite store");
+        note_binary_written(
+            &mut report,
+            &mut guard,
+            &pre_store.to_string_lossy(),
+            Some(&w_store),
+        );
+        let w_dign =
+            crate::download::replace_binary(&pre_dign, b"NEW dign").expect("overwrite dign");
+        note_binary_written(
+            &mut report,
+            &mut guard,
+            &pre_dign.to_string_lossy(),
+            Some(&w_dign),
+        );
+        let w_fresh =
+            crate::download::replace_binary(&fresh, b"NEW dig-node").expect("create fresh");
+        note_binary_written(
+            &mut report,
+            &mut guard,
+            &fresh.to_string_lossy(),
+            Some(&w_fresh),
+        );
+
+        assert_eq!(
+            std::fs::read(&pre_store).unwrap(),
+            b"NEW dig-store",
+            "precondition: the pre-existing binary was overwritten"
+        );
+        assert!(fresh.exists(), "precondition: the new file was placed");
+
+        // A later component fails → the partial install rolls back.
+        let target = Target::current().expect("host target");
+        let rb = rollback_partial_install(&guard, &target, &mut |_| {});
+
+        // The PRE-EXISTING binaries are RESTORED to their original bytes — never deleted.
+        assert!(
+            pre_store.exists() && pre_dign.exists(),
+            "the pre-existing binaries must survive the rollback"
+        );
+        assert_eq!(
+            std::fs::read(&pre_store).unwrap(),
+            b"WORKING dig-store",
+            "dig-store restored to its prior working bytes, not deleted"
+        );
+        assert_eq!(
+            std::fs::read(&pre_dign).unwrap(),
+            b"WORKING dign",
+            "dign restored to its prior working bytes, not deleted"
+        );
+        // The genuinely NEW file IS removed — rollback still cleans what the install made.
+        assert!(
+            !fresh.exists(),
+            "a newly created file is still deleted on rollback (the control)"
+        );
+        assert!(rb.clean(), "the reversal is clean");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1914: `note_binary_written` records the RIGHT reversal for each kind of
+    /// write — a replaced pre-existing binary as `FileReplaced` (restore), a
+    /// genuinely new file as `FileCreated` (delete), and a SKIPPED/up-to-date
+    /// component (`None`) as NO reversible action at all, so a later failure's
+    /// rollback never deletes a binary this install did not write.
+    #[test]
+    fn note_binary_written_maps_each_write_kind_to_the_right_reversal_1914() {
+        use crate::download::{WriteOutcome, WriteResult};
+        let mut report = report_shell();
+        let mut guard = RollbackGuard::new();
+
+        // Overwrote a pre-existing file → FileReplaced (restore on rollback).
+        let replaced = WriteResult {
+            outcome: WriteOutcome::Replaced,
+            replaced_backup: Some(std::path::PathBuf::from("/x/.dig-store.dig-bak-1")),
+            reboot_staging: None,
+        };
+        note_binary_written(&mut report, &mut guard, "/x/dig-store", Some(&replaced));
+
+        // Genuinely new file (no prior occupant) → FileCreated (delete on rollback).
+        let created = WriteResult {
+            outcome: WriteOutcome::Replaced,
+            replaced_backup: None,
+            reboot_staging: None,
+        };
+        note_binary_written(&mut report, &mut guard, "/x/dig-node", Some(&created));
+
+        // Skipped (already up to date) → installed, but NOTHING to reverse.
+        note_binary_written(&mut report, &mut guard, "/x/dig-dns", None);
+
+        let actions = guard.actions();
+        assert_eq!(
+            actions.len(),
+            2,
+            "only the two real writes are reversible; the skip records nothing"
+        );
+        assert_eq!(
+            actions[0],
+            InstallAction::FileReplaced {
+                path: "/x/dig-store".to_string(),
+                backup: "/x/.dig-store.dig-bak-1".to_string(),
+            },
+            "overwriting a pre-existing binary is recorded as a RESTORE, never a delete"
+        );
+        assert_eq!(
+            actions[1],
+            InstallAction::FileCreated("/x/dig-node".to_string()),
+            "a genuinely new file is recorded as a delete-on-rollback"
+        );
+        // All three are still reported as installed (the skip is present + current).
+        assert_eq!(report.installed.len(), 3);
     }
 
     /// A committed (fully-successful) install reverses nothing, and an already-

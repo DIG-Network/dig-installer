@@ -3,6 +3,43 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## A rollback that records "created" for an OVERWRITE deletes what it didn't create (#1914/#1915)
+
+A rollback exists to return the machine to its PRIOR state. The install recorded every binary write as
+`InstallAction::FileCreated`, and the undo for that is `remove_file`. But on a **reinstall over an
+existing install** the write is an OVERWRITE, not a creation — so a mid-install failure rolled back by
+DELETING binaries the machine already had and was relying on (`dig-store`, `digs`, `dign` were removed
+when a later `dig-app.exe` step failed). The population that hits this — someone whose install already
+went wrong — is the least able to absorb it, and the loss is silent: the rollback reports success while
+having subtracted a working binary. Same "reported-success ≠ actual-state" gap as #1753/#1870.
+
+Three durable lessons:
+
+- **Preserve before you destroy.** The unlink-first write (`write_without_following_a_symlink`, #1748)
+  destroys the prior bytes at write time, so restoration is only possible if a COPY was taken *before*
+  the write. The copy is deliberately not a rename: renaming a running Windows image can SUCCEED where
+  `remove_file` fails, which would pre-empt the delicate sharing-violation → reboot-replace detection
+  the write path depends on. Copy leaves that path byte-for-byte unchanged.
+- **The SKIP path has the same bug.** A component that is "already up to date" is not written at all,
+  yet it was still recorded `FileCreated` — so a later failure's rollback would delete a binary this
+  install never touched. The fix threads an `Option<WriteResult>` out of the version-decision so a skip
+  records NO reversible action.
+- **Restore, and if you can't, LEAVE it — never delete.** An unrestorable file left in place is strictly
+  better than a working binary removed, so a failed restore is reported (`RollbackReport.failures`), not
+  escalated into a delete. Assert on the BYTES at the destinations in tests, never on the rollback's own
+  "clean" report.
+- **A restore has no #565 gate, so the backup must be adopted at CREATION (#1910).** The bytes being
+  correct is not enough: a restore `rename`s the backup onto a privileged binary path, and `rename` keeps
+  the SOURCE's Windows security descriptor. A file the elevated installer creates carries the invoking
+  USER as owner (`CREATOR OWNER` FullControl ACE, #1910) — so promoting an un-adopted backup onto
+  `dig-node.exe` hands a non-SYSTEM principal write over a binary a SYSTEM service runs (user→SYSTEM LPE).
+  A fresh install survives this because dig-node's #565 registration refusal catches it; a ROLLBACK
+  restore runs after the install already failed, against the PRE-EXISTING registration, so nothing
+  re-checks it. The fix is to `adopt_placed_file` the backup the instant it is copied (not at restore
+  time), fail-closed if it can't — so every later promotion is already clean. General rule: when bytes
+  move onto a privileged path by a route that bypasses the usual placement gate, re-assert ownership on
+  that route.
+
 ## Root has no systemd `--user` bus under `sudo`, so a "user-level" service is unreachable there
 
 `systemd --user` is per-login-session infrastructure: it needs `XDG_RUNTIME_DIR=/run/user/<uid>` and a

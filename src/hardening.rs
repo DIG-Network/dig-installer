@@ -116,8 +116,31 @@ pub fn windows_service_recovery_args(service_name: &str) -> Vec<String> {
 /// on failure. The variants name WHAT was created; the rollback reverses each.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum InstallAction {
-    /// A file was written at this path (undo = delete it).
+    /// A file was written at this path where NOTHING existed before (undo = delete
+    /// it). This is the genuinely-new case: the destination had no prior occupant,
+    /// so removing the file returns the machine to its pre-install state.
     FileCreated(String),
+    /// A file at `path` was OVERWRITTEN over a pre-existing occupant, whose prior
+    /// bytes were preserved at `backup` for the duration of the install
+    /// (dig_ecosystem#1914/#1915).
+    ///
+    /// Undo = **restore** `backup` → `path` (never delete): a rollback must return
+    /// the machine to its prior state, so an overwrite is reversed by putting the
+    /// old bytes back, not by deleting a binary the machine already had and was
+    /// relying on. If the restore cannot complete, the current file is LEFT in
+    /// place and the failure reported — an unrestorable file is strictly better
+    /// than a working binary removed. Commit (install succeeded) = delete `backup`.
+    ///
+    /// This variant is what makes rollback safe on a **reinstall over an existing
+    /// install**: recording every write as `FileCreated` (as the code did before
+    /// #1914) made a partial-failure rollback delete binaries it had merely
+    /// overwritten, leaving the machine worse than before the install began.
+    FileReplaced {
+        /// The destination that was overwritten.
+        path: String,
+        /// The sibling backup holding the destination's prior bytes.
+        backup: String,
+    },
     /// A service was registered by this name (undo = deregister it).
     ServiceRegistered(String),
     /// The ARP entry was written (undo = delete the subkey).
