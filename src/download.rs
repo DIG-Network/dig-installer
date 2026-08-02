@@ -280,7 +280,42 @@ fn backup_path(dest: &Path) -> PathBuf {
 /// failure, which a rename could pre-empt (a running Windows image can be
 /// renamed but not deleted). The backup lives in the same root-owned protected
 /// directory as `dest`, so the extra copy is never attacker-readable.
+///
+/// The backup is **adopted into privileged ownership at creation** — see
+/// [`back_up_existing_with`] for why a restore path with no downstream #565 gate
+/// makes that a security requirement, not a nicety.
 fn back_up_existing(dest: &Path) -> Result<Option<PathBuf>, String> {
+    back_up_existing_with(dest, &crate::secure::adopt_placed_file)
+}
+
+/// [`back_up_existing`] with the "give the backup privileged ownership" effect
+/// injected, so the #1910 adoption is asserted on EVERY platform's test run —
+/// production passes [`crate::secure::adopt_placed_file`], which no-ops off
+/// Windows and outside the protected root, so injection is the only place the
+/// wiring is falsifiable on a Linux runner (the `#[cfg(windows)]`-unfalsifiable
+/// trap this codebase has been bitten by before).
+///
+/// # Why the adoption is load-bearing (dig_ecosystem#1910 via #1914)
+///
+/// The backup can later be RESTORED onto the live, privileged binary path by a
+/// rollback (`undo_install_action`'s `FileReplaced` arm, or the hard-write-error
+/// arm below) — and unlike a fresh install, that restore is NOT followed by
+/// dig-node's #565 service-registration refusal, which is what normally catches
+/// a user-writable SYSTEM binary. On Windows a file the elevated installer
+/// creates carries the invoking USER as owner with a `CREATOR OWNER` FullControl
+/// ACE (#1910), and `rename` keeps the source's security descriptor — so
+/// promoting an un-adopted backup onto `dig-node.exe` would hand a non-SYSTEM
+/// principal write over a binary a SYSTEM service executes (user → SYSTEM LPE,
+/// the exact class §565 hard-refuses). Adopting the backup HERE, at creation,
+/// makes any later promotion already clean and also secures a backup that a
+/// failed commit-time cleanup leaves behind.
+///
+/// Fail CLOSED: if the backup cannot be secured, remove it and abort the write
+/// with `dest` untouched — never stage a backup a restore could not safely use.
+fn back_up_existing_with(
+    dest: &Path,
+    adopt: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
     let meta = match std::fs::symlink_metadata(dest) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("stat {} before overwrite: {e}", dest.display())),
@@ -295,6 +330,10 @@ fn back_up_existing(dest: &Path) -> Result<Option<PathBuf>, String> {
     let _ = std::fs::remove_file(&backup);
     std::fs::copy(dest, &backup)
         .map_err(|e| format!("back up {} before overwrite: {e}", dest.display()))?;
+    if let Err(e) = adopt(&backup) {
+        let _ = std::fs::remove_file(&backup);
+        return Err(format!("secure backup {}: {e}", backup.display()));
+    }
     Ok(Some(backup))
 }
 
@@ -1183,6 +1222,60 @@ mod tests {
             b"ORIGINAL",
             "restoring the backup returns the machine to its prior binary"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1914/#1910: the prior-bytes backup can be RESTORED onto a privileged binary
+    /// on rollback — a path with no downstream #565 gate — so it MUST be adopted into
+    /// privileged ownership at creation, or a Windows restore hands a non-SYSTEM
+    /// principal write over a SYSTEM-executed binary. Proven cross-platform by
+    /// injecting the adopt effect (production `adopt_placed_file` no-ops off Windows /
+    /// outside the protected root, so injection is the only falsifiable check here).
+    #[test]
+    fn back_up_existing_adopts_the_backup_into_privileged_ownership_1910() {
+        let dir =
+            crate::sources::fixture_root().join(format!("dig-bak-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dig-node.bin");
+        std::fs::write(&dest, b"OLD").unwrap();
+
+        let adopted = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let backup = back_up_existing_with(&dest, &|p| {
+            adopted.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        })
+        .expect("backup ok")
+        .expect("a pre-existing regular file is backed up");
+        assert_eq!(
+            adopted.into_inner(),
+            vec![backup.clone()],
+            "the backup must be adopted into privileged ownership before it can be restored"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1910: if the backup cannot be secured, fail CLOSED — abort with `dest`
+    /// untouched and NO unsecured backup left behind, never a backup a restore could
+    /// promote onto a privileged binary.
+    #[test]
+    fn back_up_existing_fails_closed_when_the_backup_cannot_be_secured_1910() {
+        let dir = crate::sources::fixture_root()
+            .join(format!("dig-bak-failclosed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dign.bin");
+        std::fs::write(&dest, b"OLD").unwrap();
+
+        let err = back_up_existing_with(&dest, &|_| Err("acl adopt denied".to_string()))
+            .expect_err("an unsecurable backup must fail, not proceed");
+        assert!(err.contains("secure backup"), "got: {err}");
+        // dest is untouched (the write never happened) and no unsecured backup remains.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"OLD");
+        let leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("dig-bak"));
+        assert!(!leftover, "an unsecured backup must not be left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

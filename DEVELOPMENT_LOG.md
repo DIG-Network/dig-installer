@@ -28,6 +28,17 @@ Three durable lessons:
   better than a working binary removed, so a failed restore is reported (`RollbackReport.failures`), not
   escalated into a delete. Assert on the BYTES at the destinations in tests, never on the rollback's own
   "clean" report.
+- **A restore has no #565 gate, so the backup must be adopted at CREATION (#1910).** The bytes being
+  correct is not enough: a restore `rename`s the backup onto a privileged binary path, and `rename` keeps
+  the SOURCE's Windows security descriptor. A file the elevated installer creates carries the invoking
+  USER as owner (`CREATOR OWNER` FullControl ACE, #1910) — so promoting an un-adopted backup onto
+  `dig-node.exe` hands a non-SYSTEM principal write over a binary a SYSTEM service runs (user→SYSTEM LPE).
+  A fresh install survives this because dig-node's #565 registration refusal catches it; a ROLLBACK
+  restore runs after the install already failed, against the PRE-EXISTING registration, so nothing
+  re-checks it. The fix is to `adopt_placed_file` the backup the instant it is copied (not at restore
+  time), fail-closed if it can't — so every later promotion is already clean. General rule: when bytes
+  move onto a privileged path by a route that bypasses the usual placement gate, re-assert ownership on
+  that route.
 
 ## Root has no systemd `--user` bus under `sudo`, so a "user-level" service is unreachable there
 

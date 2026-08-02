@@ -1612,6 +1612,14 @@ The install behaves like a well-behaved native package:
   guarantee holds specifically on a **reinstall over an existing install**, the population least able
   to absorb losing working binaries. On a locked (running) Windows destination the update is staged
   for a reboot and the *staging* file — not the still-running old binary — is what a rollback removes.
+- **The backup is adopted into privileged ownership at creation (§7.x / #1910).** A restore promotes
+  the backup onto the live, privileged binary path, and — unlike a fresh install — is NOT followed by
+  dig-node's #565 service-registration refusal that normally catches a user-writable SYSTEM binary. So
+  the backup MUST carry the same privileged ownership as an installed binary the moment it is created:
+  `back_up_existing` adopts it (`adopt_placed_file`, a no-op off Windows / outside the protected root)
+  right after the copy, and **fails closed** (aborting the write with `dest` untouched) if it cannot —
+  never staging a backup a rollback could promote into a user→SYSTEM write over a SYSTEM-executed
+  binary (the §565/#1910 LPE class).
 - **Rollback is best-effort + idempotent:** an already-absent target is a clean success, and a single
   failed undo does not strand the earlier reversals — rollback continues and surfaces the failure in
   `RollbackReport { reversed, failures }` (`clean()` iff no undo failed).
