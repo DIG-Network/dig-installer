@@ -1506,18 +1506,35 @@ jobs:
             done < <(jq -r '.result.service.shadowing_units_removed[]' install.json)
           fi
 
-      # THE FALSE-READY REGRESSION GUARD, on the pre-`--scope` pin.
+      # NOT-READY GUARD, on the pre-`--scope` pin — and an HONEST account of what it
+      # does and does NOT prove (dig_ecosystem#1894).
       #
       # dig-node gained `--scope` in v0.70.0, so this leg's 0.29.0 pin predates the
       # flag: `dig-node install` has the flag rejected, the installer retries
-      # flag-less, the component reaches for a per-user manager, finds root has no
-      # session bus, and fails. An operator can still pin a component this old, so
-      # what the installer must guarantee is that such a host is never told it is
-      # ready. The pre-#526 code reported `ready: true` here, because nothing asked
-      # whether a registration existed WHERE the run needed one. That is the
-      # regression these assertions pin, and it is the assertion the --bin-dir leg
-      # cannot make: there the scope is forced to user, the unit registers, and the
-      # false-ready never arises.
+      # flag-less, the component reaches for a per-user manager, and on THIS headless
+      # CI host — root with NO session bus (this job deliberately brings none up) —
+      # that per-user registration cannot be made, so the component install FAILS.
+      # The VERIFIED outcome here is therefore `installed: false` (traced: an
+      # `install_service` `Err` on a bus-less host leaves `installed` false —
+      # src/service.rs `install_engine_service`, src/lib.rs `register_dig_node` Err
+      # arm), and readiness must follow: `evaluate_readiness` fails dig-node when it
+      # did not register, so `ready: false`.
+      #
+      # The assertions below are pinned to `installed == false` AND to the not-ready
+      # REASON naming dig-node's registration, so a run that failed for some UNRELATED
+      # reason (an install-root ACL breach, a PATH-order finding) cannot satisfy them
+      # by producing a coincidental `ready: false`.
+      #
+      # What this leg does NOT prove, stated so no one mistakes its reach: it exercises
+      # the install-FAILURE path only. It does NOT exercise a registered-but-scope-
+      # inadequate unit — a per-user unit that genuinely DID register (on a host that
+      # HAS a session bus) for an install that needed system scope. That state reports
+      # `ready: true` today, because `evaluate_readiness` gates dig-node on
+      # installed + health_ok and NOT on reboot-survival/scope-adequacy
+      # (src/lib.rs `evaluate_readiness_when`). Guarding that shape needs a product
+      # readiness gate on scope, not a test change — tracked separately; earlier text
+      # here claimed "the pre-#526 code reported `ready: true`", which was never
+      # observed and is removed.
       - name: A host where the service could not register is NEVER reported ready
         if: matrix.leg == 'legacy'
         run: |
@@ -1525,7 +1542,17 @@ jobs:
             echo "FAIL: false-ready — the service did not register, yet the run claims ready"
             exit 1
           }
-          jq -e '.result.service.installed == false' install.json
+          # The reason must BE the install failure this leg constructs, not a
+          # coincidental unrelated failure — otherwise `ready == false` above is a
+          # false green that a wholly-broken installer would also satisfy (#1894).
+          jq -e '.result.service.installed == false' install.json || {
+            echo "FAIL: the not-ready state was reached without an install failure — this leg proves nothing about the bus-less registration path"
+            exit 1
+          }
+          jq -e '[.result.failures[] | select(startswith("dig-node"))] | length > 0' install.json || {
+            echo "FAIL: not-ready for a reason unrelated to dig-node registration; the guard would pass for an incidentally-broken install. failures: $(jq -c '.result.failures' install.json)"
+            exit 1
+          }
           jq -e '.result.service.survives_reboot == false' install.json
 
           # The report must name the scope it tried and the real reason, so the
