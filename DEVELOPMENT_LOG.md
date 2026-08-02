@@ -3,6 +3,32 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## "Running now" is not "ready" — a daemon must be gated on reboot survival, not health (#1984)
+
+`evaluate_readiness` computed, reported, and even e2e-asserted a service's `survives_reboot` /
+`scope` — but the aggregate `ready` verdict never actually READ it. It gated a daemon engine on
+`installed` + `health_ok` only. So a `dig-node` that `dig-installer` registered as a `systemd --user`
+unit (the #526 pre-`--scope` default, which is loaded only inside a login session) was RUNNING at
+install time, passed `health_ok`, and was reported `ready: true` — then silently never came back after
+a reboot on a headless box. The signal existed for two years' worth of hardening; the gate that would
+have consumed it did not. Durable lessons:
+
+- **Reporting a property is not enforcing it.** A field on the report, a `--json` key, even an e2e
+  assertion on that key, all prove the value is COMPUTED. None of them prove the aggregate verdict
+  DEPENDS on it. The #1894 e2e leg even documented, in a long honest comment, that the
+  registered-but-scope-inadequate shape "reports `ready: true` today" — the gap was known and written
+  down, yet the product gate was filed as separate future work rather than closed. Search for
+  "reports X today" comments: they are unclosed gates.
+- **The health check and the reboot check answer different questions.** `health_ok` asks "is it
+  running right now?"; `survives_reboot` asks "will it come back with nobody logged in?". A per-user
+  daemon answers yes/no — the exact split a single "is it up?" gate cannot see.
+- **Scope the gate to what is genuinely required-system.** The gate fires only for `elevated &&
+  !has_custom_bin_dir` — an unelevated install legitimately lands user-scope, and a `--bin-dir` install
+  is DELIBERATELY forced to user scope (#565: a machine daemon in a caller-writable dir is a user→root
+  escalation). Collapsing those two distinct policies into "any user-scope daemon fails" would refuse
+  every ordinary per-user install. `dig-dns` needs no gate at all: it refuses without elevation and
+  only ever registers `/etc/systemd/system`, so it cannot BE the bad shape.
+
 ## A rollback that records "created" for an OVERWRITE deletes what it didn't create (#1914/#1915)
 
 A rollback exists to return the machine to its PRIOR state. The install recorded every binary write as
