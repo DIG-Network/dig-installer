@@ -28,6 +28,16 @@ have consumed it did not. Durable lessons:
   escalation). Collapsing those two distinct policies into "any user-scope daemon fails" would refuse
   every ordinary per-user install. `dig-dns` needs no gate at all: it refuses without elevation and
   only ever registers `/etc/systemd/system`, so it cannot BE the bad shape.
+- **The registered-but-user-scope shape cannot be reconstructed as an install-e2e on the GH Actions
+  runner (#1894 item 1, e2e portion DEFERRED).** The unit tests (`user_scope_service()` +
+  `readiness_fails_when_an_elevated_default_path_node_is_registered_per_user` and its exemption
+  controls) fully prove the readiness gate rejects a genuinely-registered user-scope daemon. An
+  end-to-end version needs a real `installed: true` user-scope registration, which the runner will not
+  produce: even with root `loginctl enable-linger` giving a `/run/user/0/bus`, dig-node 0.29.0's
+  install run ELEVATED does not register a per-user systemd unit (`installed` comes back false) — a
+  `sudo`/elevated context has no usable `systemctl --user` session even when a lingered bus file exists
+  (the same #526 barrier). So #1894 item 1's UNIT coverage is now complete; its install-e2e coverage
+  stays deferred with this stated reason, matching the original #1894 triage.
 
 ## A rollback that records "created" for an OVERWRITE deletes what it didn't create (#1914/#1915)
 

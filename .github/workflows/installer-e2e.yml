@@ -1291,15 +1291,6 @@ jobs:
             dig_node_version: "0.71.0"
           - leg: legacy
             dig_node_version: "0.29.0"
-          # dig_ecosystem#1984 / #1894 item 1: the same pre-`--scope` pin as `legacy`,
-          # but on a host that HAS a root user session bus (via linger). There the
-          # flag-less registration SUCCEEDS into `systemd --user` — the genuine
-          # "registered but scope-inadequate" unit the `legacy` leg could not reach
-          # (it deliberately brings no bus, so registration merely FAILS). This leg
-          # exercises the PRODUCT readiness gate: installed + enabled, yet user-scope,
-          # so it does not survive a reboot — and the verdict now correctly rejects it.
-          - leg: legacy-scoped-bus
-            dig_node_version: "0.29.0"
     defaults:
       run:
         shell: bash
@@ -1393,98 +1384,11 @@ jobs:
           jq -r '{ready: .result.ready, scope: .result.service.scope}' install.json
           true
 
-      # dig_ecosystem#1984 / #1894 item 1 — give ROOT a real user session bus, so the
-      # pre-`--scope` flag-less registration can actually SUCCEED into `systemd --user`
-      # instead of merely failing for lack of a bus (the `legacy` leg's outcome). Linger
-      # starts a persistent `user@0.service`, which is exactly the user-manager a headless
-      # box would have once someone had logged in — the machine class #526 is about.
-      - name: Give root a persistent user session bus (linger)
-        if: matrix.leg == 'legacy-scoped-bus'
-        run: |
-          sudo loginctl enable-linger root
-          # Wait for the per-user bus socket to exist, so the install below finds it.
-          for _ in $(seq 1 30); do
-            sudo test -S /run/user/0/bus && break
-            sleep 1
-          done
-          sudo test -S /run/user/0/bus || {
-            echo "FAIL: root's user session bus never came up, so this leg cannot construct"
-            echo "the registered-but-scope-inadequate shape it exists to test"
-            exit 1
-          }
-          echo "OK: /run/user/0/bus is up"
-
-      # The install itself, with the user bus made visible to dig-node's flag-less path.
-      # A non-zero exit is tolerated (as on `legacy`): the assertions below are the subject.
-      - name: Install with NO --bin-dir on a host that HAS a user bus (legacy-scoped-bus)
-        if: matrix.leg == 'legacy-scoped-bus'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          sudo -H -E \
-            XDG_RUNTIME_DIR=/run/user/0 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
-            "$PWD/target/release/dig-installer" \
-            --no-digstore --no-dig-app --no-auto-update \
-            --dig-node-version "${{ matrix.dig_node_version }}" \
-            --dig-dns-version "$DIG_DNS_VERSION" \
-            --json > install.json
-          echo "installer exit: $?"
-          jq -r '{ready: .result.ready, scope: .result.service.scope, installed: .result.service.installed, survives_reboot: .result.service.survives_reboot}' install.json
-          true
-
-      # THE #1984 ACCEPTANCE PROPERTY, and the shape #1894 item 1 could not reach: a unit
-      # that GENUINELY registered (installed + enabled) but at USER scope, on a system-
-      # required default-path install, must be reported NOT ready — because it will not
-      # come back after a reboot with nobody logged in.
-      #
-      # Every assertion is a LOAD-BEARING precondition, so the leg cannot pass vacuously:
-      #   * installed == true          — this really is the registered case, not the
-      #                                  bus-less FAILURE the `legacy` leg exercises.
-      #   * survives_reboot == false   — and it is the scope-inadequate one.
-      # Only then is `ready == false` the property under test rather than a coincidence,
-      # and the failure REASON must name dig-node + reboot, so an unrelated failure
-      # (a PATH-order finding, an ACL breach) cannot satisfy the guard.
-      - name: A registered-but-user-scope daemon is reported NOT ready (legacy-scoped-bus)
-        if: matrix.leg == 'legacy-scoped-bus'
-        run: |
-          jq -e '.result.service.installed == true' install.json || {
-            echo "FAIL: dig-node did not actually register into the user bus, so this leg"
-            echo "did NOT construct the registered-but-scope-inadequate shape it exists for"
-            exit 1
-          }
-          jq -e '.result.service.scope == "user"' install.json || {
-            echo "FAIL: the registration was not user-scope; nothing scope-inadequate to reject"
-            exit 1
-          }
-          jq -e '.result.service.survives_reboot == false' install.json || {
-            echo "FAIL: a user-scope unit must report it does not survive a reboot"
-            exit 1
-          }
-          # THE gate: the new product readiness rule must reject it.
-          jq -e '.result.ready == false' install.json || {
-            echo "FAIL: false-ready — a system-required install left a per-user daemon that"
-            echo "will not survive a reboot, yet the run claims ready"
-            exit 1
-          }
-          # And for the RIGHT reason: a dig-node failure that names reboot survival.
-          jq -e '[.result.failures[] | select(startswith("dig-node") and (test("reboot")))] | length > 0' install.json || {
-            echo "FAIL: not-ready for a reason other than reboot survival — the guard would"
-            echo "pass for an incidentally-broken install. failures: $(jq -c '.result.failures' install.json)"
-            exit 1
-          }
-          echo "OK: a genuinely-registered user-scope daemon is correctly reported NOT ready"
-
       # THE assertion this job exists for. This is the scope the installer
       # DECIDED on its own for a protected-root install — "system" — which the
       # --bin-dir leg can never show, because it forces "user" before the
       # decision is ever reached.
       - name: The installer decided SYSTEM scope for a default-path install
-        # The legacy-scoped-bus leg deliberately drives a genuine user-scope
-        # registration (a real bus + a pre-`--scope` pin), so it settles on "user";
-        # its own assertions below own that leg's contract.
-        if: matrix.leg != 'legacy-scoped-bus'
         run: |
           jq -e '.result.service.scope == "system"' install.json || {
             echo "FAIL: a default-path elevated install must request machine-wide scope"
@@ -1621,15 +1525,16 @@ jobs:
       # reason (an install-root ACL breach, a PATH-order finding) cannot satisfy them
       # by producing a coincidental `ready: false`.
       #
-      # What THIS leg exercises, precisely: the install-FAILURE path only (a bus-less
-      # host where the per-user registration cannot even be made). The complementary
-      # shape — a per-user unit that genuinely DID register on a host that HAS a session
-      # bus, for an install that needed system scope — is exercised by the
-      # `legacy-scoped-bus` leg above. That shape used to report `ready: true`, because
-      # `evaluate_readiness` gated dig-node on installed + health_ok and NOT on
-      # reboot-survival; dig_ecosystem#1984 added the scope gate to
-      # `evaluate_readiness_when`, and the `legacy-scoped-bus` leg proves the verdict
-      # now rejects it (closing #1894 item 1).
+      # What this leg does NOT prove, stated so no one mistakes its reach: it exercises
+      # the install-FAILURE path only. It does NOT exercise a registered-but-scope-
+      # inadequate unit — a per-user unit that genuinely DID register (on a host that
+      # HAS a session bus) for an install that needed system scope. That state reports
+      # `ready: true` today, because `evaluate_readiness` gates dig-node on
+      # installed + health_ok and NOT on reboot-survival/scope-adequacy
+      # (src/lib.rs `evaluate_readiness_when`). Guarding that shape needs a product
+      # readiness gate on scope, not a test change — tracked separately; earlier text
+      # here claimed "the pre-#526 code reported `ready: true`", which was never
+      # observed and is removed.
       - name: A host where the service could not register is NEVER reported ready
         if: matrix.leg == 'legacy'
         run: |
@@ -1690,10 +1595,6 @@ jobs:
       # quietly enabled linger to make its own install work, the bug would be
       # papered over rather than reported.
       - name: The install did not enable the linger workaround
-        # The legacy-scoped-bus leg enables linger ITSELF, on purpose, to construct a
-        # host with a user bus — so this "installer must not enable linger" guard does
-        # not apply there (the installer still must not, but this leg cannot prove it).
-        if: matrix.leg != 'legacy-scoped-bus'
         run: |
           systemctl is-enabled dignetwork-dig-node 2>&1 || true
           if loginctl show-user root -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
