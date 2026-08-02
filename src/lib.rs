@@ -2465,6 +2465,52 @@ fn evaluate_readiness(plan: &InstallPlan, report: &InstallReport) -> Vec<String>
     evaluate_readiness_when(plan, report, invoker::is_root())
 }
 
+/// A daemon ENGINE that a system-required install registered per-user is NOT ready
+/// (dig_ecosystem#1984).
+///
+/// # The false-ready this closes
+///
+/// `dig-installer` runs `dig-node install` as root, and a `dig-node` that predates
+/// `--scope` (or one whose system-scope registration fell back) registers a
+/// `systemd --user` unit — which is loaded only inside a login session and does NOT
+/// come back after a reboot with nobody logged in (dig_ecosystem#526). The install
+/// then reported `ready == true` because the service was RUNNING right now, and the
+/// user was sent away with a node that silently never restarts. Reboot survival is a
+/// property of the scope ([`svcscope::survives_reboot_without_login`]) and is carried
+/// on every engine result as `survives_reboot`; readiness must actually gate on it.
+///
+/// # Why the gate is `elevated && default_path`
+///
+/// * **Unelevated** — a per-user install is the best a non-root run can achieve, and
+///   the person who ran it chose it; a user-scope registration there is expected, not
+///   a defect. So an unelevated run is never failed on this.
+/// * **A caller-chosen `--bin-dir`** — an elevated install into a directory the caller
+///   picked is DELIBERATELY forced to user scope (a machine daemon pointed at a
+///   user-writable dir is the dig_ecosystem#565 user→root escalation). That downgrade
+///   is reported through `scope_note`, by design, and must not become a hard failure.
+///   `default_path` is `!plan.has_custom_bin_dir()`, so this arm excludes it.
+///
+/// The per-user `dig-app` tray AGENT is exempt by construction: it holds the user's
+/// identity, starts at LOGIN on purpose, and is never one of the engines evaluated
+/// here (it is tracked in [`InstallReport::autostart`], not the engine blocks).
+fn engine_reboot_survival_failure(
+    engine: &str,
+    installed: bool,
+    survives_reboot: bool,
+    scope_note: &str,
+    elevated: bool,
+    default_path: bool,
+) -> Option<String> {
+    if elevated && default_path && installed && !survives_reboot {
+        return Some(format!(
+            "{engine}: registered per-user, which does NOT survive a reboot with nobody logged in — \
+             an elevated, default-path install of a machine daemon must register machine-wide (system) \
+             scope so it starts on boot ({scope_note})"
+        ));
+    }
+    None
+}
+
 /// [`evaluate_readiness`] with the elevated-ness supplied instead of read from the ambient uid.
 ///
 /// The last gate in the crate to get this seam, and it needed it for the same reason as the others: the
@@ -2495,6 +2541,17 @@ fn evaluate_readiness_when(
                 s.health_note
             )),
             Some(_) => {}
+        }
+        // #1984: an elevated, default-path node registered per-user won't survive a reboot.
+        if let Some(s) = &report.service {
+            failures.extend(engine_reboot_survival_failure(
+                "dig-node",
+                s.installed,
+                s.survives_reboot,
+                &s.scope_note,
+                elevated,
+                !plan.has_custom_bin_dir(),
+            ));
         }
     }
 
@@ -2529,6 +2586,17 @@ fn evaluate_readiness_when(
                 r.note
             )),
             Some(_) => {}
+        }
+        // #1984: same reboot-survival gate as dig-node — the relay is a machine daemon too.
+        if let Some(r) = &report.relay {
+            failures.extend(engine_reboot_survival_failure(
+                "dig-relay",
+                r.installed,
+                r.survives_reboot,
+                &r.scope_note,
+                elevated,
+                !plan.has_custom_bin_dir(),
+            ));
         }
     }
 
@@ -7277,6 +7345,125 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("migration") && f.contains("dig-node")),
             "a failed migration deregister must fail readiness: {failures:?}"
+        );
+    }
+
+    /// A default-path (no `--bin-dir`) node service plan — the shape of an ordinary
+    /// `sudo dig-installer` run, so `has_custom_bin_dir()` is false and the #1984
+    /// reboot-survival gate applies. (`dig_node_service_plan` uses a fixture bin dir,
+    /// which reads as a `--bin-dir` override and is exempt from the gate by design.)
+    fn default_path_node_plan() -> InstallPlan {
+        InstallPlan {
+            bin_dir: paths::default_bin_dir(),
+            ..dig_node_service_plan()
+        }
+    }
+
+    /// A node service that INSTALLED and is RUNNING right now, but registered per-user —
+    /// exactly the healthy-looking, reboot-doomed registration dig_ecosystem#526 leaves
+    /// behind. The one field varied from [`running_service`] is the scope-survival fact:
+    /// same installed/started/health, so nothing but reboot survival can distinguish them.
+    fn user_scope_service() -> ServiceResult {
+        ServiceResult {
+            scope: svcscope::ServiceScope::User,
+            survives_reboot: false,
+            scope_note: "registered as a systemd --user unit (starts only at login)".to_string(),
+            ..running_service()
+        }
+    }
+
+    /// #1984: a system-required (elevated, default-path) dig-node whose registration is
+    /// per-user only must NOT read as ready — the service is running now but will not come
+    /// back after a reboot. The pre-fix `evaluate_readiness_when` returned no failure for
+    /// this report, because it gated on `installed` + `health_ok` and never on
+    /// `survives_reboot`; that is the false-ready this closes.
+    #[test]
+    fn readiness_fails_when_an_elevated_default_path_node_is_registered_per_user() {
+        let plan = default_path_node_plan();
+        assert!(
+            !plan.has_custom_bin_dir(),
+            "the reproducer is a DEFAULT-path install, not a --bin-dir override"
+        );
+        let mut report = report_shell();
+        report.service = Some(user_scope_service());
+
+        let failures = evaluate_readiness_when(&plan, &report, true);
+        assert!(
+            failures.iter().any(|f| f.contains("dig-node")
+                && f.contains("reboot")
+                && f.contains("system")),
+            "an elevated per-user node registration must fail readiness on reboot survival: {failures:?}"
+        );
+    }
+
+    /// The load-bearing control: the SAME elevated, default-path plan with a genuine
+    /// system-scope registration IS ready. Without this the gate above could be satisfied
+    /// by a rule that fails every install; this pins that reboot-surviving scope passes.
+    #[test]
+    fn readiness_passes_when_an_elevated_default_path_node_survives_reboot() {
+        let plan = default_path_node_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service()); // System scope, survives_reboot: true
+
+        assert!(
+            evaluate_readiness_when(&plan, &report, true).is_empty(),
+            "a system-scope registration that survives a reboot must be ready"
+        );
+    }
+
+    /// An UNELEVATED default-path install that ends up per-user is NOT failed: user scope
+    /// is the best a non-root run can achieve and the person who ran it chose it. This is
+    /// the arm that keeps the gate from refusing every ordinary per-user install.
+    #[test]
+    fn readiness_does_not_fail_an_unelevated_per_user_node() {
+        let plan = default_path_node_plan();
+        let mut report = report_shell();
+        report.service = Some(user_scope_service());
+
+        assert!(
+            evaluate_readiness_when(&plan, &report, false).is_empty(),
+            "an unelevated per-user registration is expected, not a defect"
+        );
+    }
+
+    /// The per-user `dig-app` tray agent is exempt by construction: it is login-gated by
+    /// design and is tracked in `autostart`, never in the engine service blocks. An
+    /// elevated install whose ONLY per-user, reboot-non-surviving registration is the agent
+    /// (no engine selected) must stay ready — the gate must not reach past the daemons.
+    #[test]
+    fn readiness_ignores_the_per_user_dig_app_agent() {
+        let plan = InstallPlan {
+            bin_dir: paths::default_bin_dir(),
+            with_dig_node: false,
+            with_dig_app: true,
+            dig_app_autostart: true,
+            dry_run: false,
+            ..InstallPlan::default()
+        };
+        let report = report_shell(); // no engine service; autostart is not an engine block
+        assert!(
+            evaluate_readiness_when(&plan, &report, true)
+                .iter()
+                .all(|f| !f.contains("reboot")),
+            "the login-gated tray agent must never trip the daemon reboot-survival gate"
+        );
+    }
+
+    /// A caller-chosen `--bin-dir` is the deliberate #565 downgrade to user scope (a
+    /// machine daemon in a user-writable dir would be an escalation), reported via
+    /// `scope_note`, not a hard failure. The gate must exempt it — otherwise the two
+    /// distinct policies (#526 defect vs #565 intentional downgrade) would collapse.
+    #[test]
+    fn readiness_exempts_a_custom_bin_dir_from_the_reboot_survival_gate() {
+        let plan = dig_node_service_plan(); // fixture bin dir => has_custom_bin_dir()
+        assert!(plan.has_custom_bin_dir());
+        let mut report = report_shell();
+        report.service = Some(user_scope_service());
+        assert!(
+            evaluate_readiness_when(&plan, &report, true)
+                .iter()
+                .all(|f| !f.contains("reboot")),
+            "a --bin-dir install's intentional user-scope downgrade must not be a readiness failure"
         );
     }
 

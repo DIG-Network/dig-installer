@@ -1638,6 +1638,24 @@ component installed AND its service is verified RUNNING**. The CLI prints `✓ D
 `install://error` (never `install://done`) when not ready. A `--dry-run` installs nothing, so it is
 trivially `ready`.
 
+**Reboot survival gates readiness for a system-required daemon engine (#1984).** A machine DAEMON
+engine (`dig-node`, `dig-relay`) registered on an **elevated, default-path** install MUST be
+registered at machine-wide (system) scope so it starts on boot with nobody logged in; a per-user
+registration on such an install (the #526 defect — `dig-node`'s pre-`--scope` `install` preferred a
+`systemd --user` unit, which is loaded only inside a login session) is **NOT ready**, with a failure
+naming the scope/reboot-survival inadequacy — never `ready: true`. Concretely: for `dig-node`/
+`dig-relay`, when the run is elevated AND `!has_custom_bin_dir()` AND the service `installed` but its
+`survives_reboot` is false, `evaluate_readiness_when` emits a failure. This closes the false-ready in
+which a service running RIGHT NOW (so `health_ok`) but doomed at the next reboot was reported ready.
+Three cases are deliberately EXEMPT: (a) an **unelevated** install — a per-user registration is the
+best a non-root run can achieve and the person who ran it chose it; (b) a **caller-chosen
+`--bin-dir`** — an elevated machine daemon pointed at a user-writable dir is the #565 user→root
+escalation, so it is intentionally forced to user scope and reported via `scope_note`, not failed;
+(c) the per-user **`dig-app` tray agent** — login-gated by design, tracked in `autostart` (§1.5),
+never an engine block. `dig-dns` is not gated here because its install refuses without elevation and
+always registers into `/etc/systemd/system` (`multi-user.target`), so it can never be the
+registered-but-user-scope shape.
+
 **Restart-required (#562).** `InstallReport` also carries `restart_required: bool`, set true when
 ANY component's write was reboot-deferred (its running binary was locked, so the new version is
 staged for the next reboot). It is set from EVERY component site (digstore, digs, dign, dig-node,
