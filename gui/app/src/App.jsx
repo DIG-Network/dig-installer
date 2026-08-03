@@ -223,17 +223,19 @@ export function App() {
             setLines((prev) => [...prev, p.line]);
             // #562: the CLI emits a "RESTART REQUIRED" verdict when a running
             // binary's update was staged for a reboot. Surface it on Finish so a
-            // reboot-deferred install never reads as fully done.
-            if (/RESTART REQUIRED/i.test(p.line)) setRestartRequired(true);
+            // reboot-deferred install never reads as fully done. `p.line` is now a
+            // segment array — join its text before matching.
+            const lineText = Array.isArray(p.line)
+              ? p.line.map((s) => s.text).join("")
+              : String(p.line);
+            if (/RESTART REQUIRED/i.test(lineText)) setRestartRequired(true);
           }
         },
         onError: (err) => {
           if (token !== installToken.current) return;
-          setError({ title: "Installation failed", message: err.message || String(err) });
-          setLines((prev) => [
-            ...prev,
-            `<span class="err">✗ ${escapeHtml(err.message || String(err))}</span>`,
-          ]);
+          const message = err.message || String(err);
+          setError({ title: "Installation failed", message });
+          setLines((prev) => [...prev, [{ text: `✗ ${message}`, cls: "err" }]]);
         },
         onDone: () => {
           if (token !== installToken.current) return;
@@ -428,17 +430,14 @@ export function App() {
   );
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
 // "View log": in Tauri we could open a temp file; for now dump the rendered
 // log lines into a new window/blob so the user can read/copy the full trace.
+// Each line is an array of `{text, cls}` segments (#2040) — join the segment
+// text to reconstruct the plain-text log.
 function openLog(lines) {
-  const text = lines.map((l) => l.replace(/<[^>]+>/g, "")).join("\n");
+  const text = lines
+    .map((segs) => (Array.isArray(segs) ? segs.map((s) => s.text).join("") : String(segs)))
+    .join("\n");
   if (isTauri()) {
     // best-effort: copy to clipboard so it's recoverable everywhere
     copyText(text);

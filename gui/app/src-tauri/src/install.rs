@@ -2,8 +2,9 @@
 //!
 //! Replaces the prototype's timed animation with actual filesystem work, driven
 //! from the bundled artifact (no network download on first install). Each phase
-//! emits a `install://progress` event (pct / nowFile / styled log line). On
-//! failure it emits `install://error`; on success, `install://done`.
+//! emits a `install://progress` event (pct / nowFile / a log line as ordered
+//! style segments — never HTML, #2040). On failure it emits `install://error`;
+//! on success, `install://done`.
 //!
 //! Phases (mirrors README → "Real install pipeline"):
 //!   1. Resolve target for OS/arch.
@@ -80,14 +81,41 @@ pub struct InstallOpts {
     pub selected_browsers: Vec<String>,
 }
 
+/// One styled span of a progress log line (#2040): `text` is rendered by the
+/// frontend as an escaped React text child (never HTML), and the optional `cls`
+/// (`ok`/`ac`/`dim`/`err`/`warn`) is applied as a React-safe `className`. Splitting
+/// each line into ordered segments removes the HTML-string channel entirely, so an
+/// untrusted install path / OS error / browser name can never inject markup.
+#[derive(Debug, Serialize, Clone)]
+pub struct Segment {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cls: Option<String>,
+}
+impl Segment {
+    fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            cls: None,
+        }
+    }
+    fn styled(cls: &str, s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            cls: Some(cls.into()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct Progress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "nowFile")]
     pub now_file: Option<String>,
+    /// The log line as ordered style segments (#2040) — never an HTML string.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub line: Option<String>,
+    pub line: Option<Vec<Segment>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -149,14 +177,26 @@ fn bundled_bin(app: &AppHandle) -> Result<PathBuf, String> {
     ))
 }
 
-fn emit_line(app: &AppHandle, line: impl Into<String>) {
+/// Emit one progress log line as ordered style segments (#2040) — the frontend
+/// renders each segment's `text` as escaped React text, so no HTML channel exists.
+fn emit_line(app: &AppHandle, segments: Vec<Segment>) {
     let _ = app.emit(
         "install://progress",
         Progress {
-            line: Some(line.into()),
+            line: Some(segments),
             ..Default::default()
         },
     );
+}
+/// Convenience for a single unstyled text line (e.g. the library's plain-text
+/// `run_report` callback, which emits no styling).
+fn emit_text(app: &AppHandle, line: impl Into<String>) {
+    emit_line(app, vec![Segment::text(line)]);
+}
+/// Concatenate a line's segment text into the plain string the root-child log
+/// (`println!`) and any text-only consumer needs.
+fn segments_plain(segs: &[Segment]) -> String {
+    segs.iter().map(|s| s.text.as_str()).collect()
 }
 fn emit_pct(app: &AppHandle, pct: f64, now_file: Option<&str>) {
     let _ = app.emit(
@@ -379,16 +419,19 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     let os = std::env::consts::OS;
     emit_line(
         app,
-        format!(
-            r#"<span class="dim">$</span> dig-installer --target {}"#,
-            opts.install_path
-        ),
+        vec![
+            Segment::styled("dim", "$"),
+            Segment::text(format!(" dig-installer --target {}", opts.install_path)),
+        ],
     );
     emit_line(
         app,
-        format!(
-            r#"Resolving release <span class="ac">v1.0.0</span> · compiler 1.0.0 · module format 1 <span class="dim">({os}/{arch})</span>"#
-        ),
+        vec![
+            Segment::text("Resolving release "),
+            Segment::styled("ac", "v1.0.0"),
+            Segment::text(" · compiler 1.0.0 · module format 1 "),
+            Segment::styled("dim", format!("({os}/{arch})")),
+        ],
     );
 
     let (payload, expected_sha) = digstore_payload(app)?;
@@ -417,20 +460,22 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         Some(_) => {
             emit_line(
                 app,
-                format!(
-                    r#"<span class="ok">✓</span> Verified package checksum (SHA-256) <span class="dim">({}…)</span>"#,
-                    &digest[..12]
-                ),
+                vec![
+                    Segment::styled("ok", "✓"),
+                    Segment::text(" Verified package checksum (SHA-256) "),
+                    Segment::styled("dim", format!("({}…)", &digest[..12])),
+                ],
             );
         }
         None => {
             // No expected digest available — surface honestly rather than faking a pass.
             emit_line(
                 app,
-                format!(
-                    r#"<span class="warn">!</span> No checksum manifest; recorded digest <span class="dim">{}…</span>"#,
-                    &digest[..12]
-                ),
+                vec![
+                    Segment::styled("warn", "!"),
+                    Segment::text(" No checksum manifest; recorded digest "),
+                    Segment::styled("dim", format!("{}…", &digest[..12])),
+                ],
             );
         }
     }
@@ -451,10 +496,11 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     }
     emit_line(
         app,
-        format!(
-            r#"Unpacking <span class="ac">DigStore CLI</span> → {}"#,
-            bin_dir.display()
-        ),
+        vec![
+            Segment::text("Unpacking "),
+            Segment::styled("ac", "DigStore CLI"),
+            Segment::text(format!(" → {}", bin_dir.display())),
+        ],
     );
 
     if *opts.selected.get("host").unwrap_or(&true) {
@@ -469,15 +515,27 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         );
         emit_line(
             app,
-            r#"Unpacking <span class="ac">Host Runtime</span> <span class="dim">(64 KiB → 16 MiB memory bounds)</span>"#,
+            vec![
+                Segment::text("Unpacking "),
+                Segment::styled("ac", "Host Runtime"),
+                Segment::text(" "),
+                Segment::styled("dim", "(64 KiB → 16 MiB memory bounds)"),
+            ],
         );
         emit_line(
             app,
-            r#"Embedding trusted host keys <span class="dim">dig-host-key-v1:…</span>"#,
+            vec![
+                Segment::text("Embedding trusted host keys "),
+                Segment::styled("dim", "dig-host-key-v1:…"),
+            ],
         );
         emit_line(
             app,
-            r#"<span class="ok">✓</span> Content-defined chunking ready <span class="dim">(16/64/256 KiB)</span>"#,
+            vec![
+                Segment::styled("ok", "✓"),
+                Segment::text(" Content-defined chunking ready "),
+                Segment::styled("dim", "(16/64/256 KiB)"),
+            ],
         );
     }
 
@@ -497,7 +555,10 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         }
         emit_line(
             app,
-            r#"Installing shell completions <span class="dim">bash · zsh · fish</span>"#,
+            vec![
+                Segment::text("Installing shell completions "),
+                Segment::styled("dim", "bash · zsh · fish"),
+            ],
         );
     }
     if *opts.selected.get("example").unwrap_or(&false) {
@@ -510,7 +571,12 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         );
         emit_line(
             app,
-            r#"Unpacking <span class="ac">Example store</span> <span class="dim">(urn:dig:…)</span>"#,
+            vec![
+                Segment::text("Unpacking "),
+                Segment::styled("ac", "Example store"),
+                Segment::text(" "),
+                Segment::styled("dim", "(urn:dig:…)"),
+            ],
         );
     }
 
@@ -521,7 +587,11 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
             Ok(note) => {
                 emit_line(
                     app,
-                    format!(r#"Linking <span class="ac">digstore</span> → {note}"#),
+                    vec![
+                        Segment::text("Linking "),
+                        Segment::styled("ac", "digstore"),
+                        Segment::text(format!(" → {note}")),
+                    ],
                 );
             }
             Err(e) => {
@@ -529,9 +599,11 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
                 // as a warning, not a hard error.
                 emit_line(
                     app,
-                    format!(
-                        r#"<span class="warn">!</span> Could not update PATH automatically <span class="dim">({e})</span>"#
-                    ),
+                    vec![
+                        Segment::styled("warn", "!"),
+                        Segment::text(" Could not update PATH automatically "),
+                        Segment::styled("dim", format!("({e})")),
+                    ],
                 );
             }
         }
@@ -542,15 +614,20 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
     match register_dig_association(&install_dir) {
         Ok(note) => emit_line(
             app,
-            format!(
-                r#"Registering <span class="ac">.dig</span> file icon <span class="dim">({note})</span>"#
-            ),
+            vec![
+                Segment::text("Registering "),
+                Segment::styled("ac", ".dig"),
+                Segment::text(" file icon "),
+                Segment::styled("dim", format!("({note})")),
+            ],
         ),
         Err(e) => emit_line(
             app,
-            format!(
-                r#"<span class="warn">!</span> Skipped .dig icon <span class="dim">({e})</span>"#
-            ),
+            vec![
+                Segment::styled("warn", "!"),
+                Segment::text(" Skipped .dig icon "),
+                Segment::styled("dim", format!("({e})")),
+            ],
         ),
     }
 
@@ -604,21 +681,31 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
         emit_line(
             app,
-            format!(
-                r#"<span class="ok">✓</span> Verifying install · <span class="ac">{}</span>"#,
-                if ver.is_empty() {
-                    "digstore --version".into()
-                } else {
-                    ver
-                }
-            ),
+            vec![
+                Segment::styled("ok", "✓"),
+                Segment::text(" Verifying install · "),
+                Segment::styled(
+                    "ac",
+                    if ver.is_empty() {
+                        "digstore --version".to_string()
+                    } else {
+                        ver
+                    },
+                ),
+            ],
         );
     } else {
         // Elevated + a user-writable CLI: verification is deferred, NOT run here,
         // so no privileged process execs a user-writable binary (#635 item 2).
         emit_line(
             app,
-            r#"<span class="dim">·</span> Deferring <span class="ac">digstore --version</span> to the unprivileged step <span class="dim">(no elevated exec of a user-writable binary)</span>"#,
+            vec![
+                Segment::styled("dim", "·"),
+                Segment::text(" Deferring "),
+                Segment::styled("ac", "digstore --version"),
+                Segment::text(" to the unprivileged step "),
+                Segment::styled("dim", "(no elevated exec of a user-writable binary)"),
+            ],
         );
     }
 
@@ -649,10 +736,7 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
         || wants_extension_forcelist(&opts)
     {
         emit_pct(app, 94.0, Some("additional components"));
-        emit_line(
-            app,
-            "Installing the other selected DIG components:".to_string(),
-        );
+        emit_text(app, "Installing the other selected DIG components:");
         // The privileged orchestration runs EITHER in-process (already root, or
         // Windows) OR — on unelevated Linux (#638) — as a one-shot `pkexec` root
         // relaunch of this executable. Both funnel through the SAME tested
@@ -705,14 +789,17 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
             if handled_in_child {
                 emit_line(
                     app,
-                    format!(
-                        r#"<span class="ok">✓</span> DIG extension force-installed in the elevated step for {} browser(s): {}"#,
-                        opts.selected_browsers.len(),
-                        opts.selected_browsers.join(", ")
-                    ),
+                    vec![
+                        Segment::styled("ok", "✓"),
+                        Segment::text(format!(
+                            " DIG extension force-installed in the elevated step for {} browser(s): {}",
+                            opts.selected_browsers.len(),
+                            opts.selected_browsers.join(", ")
+                        )),
+                    ],
                 );
             } else if let Err(msg) =
-                configure_extension_forcelist_step(&opts, &mut |line| emit_line(app, line))
+                configure_extension_forcelist_step(&opts, &mut |segs| emit_line(app, segs))
             {
                 let _ = app.emit(
                     "install://error",
@@ -727,7 +814,10 @@ pub fn run(app: &AppHandle, opts: InstallOpts) -> Result<(), String> {
 
     // Every selected component installed AND its service is verified RUNNING.
     emit_pct(app, 100.0, Some("done"));
-    emit_line(app, r#"<span class="ok">✓</span> DIG is ready."#);
+    emit_line(
+        app,
+        vec![Segment::styled("ok", "✓"), Segment::text(" DIG is ready.")],
+    );
 
     let _ = app.emit("install://done", ());
     Ok(())
@@ -844,7 +934,7 @@ fn wants_extension_forcelist(opts: &InstallOpts) -> bool {
 /// silently-failed force-install.
 fn configure_extension_forcelist_step(
     opts: &InstallOpts,
-    emit: &mut dyn FnMut(String),
+    emit: &mut dyn FnMut(Vec<Segment>),
 ) -> Result<(), String> {
     use dig_installer::forcelist::Channel;
 
@@ -852,10 +942,14 @@ fn configure_extension_forcelist_step(
         return Ok(());
     }
 
-    emit(format!(
-        r#"<span class="dim">·</span> Force-installing the DIG extension into {} browser(s) <span class="dim">(enterprise managed policy)</span>"#,
-        opts.selected_browsers.len()
-    ));
+    emit(vec![
+        Segment::styled("dim", "·"),
+        Segment::text(format!(
+            " Force-installing the DIG extension into {} browser(s) ",
+            opts.selected_browsers.len()
+        )),
+        Segment::styled("dim", "(enterprise managed policy)"),
+    ]);
 
     let outcomes =
         dig_installer::configure_extension_forcelist(&opts.selected_browsers, Channel::Stable);
@@ -877,7 +971,7 @@ fn configure_extension_forcelist_step(
 /// force-install did not land.
 fn summarize_forcelist_outcomes(
     outcomes: &[dig_installer::forcelist::ForcelistOutcome],
-) -> (Vec<String>, Result<(), String>) {
+) -> (Vec<Vec<Segment>>, Result<(), String>) {
     use dig_installer::forcelist::ForcelistAction;
 
     let mut lines = Vec::with_capacity(outcomes.len());
@@ -895,16 +989,16 @@ fn summarize_forcelist_outcomes(
             ForcelistAction::Removed => ("ok", "removed"),
             ForcelistAction::NothingToRemove => ("dim", "nothing to remove"),
         };
-        let note = if o.note.is_empty() {
-            String::new()
-        } else {
-            format!(r#" <span class="dim">({})</span>"#, o.note)
-        };
-        lines.push(format!(
-            r#"<span class="{mark}">{sym}</span> {verb}: {loc}{note}"#,
-            sym = if mark == "err" { "✗" } else { "✓" },
-            loc = o.location,
-        ));
+        let sym = if mark == "err" { "✗" } else { "✓" };
+        let mut segs = vec![
+            Segment::styled(mark, sym),
+            Segment::text(format!(" {verb}: {}", o.location)),
+        ];
+        if !o.note.is_empty() {
+            segs.push(Segment::text(" "));
+            segs.push(Segment::styled("dim", format!("({})", o.note)));
+        }
+        lines.push(segs);
         if o.action == ForcelistAction::Failed {
             failures.push(format!("{} ({})", o.location, o.note));
         }
@@ -933,7 +1027,7 @@ fn run_report_in_process(
 ) -> Result<(), String> {
     // Fail-loud (#493): a completed-but-not-ready report (a selected component
     // didn't install or its service isn't RUNNING) is a FAILURE — never "ready".
-    match dig_installer::run_report(extra_plan, &mut |line| emit_line(app, line)) {
+    match dig_installer::run_report(extra_plan, &mut |line| emit_text(app, line)) {
         Ok(report) if !report.ready => Err(format!(
             "DIG is NOT ready — {} component(s) failed: {}. Re-run elevated \
              (Administrator/root) if elevation is the cause.",
@@ -981,7 +1075,11 @@ fn run_privileged_via_pkexec(app: &AppHandle, opts: &InstallOpts) -> Result<(), 
 
     emit_line(
         app,
-        r#"<span class="dim">·</span> Requesting administrator authorization <span class="dim">(pkexec)</span>"#,
+        vec![
+            Segment::styled("dim", "·"),
+            Segment::text(" Requesting administrator authorization "),
+            Segment::styled("dim", "(pkexec)"),
+        ],
     );
 
     match dig_installer::elevation::relaunch_elevated(&exe, &plan_json) {
@@ -1038,7 +1136,9 @@ pub fn run_elevated_privileged_install_from_stdin() -> Result<(), String> {
         // succeed; a Failed forcelist write fails the whole privileged step (a
         // non-zero exit the parent surfaces), so the install never reports "ready"
         // while a force-install silently failed.
-        Ok(_) => configure_extension_forcelist_step(&opts, &mut |line| println!("{line}")),
+        Ok(_) => configure_extension_forcelist_step(&opts, &mut |segs| {
+            println!("{}", segments_plain(&segs))
+        }),
         Err(e) => Err(format!("privileged install failed: {e}")),
     }
 }
@@ -1079,7 +1179,11 @@ fn run_privileged_via_osascript(app: &AppHandle, opts: &InstallOpts) -> Result<(
 
     emit_line(
         app,
-        r#"<span class="dim">·</span> Requesting administrator authorization <span class="dim">(osascript)</span>"#,
+        vec![
+            Segment::styled("dim", "·"),
+            Segment::text(" Requesting administrator authorization "),
+            Segment::styled("dim", "(osascript)"),
+        ],
     );
 
     match dig_installer::elevation::relaunch_elevated_macos(&current, &plan_json) {
@@ -1143,7 +1247,9 @@ pub fn run_elevated_privileged_install_from_file(plan_path: &Path) -> Result<(),
         // policy write into `/Library/Managed Preferences`, so it belongs to THIS
         // root child — never the unelevated GUI parent. A Failed forcelist write
         // fails the whole privileged step (a non-zero exit the parent surfaces).
-        Ok(_) => configure_extension_forcelist_step(&opts, &mut |line| println!("{line}")),
+        Ok(_) => configure_extension_forcelist_step(&opts, &mut |segs| {
+            println!("{}", segments_plain(&segs))
+        }),
         Err(e) => Err(format!("privileged install failed: {e}")),
     }
 }
