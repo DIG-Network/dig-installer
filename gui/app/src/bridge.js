@@ -258,17 +258,17 @@ export async function cancelInstall() {
 
 /* ---- browser-only simulation (parity with the prototype timings) ---- */
 const SIM_LOG = [
-  { t: 240, html: '<span class="dim">$</span> dig-installer --target {PATH}' },
-  { t: 520, html: 'Resolving release <span class="ac">v1.0.0</span> · compiler 1.0.0 · module format 1' },
-  { t: 900, html: '<span class="ok">✓</span> Verified package checksum <span class="dim">(SHA-256 manifest)</span>' },
-  { t: 1300, html: 'Unpacking <span class="ac">DigStore CLI</span> → {PATH}/bin' },
-  { t: 1750, html: 'Unpacking <span class="ac">Host Runtime</span> <span class="dim">(64 KiB → 16 MiB memory bounds)</span>' },
-  { t: 2200, html: 'Embedding trusted host keys <span class="dim">dig-host-key-v1:…</span>' },
-  { t: 2650, html: '<span class="ok">✓</span> Content-defined chunking ready <span class="dim">(16/64/256 KiB)</span>' },
-  { t: 3050, html: 'Linking <span class="ac">digstore</span> → PATH' },
-  { t: 3450, html: 'Installing shell completions <span class="dim">bash · zsh · fish</span>' },
-  { t: 3850, html: '<span class="ok">✓</span> Verifying install · digstore --version' },
-  { t: 4150, html: '<span class="ok">✓</span> DIG is ready.' },
+  { t: 240, segs: [{ text: "$", cls: "dim" }, { text: " dig-installer --target {PATH}" }] },
+  { t: 520, segs: [{ text: "Resolving release " }, { text: "v1.0.0", cls: "ac" }, { text: " · compiler 1.0.0 · module format 1" }] },
+  { t: 900, segs: [{ text: "✓", cls: "ok" }, { text: " Verified package checksum " }, { text: "(SHA-256 manifest)", cls: "dim" }] },
+  { t: 1300, segs: [{ text: "Unpacking " }, { text: "DigStore CLI", cls: "ac" }, { text: " → {PATH}/bin" }] },
+  { t: 1750, segs: [{ text: "Unpacking " }, { text: "Host Runtime", cls: "ac" }, { text: " " }, { text: "(64 KiB → 16 MiB memory bounds)", cls: "dim" }] },
+  { t: 2200, segs: [{ text: "Embedding trusted host keys " }, { text: "dig-host-key-v1:…", cls: "dim" }] },
+  { t: 2650, segs: [{ text: "✓", cls: "ok" }, { text: " Content-defined chunking ready " }, { text: "(16/64/256 KiB)", cls: "dim" }] },
+  { t: 3050, segs: [{ text: "Linking " }, { text: "digstore", cls: "ac" }, { text: " → PATH" }] },
+  { t: 3450, segs: [{ text: "Installing shell completions " }, { text: "bash · zsh · fish", cls: "dim" }] },
+  { t: 3850, segs: [{ text: "✓", cls: "ok" }, { text: " Verifying install · digstore --version" }] },
+  { t: 4150, segs: [{ text: "✓", cls: "ok" }, { text: " DIG is ready." }] },
 ];
 const SIM_FILES = ["bin/digstore", "lib/dig_host.wasm", "lib/compiler.wasm", "share/completions/_digstore", "trusted/host-keys.toml", "examples/hello.wasm"];
 
@@ -276,7 +276,10 @@ function simulateInstall(opts, { onProgress, onDone }) {
   return new Promise((resolve) => {
     const path = opts.installPath || "/usr/local/digstore";
     const timers = SIM_LOG.map((ev) =>
-      setTimeout(() => onProgress({ line: ev.html.replaceAll("{PATH}", path) }), ev.t)
+      setTimeout(
+        () => onProgress({ line: ev.segs.map((s) => ({ ...s, text: s.text.replaceAll("{PATH}", path) })) }),
+        ev.t,
+      )
     );
     const start = performance.now();
     const dur = 4150;

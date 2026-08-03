@@ -2,10 +2,13 @@ import { useEffect, useRef } from "react";
 import { useIntl } from "react-intl";
 import { Ic } from "../icons.jsx";
 
-// `lines` are HTML strings emitted by the Rust pipeline (with .ok/.ac/.dim/.err
-// spans). The terminal auto-scrolls as lines append. On error, the progress
-// fill tints red, the caret stops, and an error banner appears (new — the
-// prototype has no error state). Copy is externalized to react-intl (#654).
+// `lines` are ordered arrays of `{text, cls}` segments emitted by the Rust
+// pipeline. Each segment renders as an escaped React text child (never HTML —
+// #2040), with `cls` (ok/ac/dim/err/warn) applied as a React-safe className, so
+// an untrusted path/error/browser-name in `text` can never inject markup. The
+// terminal auto-scrolls as lines append. On error, the progress fill tints red,
+// the caret stops, and an error banner appears (new — the prototype has no error
+// state). Copy is externalized to react-intl (#654).
 export function Installing({ pct, lines, nowFile, error }) {
   const intl = useIntl();
   const termRef = useRef(null);
@@ -42,8 +45,12 @@ export function Installing({ pct, lines, nowFile, error }) {
           <div className={"fill" + (error ? " err" : "")} style={{ width: pct + "%" }}></div>
         </div>
         <div className="term" ref={termRef}>
-          {lines.map((l, i) => (
-            <div className="ln" key={i} dangerouslySetInnerHTML={{ __html: l }} />
+          {lines.map((segs, i) => (
+            <div className="ln" key={i}>
+              {segs.map((s, j) => (
+                <span key={j} className={s.cls || undefined}>{s.text}</span>
+              ))}
+            </div>
           ))}
           {!done && !error && (
             <div className="ln caret-line">
