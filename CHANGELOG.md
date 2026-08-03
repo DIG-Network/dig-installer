@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.40.0] - 2026-08-03
+
+### Features
+- **gui:** Reframe the installer identity as the whole DIG Network, not the dig CLI (#56)- **readiness:** Gate a system-required daemon engine on reboot survival (#58)
+
+### Bug Fixes
+- **install:** Restore overwritten binaries on rollback, never delete them (#55)
+
+### Testing
+- **e2e:** Make the system-scope not-ready guard load-bearing on its reason (#57)
+
 ## [0.37.0] - 2026-08-01
 
 ### Features
