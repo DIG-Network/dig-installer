@@ -678,20 +678,25 @@ the install reports NOT ready (`MigrationResult::deregister_failures`), never a 
 tolerated re-install that could leave the service at the legacy binPath. Recorded in
 `InstallReport.migration`.
 
+**The beacon is registered and deregistered SYSTEM-scope ONLY (`regaudit`).** dig-updater installs
+the beacon system-scope on every OS (Linux writes `/etc/systemd/system` under elevation with no
+`systemctl --user`; Windows a SYSTEM Scheduled Task; macOS a `/Library/LaunchDaemons` root daemon),
+so a `--user`-scope `dig-updater` unit is NEVER a DIG registration. Every beacon query and removal
+therefore uses the machine scope only and MUST NOT query or touch the `--user` scope: doing so both
+performed root-adjacent file operations inside a user-owned directory AND handed an unprivileged local
+account a denial primitive — a planted, still-loaded `--user`-scope `dig-updater.timer` made the
+(fatal) deregister post-check fail, turning a blameless upgrade into a fatal migration failure.
+
 **The Linux beacon unit-file removal is BOUNDED (`regaudit::plan_unit_file_removal`).** The path
 removed is the one systemd itself names (`systemctl show -p FragmentPath <unit>`), and it MUST be
 vetted before anything is unlinked: absolute, no `.`/`..`/empty component, named EXACTLY for the unit
-being deregistered, a `.service` or `.timer`, and its parent one of the allowed unit directories —
-`/etc/systemd/system` and `/run/systemd/system` for the SYSTEM scope, the invoking account's own
-`~/.config/systemd/user`, `~/.local/share/systemd/user`, `$XDG_CONFIG_HOME/systemd/user` and
-`/run/user/<uid>/systemd/user` for the `--user` scope. A package-owned directory
-(`/usr/lib/systemd/system`, `/lib/systemd/system`) is REFUSED, never unlinked: removing a
+being deregistered, a `.service` or `.timer`, and its parent one of the SYSTEM unit directories —
+`/etc/systemd/system` or `/run/systemd/system`, both root-owned. A path under a user tree (e.g.
+`~/.config/systemd/user`) is therefore REFUSED, never unlinked with root's authority. A package-owned
+directory (`/usr/lib/systemd/system`, `/lib/systemd/system`) is REFUSED, never unlinked: removing a
 package-owned unit leaves the package database inconsistent and `apt install --reinstall` would
-silently restore the schedule. A `--user`-scope unit file MUST NOT be unlinked with root's authority
-— under elevation the removal is dropped to the invoking account (`su - <user> -c rm`), because
-`sudo -E` propagates `XDG_CONFIG_HOME` and a root `systemctl --user` therefore reads units from a
-directory that account controls. Every refusal MUST be reported (it is folded into the fatal
-deregister verdict), never silent.
+silently restore the schedule. Every refusal MUST be reported (it is folded into the fatal deregister
+verdict), never silent.
 
 A run that does NOT select the auto-update beacon MUST NOT install or register it: declining the
 beacon means "install nothing". The #565 migration nevertheless vacates a beacon schedule that

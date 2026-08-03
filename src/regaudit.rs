@@ -513,6 +513,20 @@ fn service_bin_path(id: &str) -> Option<String> {
     }
 }
 
+/// The systemctl scopes a beacon query/removal iterates on Linux: the machine scope
+/// ONLY. dig-updater installs the beacon system-scope on every OS (Linux writes
+/// `/etc/systemd/system` under `require_elevated()`, never `systemctl --user`; Windows a
+/// SYSTEM Scheduled Task; macOS a `/Library/LaunchDaemons` root daemon), so a user-scope
+/// `dig-updater` unit is NEVER ours (#1873). Querying the user scope both performed
+/// root-adjacent file ops inside a user-owned directory AND handed an unprivileged local
+/// account a denial primitive: a planted, still-loaded `--user`-scope `dig-updater.timer`
+/// made the deregister post-check fail, and a deregister failure is fatal (#565 H2a), so a
+/// blameless upgrade became a fatal migration failure.
+#[cfg(any(target_os = "linux", test))]
+fn beacon_systemctl_scopes() -> [Vec<&'static str>; 1] {
+    [vec![]]
+}
+
 /// Read the beacon scheduled-task/timer/LaunchDaemon's configured binary path.
 /// `None` off-host or when the beacon is not registered / unreadable.
 fn beacon_bin_path() -> Option<String> {
@@ -524,8 +538,8 @@ fn beacon_bin_path() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let unit = format!("{BEACON_SYSTEMD_UNIT}.service");
-        for scope in [vec!["--user"], vec![]] {
-            let mut args: Vec<String> = scope.into_iter().map(String::from).collect();
+        for scope in beacon_systemctl_scopes() {
+            let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
             args.extend(["show".into(), "-p".into(), "ExecStart".into(), unit.clone()]);
             if let Some(out) = spawn("systemctl", &args) {
                 if let Some(p) = parse_systemctl_execstart_path(&out) {
@@ -568,8 +582,8 @@ fn beacon_is_registered() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        for scope in [vec!["--user"], vec![]] {
-            let mut args: Vec<String> = scope.into_iter().map(String::from).collect();
+        for scope in beacon_systemctl_scopes() {
+            let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
             args.extend([
                 "show".into(),
                 "-p".into(),
@@ -603,8 +617,9 @@ fn beacon_is_registered() -> bool {
 
 /// Deregister the beacon's daily scheduler artifact by the built-in scheduler
 /// tool — Windows `schtasks /Delete`, Linux `systemctl disable --now
-/// <unit>.timer` (both scopes) plus removal of the unit FILE systemd names, macOS
-/// `launchctl bootout` + plist removal. Never executes dig-updater (#565).
+/// <unit>.timer` (SYSTEM scope only — the beacon is never user-scope, #1873) plus
+/// removal of the unit FILE systemd names, macOS `launchctl bootout` + plist
+/// removal. Never executes dig-updater (#565).
 /// `Ok(())` when the beacon is no longer registered; a refusal to remove a
 /// unit file that failed vetting is folded into the error so the (fatal) verdict
 /// explains itself.
@@ -613,9 +628,8 @@ fn deregister_beacon() -> Result<(), String> {
         return Ok(());
     }
     // Every unit-file removal this deregister REFUSED (a path that failed vetting, a
-    // vendor-owned unit, a user-scope removal that could not drop privilege). Kept so the
-    // fatal post-check below can say WHY the beacon is still registered instead of
-    // reporting a bare "still registered".
+    // vendor-owned unit). Kept so the fatal post-check below can say WHY the beacon is
+    // still registered instead of reporting a bare "still registered".
     #[allow(unused_mut)]
     let mut notes: Vec<String> = Vec::new();
     #[cfg(windows)]
@@ -624,29 +638,30 @@ fn deregister_beacon() -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        for scope in [vec!["--user"], vec![]] {
-            for unit in [
-                format!("{BEACON_SYSTEMD_UNIT}.timer"),
-                format!("{BEACON_SYSTEMD_UNIT}.service"),
-            ] {
-                let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
-                args.extend(["disable".into(), "--now".into(), unit.clone()]);
-                let _ = spawn("systemctl", &args);
-                // `disable` only un-links the enablement symlinks — the unit FILE stays
-                // on disk, so systemd keeps reporting `LoadState=loaded` and the beacon
-                // reads as still registered. Without removing the file the deregister
-                // could NEVER succeed on Linux and the (fatal) #565 migration failed
-                // every upgrade off a legacy root. Mirrors the macOS branch below, which
-                // has always removed its plist.
-                if let Some(note) = remove_systemd_unit_file(&scope, &unit) {
-                    eprintln!("    ! {note}");
-                    notes.push(note);
-                }
+        // The beacon is installed SYSTEM-scope only (#1873): a `--user`-scope
+        // `dig-updater` unit is never ours, so it is neither disabled nor removed.
+        // Treating one as ours previously handed an unprivileged local account a denial
+        // primitive — a planted, still-loaded user-scope timer made this (fatal, #565 H2a)
+        // deregister fail on a blameless upgrade.
+        for unit in [
+            format!("{BEACON_SYSTEMD_UNIT}.timer"),
+            format!("{BEACON_SYSTEMD_UNIT}.service"),
+        ] {
+            let _ = spawn(
+                "systemctl",
+                &["disable".into(), "--now".into(), unit.clone()],
+            );
+            // `disable` only un-links the enablement symlinks — the unit FILE stays on
+            // disk, so systemd keeps reporting `LoadState=loaded` and the beacon reads as
+            // still registered. Without removing the file the deregister could NEVER
+            // succeed on Linux and the (fatal) #565 migration failed every upgrade off a
+            // legacy root. Mirrors the macOS branch below, which has always removed its plist.
+            if let Some(note) = remove_systemd_unit_file(&unit) {
+                eprintln!("    ! {note}");
+                notes.push(note);
             }
-            let mut reload: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
-            reload.push("daemon-reload".into());
-            let _ = spawn("systemctl", &reload);
         }
+        let _ = spawn("systemctl", &["daemon-reload".into()]);
     }
     #[cfg(target_os = "macos")]
     {
@@ -777,76 +792,27 @@ fn vet_unit_file_path(path: &str, unit: &str, allowed_dirs: &[&str]) -> Result<(
     Ok(())
 }
 
-/// The user-scope unit directories belonging to `user` — the only places a `--user`-scope
-/// removal may touch, all inside that account's own tree. `xdg_config_home` is the
-/// process's `XDG_CONFIG_HOME` when set (systemd honours it, and `sudo -E` propagates it).
-/// Pure.
-#[cfg(any(target_os = "linux", test))]
-fn user_unit_dirs(home: &Path, uid: Option<u32>, xdg_config_home: Option<&str>) -> Vec<String> {
-    let mut dirs = vec![
-        format!("{}/.config/systemd/user", home.display()),
-        format!("{}/.local/share/systemd/user", home.display()),
-    ];
-    if let Some(xdg) = xdg_config_home
-        .map(str::trim)
-        .filter(|x| x.starts_with('/'))
-    {
-        dirs.push(format!("{}/systemd/user", xdg.trim_end_matches('/')));
-    }
-    if let Some(uid) = uid {
-        dirs.push(format!("/run/user/{uid}/systemd/user"));
-    }
-    dirs
-}
-
-/// Delete the on-disk unit file backing `unit` in `scope`, as named by systemd's own
-/// `FragmentPath` property and VETTED by [`plan_unit_file_removal`] before anything is
-/// unlinked. `Some(note)` when a removal was refused or failed — the caller logs it and
-/// folds it into the (fatal) post-check's verdict; `None` when there was nothing to do or
-/// the file is gone.
+/// Delete the on-disk unit file backing `unit`, as named by systemd's own `FragmentPath`
+/// property and VETTED by [`plan_unit_file_removal`] before anything is unlinked. `Some(note)`
+/// when a removal was refused or failed — the caller logs it and folds it into the (fatal)
+/// post-check's verdict; `None` when there was nothing to do or the file is gone.
 ///
-/// Scope decides the authority as well as the allowlist. A SYSTEM-scope unit file is
-/// root's to remove, bounded to [`SYSTEM_UNIT_DIRS`]. A `--user`-scope unit file belongs
-/// to the invoking account — `unix_audits_only_the_machine_wide_dig_dns_and_beacon` records
-/// that those services are not an escalation — so it is never unlinked with root's
-/// authority: under elevation the removal is DROPPED to that user (`su - <user> -c rm`,
-/// the idiom [`crate::userwrite`] already uses), which makes a planted symlink out of the
-/// account's own tree fail with `EPERM` instead of deleting root's files.
+/// The beacon is installed SYSTEM-scope only (#1873), so the only unit file to remove is
+/// root's own, bounded to [`SYSTEM_UNIT_DIRS`]. There is deliberately no user-scope path: a
+/// `--user`-scope `dig-updater` unit is never ours, so this never performs a file operation
+/// inside a user-owned directory.
 #[cfg(target_os = "linux")]
-fn remove_systemd_unit_file(scope: &[&str], unit: &str) -> Option<String> {
-    let mut args: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
-    args.extend([
-        "show".into(),
-        "-p".into(),
-        "FragmentPath".into(),
-        unit.to_string(),
-    ]);
-    let out = spawn("systemctl", &args)?;
-
-    let user_scope = scope.contains(&"--user");
-    let user = crate::invoker::target_user();
-    let owned_dirs: Vec<String> = if user_scope {
-        user_unit_dirs(
-            &user.home,
-            user.uid,
-            std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        )
-    } else {
-        SYSTEM_UNIT_DIRS.iter().map(|d| d.to_string()).collect()
-    };
-    let allowed: Vec<&str> = owned_dirs.iter().map(String::as_str).collect();
-
-    match plan_unit_file_removal(&out, unit, &allowed) {
-        UnitFileRemoval::Nothing => None,
-        UnitFileRemoval::Refused(why) => Some(why),
-        UnitFileRemoval::Remove(path) => {
-            if user_scope && crate::invoker::is_root() {
-                remove_file_as_user(&path, user).err()
-            } else {
-                apply_unit_file_removal(&UnitFileRemoval::Remove(path))
-            }
-        }
-    }
+fn remove_systemd_unit_file(unit: &str) -> Option<String> {
+    let out = spawn(
+        "systemctl",
+        &[
+            "show".into(),
+            "-p".into(),
+            "FragmentPath".into(),
+            unit.to_string(),
+        ],
+    )?;
+    apply_unit_file_removal(&plan_unit_file_removal(&out, unit, SYSTEM_UNIT_DIRS))
 }
 
 /// Perform a vetted removal decision: unlink on [`UnitFileRemoval::Remove`], and on
@@ -867,43 +833,6 @@ fn apply_unit_file_removal(plan: &UnitFileRemoval) -> Option<String> {
             Err(e) => Some(format!("could not remove {path}: {e}")),
         },
     }
-}
-
-/// Unlink `path` with `user`'s own authority rather than root's, by running `rm` under
-/// `su - <user>` (`su` resolved from the trusted system directories, never `$PATH` — this
-/// runs as root; same reasoning as [`crate::userwrite`]).
-#[cfg(target_os = "linux")]
-fn remove_file_as_user(path: &str, user: &crate::invoker::TargetUser) -> Result<(), String> {
-    use crate::proc::HideConsole;
-    use std::process::Command;
-
-    let su = crate::elevation::resolve_system_tool("su")
-        .ok_or_else(|| "su not found in any trusted system directory".to_string())?;
-    let script = format!(
-        "rm -f -- {}",
-        crate::userwrite::shell_quote(Path::new(path))
-    );
-    let out = Command::new(su)
-        .arg("-")
-        .arg(&user.name)
-        .arg("-c")
-        .arg(&script)
-        .hide_console()
-        .output()
-        .map_err(|e| format!("could not remove {path} as {}: {e}", user.name))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(format!(
-        "could not remove {path} as {}: {}",
-        user.name,
-        if stderr.is_empty() {
-            format!("exit {}", out.status.code().unwrap_or(-1))
-        } else {
-            stderr
-        }
-    ))
 }
 
 /// Extract the unit-file path from `systemctl show -p FragmentPath <unit>` output —
@@ -1278,7 +1207,7 @@ mod tests {
                 .as_deref(),
             Some("/etc/systemd/system/dig-updater.timer")
         );
-        // A user-scope query for a unit that is not installed there.
+        // A query for a unit that has no backing file on disk.
         assert_eq!(parse_systemctl_fragment_path("FragmentPath=\n"), None);
         assert_eq!(parse_systemctl_fragment_path("FragmentPath=   \n"), None);
         // Only a line that IS the property counts — never one that merely mentions it.
@@ -1286,13 +1215,13 @@ mod tests {
             parse_systemctl_fragment_path("Description=see FragmentPath=/etc/passwd\n"),
             None
         );
-        // The empty machine-scope answer must not shadow the real user-scope one.
+        // An empty leading line is skipped; the real FragmentPath is returned.
         assert_eq!(
             parse_systemctl_fragment_path(
-                "FragmentPath=\nFragmentPath=/home/u/.config/systemd/user/dig-updater.timer\n"
+                "FragmentPath=\nFragmentPath=/etc/systemd/system/dig-updater.timer\n"
             )
             .as_deref(),
-            Some("/home/u/.config/systemd/user/dig-updater.timer")
+            Some("/etc/systemd/system/dig-updater.timer")
         );
     }
 
@@ -1419,19 +1348,60 @@ mod tests {
         );
     }
 
-    /// A `--user`-scope removal is bounded to the invoking account's OWN unit directories,
-    /// so even the privilege-dropped `rm` cannot be pointed outside them.
+    /// #1873: the beacon is queried SYSTEM-scope only. dig-updater never registers the
+    /// beacon `--user`-scope, so a user-scope `dig-updater` unit is not ours — querying it
+    /// both touched a user-owned directory as root and let an unprivileged account plant a
+    /// still-loaded user-scope timer that made the (fatal, #565 H2a) deregister fail. This
+    /// is the seam every beacon query/removal loop iterates; against the pre-fix
+    /// `[vec!["--user"], vec![]]` both-scopes logic it FAILS (two scopes, one of them
+    /// `--user`).
     #[test]
-    fn user_scope_unit_dirs_stay_inside_the_accounts_own_tree() {
-        let dirs = user_unit_dirs(Path::new("/home/u"), Some(1000), Some("/home/u/.cfg"));
-        assert!(dirs.contains(&"/home/u/.config/systemd/user".to_string()));
-        assert!(dirs.contains(&"/home/u/.local/share/systemd/user".to_string()));
-        assert!(dirs.contains(&"/home/u/.cfg/systemd/user".to_string()));
-        assert!(dirs.contains(&"/run/user/1000/systemd/user".to_string()));
-        // A relative `XDG_CONFIG_HOME` names no directory we can bound, so it is dropped
-        // rather than turned into a relative allowlist entry.
-        let dirs = user_unit_dirs(Path::new("/home/u"), None, Some("relative/cfg"));
-        assert!(dirs.iter().all(|d| d.starts_with("/home/u/")), "{dirs:?}");
+    fn the_beacon_is_queried_system_scope_only_never_user_scope() {
+        let scopes = beacon_systemctl_scopes();
+        assert_eq!(
+            scopes.len(),
+            1,
+            "the beacon is machine-scope only, not both scopes: {scopes:?}"
+        );
+        assert!(
+            scopes.iter().all(|s| !s.contains(&"--user")),
+            "a user-scope beacon unit is never ours (#1873): {scopes:?}"
+        );
+        assert!(
+            scopes[0].is_empty(),
+            "the only scope is the machine scope (no flag): {scopes:?}"
+        );
+    }
+
+    /// #1873: no root file operation targets a user directory. The beacon removal planner
+    /// is bounded to the root-owned [`SYSTEM_UNIT_DIRS`] and never to a user tree, so a
+    /// `~/.config/systemd/user/...` FragmentPath (which `sudo -E` + `systemctl --user`
+    /// could once surface) is REFUSED — never `Remove`d — and the file survives. Driven
+    /// through the real decision → unlink path with the exact dirs the beacon removal uses.
+    #[test]
+    #[cfg(unix)]
+    fn a_user_scope_beacon_unit_file_is_never_removed_by_root() {
+        let dir = std::env::temp_dir().join(format!("regaudit-userdir-{}", std::process::id()));
+        let user_units = dir.join(".config/systemd/user");
+        std::fs::create_dir_all(&user_units).unwrap();
+        let planted = user_units.join("dig-updater.timer");
+        std::fs::write(&planted, b"planted by an unprivileged account").unwrap();
+
+        // Exactly what `remove_systemd_unit_file` now feeds the planner: SYSTEM_UNIT_DIRS.
+        let show = format!("FragmentPath={}\n", planted.display());
+        let plan = plan_unit_file_removal(&show, "dig-updater.timer", SYSTEM_UNIT_DIRS);
+        let note = apply_unit_file_removal(&plan).expect("a user-tree path must be refused");
+
+        assert!(
+            planted.exists(),
+            "a user-owned unit file was deleted with root's authority — the #1873 primitive"
+        );
+        assert!(
+            note.contains("not one of the unit directories"),
+            "the refusal must name the out-of-allowlist rule: {note}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
