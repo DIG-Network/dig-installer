@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.40.2] - 2026-08-04
+
+### Bug Fixes
+- **installer:** Render progress log lines as structured segments, not innerHTML (#2040)- **installer:** Treat a user-scope dig-updater beacon registration as not-ours (#1873)
+
 ## [0.40.0] - 2026-08-03
 
 ### Features
