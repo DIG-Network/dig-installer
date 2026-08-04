@@ -950,6 +950,42 @@ manual matrix):
   auto-updates flow is documented manual acceptance in the runbook (a real browser reading managed
   policy off the network is not reliably CI-drivable headless).
 
+### 1.12 Privileged TLS root — provisioning HTTPS on install (#623/#858)
+
+`dig-node` serves `https://dig.local` from per-machine TLS material it resolves at
+`dig_cert::TlsPaths::machine()`, and it REFUSES to serve HTTPS — falling back to plaintext — unless
+that root passes its own privileged-owner gate (`dig-node-service`'s `security::dir_is_privileged`):
+every path component owned by a privileged principal (Windows SYSTEM `S-1-5-18` / Administrators
+`S-1-5-32-544` / TrustedInstaller, non-reparse; unix uid 0, non-symlink, no group/other write bit)
+and the `tls` leaf owner-only. This installer is what provisions that root so the node can turn HTTPS
+on. Only when dig-node is being installed (`--with-dig-node`); `--dry-run` reports intent only.
+
+- **Location + ownership.** Windows `%ProgramData%\DIG\tls` — `C:\ProgramData` already qualifies
+  (TrustedInstaller-owned); the installer owns + locks the `DIG` and `tls` levels NON-recursively to a
+  protected `{SYSTEM:F, Administrators:F}` DACL (no interactive-user ACE — the node reads the CA key
+  as SYSTEM/Administrator), read-back-verified, fail-closed, exactly the daemon-state-dir hardening
+  pattern (§1 / #501/#715). Linux + macOS `/etc/dig/tls` — created by root under root-owned `/etc`,
+  `tls` mode `0700`, `/etc/dig` `0755`, symlink-rejected, fail-closed on any chmod failure.
+- **Material.** A per-machine, name-constrained CA (`ca.{key,crt}`) + a 90-day leaf (`leaf.{key,crt}`)
+  minted via the `dig-cert` crate (never re-implemented) — the CA's critical `nameConstraints` scope
+  it to `dig.local`/`.dig`/loopback. Unix key files are `0600`, certs `0644`; on Windows they inherit
+  the root's SYSTEM/Administrators-only DACL. **Idempotent:** a run finding a complete, parseable CA +
+  leaf already on disk SKIPS the mint — never clobbering a working CA, which would orphan the trust
+  anchor already installed against it.
+- **Trust anchor.** `ca.crt` is installed as an OS trust root so a browser on the machine trusts
+  `https://dig.local`: Windows `certutil -addstore -f Root`, macOS `security add-trusted-cert -d -r
+  trustRoot -k /Library/Keychains/System.keychain`, Linux `update-ca-certificates` (Debian anchor
+  `/usr/local/share/ca-certificates/dig-local-ca.crt`) with an `update-ca-trust` fallback (RHEL anchor
+  `/etc/pki/ca-trust/source/anchors/dig-local-ca.crt`). Every external tool is spawned through the
+  crate's guarded, console-hidden wrapper (`proc::system_tool`, absolute on Windows — #657).
+- **Trust-manifest ledger.** Each installed anchor is recorded at `dig_cert::TlsPaths::trust_manifest()`
+  (`{store, fingerprint (SHA-1 thumbprint of the CA DER), path?}`) so `uninstall` can revert exactly the
+  DIG-owned entries (§3.10 step 5a) and nothing else.
+- **Readiness.** The `TlsRootResult` `created` flag (root privileged-owned AND holding a CA + leaf) is
+  a hard readiness gate: a `created: false` result makes the install NOT ready rather than let the node
+  silently serve plaintext. The trust-anchor install is REPORTED but not gated (the node serves HTTPS
+  regardless; the anchor only affects client trust, and a headless host may lack the trust tool).
+
 ## 2. Install lifecycle — stop before write, start after write
 
 For the two components this installer registers as OS services with their OWN `install`/
@@ -1537,6 +1573,11 @@ ordered sequence (services/schedulers first so a live service never points at a 
 3. **beacon** — remove the auto-update scheduler registration;
 4. **scheme** — unregister the dig/chia/urn handlers (DIG-owned only);
 5. **network** — remove the `dig.local` hosts entry + the peer firewall rule;
+5a. **tls-trust** — revert the DIG TLS trust anchor(s) recorded in the trust-manifest ledger (§1.12),
+   then remove the privileged TLS root. Strictly DIG-owned scope (only the anchors this install's
+   ledger recorded, addressed by SHA-1 thumbprint / recorded anchor-file path) and idempotent (an
+   already-absent anchor / root is success). A left-behind trust anchor keeps the machine trusting a
+   private CA after DIG is gone, so a failed revert makes the run NOT complete;
 6. **login-path** — remove the system-wide login-`PATH` fragment;
 7. **msi** — remove every MSI-installed DIG product (§3.10.1). Before the binaries, because
    `msiexec /x` runs the product's own uninstall sequence from the product's own files;

@@ -263,3 +263,20 @@ a caller-chosen directory. Re-run elevated, without `--bin-dir`.
 per-user scope on every OS, unconditionally, because an earlier run may have chosen either. A scope
 that still holds a registration afterwards is reported as a failure rather than passed over. To check
 by hand, run the per-OS probes above and expect "not registered" from both.
+
+## HTTPS on install — the privileged TLS root (#623/#858)
+
+A `--with-dig-node` install provisions the per-machine TLS material so dig-node serves
+`https://dig.local` instead of plaintext. It mints a name-constrained CA + a 90-day leaf under the
+privileged TLS root — Windows `%ProgramData%\DIG\tls` (locked to SYSTEM/Administrators), Linux + macOS
+`/etc/dig/tls` (root-owned, `tls` mode `0700`, keys `0600`) — and installs the CA as an OS trust
+anchor (`certutil -addstore Root` / `security add-trusted-cert` / `update-ca-certificates`, with an
+`update-ca-trust` RHEL fallback), recording each anchor in `<root>/trust-manifest.json`. Re-running is
+idempotent: a valid CA + leaf already present is KEPT, never re-minted. Verify by hand on unix:
+`sudo ls -l /etc/dig/tls` (expect `ca.{key,crt}` + `leaf.{key,crt}`, `ca.key` mode `0600`, the dir
+`0700` root-owned); the JSON report carries `result.tls_root.created`.
+
+`dig-installer --uninstall` reverts exactly the DIG trust anchors recorded in that ledger (by SHA-1
+thumbprint on Windows/macOS, by anchor-file path on Linux) and removes the TLS root — DIG-owned scope
+only, idempotent. A trust anchor left behind would keep the machine trusting a private CA after DIG is
+gone, so a failed revert makes the uninstall report NOT complete.

@@ -83,6 +83,7 @@ pub mod sources;
 pub mod svc;
 pub mod svcscope;
 pub mod target;
+pub mod tlsroot;
 pub mod uninstall;
 pub mod units;
 pub mod update;
@@ -521,6 +522,12 @@ pub struct InstallReport {
     /// identity-independent control/auth dirs the dig-node/dig-dns daemons +
     /// the operator CLI share. Empty on dry-run / when no daemon is installed.
     pub daemon_dirs: Vec<daemon_dir::DaemonDirResult>,
+    /// The privileged TLS root provisioned so dig-node serves HTTPS on `https://dig.local`
+    /// (#623/#858): the per-machine name-constrained CA + leaf under the SYSTEM/root-owned root
+    /// dig-node's own privileged-owner gate requires, plus the CA installed as an OS trust anchor.
+    /// `None` on dry-run / when dig-node is not being installed. A `created: false` result makes the
+    /// install NOT ready ([`evaluate_readiness`]) — the node would otherwise fall back to plaintext.
+    pub tls_root: Option<tlsroot::TlsRootResult>,
     /// The post-install verification that the PROTECTED install root denies
     /// unprivileged write (#565): the machine-checkable form of "no service
     /// binary lives where a non-admin could replace it". `None` on dry-run or
@@ -930,6 +937,7 @@ fn run_report_gated(
         installed: Vec::new(),
         cli_path_checks: Vec::new(),
         daemon_dirs: Vec::new(),
+        tls_root: None,
         install_root_security: None,
         bin_dir_security: None,
         veneer_security: None,
@@ -985,6 +993,16 @@ fn run_report_gated(
         if plan.with_dig_node || plan.with_dig_dns {
             log("Preparing the machine-wide daemon state directories:");
             report.daemon_dirs = daemon_dir::ensure(target.os, plan.dry_run, log);
+        }
+
+        // 0b. The privileged TLS root (#623/#858). Provisioned right after the state dirs and BEFORE
+        //     dig-node starts, so the node finds a SYSTEM/root-owned root holding a name-constrained
+        //     CA + leaf and serves HTTPS on https://dig.local instead of plaintext (dig-node refuses
+        //     HTTPS unless the root passes its own privileged-owner gate). Only when dig-node is
+        //     being installed — dig-dns needs no local-TLS material. Honors --dry-run (intent only).
+        if plan.with_dig_node {
+            log("Provisioning the privileged TLS root (HTTPS on https://dig.local):");
+            report.tls_root = Some(tlsroot::provision(plan.dry_run, log));
         }
 
         // 1. dig-store CLI + its `digs` alias binary (issue #434). `digs` is
@@ -2638,6 +2656,24 @@ fn evaluate_readiness_when(
         }
     }
 
+    // The privileged TLS root (#623/#858): dig-node serves HTTPS on https://dig.local only when the
+    // root exists SYSTEM/root-owned and holds a CA + leaf. A `created: false` result means the root
+    // could not be established, so the node would silently fall back to plaintext — a hard failure,
+    // never a silent green. (The trust-anchor install is reported but NOT gated here: the node
+    // serves HTTPS regardless; the anchor only makes local clients trust it.)
+    if plan.with_dig_node {
+        match &report.tls_root {
+            None => failures
+                .push("dig-node: the privileged TLS root was not provisioned".to_string()),
+            Some(t) if !t.created => failures.push(format!(
+                "dig-node: the privileged TLS root could not be provisioned — HTTPS would fall back \
+                 to plaintext ({})",
+                t.note
+            )),
+            Some(_) => {}
+        }
+    }
+
     // #565: the install root MUST deny unprivileged write. A DEFINITIVE breach
     // (the ACL/mode read back and an unprivileged principal CAN write) is a hard
     // failure — a service binary a non-admin can replace is the exact local
@@ -4259,6 +4295,12 @@ impl uninstall::UninstallActions for SystemActions<'_> {
             notes.push(fw.note);
         }
         (ok, notes.join("; "))
+    }
+
+    fn remove_tls_trust(&mut self) -> (bool, String) {
+        // Reverts exactly the anchors the trust-manifest ledger recorded, then removes the TLS root
+        // (#623/#858). DIG-owned scope + idempotent — see [`tlsroot::remove_trust_and_root`].
+        tlsroot::remove_trust_and_root(self.dry_run)
     }
 
     fn delete_binaries(&mut self, skip: &[String]) -> (bool, String) {
@@ -6337,6 +6379,16 @@ mod tests {
             installed: Vec::new(),
             cli_path_checks: Vec::new(),
             daemon_dirs: Vec::new(),
+            // A healthy node install always provisions the privileged TLS root, so the baseline
+            // shell carries a successful result — a test exercising a TLS-root FAILURE overrides
+            // this explicitly (see `readiness_fails_when_the_tls_root_is_not_provisioned`).
+            tls_root: Some(tlsroot::TlsRootResult {
+                root: r"C:\ProgramData\DIG\tls".to_string(),
+                created: true,
+                ca_minted: true,
+                trust_installed: true,
+                note: "test baseline".to_string(),
+            }),
             install_root_security: None,
             bin_dir_security: None,
             veneer_security: None,
@@ -7823,6 +7875,46 @@ mod tests {
             note: "not hardened".to_string(),
         }];
         assert!(evaluate_readiness(&plan, &report).is_empty());
+    }
+
+    #[test]
+    fn readiness_fails_when_the_tls_root_is_not_provisioned() {
+        // #623/#858: dig-node serves HTTPS only when the privileged TLS root exists + holds a
+        // CA/leaf (`created: true`). A `created: false` result means the node would silently fall
+        // back to plaintext — a hard failure. The baseline shell is otherwise fully ready, so this
+        // isolates the TLS-root gate: flipping ONLY `created` must be what fails the install.
+        let plan = dig_node_service_plan();
+        let mut report = report_shell();
+        report.service = Some(running_service());
+        report.tls_root = Some(tlsroot::TlsRootResult {
+            root: r"C:\ProgramData\DIG\tls".to_string(),
+            created: false,
+            ca_minted: false,
+            trust_installed: false,
+            note: "could not set the SYSTEM-only DACL (fail closed)".to_string(),
+        });
+        let failures = evaluate_readiness(&plan, &report);
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].contains("dig-node"));
+        assert!(failures[0].contains("TLS root"));
+    }
+
+    #[test]
+    fn readiness_ignores_the_tls_root_for_a_node_less_install() {
+        // The TLS root is dig-node's HTTPS material: a dig-dns-only install must not be failed on a
+        // missing TLS root (`with_dig_node = false`), even though the shell defaults it present.
+        let mut plan = dig_node_service_plan();
+        plan.with_dig_node = false;
+        plan.with_dig_dns = true;
+        let mut report = report_shell();
+        report.tls_root = None;
+        // No dig-node service expected; the only relevant assertion is that NO tls-root failure is
+        // raised (other dig-dns gates are covered by their own tests).
+        let failures = evaluate_readiness(&plan, &report);
+        assert!(
+            !failures.iter().any(|f| f.contains("TLS root")),
+            "a node-less install must not be failed on the TLS root: {failures:?}"
+        );
     }
 
     #[test]

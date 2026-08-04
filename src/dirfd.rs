@@ -144,6 +144,9 @@ pub fn stat_of(fd: &DirFd, path: &Path) -> Result<(u32, u32), String> {
             std::io::Error::last_os_error()
         ));
     }
+    // `st_uid`/`st_mode` are `u32` on Linux but `u16`/`u32` on macOS/BSD, so the casts are load-bearing
+    // for portability even though this platform's clippy sees them as same-type (toolchain-drift lint).
+    #[allow(clippy::unnecessary_cast)]
     Ok((st.st_uid as u32, st.st_mode as u32 & 0o7777))
 }
 

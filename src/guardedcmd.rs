@@ -183,6 +183,11 @@ exit 0
             "paths.rs",
             "userwrite.rs",
             "pathcheck.rs",
+            // Spawns only trusted OS trust-store tools (`certutil`/`security`/`update-ca-*`/`sh -c
+            // command -v`) to install + revert the CA trust anchor, resolved absolutely on Windows
+            // via `proc::system_tool` (#657). It never executes an INSTALLED binary — the arguments
+            // are fixed cert paths + thumbprints, never a DIG binary path (#623/#858).
+            "tlsroot.rs",
             // `msiexec.exe` and `taskkill.exe`/`pkill` — trusted system tools resolved absolutely
             // (`proc::system_tool` / `elevation::resolve_system_tool`). Neither ever spawns an
             // INSTALLED binary: msiexec is handed a validated ProductCode (`msi::ProductCode`, which

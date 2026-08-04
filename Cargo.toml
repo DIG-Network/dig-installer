@@ -30,7 +30,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.40.2"
+version = "0.41.0"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -54,7 +54,21 @@ serde_json = "1"
 # crates' rustls-only posture so the installer is a self-contained binary.
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
 sha2 = "0.10"
+# SHA-1 thumbprint of the CA certificate (DER) — the identity `certutil -delstore`
+# and `security delete-certificate -Z` both address a trust-store entry by, so the
+# uninstall ledger records exactly what those tools need to revert a trust anchor.
+sha1 = "0.10"
 hex = "0.4"
+# Deterministic issuance/parse instant for the local CA + leaf (dig-cert takes an
+# injected `OffsetDateTime`), and the wall clock for provisioning. Matches the
+# `time` version dig-cert itself pins so one copy resolves across the graph.
+time = "0.3"
+# The single source of truth for DIG local-TLS material (#620/#622): the
+# per-machine name-constrained CA generator + leaf issuer + the canonical on-disk
+# `TlsPaths` layout dig-node consumes. PINNED to the released tag v0.1.0 (never
+# `main`) — byte-identical to dig-node's own dependency (release-first, §4.1): the
+# installer provisions the exact root (#623/#858) dig-node reads.
+dig-cert = { git = "https://github.com/DIG-Network/dig-cert", tag = "v0.1.0" }
 dirs = "5"
 tempfile = "3"
 # Cross-platform service manager (Windows SCM via sc.exe, Linux systemd,
