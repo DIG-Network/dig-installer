@@ -738,13 +738,27 @@ mod tests {
     /// Arm B is what makes this load-bearing: under the pre-fix expansion it splices the current root
     /// in ahead of the stale one and the check reports a clean PATH, so the two arms disagree. They
     /// must now agree, and agree on the truth a fresh session shows — the stale root wins.
+    /// Reduce a Windows-shaped path to one comparable form: `\` and `/` are interchangeable, and a
+    /// repeated separator is one separator.
+    ///
+    /// Needed because the fixture keeps the TRAILING backslash the measured machine `Path` entry
+    /// really carries, and `Path::join` folds that on Windows but doubles it on unix — a difference in
+    /// path SYNTAX that must not decide a test about resolution ORDER.
+    fn windows_pathish(p: &str) -> String {
+        p.replace('\\', "/").replace("//", "/")
+    }
+
     #[test]
     fn the_resolution_verdict_does_not_depend_on_the_launching_shells_path() {
-        let exists = only(&[
+        let present = [
             "C:/Program Files/DIG Network/dig-node/dig-node.exe",
             "C:/Program Files/DIG/bin/dig-node.exe",
             "C:/Windows/system32/where.exe",
-        ]);
+        ];
+        let exists = |p: &Path| {
+            let p = windows_pathish(&p.to_string_lossy());
+            present.iter().any(|q| *q == p)
+        };
         let verdict = |ambient: &'static str| {
             let expanded = expand_env_refs(PERSISTED_MACHINE_THEN_USER, move |name| match name {
                 "PATH" | "Path" => Some(ambient.to_string()),
@@ -752,6 +766,7 @@ mod tests {
                 _ => None,
             });
             resolve_in_path(&expanded, "dig-node.exe", ';', &exists)
+                .map(|p| windows_pathish(&p.to_string_lossy()))
         };
 
         let clean_launch = verdict(r"C:\Windows\system32");
@@ -763,12 +778,9 @@ mod tests {
             "the shadow verdict changed with the launching shell's PATH — it must be a property of \
              the persisted machine+user Path alone"
         );
-        // Built with the same `join` the resolver uses, not a literal backslash: a unix runner joins
-        // with `/`, so a hand-written `…\dig-node.exe` would fail there for a reason that has nothing
-        // to do with the property under test.
         assert_eq!(
-            clean_launch,
-            Some(Path::new(STALE_ROOT).join("dig-node.exe")),
+            clean_launch.as_deref(),
+            Some("C:/Program Files/DIG Network/dig-node/dig-node.exe"),
             "the machine Path's stale root precedes the user Path's current root, so it wins a fresh \
              shell and the check must say so"
         );
