@@ -173,7 +173,13 @@ pub fn remove_superseded_roots(target: &Target, log: &mut dyn FnMut(&str)) -> Su
                 result.refused.push(reason);
             }
             Verdict::Remove => {
-                remove_root(target, &root, &mut result, log);
+                remove_root(
+                    target,
+                    &root,
+                    paths::superseded_root_base(target.os).as_deref(),
+                    &mut result,
+                    log,
+                );
                 drop_path_entries(&root, &mut result, log);
             }
         }
@@ -209,8 +215,11 @@ fn entry_names(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Delete the DIG binaries in `root`, then the directory itself (and its parent, if that leaves the
-/// superseded base empty).
+/// Delete the DIG binaries in `root`, then the directory itself — and `base`, if removing `root` left
+/// the superseded base empty.
+///
+/// `base` is INJECTED rather than derived from `target`, so a test can exercise the real deletion
+/// against a temporary directory without the tidy-up reaching for a real `%ProgramFiles%` path.
 ///
 /// Only KNOWN DIG filenames are deleted, one by one, and `symlink_metadata` is used so a reparse point
 /// is never followed — the same rule [`crate::migrate`] follows. [`decide`] has already established
@@ -219,6 +228,7 @@ fn entry_names(dir: &Path) -> Vec<String> {
 fn remove_root(
     target: &Target,
     root: &Path,
+    base: Option<&Path>,
     result: &mut SupersedeResult,
     log: &mut dyn FnMut(&str),
 ) {
@@ -244,8 +254,8 @@ fn remove_root(
     // Non-recursive: an unexpected leftover keeps the directory and is reported, never bulldozed.
     if std::fs::remove_dir(root).is_ok() {
         result.removed_roots.push(root.display().to_string());
-        if let Some(base) = paths::superseded_root_base(target.os) {
-            let _ = std::fs::remove_dir(&base); // only succeeds once every component dir is gone
+        if let Some(base) = base {
+            let _ = std::fs::remove_dir(base); // only succeeds once every component dir is gone
         }
     } else {
         result.notes.push(format!(
@@ -516,6 +526,102 @@ mod tests {
     fn no_running_process_under_the_root_yields_nothing() {
         let listing = "C:\\Program Files\\DIG\\bin\\dig-node.exe\nC:\\Windows\\explorer.exe\n";
         assert!(images_under(listing, Path::new(ROOT), Os::Windows).is_empty());
+    }
+
+    // -- the deletion itself ---------------------------------------------------
+
+    /// A `Target` for the host's own OS, so `exe_name` produces the filenames these tests create.
+    fn host_target() -> Target {
+        Target::current().expect("the host OS is supported")
+    }
+
+    /// The cleared path, end to end on a real filesystem: the DIG binaries go, the directory goes,
+    /// and the now-empty base goes with it.
+    ///
+    /// This is the half `decide` cannot speak for. It is asserted on real files rather than a mock
+    /// because the property at issue — that the deletion actually happens and is confined to the
+    /// candidate — is a filesystem property.
+    #[test]
+    fn a_cleared_root_and_its_emptied_base_are_really_deleted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("DIG Network");
+        let root = base.join("dig-node");
+        std::fs::create_dir_all(&root).expect("create");
+        let target = host_target();
+        let binary = root.join(target.exe_name("dig-node"));
+        std::fs::write(&binary, b"superseded").expect("write");
+
+        let mut result = SupersedeResult::default();
+        remove_root(&target, &root, Some(&base), &mut result, &mut |_| {});
+
+        assert!(!binary.exists(), "the superseded binary must be deleted");
+        assert!(!root.exists(), "the superseded root must be deleted");
+        assert!(
+            !base.exists(),
+            "an emptied superseded base must be deleted too"
+        );
+        assert_eq!(result.removed_roots, vec![root.display().to_string()]);
+        assert_eq!(result.removed_binaries, vec![binary.display().to_string()]);
+        assert!(result.notes.is_empty(), "a clean removal reports no note");
+    }
+
+    /// The deletion is confined to KNOWN DIG filenames, and an unexpected leftover keeps the whole
+    /// directory rather than being bulldozed.
+    ///
+    /// `decide` should never route such a root here (rule 3 refuses it), so this asserts the SECOND,
+    /// independent guard — the one that still holds if the verdict is ever wrong. The fixture pairs a
+    /// DIG binary with a foreign file so both halves are observable in one run: the DIG binary must
+    /// go, the foreign file must stay, and the directory must survive because the foreign file does.
+    #[test]
+    fn deletion_is_confined_to_known_dig_filenames_and_keeps_a_directory_that_is_not_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("DIG Network");
+        let root = base.join("dig-node");
+        std::fs::create_dir_all(&root).expect("create");
+        let target = host_target();
+        let dig_binary = root.join(target.exe_name("dig-node"));
+        let foreign = root.join("operator-notes.txt");
+        std::fs::write(&dig_binary, b"superseded").expect("write");
+        std::fs::write(&foreign, b"do not delete me").expect("write");
+
+        let mut result = SupersedeResult::default();
+        remove_root(&target, &root, Some(&base), &mut result, &mut |_| {});
+
+        assert!(!dig_binary.exists(), "the DIG binary is still removed");
+        assert!(
+            foreign.exists(),
+            "a file the installer did not place must survive"
+        );
+        assert!(
+            root.exists(),
+            "a non-empty directory must be kept, never bulldozed"
+        );
+        assert!(result.removed_roots.is_empty());
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|n| n.contains("still holds entries")),
+            "keeping the directory must be reported, not silent: {:?}",
+            result.notes
+        );
+    }
+
+    /// `entry_names` reports what is really there, and an unreadable/absent directory yields nothing
+    /// rather than panicking — the verdict for a vanished root must still be reachable.
+    #[test]
+    fn entry_names_lists_a_real_directory_and_tolerates_a_missing_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("dig-node.exe"), b"x").expect("write");
+        std::fs::create_dir(tmp.path().join("nested")).expect("mkdir");
+
+        let mut found = entry_names(tmp.path());
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["dig-node.exe".to_string(), "nested".to_string()]
+        );
+        assert!(entry_names(&tmp.path().join("no-such-dir")).is_empty());
     }
 
     // -- the report ------------------------------------------------------------
