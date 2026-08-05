@@ -266,15 +266,71 @@ fn persisted_path() -> Result<String, String> {
     if joined.is_empty() {
         Err("could not read the persisted Windows Path".to_string())
     } else {
-        // Expand `%SystemRoot%`-style references the persisted REG_EXPAND_SZ values contain.
-        Ok(expand_env_refs(&joined))
+        // Expand `%SystemRoot%`-style references the persisted REG_EXPAND_SZ values contain, against
+        // the PERSISTED environment rather than our own (see `persisted_env_lookup`).
+        Ok(expand_env_refs(&joined, persisted_env_lookup))
     }
 }
 
-/// Expand `%NAME%` references in a persisted `REG_EXPAND_SZ` PATH. An unknown name is left verbatim
-/// so a broken reference is visible in the reported PATH rather than silently becoming empty.
+/// Resolve `%NAME%` from the PERSISTED environment — the machine `Environment` key, then the user's —
+/// falling back to this process's value only for a name neither key defines.
+///
+/// # Why the persisted keys come first (dig_ecosystem#2205)
+///
+/// The fallback is needed at all because the names a persisted `Path` most often references
+/// (`SystemRoot`, `ProgramFiles`, `USERPROFILE`) live in the session environment block Windows builds,
+/// not in either `Environment` key — so a persisted-only lookup would leave `%SystemRoot%\system32`
+/// unexpanded and stop the check finding anything in it. But where a key DOES define the name, that
+/// value is the one a new shell will carry, and ours may have been changed in-process or inherited from
+/// a launching shell. Persisted state decides; our own environment is the last resort.
 #[cfg(windows)]
-fn expand_env_refs(value: &str) -> String {
+fn persisted_env_lookup(name: &str) -> Option<String> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+
+    let from = |root, subkey| -> Option<String> {
+        RegKey::predef(root)
+            .open_subkey_with_flags(subkey, KEY_READ)
+            .and_then(|k| k.get_value(name))
+            .ok()
+    };
+    from(HKEY_LOCAL_MACHINE, MACHINE_ENV)
+        .or_else(|| from(HKEY_CURRENT_USER, "Environment"))
+        .or_else(|| std::env::var(name).ok())
+}
+
+/// Expand `%NAME%` references in a persisted `REG_EXPAND_SZ` PATH, resolving each name through
+/// `lookup`. An unknown name is left verbatim so a broken reference is visible in the reported PATH
+/// rather than silently becoming empty.
+///
+/// # A `%PATH%` self-reference expands to NOTHING, deliberately (dig_ecosystem#2205)
+///
+/// A persisted `Path` may contain a literal `%PATH%` entry — this is not hypothetical; it was the
+/// second entry of the machine `Path` on the machine that raised #2205. The name it references is the
+/// value being composed, so there is no honest persisted answer, and resolving it through the process
+/// environment is actively wrong: it splices THIS process's `PATH` into the middle of the value, which
+/// is precisely the source this module refuses to consult (see the module header).
+///
+/// It was measured doing real damage. Expanding that one entry against the installer's inherited
+/// environment turned a 63-entry composed session `PATH` into a 151-entry one, and the extra entries
+/// carried a copy of the install root — so whether the shadow check saw a genuine shadow depended on
+/// which shell had launched the installer:
+///
+/// * launched from a shell that had already inherited the install root, the spliced entries put it
+///   early and the check reported a clean PATH while a stale root really did win a fresh shell — a
+///   false NEGATIVE, the failure mode this guard exists to prevent;
+/// * launched from a clean context, the same code reported the shadow correctly.
+///
+/// Dropping the self-reference cannot hide a real shadow: every directory it could contribute is either
+/// already an entry of the machine or user `Path` (and therefore still searched), or is a volatile
+/// addition made by the launching process, which no new shell will have.
+fn expand_env_refs(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    /// The name whose expansion is the value being composed — never resolved. Compared
+    /// case-insensitively: the registry writes `Path`, shells say `PATH`, and both appear in the wild.
+    const SELF_REFERENCE: &str = "PATH";
+
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find('%') {
@@ -283,13 +339,15 @@ fn expand_env_refs(value: &str) -> String {
         match after.find('%') {
             Some(end) => {
                 let name = &after[..end];
-                match std::env::var(name) {
-                    Ok(v) => out.push_str(&v),
-                    Err(_) => {
-                        out.push('%');
-                        out.push_str(name);
-                        out.push('%');
-                    }
+                if name.eq_ignore_ascii_case(SELF_REFERENCE) {
+                    // Expands to nothing; the surrounding separators collapse into an empty PATH
+                    // entry, which `resolve_in_path` already skips.
+                } else if let Some(v) = lookup(name) {
+                    out.push_str(&v);
+                } else {
+                    out.push('%');
+                    out.push_str(name);
+                    out.push('%');
                 }
                 rest = &after[end + 1..];
             }
@@ -647,6 +705,105 @@ mod tests {
             resolve_in_path("/usr/bin : /usr/local/bin ", "digs", ':', &exists),
             Some(PathBuf::from("/usr/local/bin/digs"))
         );
+    }
+
+    // -- #2205: the verdict is a property of PERSISTED state, never of our own env ----
+
+    /// The install root and the superseded root as they were measured on the #2205 machine: the stale
+    /// root is an entry of the MACHINE `Path`, the current root only of the USER `Path`, and the
+    /// machine value's second entry is a literal `%PATH%` self-reference.
+    const STALE_ROOT: &str = r"C:\Program Files\DIG Network\dig-node";
+    const CURRENT_ROOT: &str = r"C:\Program Files\DIG\bin";
+    const PERSISTED_MACHINE_THEN_USER: &str =
+        concat!(r"C:\Windows\system32;%PATH%;C:\Program Files\DIG Network\dig-node\;",
+                r"%SystemRoot%\System32\Wbem;C:\Program Files\DIG\bin");
+
+    /// THE #2205 property: which binary the shadow check reports must not depend on the environment
+    /// of whatever launched the installer.
+    ///
+    /// The fixture is the measured one. Both DIG roots hold `dig-node.exe`, so resolution succeeds
+    /// either way and only the ORDER decides the verdict — a resolver that simply failed is
+    /// distinguishable. The two arms differ in exactly ONE thing, the ambient `PATH` the `%PATH%`
+    /// entry would resolve to:
+    ///
+    /// * arm A — an ambient `PATH` that does NOT carry the current root (a clean/elevated launch);
+    /// * arm B — an ambient `PATH` that carries the current root FIRST (launched from a shell that
+    ///   had already inherited it).
+    ///
+    /// Arm B is what makes this load-bearing: under the pre-fix expansion it splices the current root
+    /// in ahead of the stale one and the check reports a clean PATH, so the two arms disagree. They
+    /// must now agree, and agree on the truth a fresh session shows — the stale root wins.
+    #[test]
+    fn the_resolution_verdict_does_not_depend_on_the_launching_shells_path() {
+        let exists = only(&[
+            "C:/Program Files/DIG Network/dig-node/dig-node.exe",
+            "C:/Program Files/DIG/bin/dig-node.exe",
+            "C:/Windows/system32/where.exe",
+        ]);
+        let verdict = |ambient: &'static str| {
+            let expanded = expand_env_refs(PERSISTED_MACHINE_THEN_USER, move |name| match name {
+                "PATH" | "Path" => Some(ambient.to_string()),
+                "SystemRoot" => Some(r"C:\Windows".to_string()),
+                _ => None,
+            });
+            resolve_in_path(&expanded, "dig-node.exe", ';', &exists)
+        };
+
+        let clean_launch = verdict(r"C:\Windows\system32");
+        let launched_from_a_shell_carrying_the_current_root =
+            verdict(concat!(r"C:\Program Files\DIG\bin;C:\Windows\system32"));
+
+        assert_eq!(
+            clean_launch, launched_from_a_shell_carrying_the_current_root,
+            "the shadow verdict changed with the launching shell's PATH — it must be a property of \
+             the persisted machine+user Path alone"
+        );
+        assert_eq!(
+            clean_launch,
+            Some(PathBuf::from(format!(r"{STALE_ROOT}\dig-node.exe"))),
+            "the machine Path's stale root precedes the user Path's current root, so it wins a fresh \
+             shell and the check must say so"
+        );
+    }
+
+    /// The control for the test above: with the self-reference removed from the fixture, the SAME
+    /// persisted value must still resolve the stale root first, and the current root must still be
+    /// reachable. Without this, an expansion that returned the empty string for everything would
+    /// satisfy the agreement assertion while destroying the PATH.
+    #[test]
+    fn expansion_preserves_every_entry_other_than_the_self_reference() {
+        let expanded = expand_env_refs(PERSISTED_MACHINE_THEN_USER, |name| match name {
+            "SystemRoot" => Some(r"C:\Windows".to_string()),
+            _ => None,
+        });
+        assert!(path_contains(&expanded, STALE_ROOT, ';'), "got: {expanded}");
+        assert!(path_contains(&expanded, CURRENT_ROOT, ';'), "got: {expanded}");
+        assert!(
+            path_contains(&expanded, r"C:\Windows\System32\Wbem", ';'),
+            "an ordinary %VAR% must still expand: {expanded}"
+        );
+        assert!(
+            !expanded.to_ascii_uppercase().contains("%PATH%"),
+            "the self-reference must not survive as a literal entry: {expanded}"
+        );
+    }
+
+    /// A name neither `Environment` key defines is left verbatim, so a broken reference is visible in
+    /// the reported PATH instead of silently swallowing the rest of the entry.
+    #[test]
+    fn an_unresolvable_reference_is_left_verbatim() {
+        let expanded = expand_env_refs(r"C:\Windows;%NoSuchVar%\bin", |_| None);
+        assert_eq!(expanded, r"C:\Windows;%NoSuchVar%\bin");
+    }
+
+    /// An unterminated `%` is not a reference and must be carried through unchanged rather than
+    /// consuming the tail of the value.
+    #[test]
+    fn an_unterminated_percent_is_not_a_reference() {
+        let expanded = expand_env_refs(r"C:\Windows;C:\100%bin", |_| {
+            panic!("no complete reference exists, so lookup must not be consulted")
+        });
+        assert_eq!(expanded, r"C:\Windows;C:\100%bin");
     }
 
     // -- path_contains ---------------------------------------------------------
