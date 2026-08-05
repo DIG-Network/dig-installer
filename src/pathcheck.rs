@@ -750,22 +750,23 @@ mod tests {
 
     #[test]
     fn the_resolution_verdict_does_not_depend_on_the_launching_shells_path() {
-        let present = [
-            "C:/Program Files/DIG Network/dig-node/dig-node.exe",
-            "C:/Program Files/DIG/bin/dig-node.exe",
-            "C:/Windows/system32/where.exe",
-        ];
-        let exists = |p: &Path| {
-            let p = windows_pathish(&p.to_string_lossy());
-            present.iter().any(|q| *q == p)
-        };
+        // A nested `fn` rather than a closure: it is `Copy`, so both arms can pass it by value.
+        fn exists(candidate: &Path) -> bool {
+            const PRESENT: [&str; 3] = [
+                "C:/Program Files/DIG Network/dig-node/dig-node.exe",
+                "C:/Program Files/DIG/bin/dig-node.exe",
+                "C:/Windows/system32/where.exe",
+            ];
+            let candidate = windows_pathish(&candidate.to_string_lossy());
+            PRESENT.iter().any(|q| *q == candidate)
+        }
         let verdict = |ambient: &'static str| {
             let expanded = expand_env_refs(PERSISTED_MACHINE_THEN_USER, move |name| match name {
                 "PATH" | "Path" => Some(ambient.to_string()),
                 "SystemRoot" => Some(r"C:\Windows".to_string()),
                 _ => None,
             });
-            resolve_in_path(&expanded, "dig-node.exe", ';', &exists)
+            resolve_in_path(&expanded, "dig-node.exe", ';', exists)
                 .map(|p| windows_pathish(&p.to_string_lossy()))
         };
 
