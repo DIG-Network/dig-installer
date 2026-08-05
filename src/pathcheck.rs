@@ -714,9 +714,10 @@ mod tests {
     /// machine value's second entry is a literal `%PATH%` self-reference.
     const STALE_ROOT: &str = r"C:\Program Files\DIG Network\dig-node";
     const CURRENT_ROOT: &str = r"C:\Program Files\DIG\bin";
-    const PERSISTED_MACHINE_THEN_USER: &str =
-        concat!(r"C:\Windows\system32;%PATH%;C:\Program Files\DIG Network\dig-node\;",
-                r"%SystemRoot%\System32\Wbem;C:\Program Files\DIG\bin");
+    const PERSISTED_MACHINE_THEN_USER: &str = concat!(
+        r"C:\Windows\system32;%PATH%;C:\Program Files\DIG Network\dig-node\;",
+        r"%SystemRoot%\System32\Wbem;C:\Program Files\DIG\bin"
+    );
 
     /// THE #2205 property: which binary the shadow check reports must not depend on the environment
     /// of whatever launched the installer.
@@ -751,7 +752,7 @@ mod tests {
 
         let clean_launch = verdict(r"C:\Windows\system32");
         let launched_from_a_shell_carrying_the_current_root =
-            verdict(concat!(r"C:\Program Files\DIG\bin;C:\Windows\system32"));
+            verdict(r"C:\Program Files\DIG\bin;C:\Windows\system32");
 
         assert_eq!(
             clean_launch, launched_from_a_shell_carrying_the_current_root,
@@ -777,7 +778,10 @@ mod tests {
             _ => None,
         });
         assert!(path_contains(&expanded, STALE_ROOT, ';'), "got: {expanded}");
-        assert!(path_contains(&expanded, CURRENT_ROOT, ';'), "got: {expanded}");
+        assert!(
+            path_contains(&expanded, CURRENT_ROOT, ';'),
+            "got: {expanded}"
+        );
         assert!(
             path_contains(&expanded, r"C:\Windows\System32\Wbem", ';'),
             "an ordinary %VAR% must still expand: {expanded}"

@@ -48,8 +48,8 @@ use crate::target::{Os, Target};
 
 /// What was observed about one candidate superseded root — the whole input to [`decide`].
 ///
-/// Gathered by [`gather`]; constructed directly by tests, so every verdict is reachable without a real
-/// install.
+/// Gathered from the machine by [`remove_superseded_roots`]; constructed directly by tests, so every
+/// verdict is reachable without a real install.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RootEvidence {
     /// The candidate directory.
@@ -216,14 +216,21 @@ fn entry_names(dir: &Path) -> Vec<String> {
 /// is never followed — the same rule [`crate::migrate`] follows. [`decide`] has already established
 /// that every entry here also exists in the current root, so this cannot be the only copy of anything;
 /// the filename restriction is the second, independent guard.
-fn remove_root(target: &Target, root: &Path, result: &mut SupersedeResult, log: &mut dyn FnMut(&str)) {
+fn remove_root(
+    target: &Target,
+    root: &Path,
+    result: &mut SupersedeResult,
+    log: &mut dyn FnMut(&str),
+) {
     for stem in crate::migrate::DIG_BINARY_STEMS {
         let candidate = root.join(target.exe_name(stem));
         match std::fs::symlink_metadata(&candidate) {
             Ok(md) if md.file_type().is_file() => match std::fs::remove_file(&candidate) {
                 Ok(()) => {
                     log(&format!("    ✓ removed {}", candidate.display()));
-                    result.removed_binaries.push(candidate.display().to_string());
+                    result
+                        .removed_binaries
+                        .push(candidate.display().to_string());
                 }
                 Err(e) => {
                     let note = format!("could not remove {} ({e})", candidate.display());
@@ -241,9 +248,10 @@ fn remove_root(target: &Target, root: &Path, result: &mut SupersedeResult, log: 
             let _ = std::fs::remove_dir(&base); // only succeeds once every component dir is gone
         }
     } else {
-        result
-            .notes
-            .push(format!("{} still holds entries and was kept", root.display()));
+        result.notes.push(format!(
+            "{} still holds entries and was kept",
+            root.display()
+        ));
     }
 }
 
@@ -263,7 +271,10 @@ fn drop_path_entries(root: &Path, result: &mut SupersedeResult, log: &mut dyn Fn
             }
         }
         Err(e) => {
-            let note = format!("could not drop {} from the persisted PATH: {e}", root.display());
+            let note = format!(
+                "could not drop {} from the persisted PATH: {e}",
+                root.display()
+            );
             log(&format!("    ! {note}"));
             result.notes.push(note);
         }
@@ -350,9 +361,14 @@ mod tests {
         match decide(&evidence) {
             Verdict::Refuse(reason) => {
                 assert!(reason.contains("dig-node service"), "got: {reason}");
-                assert!(reason.contains(ROOT), "the reason must name the root: {reason}");
+                assert!(
+                    reason.contains(ROOT),
+                    "the reason must name the root: {reason}"
+                );
             }
-            Verdict::Remove => panic!("a root a privileged registration points at must NOT be removed"),
+            Verdict::Remove => {
+                panic!("a root a privileged registration points at must NOT be removed")
+            }
         }
     }
 
@@ -525,7 +541,10 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["acted"], true);
         assert_eq!(v["removed_roots"][0], ROOT);
-        assert_eq!(v["path_entries_removed"][0], format!("machine PATH: {ROOT}"));
+        assert_eq!(
+            v["path_entries_removed"][0],
+            format!("machine PATH: {ROOT}")
+        );
         assert_eq!(v["refused"][0], "still referenced");
     }
 }
