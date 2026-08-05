@@ -763,9 +763,12 @@ mod tests {
             "the shadow verdict changed with the launching shell's PATH — it must be a property of \
              the persisted machine+user Path alone"
         );
+        // Built with the same `join` the resolver uses, not a literal backslash: a unix runner joins
+        // with `/`, so a hand-written `…\dig-node.exe` would fail there for a reason that has nothing
+        // to do with the property under test.
         assert_eq!(
             clean_launch,
-            Some(PathBuf::from(format!(r"{STALE_ROOT}\dig-node.exe"))),
+            Some(Path::new(STALE_ROOT).join("dig-node.exe")),
             "the machine Path's stale root precedes the user Path's current root, so it wins a fresh \
              shell and the check must say so"
         );
