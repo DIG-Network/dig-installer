@@ -326,6 +326,10 @@ fn persisted_env_lookup(name: &str) -> Option<String> {
 /// Dropping the self-reference cannot hide a real shadow: every directory it could contribute is either
 /// already an entry of the machine or user `Path` (and therefore still searched), or is a volatile
 /// addition made by the launching process, which no new shell will have.
+// Only `persisted_path` (Windows) calls this in a production build, but it is deliberately NOT
+// `cfg(windows)`-gated: gating it would make its tests unfalsifiable on a unix runner, and the #2205
+// regression they pin is the kind that only a cross-platform suite keeps honest.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn expand_env_refs(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     /// The name whose expansion is the value being composed — never resolved. Compared
     /// case-insensitively: the registry writes `Path`, shells say `PATH`, and both appear in the wild.

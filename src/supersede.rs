@@ -320,6 +320,11 @@ fn running_images_under(_root: &Path, _os: Os) -> Vec<String> {
 
 /// The lines of `image_paths` that resolve under `root`. Pure — the parsing and the prefix rule are
 /// tested without spawning anything.
+// Called in production only from the Windows `running_images_under`, but left un-gated for the same
+// reason as `pathcheck::expand_env_refs`: a `cfg(windows)` gate would hide its tests from every unix
+// runner, and matching a process by ROOT rather than by executable name is exactly the rule that must
+// stay pinned.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn images_under(image_paths: &str, root: &Path, os: Os) -> Vec<String> {
     image_paths
         .lines()
