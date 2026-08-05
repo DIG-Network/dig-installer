@@ -145,6 +145,14 @@ pub trait UninstallActions {
     fn unregister_scheme(&mut self) -> (bool, String);
     /// Remove the dig.local hosts entry + the peer firewall rule.
     fn remove_network_config(&mut self) -> (bool, String);
+    /// Revert the DIG TLS trust anchor(s) recorded in the trust-manifest ledger, then remove the
+    /// privileged TLS root (#623/#858).
+    ///
+    /// Its own step because a trust anchor is machine-wide state that outlives every binary: an
+    /// installed CA left in the OS Root store keeps the machine trusting a private CA after DIG is
+    /// gone. Strictly DIG-owned scope — only the anchors this install's ledger recorded — and
+    /// idempotent (an already-absent anchor / root is success).
+    fn remove_tls_trust(&mut self) -> (bool, String);
     /// Delete all installed DIG binaries from both bin roots, EXCEPT the
     /// binaries of the component stems in `skip` — those had a failed service
     /// teardown, so deleting their binary would orphan a still-registered
@@ -206,6 +214,12 @@ pub fn orchestrate(actions: &mut dyn UninstallActions, dry_run: bool) -> Uninsta
 
     let (ok, note) = actions.remove_network_config();
     report.record("network", ok, note);
+
+    // Revert the trust anchor while the ledger under the TLS root still exists (this step removes
+    // the root last), and before the binaries so teardown of machine-wide trust state never lags a
+    // now-empty install.
+    let (ok, note) = actions.remove_tls_trust();
+    report.record("tls-trust", ok, note);
 
     // Before the binaries: while they still exist the fragment is at least pointing at something this
     // installer placed, so removing it first never widens the window in which it names a directory
@@ -294,6 +308,9 @@ mod tests {
         }
         fn remove_network_config(&mut self) -> (bool, String) {
             self.outcome("network")
+        }
+        fn remove_tls_trust(&mut self) -> (bool, String) {
+            self.outcome("tls-trust")
         }
         fn delete_binaries(&mut self, skip: &[String]) -> (bool, String) {
             self.calls.push("binaries".to_string());
@@ -429,6 +446,41 @@ mod tests {
         assert!(!r.complete());
     }
 
+    /// The DIG TLS trust anchor is machine-wide state (a CA in the OS Root store) that outlives
+    /// every binary, so an uninstall MUST revert it — and before the binaries, so the ledger under
+    /// the TLS root is still present when the revert reads it. The order is the property: reverting
+    /// after the root is gone would leave a trusted private CA behind with nothing to revert it by.
+    #[test]
+    fn the_tls_trust_anchor_is_reverted_before_the_binaries() {
+        let mut a = FakeActions::default();
+        let r = orchestrate(&mut a, false);
+        let tls = a
+            .calls
+            .iter()
+            .position(|c| c == "tls-trust")
+            .expect("the TLS trust anchor must be reverted");
+        let bins = a.calls.iter().position(|c| c == "binaries").unwrap();
+        assert!(
+            tls < bins,
+            "the trust anchor must be reverted before the binaries: {:?}",
+            a.calls
+        );
+        assert!(r.steps.iter().find(|s| s.id == "tls-trust").unwrap().ok);
+    }
+
+    /// A failed trust revert leaves a private CA trusted machine-wide — precisely the residue the
+    /// report must surface, never swallow into a green run.
+    #[test]
+    fn a_failed_tls_trust_revert_makes_the_run_incomplete() {
+        let mut a = FakeActions {
+            fail_step: Some("tls-trust".to_string()),
+            ..Default::default()
+        };
+        let r = orchestrate(&mut a, false);
+        assert!(!r.complete());
+        assert!(!r.steps.iter().find(|s| s.id == "tls-trust").unwrap().ok);
+    }
+
     #[test]
     fn scans_for_residue_last() {
         let mut a = FakeActions::default();
@@ -442,7 +494,7 @@ mod tests {
         let r = orchestrate(&mut a, false);
         assert!(r.complete());
         assert!(r.residue.is_empty());
-        assert_eq!(r.steps.len(), 9);
+        assert_eq!(r.steps.len(), 10);
         assert!(r.steps.iter().all(|s| s.ok));
     }
 

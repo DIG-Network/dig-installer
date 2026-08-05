@@ -341,6 +341,39 @@ jobs:
           jq -e '(.result.registration_audit | length) > 0' install.json
           jq -e '[.result.registration_audit[] | select(.under_legacy_root)] | length == 0' install.json
 
+      # #623/#858: the installer provisions the privileged TLS root so dig-node can serve HTTPS on
+      # https://dig.local instead of plaintext. Assert the reported provisioning first (cross-OS, from
+      # the JSON), then — on unix, where the layout + ownership are directly checkable — that the root
+      # is REALLY root-owned 0700 with the CA + leaf present and the CA private key owner-only. This
+      # verifies THIS installer's deliverable; the dig-node-side "HTTPS listening" log depends on the
+      # pinned dig-node version consuming the root (coordinated separately) and is not asserted here.
+      - name: Assert the privileged TLS root was provisioned (#623/#858)
+        run: |
+          jq -e '.result.tls_root.created == true' install.json
+          jq -e '.result.tls_root.ca_minted == true' install.json
+      - name: Assert the TLS root is root-owned 0700 with a CA + leaf (unix, #623/#858)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          root=/etc/dig/tls
+          # The root is deliberately 0700 root-owned — it holds the CA private key, so an unprivileged
+          # user must not be able to descend into it. That is exactly why the file checks below run under
+          # `sudo`: resolving `$root/ca.crt` needs SEARCH permission on the 0700 dir, which only root has.
+          # A plain `test -f "$root/ca.crt"` fails on permission (not absence) and would falsely read as
+          # "missing" against a correctly locked-down root. The install itself ran with `$SUDO`, so we
+          # inspect its output the same way. `stat` on the dir inode only needs search on /etc/dig (0755),
+          # but running it under sudo too keeps the whole assertion uniform.
+          sudo test -d "$root" || { echo "TLS root $root missing"; exit 1; }
+          owner=$(sudo stat -c %u "$root" 2>/dev/null || sudo stat -f %u "$root")
+          test "$owner" = "0" || { echo "TLS root owned by uid $owner, not root"; exit 1; }
+          mode=$(sudo stat -c %a "$root" 2>/dev/null || sudo stat -f %Lp "$root")
+          test "$mode" = "700" || { echo "TLS root mode $mode, expected 700"; exit 1; }
+          for f in ca.crt ca.key leaf.crt leaf.key; do
+            sudo test -f "$root/$f" || { echo "missing $root/$f"; exit 1; }
+          done
+          keymode=$(sudo stat -c %a "$root/ca.key" 2>/dev/null || sudo stat -f %Lp "$root/ca.key")
+          test "$keymode" = "600" || { echo "ca.key mode $keymode, expected 600"; exit 1; }
+
       # dig_ecosystem#526: the registration's SCOPE and its reboot survival are now reported, so the
       # e2e asserts them rather than only "installed". This leg passes `--bin-dir`, which is FORCED to
       # user scope (#565: a machine-wide daemon must never be pointed at a caller-selected path), so

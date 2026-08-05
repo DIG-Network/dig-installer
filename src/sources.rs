@@ -70,6 +70,7 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
         ("svcscope.rs", include_str!("svcscope.rs")),
         ("units.rs", include_str!("units.rs")),
         ("target.rs", include_str!("target.rs")),
+        ("tlsroot.rs", include_str!("tlsroot.rs")),
         ("uninstall.rs", include_str!("uninstall.rs")),
         ("update.rs", include_str!("update.rs")),
         ("userwrite.rs", include_str!("userwrite.rs")),
