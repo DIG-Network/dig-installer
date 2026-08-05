@@ -242,11 +242,21 @@ pub fn audit_failures(audits: &[RegistrationAudit]) -> Vec<String> {
 /// user-writable root — the set the migration deregisters INDEPENDENT of the
 /// current plan (#565 H1). I/O (reads each registration's binPath).
 pub fn regs_pointing_under_legacy(os: Os) -> Vec<PrivilegedReg> {
-    let legacy = paths::legacy_privileged_roots(os);
+    regs_pointing_under(&paths::legacy_privileged_roots(os), os)
+}
+
+/// The privileged registrations that CURRENTLY resolve to a binary under any of `roots`. I/O (reads
+/// each registration's binPath).
+///
+/// The general form of [`regs_pointing_under_legacy`]. [`crate::supersede`] asks it about a SUPERSEDED
+/// root, where the answer means the opposite thing: a hit there is a reason to REFUSE to remove the
+/// directory, not a reason to deregister (dig_ecosystem#2205). Same question, opposite policy — so the
+/// query belongs here and the policy stays with each caller.
+pub fn regs_pointing_under(roots: &[PathBuf], os: Os) -> Vec<PrivilegedReg> {
     privileged_regs(os)
         .into_iter()
         .filter(|reg| match reg.registered_bin_path() {
-            Some(bin) => bin_path_under_any(&bin, &legacy, os),
+            Some(bin) => bin_path_under_any(&bin, roots, os),
             None => false,
         })
         .collect()

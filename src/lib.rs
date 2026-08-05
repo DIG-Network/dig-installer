@@ -81,6 +81,7 @@ pub mod secure;
 pub mod service;
 pub mod sources;
 pub mod svc;
+pub mod supersede;
 pub mod svcscope;
 pub mod target;
 pub mod tlsroot;
@@ -583,6 +584,11 @@ pub struct InstallReport {
     /// legacy binaries removed, legacy PATH entries dropped. `None` on dry-run or
     /// when no legacy install was detected.
     pub migration: Option<migrate::MigrationResult>,
+    /// The record of clearing a SUPERSEDED install root (dig_ecosystem#2205): the stale
+    /// per-component directories under the old Program Files layout removed, their persisted PATH
+    /// entries dropped, and — just as loudly — any root deliberately LEFT in place with the reason.
+    /// `None` on dry-run or when no superseded root was found.
+    pub superseded_roots: Option<supersede::SupersedeResult>,
     /// The record of restoring an auto-update schedule the #565 migration removed off a
     /// legacy root on a run that did NOT select the beacon (dig_ecosystem#1854).
     ///
@@ -945,6 +951,7 @@ fn run_report_gated(
         veneer_links_removed: Vec::new(),
         preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
+        superseded_roots: None,
         beacon_rearm: None,
         rearmed_registrations: Vec::new(),
         registration_audit: Vec::new(),
@@ -1646,6 +1653,17 @@ fn run_report_gated(
         // immediately. Non-dry-run only (dry-run installs nothing to resolve).
         if !plan.dry_run {
             link_protected_clis(&target, report, veneer_is_safe, log);
+            // A SUPERSEDED install root is cleared FIRST (dig_ecosystem#2205). The ordering is
+            // load-bearing in both directions: the binaries this run placed must already be in the
+            // current root, because a superseded root is only removable once the current one holds
+            // everything it holds; and the removal must precede the verification, because a stale
+            // root on the MACHINE `Path` shadows the current root for every new shell and would
+            // otherwise fail this install's own reachability check — correctly, but over a directory
+            // the installer is able to clean up itself.
+            let superseded = supersede::remove_superseded_roots(&target, log);
+            if superseded.acted {
+                report.superseded_roots = Some(superseded);
+            }
             verify_clis_on_path(&target, invoker::target_user(), report, log);
             #[cfg(unix)]
             {
@@ -6396,6 +6414,7 @@ mod tests {
             veneer_links_removed: Vec::new(),
             preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
+            superseded_roots: None,
             beacon_rearm: None,
             rearmed_registrations: Vec::new(),
             registration_audit: Vec::new(),

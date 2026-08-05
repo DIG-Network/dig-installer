@@ -67,6 +67,7 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
         ("sources.rs", include_str!("sources.rs")),
         ("rearm.rs", include_str!("rearm.rs")),
         ("svc.rs", include_str!("svc.rs")),
+        ("supersede.rs", include_str!("supersede.rs")),
         ("svcscope.rs", include_str!("svcscope.rs")),
         ("units.rs", include_str!("units.rs")),
         ("target.rs", include_str!("target.rs")),
