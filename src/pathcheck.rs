@@ -320,6 +320,10 @@ fn persisted_env_lookup(name: &str) -> Option<String> {
 /// most often references (`SystemRoot`, `ProgramFiles`, `USERPROFILE`) which live in the session
 /// environment block rather than in either key — without it, `%SystemRoot%\system32` would never
 /// expand and the check would find nothing in it.
+// Production-called only from the Windows `persisted_env_lookup`, and deliberately not
+// `cfg(windows)`-gated: the ORDER is the property, and gating it would hide the test that pins it from
+// every unix runner. Same reasoning as `expand_env_refs` below.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_env_name(
     machine: Option<String>,
     user: Option<String>,
