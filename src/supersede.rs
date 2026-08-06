@@ -932,7 +932,18 @@ mod tests {
     /// invisible in `--json`.
     #[test]
     fn every_candidate_reaches_the_path_drop_and_a_path_only_change_is_reported() {
-        let target = host_target();
+        // Windows STATED, not `host_target()`. The gating `test + coverage` job runs ubuntu-only, and
+        // `superseded_roots(Os::Linux)` is empty -- so on the one runner that blocks merge the loop
+        // body never executed and the test fell into its own `candidates.is_empty()` arm, which is
+        // true for ANY loop body including none. Proven: deleting the PATH-drop leg fails this test
+        // on a Windows target and PASSES on a Linux one (dig-installer#62 review, round 2).
+        //
+        // Host-independent: `superseded_roots(Os::Windows)` is a pure function of the OS, and the
+        // not-a-directory branch these candidates take reaches no Windows-only I/O.
+        let target = Target {
+            os: Os::Windows,
+            arch: host_target().arch,
+        };
         let mut seen = Vec::new();
         let result = {
             let mut remover = recording_remover(Ok(vec![paths::PathScope::Machine]), &mut seen);
