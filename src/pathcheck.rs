@@ -296,9 +296,36 @@ fn persisted_env_lookup(name: &str) -> Option<String> {
             .and_then(|k| k.get_value(name))
             .ok()
     };
-    from(HKEY_LOCAL_MACHINE, MACHINE_ENV)
-        .or_else(|| from(HKEY_CURRENT_USER, "Environment"))
-        .or_else(|| std::env::var(name).ok())
+    resolve_env_name(
+        from(HKEY_LOCAL_MACHINE, MACHINE_ENV),
+        from(HKEY_CURRENT_USER, "Environment"),
+        std::env::var(name).ok(),
+    )
+}
+
+/// Choose between the three places a `%NAME%` reference could resolve from: the machine `Environment`
+/// key, the user's, and this process's environment — IN THAT ORDER. Pure.
+///
+/// # The order is the property, so it is a function of its own (dig_ecosystem#2205 review F2)
+///
+/// This was inlined as an `or_else` chain, and a reviewer reordered it to consult the PROCESS value
+/// first: it compiled and the whole suite stayed green, because every test injects its own lookup. The
+/// suite pinned the `%PATH%` short-circuit and nothing about WHERE a name resolves — which is the half
+/// of the defect that produces a false negative, and the reason the guard could report a clean PATH
+/// while a stale root really won a fresh shell.
+///
+/// Persisted first, because a persisted value is what a NEW shell will carry and ours may have been
+/// changed in-process or inherited from a launching shell. Machine before user, matching the order
+/// Windows composes them in. The process value is a last resort only, for the names a persisted `Path`
+/// most often references (`SystemRoot`, `ProgramFiles`, `USERPROFILE`) which live in the session
+/// environment block rather than in either key — without it, `%SystemRoot%\system32` would never
+/// expand and the check would find nothing in it.
+fn resolve_env_name(
+    machine: Option<String>,
+    user: Option<String>,
+    process: Option<String>,
+) -> Option<String> {
+    machine.or(user).or(process)
 }
 
 /// Expand `%NAME%` references in a persisted `REG_EXPAND_SZ` PATH, resolving each name through
@@ -810,6 +837,43 @@ mod tests {
             !expanded.to_ascii_uppercase().contains("%PATH%"),
             "the self-reference must not survive as a literal entry: {expanded}"
         );
+    }
+
+    /// The RESOLUTION ORDER, pinned directly (review F2).
+    ///
+    /// Reordering `resolve_env_name` to consult the process value first used to leave the whole suite
+    /// green, because every other test injects its own lookup. Each row below is a state where the
+    /// three sources DISAGREE, so any reordering changes an answer:
+    ///
+    /// * all three present   → machine wins, so machine-before-user and machine-before-process both fail if swapped;
+    /// * user + process only → user wins, which is the row a process-first order breaks;
+    /// * process only        → the fallback still works, so the order cannot be "fixed" by dropping it.
+    #[test]
+    fn a_name_resolves_from_persisted_state_before_our_own_environment() {
+        let m = || Some("from-machine".to_string());
+        let u = || Some("from-user".to_string());
+        let p = || Some("from-process".to_string());
+
+        assert_eq!(
+            resolve_env_name(m(), u(), p()).as_deref(),
+            Some("from-machine"),
+            "the machine Environment key wins: it is what a new shell composes first"
+        );
+        assert_eq!(
+            resolve_env_name(None, u(), p()).as_deref(),
+            Some("from-user"),
+            "the user key still beats OUR environment — this is the row a process-first order breaks"
+        );
+        assert_eq!(
+            resolve_env_name(m(), None, p()).as_deref(),
+            Some("from-machine")
+        );
+        assert_eq!(
+            resolve_env_name(None, None, p()).as_deref(),
+            Some("from-process"),
+            "the process fallback must survive, or %SystemRoot% would never expand"
+        );
+        assert_eq!(resolve_env_name(None, None, None), None);
     }
 
     /// A name neither `Environment` key defines is left verbatim, so a broken reference is visible in

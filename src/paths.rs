@@ -577,6 +577,14 @@ pub fn remove_from_persisted_path(dir: &Path) -> Result<Vec<PathScope>, String> 
         let Some(new_path) = path_remove(&current, &dir.to_string_lossy(), ';') else {
             continue;
         };
+        // Write back the value's OWN type. A `Path` is normally `REG_EXPAND_SZ`, but a machine that
+        // has a plain `REG_SZ` one is not ours to convert: promoting it would start expanding
+        // `%VAR%` references that were previously literal, changing what every process on the box
+        // resolves (dig_ecosystem#2205 review).
+        let vtype = env
+            .get_raw_value("Path")
+            .map(|v| v.vtype)
+            .unwrap_or(REG_EXPAND_SZ);
         let writable = RegKey::predef(root)
             .open_subkey_with_flags(subkey, KEY_READ | KEY_WRITE)
             .map_err(|e| format!("open {} for write: {e}", scope.label()))?;
@@ -584,7 +592,7 @@ pub fn remove_from_persisted_path(dir: &Path) -> Result<Vec<PathScope>, String> 
             .set_raw_value(
                 "Path",
                 &RegValue {
-                    vtype: REG_EXPAND_SZ,
+                    vtype,
                     bytes: string_to_reg_expand_sz_bytes(&new_path),
                 },
             )

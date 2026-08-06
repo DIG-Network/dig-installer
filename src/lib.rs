@@ -589,6 +589,10 @@ pub struct InstallReport {
     /// entries dropped, and — just as loudly — any root deliberately LEFT in place with the reason.
     /// `None` on dry-run or when no superseded root was found.
     pub superseded_roots: Option<supersede::SupersedeResult>,
+    /// MSI-installed DIG products this run superseded via `msiexec /x` (dig_ecosystem#2205),
+    /// removing their files, Add/Remove-Programs registration, machine-PATH component and service
+    /// together. Empty when no DIG Windows Installer product was registered — the common case.
+    pub msi_superseded: Vec<msi::MsiRemoval>,
     /// The record of restoring an auto-update schedule the #565 migration removed off a
     /// legacy root on a run that did NOT select the beacon (dig_ecosystem#1854).
     ///
@@ -952,6 +956,7 @@ fn run_report_gated(
         preceding_unsafe_path_dirs: Vec::new(),
         migration: None,
         superseded_roots: None,
+        msi_superseded: Vec::new(),
         beacon_rearm: None,
         rearmed_registrations: Vec::new(),
         registration_audit: Vec::new(),
@@ -981,6 +986,20 @@ fn run_report_gated(
         //    `installs_a_protected_component` so it runs on a `--bin-dir`/GUI
         //    privileged install too (the migration only acts on legacy roots, never
         //    the custom dir): otherwise a legacy-bound registration would survive.
+        // #2205: SUPERSEDE an MSI-installed copy of a component this run installs, BEFORE anything
+        //    else. The package installs the same component to `%ProgramFiles%\DIG Network\<stem>`,
+        //    puts that directory on the MACHINE PATH through its own component, and registers the
+        //    same service — so leaving it means the MSI's binary wins the bare name and this install
+        //    fails its own reachability check. It must run HERE, before step 3, because the package's
+        //    `ServiceControl` deletes the shared service on uninstall: run later, it would remove the
+        //    service this run had just registered. The install below re-registers it from the current
+        //    root, exactly as the #565 migration relies on.
+        let msi_superseded =
+            supersede::supersede_msi_products(&plan.selected_components(), plan.dry_run, log);
+        if !msi_superseded.is_empty() {
+            report.msi_superseded = msi_superseded;
+        }
+
         if !plan.dry_run && plan.installs_a_privileged_binary(target.os) {
             migrate_legacy_roots_step(
                 plan,
@@ -6415,6 +6434,7 @@ mod tests {
             preceding_unsafe_path_dirs: Vec::new(),
             migration: None,
             superseded_roots: None,
+            msi_superseded: Vec::new(),
             beacon_rearm: None,
             rearmed_registrations: Vec::new(),
             registration_audit: Vec::new(),
