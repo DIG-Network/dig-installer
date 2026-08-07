@@ -212,6 +212,40 @@ pub struct MsiRemoval {
     pub note: String,
 }
 
+/// Which of the MSI products currently registered on this machine an INSTALL must supersede
+/// (dig_ecosystem#2205). Pure — `installed` is what the machine reported, `installing` is the set of
+/// component stems this run places.
+///
+/// # Why an install removes an MSI product at all
+///
+/// A DIG MSI package installs the same component this run is installing, to a DIFFERENT location
+/// (`dig-node.wxs` → `%ProgramFiles%\DIG Network\dig-node\`), adds that location to the MACHINE PATH
+/// through its own `PathEntry` component, and registers the same service through `ServiceInstall`. Two
+/// managed copies of one component is not a state either installer can keep coherent: the MSI's PATH
+/// entry is composed before the user PATH, so its binary wins the bare name against the copy this run
+/// places, and the install then correctly fails its own reachability check.
+///
+/// Removal MUST go through `msiexec /x` and never through deleting the directory
+/// ([`crate::supersede`]): the files, the Add/Remove-Programs registration, the MSI-owned PATH
+/// component and the service are one transaction in the Windows Installer database, and hand-deleting
+/// leaves a registered product with no files — the ghost this module's header exists to prevent.
+///
+/// # Why only the stems this run installs
+///
+/// Superseding a product means this run takes over managing that component. A DIG MSI for a component
+/// the run was NOT asked to install has no replacement coming, so removing it would simply leave the
+/// machine without it.
+pub fn products_to_supersede(
+    installed: &[(String, ProductCode)],
+    installing: &[&str],
+) -> Vec<(String, ProductCode)> {
+    installed
+        .iter()
+        .filter(|(stem, _)| installing.iter().any(|s| s.eq_ignore_ascii_case(stem)))
+        .cloned()
+        .collect()
+}
+
 /// Summarise the MSI step for the uninstall report: `(ok, note)`, where `ok` means every product
 /// reached the desired end state. An empty list is success — no MSI-installed DIG product is present,
 /// which is the common case on a raw-binary install. Pure.
@@ -381,34 +415,41 @@ pub fn remove_product(_code: &ProductCode) -> MsiOutcome {
 pub fn remove_all_dig_products(dry_run: bool) -> Vec<MsiRemoval> {
     installed_dig_products()
         .into_iter()
-        .map(|(stem, code)| {
-            if dry_run {
-                return MsiRemoval {
-                    note: format!("would remove {stem} via msiexec /x {code}"),
-                    stem,
-                    product_code: code.as_str().to_string(),
-                    outcome: MsiOutcome::Removed,
-                };
-            }
-            let outcome = remove_product(&code);
-            let note = match outcome {
-                MsiOutcome::Removed => format!("{stem}: removed MSI product {code}"),
-                MsiOutcome::AlreadyAbsent => format!("{stem}: MSI product {code} already absent"),
-                MsiOutcome::RemovedRebootRequired => {
-                    format!("{stem}: removed MSI product {code} — a reboot is required to finish")
-                }
-                MsiOutcome::Failed(c) => {
-                    format!("{stem}: msiexec /x {code} failed with exit code {c}")
-                }
-            };
-            MsiRemoval {
-                stem,
-                product_code: code.as_str().to_string(),
-                outcome,
-                note,
-            }
-        })
+        .map(|(stem, code)| remove_one_product(stem, code, dry_run))
         .collect()
+}
+
+/// Uninstall ONE known DIG product and describe what happened.
+///
+/// Shared by the uninstall's [`remove_all_dig_products`] and the install's
+/// [`crate::supersede::supersede_msi_products`], so the two paths cannot drift in what they do or in
+/// how they report it — the note strings end up in the same `--json` shape.
+pub fn remove_one_product(stem: String, code: ProductCode, dry_run: bool) -> MsiRemoval {
+    if dry_run {
+        return MsiRemoval {
+            note: format!("would remove {stem} via msiexec /x {code}"),
+            stem,
+            product_code: code.as_str().to_string(),
+            outcome: MsiOutcome::Removed,
+        };
+    }
+    let outcome = remove_product(&code);
+    let note = match outcome {
+        MsiOutcome::Removed => format!("{stem}: removed MSI product {code}"),
+        MsiOutcome::AlreadyAbsent => format!("{stem}: MSI product {code} already absent"),
+        MsiOutcome::RemovedRebootRequired => {
+            format!("{stem}: removed MSI product {code} — a reboot is required to finish")
+        }
+        MsiOutcome::Failed(c) => {
+            format!("{stem}: msiexec /x {code} failed with exit code {c}")
+        }
+    };
+    MsiRemoval {
+        stem,
+        product_code: code.as_str().to_string(),
+        outcome,
+        note,
+    }
 }
 
 #[cfg(test)]

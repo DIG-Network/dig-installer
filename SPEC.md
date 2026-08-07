@@ -678,6 +678,66 @@ the install reports NOT ready (`MigrationResult::deregister_failures`), never a 
 tolerated re-install that could leave the service at the legacy binPath. Recorded in
 `InstallReport.migration`.
 
+**Superseding a competing installation (`supersede`).** DISTINCT from the migration above, and
+governed by the opposite policy. A Windows machine can carry two managed copies of one component: this
+installer places `dig-node.exe` in `%ProgramFiles%\DIG\bin`, while the dig-node MSI package places its
+own in `%ProgramFiles%\DIG Network\dig-node\` (`dig-node.wxs` -> `INSTALLFOLDER`), adds that directory
+to the MACHINE `Path` through its own `PathEntry` component, and registers the same
+`net.dignetwork.dig-node` service through `ServiceInstall`. A new shell composes the machine `Path`
+BEFORE the user `Path`, so the MSI's copy wins the bare name and the install correctly fails its own
+reachability check. The installer MUST resolve this, and the resolution depends on what owns the
+directory.
+
+**A REGISTERED Windows Installer product MUST be removed with `msiexec /x`, never by deleting files**
+(`supersede::supersede_msi_products`). Its files, Add/Remove-Programs registration, machine-PATH
+component and service are one transaction in the Installer database; deleting the directory leaves a
+registered product with no files, a repair that fails, and an upgrade that believes an older version is
+present. Only a product whose component stem THIS RUN installs is superseded
+(`msi::products_to_supersede`) — a product with no replacement coming MUST be left alone.
+
+**That step MUST run before any service is registered.** The package's `ServiceControl` stops and
+deletes the shared service on uninstall, so running it later would remove the service this run had just
+registered. It is therefore placed beside the #565 migration, before component installation, and the
+normal install re-registers the service from the current root.
+
+**An ORPHANED directory** — the same path with no registered product — has no database to respect and
+is removed here, conditionally, after placement and before the reachability check. Candidates are
+derived (`paths::superseded_roots`) as one directory per DIG component under
+`paths::superseded_root_base` (`%ProgramFiles%\DIG Network` on Windows; NOTHING on unix, whose layout
+has always been the single `/opt/dig/bin` root), never the current `protected_bin_dir`, each judged
+INDEPENDENTLY.
+
+Removal REFUSES — leaving the directory in place and recording the reason — when any of these holds, in
+this precedence (`supersede::decide`, pure):
+
+0. a STILL-REGISTERED Windows Installer product owns the directory. This is ABSOLUTE: it is never a
+   fallback, and specifically MUST NOT be bypassed after a failed `msiexec` attempt;
+1. a privileged registration (a service `PathName`, the beacon task) resolves under the root;
+2. a RUNNING process's image resolves under the root, matched by ROOT and never by executable name (the
+   two copies share a filename);
+3. the root holds an entry the current install root does not, compared case-insensitively.
+
+Otherwise the KNOWN DIG binary filenames are deleted one by one via `symlink_metadata` (never a
+recursive walk, never following a reparse point), the directory is removed NON-recursively, and the root
+is dropped from EVERY persisted `Path` scope that carries it — machine and user
+(`paths::remove_from_persisted_path`), preserving each value's own registry type so a `REG_SZ` `Path` is
+never promoted to `REG_EXPAND_SZ`. The PATH drop MUST also run for a candidate whose directory is already
+gone, since a stale machine-PATH entry outlives its directory and still shadows. Nothing here is fatal:
+what cannot be cleaned is recorded in `InstallReport.superseded_roots` / `InstallReport.msi_superseded`
+and the reachability check remains free to fail the install.
+
+**PATH reachability is a property of PERSISTED state, never of the installer's own environment
+(`pathcheck`).** On Windows the PATH consulted is the persisted machine `Path` followed by the persisted
+user `Path`, with `%NAME%` references resolved against the persisted `Environment` keys first and this
+process's environment only as a last resort for a name neither key defines. That ORDER is normative:
+machine key, then user key, then this process (`pathcheck::resolve_env_name`) — consulting the process
+value earlier reintroduces the false negative below. A `%PATH%` SELF-REFERENCE MUST
+expand to nothing: the name it references is the value being composed, and resolving it through the process
+environment splices the launching shell's `PATH` into the verdict — which was measured turning a 63-entry
+composed session `PATH` into a 151-entry one and making the shadow check report a clean PATH while a stale
+root genuinely won a fresh shell (a false negative). The verdict MUST be identical however the installer
+was launched.
+
 **The beacon is registered and deregistered SYSTEM-scope ONLY (`regaudit`).** dig-updater installs
 the beacon system-scope on every OS (Linux writes `/etc/systemd/system` under elevation with no
 `systemctl --user`; Windows a SYSTEM Scheduled Task; macOS a `/Library/LaunchDaemons` root daemon),

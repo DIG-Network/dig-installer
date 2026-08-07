@@ -266,6 +266,43 @@ pub fn legacy_privileged_roots(os: Os) -> Vec<PathBuf> {
     }
 }
 
+/// The base of the SUPERSEDED Program Files layout an earlier installer used, on `os`.
+///
+/// Before the install root was unified on `%ProgramFiles%\DIG\bin`, Windows installs placed each
+/// component in its own directory under `%ProgramFiles%\DIG Network` (`DIG Network\dig-node\
+/// dig-node.exe`, and so on). Those directories are admin-only-writable, so unlike a
+/// [`legacy_privileged_roots`] entry they are not a privilege-escalation surface — but they stay on
+/// the machine PATH, where they SHADOW the current root and make a correct install fail its own
+/// reachability check (dig_ecosystem#2205). [`crate::supersede`] removes them, conditionally.
+///
+/// `None` on unix: the unix layout has always been the single `/opt/dig/bin` root, so there is no
+/// superseded per-component base to vacate.
+pub fn superseded_root_base(os: Os) -> Option<PathBuf> {
+    match os {
+        Os::Windows => Some(program_files().join("DIG Network")),
+        Os::Linux | Os::MacOs => None,
+    }
+}
+
+/// The concrete SUPERSEDED install roots to consider removing on `os` — one per DIG component under
+/// [`superseded_root_base`], never the current [`protected_bin_dir`].
+///
+/// Derived from the component list rather than hardcoded per path, so a root is "a DIG root that is
+/// not the current one" rather than a literal that a second implementation could drift from. Judged
+/// and removed INDEPENDENTLY: a refusal on one component's directory must not keep another's stale
+/// directory on PATH.
+pub fn superseded_roots(os: Os) -> Vec<PathBuf> {
+    let Some(base) = superseded_root_base(os) else {
+        return Vec::new();
+    };
+    let current = protected_bin_dir();
+    crate::migrate::DIG_BINARY_STEMS
+        .iter()
+        .map(|stem| base.join(stem))
+        .filter(|root| root != &current)
+        .collect()
+}
+
 /// Compute the new user-PATH string after REMOVING every entry equal to `dir`
 /// (the mirror of [`path_append`]) — used by the #565 migration to drop a stale,
 /// user-writable legacy bin dir so it can no longer shadow the new protected
@@ -486,6 +523,92 @@ fn windows_add_to_path(bin_dir: &Path) -> Result<PathWiring, String> {
     .map_err(|e| format!("write HKCU\\Environment\\Path: {e}"))?;
     broadcast_environment_change();
     Ok(PathWiring::changed(format!("user PATH: {dir}")))
+}
+
+/// A persisted Windows `Path` value, named by the registry scope that owns it.
+///
+/// Both scopes matter to reachability and they are written by different identities: an install wires
+/// the USER value ([`add_to_path`]), while an older installer — or an MSI — could leave an entry in the
+/// MACHINE value, which a new shell composes FIRST and which therefore shadows everything in the user
+/// value (dig_ecosystem#2205). Removing a superseded root's entry has to address both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathScope {
+    /// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment` — composed FIRST.
+    Machine,
+    /// `HKCU\Environment` — composed after the machine value.
+    User,
+}
+
+impl PathScope {
+    /// The scope's name as it appears in a log line or a `--json` report.
+    pub fn label(self) -> &'static str {
+        match self {
+            PathScope::Machine => "machine PATH",
+            PathScope::User => "user PATH",
+        }
+    }
+}
+
+/// Remove `dir` from the persisted Windows `Path` in every scope that carries it, returning the
+/// scopes actually changed (empty when `dir` was on neither).
+///
+/// Writing the MACHINE value needs elevation; a refusal there is reported as an error rather than
+/// swallowed, because an entry left on the machine `Path` keeps shadowing the current root.
+#[cfg(windows)]
+pub fn remove_from_persisted_path(dir: &Path) -> Result<Vec<PathScope>, String> {
+    use winreg::enums::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_EXPAND_SZ,
+    };
+    use winreg::{RegKey, RegValue};
+
+    const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+
+    let mut changed = Vec::new();
+    for (scope, root, subkey) in [
+        (PathScope::Machine, HKEY_LOCAL_MACHINE, MACHINE_ENV),
+        (PathScope::User, HKEY_CURRENT_USER, "Environment"),
+    ] {
+        let Ok(env) = RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ) else {
+            continue; // the key is absent — nothing of ours can be on a value that does not exist
+        };
+        // Read the RAW value: expanding it first and writing the result back would bake this
+        // machine's current `%SystemRoot%` into a value that must stay relocatable.
+        let current: String = env.get_value("Path").unwrap_or_default();
+        let Some(new_path) = path_remove(&current, &dir.to_string_lossy(), ';') else {
+            continue;
+        };
+        // Write back the value's OWN type. A `Path` is normally `REG_EXPAND_SZ`, but a machine that
+        // has a plain `REG_SZ` one is not ours to convert: promoting it would start expanding
+        // `%VAR%` references that were previously literal, changing what every process on the box
+        // resolves (dig_ecosystem#2205 review).
+        let vtype = env
+            .get_raw_value("Path")
+            .map(|v| v.vtype)
+            .unwrap_or(REG_EXPAND_SZ);
+        let writable = RegKey::predef(root)
+            .open_subkey_with_flags(subkey, KEY_READ | KEY_WRITE)
+            .map_err(|e| format!("open {} for write: {e}", scope.label()))?;
+        writable
+            .set_raw_value(
+                "Path",
+                &RegValue {
+                    vtype,
+                    bytes: string_to_reg_expand_sz_bytes(&new_path),
+                },
+            )
+            .map_err(|e| format!("write {}: {e}", scope.label()))?;
+        changed.push(scope);
+    }
+    if !changed.is_empty() {
+        broadcast_environment_change();
+    }
+    Ok(changed)
+}
+
+/// Non-Windows: there is no persisted `Path` registry value to rewrite.
+#[cfg(not(windows))]
+pub fn remove_from_persisted_path(_dir: &Path) -> Result<Vec<PathScope>, String> {
+    Ok(Vec::new())
 }
 
 /// Does `component`, having landed in `bin_dir`, need a symlink from [`UNIX_MACHINE_BIN_DIR`] so a user
