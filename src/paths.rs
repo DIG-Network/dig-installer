@@ -549,43 +549,49 @@ impl PathScope {
     }
 }
 
-/// Remove `dir` from the persisted Windows `Path` in every scope that carries it, returning the
+/// Remove `dir` from the persisted Windows `Path` in EVERY scope that carries it, returning the
 /// scopes actually changed (empty when `dir` was on neither).
 ///
 /// Writing the MACHINE value needs elevation; a refusal there is reported as an error rather than
-/// swallowed, because an entry left on the machine `Path` keeps shadowing the current root.
+/// swallowed, because an entry left on the machine `Path` keeps shadowing the current root. A failure
+/// in ONE scope MUST NOT skip the other: an unelevated run whose `HKLM` write fails must still clean
+/// the `HKCU` entry — the contract is "every scope" (dig_ecosystem#2305 F4).
 #[cfg(windows)]
 pub fn remove_from_persisted_path(dir: &Path) -> Result<Vec<PathScope>, String> {
     use winreg::enums::{
-        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_EXPAND_SZ,
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_EXPAND_SZ,
     };
     use winreg::{RegKey, RegValue};
 
     const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    fn location(scope: PathScope) -> (HKEY, &'static str) {
+        match scope {
+            PathScope::Machine => (HKEY_LOCAL_MACHINE, MACHINE_ENV),
+            PathScope::User => (HKEY_CURRENT_USER, "Environment"),
+        }
+    }
 
-    let mut changed = Vec::new();
-    for (scope, root, subkey) in [
-        (PathScope::Machine, HKEY_LOCAL_MACHINE, MACHINE_ENV),
-        (PathScope::User, HKEY_CURRENT_USER, "Environment"),
-    ] {
-        let Ok(env) = RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ) else {
-            continue; // the key is absent — nothing of ours can be on a value that does not exist
-        };
-        // Read the RAW value: expanding it first and writing the result back would bake this
-        // machine's current `%SystemRoot%` into a value that must stay relocatable.
-        let current: String = env.get_value("Path").unwrap_or_default();
-        let Some(new_path) = path_remove(&current, &dir.to_string_lossy(), ';') else {
-            continue;
-        };
+    // Read the RAW value: expanding it first and writing the result back would bake this machine's
+    // current `%SystemRoot%` into a value that must stay relocatable. `None` = the key is absent, so
+    // nothing of ours can be on a value that does not exist.
+    let read = |scope: PathScope| -> Option<String> {
+        let (hive, subkey) = location(scope);
+        let env = RegKey::predef(hive)
+            .open_subkey_with_flags(subkey, KEY_READ)
+            .ok()?;
+        Some(env.get_value("Path").unwrap_or_default())
+    };
+    let mut write = |scope: PathScope, new_path: &str| -> Result<(), String> {
+        let (hive, subkey) = location(scope);
         // Write back the value's OWN type. A `Path` is normally `REG_EXPAND_SZ`, but a machine that
-        // has a plain `REG_SZ` one is not ours to convert: promoting it would start expanding
-        // `%VAR%` references that were previously literal, changing what every process on the box
-        // resolves (dig_ecosystem#2205 review).
-        let vtype = env
-            .get_raw_value("Path")
-            .map(|v| v.vtype)
+        // has a plain `REG_SZ` one is not ours to convert: promoting it would start expanding `%VAR%`
+        // references that were previously literal (dig_ecosystem#2205 review).
+        let vtype = RegKey::predef(hive)
+            .open_subkey_with_flags(subkey, KEY_READ)
+            .ok()
+            .and_then(|env| env.get_raw_value("Path").ok().map(|v| v.vtype))
             .unwrap_or(REG_EXPAND_SZ);
-        let writable = RegKey::predef(root)
+        let writable = RegKey::predef(hive)
             .open_subkey_with_flags(subkey, KEY_READ | KEY_WRITE)
             .map_err(|e| format!("open {} for write: {e}", scope.label()))?;
         writable
@@ -593,16 +599,62 @@ pub fn remove_from_persisted_path(dir: &Path) -> Result<Vec<PathScope>, String> 
                 "Path",
                 &RegValue {
                     vtype,
-                    bytes: string_to_reg_expand_sz_bytes(&new_path),
+                    bytes: string_to_reg_expand_sz_bytes(new_path),
                 },
             )
-            .map_err(|e| format!("write {}: {e}", scope.label()))?;
-        changed.push(scope);
-    }
+            .map_err(|e| format!("write {}: {e}", scope.label()))
+    };
+
+    let (changed, err) = remove_from_persisted_path_in(
+        dir,
+        &[PathScope::Machine, PathScope::User],
+        &read,
+        &mut write,
+    );
     if !changed.is_empty() {
         broadcast_environment_change();
     }
-    Ok(changed)
+    match err {
+        Some(e) => Err(e),
+        None => Ok(changed),
+    }
+}
+
+/// The scope-iteration core of [`remove_from_persisted_path`], over injected per-scope read/write so
+/// the "every scope" contract is testable without a real registry (dig_ecosystem#2305 F4).
+///
+/// Every scope is attempted in turn: a scope carrying `dir` (its `read` yields a value from which
+/// [`path_remove`] can drop `dir`) is written back, and a write failure is REMEMBERED but does NOT
+/// short-circuit the remaining scopes — so an `HKLM` write that an unelevated run cannot perform never
+/// leaves the `HKCU` entry behind. Returns the scopes actually changed plus the first write error, if
+/// any (`Some` only when a scope that HELD the entry could not be cleaned).
+#[cfg(any(windows, test))]
+fn remove_from_persisted_path_in(
+    dir: &Path,
+    scopes: &[PathScope],
+    read: &dyn Fn(PathScope) -> Option<String>,
+    write: &mut dyn FnMut(PathScope, &str) -> Result<(), String>,
+) -> (Vec<PathScope>, Option<String>) {
+    let needle = dir.to_string_lossy();
+    let mut changed = Vec::new();
+    let mut first_err: Option<String> = None;
+    for &scope in scopes {
+        let Some(current) = read(scope) else {
+            continue; // the key is absent — nothing of ours can be there
+        };
+        let Some(new_path) = path_remove(&current, &needle, ';') else {
+            continue; // this scope does not carry the entry
+        };
+        match write(scope, &new_path) {
+            Ok(()) => changed.push(scope),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    (changed, first_err)
 }
 
 /// Non-Windows: there is no persisted `Path` registry value to rewrite.
@@ -1558,6 +1610,87 @@ mod tests {
             path_remove("/home/U/.dig/bin:/usr/bin", "/home/u/.dig/bin", ':'),
             None
         );
+    }
+
+    // -- remove_from_persisted_path: EVERY scope, no short-circuit (F4) ---------
+
+    /// A failure cleaning one scope must NOT skip the others: an unelevated run whose `HKLM` write
+    /// fails must STILL clean the `HKCU` entry, or the user entry keeps shadowing the current root.
+    ///
+    /// The fixture puts the entry on BOTH scopes and fails only the machine write. Under a `?`-style
+    /// short-circuit the user scope is never reached; the "every scope" contract requires it be
+    /// cleaned regardless (dig_ecosystem#2305 F4).
+    #[test]
+    fn remove_from_persisted_path_cleans_the_user_scope_even_when_the_machine_write_fails() {
+        let dir = Path::new(r"C:\Program Files\DIG Network\dig-node");
+        let both = format!(r"C:\Windows;{};C:\Other", dir.display());
+        let read = |_scope: PathScope| Some(both.clone());
+        let mut written: Vec<PathScope> = Vec::new();
+        let (changed, err) = {
+            let mut write = |scope: PathScope, _new: &str| -> Result<(), String> {
+                match scope {
+                    PathScope::Machine => {
+                        Err("open machine PATH for write: access denied".to_string())
+                    }
+                    PathScope::User => {
+                        written.push(scope);
+                        Ok(())
+                    }
+                }
+            };
+            remove_from_persisted_path_in(
+                dir,
+                &[PathScope::Machine, PathScope::User],
+                &read,
+                &mut write,
+            )
+        };
+
+        assert_eq!(
+            written,
+            vec![PathScope::User],
+            "the user scope MUST be cleaned despite the machine failure"
+        );
+        assert_eq!(
+            changed,
+            vec![PathScope::User],
+            "only the successfully-cleaned scope is reported as changed"
+        );
+        let err = err.expect("the machine failure must still be surfaced");
+        assert!(err.contains("access denied"), "got: {err:?}");
+    }
+
+    /// Both scopes carrying the entry are both cleaned, and a scope that does not carry it is skipped
+    /// (never a spurious write). The happy-path companion to the failure case above.
+    #[test]
+    fn remove_from_persisted_path_cleans_only_the_scopes_that_carry_the_entry() {
+        let dir = Path::new(r"C:\Program Files\DIG Network\dig-node");
+        let on_machine = format!(r"C:\Windows;{}", dir.display());
+        let read = |scope: PathScope| match scope {
+            PathScope::Machine => Some(on_machine.clone()),
+            PathScope::User => Some(r"C:\Users\me\.dig\bin".to_string()), // does not carry it
+        };
+        let mut written: Vec<PathScope> = Vec::new();
+        let (changed, err) = {
+            let mut write = |scope: PathScope, _new: &str| -> Result<(), String> {
+                written.push(scope);
+                Ok(())
+            };
+            remove_from_persisted_path_in(
+                dir,
+                &[PathScope::Machine, PathScope::User],
+                &read,
+                &mut write,
+            )
+        };
+
+        assert_eq!(
+            written,
+            vec![PathScope::Machine],
+            "only the scope that carries the entry is written"
+        );
+        assert_eq!(changed, vec![PathScope::Machine]);
+        assert!(err.is_none(), "no failure, so no error is surfaced");
     }
 
     // -- unix profile-append tests against a TEMP home (never the real dotfiles).
