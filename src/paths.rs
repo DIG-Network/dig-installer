@@ -559,9 +559,9 @@ impl PathScope {
 #[cfg(windows)]
 pub fn remove_from_persisted_path(dir: &Path) -> Result<Vec<PathScope>, String> {
     use winreg::enums::{
-        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_EXPAND_SZ,
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_EXPAND_SZ,
     };
-    use winreg::{RegKey, RegValue};
+    use winreg::{RegKey, RegValue, HKEY};
 
     const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     fn location(scope: PathScope) -> (HKEY, &'static str) {
