@@ -986,14 +986,17 @@ fn run_report_gated(
         //    `installs_a_protected_component` so it runs on a `--bin-dir`/GUI
         //    privileged install too (the migration only acts on legacy roots, never
         //    the custom dir): otherwise a legacy-bound registration would survive.
-        // #2205: SUPERSEDE an MSI-installed copy of a component this run installs, BEFORE anything
-        //    else. The package installs the same component to `%ProgramFiles%\DIG Network\<stem>`,
-        //    puts that directory on the MACHINE PATH through its own component, and registers the
-        //    same service — so leaving it means the MSI's binary wins the bare name and this install
-        //    fails its own reachability check. It must run HERE, before step 3, because the package's
-        //    `ServiceControl` deletes the shared service on uninstall: run later, it would remove the
-        //    service this run had just registered. The install below re-registers it from the current
-        //    root, exactly as the #565 migration relies on.
+        // #2205/#2304: SUPERSEDE only a genuine LEGACY-SHADOW MSI copy — one whose recorded install
+        //    location is under `%ProgramFiles%\DIG Network\<stem>` and NOT the current canonical
+        //    `%ProgramFiles%\DIG\bin` root — of a component this run installs, BEFORE anything else. An
+        //    older MSI placed a SECOND copy there with its own machine-PATH row, so it won the bare
+        //    name and this install failed its reachability check. Since dig-node 0.99.9 the MSI instead
+        //    installs to the SAME canonical root with no PATH row, so it is the CURRENT install, never a
+        //    shadow — `products_to_supersede` fails safe and leaves it (and any unknown-location
+        //    product) alone, so this step can never `msiexec /x` the live install (#2304). It must run
+        //    HERE, before step 3, because a legacy package's `ServiceControl` deletes the shared service
+        //    on uninstall: run later, it would remove the service this run had just registered. The
+        //    install below re-registers it from the current root, as the #565 migration relies on.
         let msi_superseded =
             supersede::supersede_msi_products(&plan.selected_components(), plan.dry_run, log);
         if !msi_superseded.is_empty() {
@@ -4504,7 +4507,7 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         residue.extend(
             msi::installed_dig_products()
                 .into_iter()
-                .map(|(stem, code)| format!("MSI product still registered: {stem} {code}")),
+                .map(|p| format!("MSI product still registered: {} {}", p.stem, p.code)),
         );
         residue
     }

@@ -679,21 +679,27 @@ tolerated re-install that could leave the service at the legacy binPath. Recorde
 `InstallReport.migration`.
 
 **Superseding a competing installation (`supersede`).** DISTINCT from the migration above, and
-governed by the opposite policy. A Windows machine can carry two managed copies of one component: this
-installer places `dig-node.exe` in `%ProgramFiles%\DIG\bin`, while the dig-node MSI package places its
-own in `%ProgramFiles%\DIG Network\dig-node\` (`dig-node.wxs` -> `INSTALLFOLDER`), adds that directory
-to the MACHINE `Path` through its own `PathEntry` component, and registers the same
-`net.dignetwork.dig-node` service through `ServiceInstall`. A new shell composes the machine `Path`
-BEFORE the user `Path`, so the MSI's copy wins the bare name and the install correctly fails its own
-reachability check. The installer MUST resolve this, and the resolution depends on what owns the
-directory.
+governed by the opposite policy. A Windows machine could historically carry two managed copies of one
+component: this installer places `dig-node.exe` in `%ProgramFiles%\DIG\bin`, while an OLDER dig-node MSI
+package placed its own in a SECOND, competing location under `%ProgramFiles%\DIG Network\dig-node\`
+(`dig-node.wxs` -> `INSTALLFOLDER`), added that directory to the MACHINE `Path` through its own
+`PathEntry` component, and registered the same `net.dignetwork.dig-node` service. A new shell composes
+the machine `Path` BEFORE the user `Path`, so that legacy copy wins the bare name and the install
+correctly fails its own reachability check. Since dig-node 0.99.9/0.99.10 the MSI instead installs to
+the SAME canonical `%ProgramFiles%\DIG\bin` root with NO PATH row — so it is the current install, not a
+competing shadow. The installer MUST resolve only a genuine legacy shadow, decided from the product's
+recorded install LOCATION.
 
 **A REGISTERED Windows Installer product MUST be removed with `msiexec /x`, never by deleting files**
-(`supersede::supersede_msi_products`). Its files, Add/Remove-Programs registration, machine-PATH
-component and service are one transaction in the Installer database; deleting the directory leaves a
+(`supersede::supersede_msi_products`). Its files, Add/Remove-Programs registration, any machine-PATH
+component and its service are one transaction in the Installer database; deleting the directory leaves a
 registered product with no files, a repair that fails, and an upgrade that believes an older version is
-present. Only a product whose component stem THIS RUN installs is superseded
-(`msi::products_to_supersede`) — a product with no replacement coming MUST be left alone.
+present. A product is superseded ONLY when its ARP `InstallLocation` resolves under the legacy
+`%ProgramFiles%\DIG Network` root AND is NOT the current canonical `%ProgramFiles%\DIG\bin` root, and
+its component stem is one THIS RUN installs (`msi::products_to_supersede`, pure). A product installed to
+the canonical root, one with an unknown location, or one with no replacement coming MUST be left alone —
+the fail-safe that prevents `msiexec /x` from uninstalling the live canonical dig-node
+(dig_ecosystem#2304).
 
 **That step MUST run before any service is registered.** The package's `ServiceControl` stops and
 deletes the shared service on uninstall, so running it later would remove the service this run had just
