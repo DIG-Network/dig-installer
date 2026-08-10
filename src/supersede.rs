@@ -3,21 +3,27 @@
 //! # The situation
 //!
 //! A Windows machine can end up with two managed copies of one component. dig-installer places
-//! `dig-node.exe` in `%ProgramFiles%\DIG\bin`; the dig-node MSI package places its own in
-//! `%ProgramFiles%\DIG Network\dig-node\` (`dig-node.wxs` -> `INSTALLFOLDER`), adds THAT directory to
-//! the MACHINE `Path` through its own `PathEntry` component, and registers the same
-//! `net.dignetwork.dig-node` service through `ServiceInstall`.
+//! `dig-node.exe` in `%ProgramFiles%\DIG\bin`; an OLDER dig-node MSI package placed its own in a
+//! SECOND, competing location under `%ProgramFiles%\DIG Network\dig-node\` (`dig-node.wxs` ->
+//! `INSTALLFOLDER`), added THAT directory to the MACHINE `Path` through its own `PathEntry` component,
+//! and registered the same `net.dignetwork.dig-node` service through `ServiceInstall`.
 //!
-//! A new shell composes the machine `Path` BEFORE the user `Path`, so the MSI's copy wins the bare
+//! A new shell composes the machine `Path` BEFORE the user `Path`, so that legacy copy wins the bare
 //! name against the copy this run places. Measured on the machine that raised #2205:
 //!
 //! ```text
-//! fresh session PATH entry [50]  C:\Program Files\DIG Network\dig-node\   <- the MSI's copy, wins
+//! fresh session PATH entry [50]  C:\Program Files\DIG Network\dig-node\   <- the legacy copy, wins
 //! fresh session PATH entry [51]  C:\Program Files\DIG\bin                 <- this installer's copy
 //! ```
 //!
 //! The install then correctly failed its own reachability check
 //! ([`crate::pathcheck::verify_cli_resolves`]). The check was right; the machine had two installers.
+//!
+//! Since dig-node 0.99.9/0.99.10 (`874ac4c`) the MSI installs to the SAME canonical
+//! `%ProgramFiles%\DIG\bin` root with NO PATH row — so on an up-to-date machine the MSI IS the current
+//! install, not a shadow. Supersession is therefore decided from the product's recorded install
+//! LOCATION and narrowed to a genuine legacy shadow, so this step can never uninstall the live
+//! canonical install (dig_ecosystem#2304).
 //!
 //! # Two paths, because two different things can own that directory
 //!
@@ -222,15 +228,40 @@ pub fn supersede_msi_products(
     log: &mut dyn FnMut(&str),
 ) -> Vec<msi::MsiRemoval> {
     let installed = msi::installed_dig_products();
-    let superseding = msi::products_to_supersede(&installed, installing);
+    let mut remove = |stem, code| msi::remove_one_product(stem, code, dry_run);
+    supersede_msi_products_with(installing, &installed, &mut remove, log)
+}
+
+/// Uninstalling ONE superseded MSI product, as an injectable boundary.
+///
+/// Production removes it with `msiexec /x` ([`msi::remove_one_product`]); a test supplies its own so
+/// the ORCHESTRATION — and, critically, that NO destructive `msiexec` is invoked when nothing is a
+/// legacy shadow (dig_ecosystem#2304 AC2) — is provable without spawning `msiexec` or touching the
+/// Windows Installer database.
+pub type MsiRemover<'a> = dyn FnMut(String, msi::ProductCode) -> msi::MsiRemoval + 'a;
+
+/// [`supersede_msi_products`] with the installed-product set and the removal action injected.
+///
+/// The removal is only ever reached for a product [`msi::products_to_supersede`] selected — which, per
+/// dig_ecosystem#2304, is ONLY a genuine legacy shadow under `%ProgramFiles%\DIG Network`, never the
+/// current canonical `%ProgramFiles%\DIG\bin` install. On an up-to-date machine the selection is empty
+/// and this returns before `remove_product` is ever called, so a later-step install failure cannot have
+/// uninstalled the live canonical dig-node.
+pub fn supersede_msi_products_with(
+    installing: &[&str],
+    installed: &[msi::InstalledMsiProduct],
+    remove_product: &mut MsiRemover<'_>,
+    log: &mut dyn FnMut(&str),
+) -> Vec<msi::MsiRemoval> {
+    let superseding = msi::products_to_supersede(installed, installing);
     if superseding.is_empty() {
         return Vec::new();
     }
-    log("Superseding an MSI-installed DIG component this run replaces (#2205):");
+    log("Superseding a legacy-shadow MSI-installed DIG component this run replaces (#2205/#2304):");
     superseding
         .into_iter()
         .map(|(stem, code)| {
-            let removal = msi::remove_one_product(stem, code, dry_run);
+            let removal = remove_product(stem, code);
             let mark = if removal.outcome.ok() {
                 '\u{2713}'
             } else {
@@ -333,7 +364,7 @@ fn registered_msi_product_for(root: &Path) -> Option<String> {
         .filter(|p| {
             installed
                 .iter()
-                .any(|(s, _)| s.eq_ignore_ascii_case(p.stem))
+                .any(|ip| ip.stem.eq_ignore_ascii_case(p.stem))
         })
         .map(|p| p.display_name.to_string())
 }
@@ -980,15 +1011,26 @@ mod tests {
     #[test]
     fn only_a_product_for_a_component_this_run_installs_is_superseded() {
         let code = |g: &str| msi::parse_product_code(g).expect("valid GUID");
+        // Both are genuine LEGACY SHADOWS (under `%ProgramFiles%\DIG Network`) — so selection here
+        // turns purely on the stem, which is what this test pins.
+        let shadow = |stem: &str| {
+            Some(
+                paths::superseded_root_base(Os::Windows)
+                    .expect("Windows has a legacy base")
+                    .join(stem),
+            )
+        };
         let installed = vec![
-            (
-                "dig-node".to_string(),
-                code("{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}"),
-            ),
-            (
-                "dig-relay".to_string(),
-                code("{01234567-89AB-CDEF-0123-456789ABCDEF}"),
-            ),
+            msi::InstalledMsiProduct {
+                stem: "dig-node".to_string(),
+                code: code("{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}"),
+                location: shadow("dig-node"),
+            },
+            msi::InstalledMsiProduct {
+                stem: "dig-relay".to_string(),
+                code: code("{01234567-89AB-CDEF-0123-456789ABCDEF}"),
+                location: shadow("dig-relay"),
+            },
         ];
 
         let selected = msi::products_to_supersede(&installed, &["dig-node", "dign", "digstore"]);
@@ -1005,6 +1047,85 @@ mod tests {
             "stems compare case-insensitively"
         );
         assert!(msi::products_to_supersede(&[], &["dig-node"]).is_empty());
+    }
+
+    /// AC2 (dig_ecosystem#2304): on an up-to-date machine — where the dig-node MSI installed to the
+    /// CURRENT canonical `%ProgramFiles%\DIG\bin` — the supersede step takes NO destructive action, so
+    /// no `msiexec /x` can uninstall the live install and a later-step failure leaves it intact.
+    ///
+    /// The removal boundary is injected and COUNTS its calls: the load-bearing property is not "the
+    /// returned list is empty" (which a filter at any layer could satisfy) but "the destructive action
+    /// was never reached". The fixture pairs a canonical dig-node with a legacy-shadow dig-relay the run
+    /// is NOT installing, so a stem-only OR a location-blind implementation is both distinguishable.
+    #[test]
+    fn a_canonical_install_is_never_superseded_so_no_msiexec_runs() {
+        let canonical = paths::protected_bin_dir();
+        let legacy = paths::superseded_root_base(Os::Windows).expect("Windows has a legacy base");
+        let code = |g: &str| msi::parse_product_code(g).expect("valid GUID");
+        let installed = vec![
+            msi::InstalledMsiProduct {
+                stem: "dig-node".to_string(),
+                code: code("{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}"),
+                location: Some(canonical.clone()),
+            },
+            msi::InstalledMsiProduct {
+                stem: "dig-relay".to_string(),
+                code: code("{01234567-89AB-CDEF-0123-456789ABCDEF}"),
+                location: Some(legacy.join("dig-relay")),
+            },
+        ];
+
+        let mut removed: Vec<String> = Vec::new();
+        let out = {
+            let mut remover = |stem: String, code: msi::ProductCode| {
+                removed.push(stem.clone());
+                msi::MsiRemoval {
+                    stem,
+                    product_code: code.as_str().to_string(),
+                    outcome: msi::MsiOutcome::Removed,
+                    note: "should never be reached".to_string(),
+                }
+            };
+            supersede_msi_products_with(&["dig-node"], &installed, &mut remover, &mut |_| {})
+        };
+
+        assert!(
+            removed.is_empty(),
+            "the canonical dig-node install must never be uninstalled: {removed:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "nothing was superseded, so nothing is reported"
+        );
+    }
+
+    /// The regression complement of AC2: a genuine legacy shadow the run installs IS still removed via
+    /// the boundary (the #2205 case must keep working).
+    #[test]
+    fn a_legacy_shadow_this_run_installs_is_still_superseded() {
+        let legacy = paths::superseded_root_base(Os::Windows).expect("Windows has a legacy base");
+        let installed = vec![msi::InstalledMsiProduct {
+            stem: "dig-node".to_string(),
+            code: msi::parse_product_code("{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}").unwrap(),
+            location: Some(legacy.join("dig-node")),
+        }];
+
+        let mut removed: Vec<String> = Vec::new();
+        let out = {
+            let mut remover = |stem: String, code: msi::ProductCode| {
+                removed.push(stem.clone());
+                msi::MsiRemoval {
+                    stem,
+                    product_code: code.as_str().to_string(),
+                    outcome: msi::MsiOutcome::Removed,
+                    note: "removed".to_string(),
+                }
+            };
+            supersede_msi_products_with(&["dig-node"], &installed, &mut remover, &mut |_| {})
+        };
+
+        assert_eq!(removed, vec!["dig-node".to_string()]);
+        assert_eq!(out.len(), 1);
     }
 
     // -- the report ------------------------------------------------------------

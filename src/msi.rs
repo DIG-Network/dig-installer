@@ -27,7 +27,12 @@
 //! `/x <ProductCode>` is also preferred over `/x <path.msi>` because by uninstall time the original
 //! package file is usually long gone.
 
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
+
+use crate::paths;
+use crate::target::Os;
 
 /// The `Manufacturer` every DIG MSI package declares (`dig-node.wxs`). Byte-identical with
 /// [`crate::hardening::ARP_PUBLISHER`] — a DIG package that disagreed would not be recognised here.
@@ -212,21 +217,45 @@ pub struct MsiRemoval {
     pub note: String,
 }
 
+/// One MSI-installed DIG product the machine reported: its component stem, resolved ProductCode, and
+/// the Add/Remove-Programs `InstallLocation` it registered (`None` when the product recorded none).
+///
+/// The location is load-bearing: it is what [`products_to_supersede`] uses to tell a genuine legacy
+/// *shadow* install (a second, competing copy under `%ProgramFiles%\DIG Network`) apart from the
+/// CURRENT canonical install (`%ProgramFiles%\DIG\bin`) — which this run must never uninstall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledMsiProduct {
+    /// The component stem, matching [`crate::uninstall::COMPONENT_STEMS`].
+    pub stem: String,
+    /// The ProductCode Windows Installer resolved for this product.
+    pub code: ProductCode,
+    /// The ARP `InstallLocation` value, when the product registered one. `None` = unknown.
+    pub location: Option<PathBuf>,
+}
+
 /// Which of the MSI products currently registered on this machine an INSTALL must supersede
-/// (dig_ecosystem#2205). Pure — `installed` is what the machine reported, `installing` is the set of
-/// component stems this run places.
+/// (dig_ecosystem#2205, narrowed by dig_ecosystem#2304). Pure — `installed` is what the machine
+/// reported, `installing` is the set of component stems this run places.
 ///
-/// # Why an install removes an MSI product at all
+/// # Only a genuine LEGACY SHADOW is superseded — never the canonical install
 ///
-/// A DIG MSI package installs the same component this run is installing, to a DIFFERENT location
-/// (`dig-node.wxs` → `%ProgramFiles%\DIG Network\dig-node\`), adds that location to the MACHINE PATH
-/// through its own `PathEntry` component, and registers the same service through `ServiceInstall`. Two
-/// managed copies of one component is not a state either installer can keep coherent: the MSI's PATH
-/// entry is composed before the user PATH, so its binary wins the bare name against the copy this run
-/// places, and the install then correctly fails its own reachability check.
+/// The premise this step was born with — that the dig-node MSI is always a *second* copy under
+/// `%ProgramFiles%\DIG Network\<stem>\` with its own machine-PATH row — stopped being universally true
+/// in dig-node 0.99.9/0.99.10 (`874ac4c`): the MSI now installs to the SAME canonical
+/// `%ProgramFiles%\DIG\bin` this run uses, with NO PATH row. Superseding by stem alone therefore
+/// `msiexec /x`'d the canonical dig-node install — deleting `dig-node.exe`, stopping+deleting the
+/// LocalSystem service, and removing the `chia://` handler — and a later-step failure then stranded the
+/// machine with no dig-node and no recovery.
 ///
-/// Removal MUST go through `msiexec /x` and never through deleting the directory
-/// ([`crate::supersede`]): the files, the Add/Remove-Programs registration, the MSI-owned PATH
+/// So a product is superseded ONLY when its install location resolves under the legacy
+/// `%ProgramFiles%\DIG Network` root AND is NOT the current canonical install root. A location that IS
+/// the canonical root, or is unknown/`None`, is NEVER superseded — the fail-safe: on absent or
+/// ambiguous evidence this step does nothing rather than risk uninstalling the live install.
+///
+/// # Removal is still `msiexec /x`, never a file delete
+///
+/// When a legacy shadow IS selected, removal goes through `msiexec /x` ([`crate::supersede`]) and never
+/// through deleting the directory: the files, the Add/Remove-Programs registration, any MSI-owned PATH
 /// component and the service are one transaction in the Windows Installer database, and hand-deleting
 /// leaves a registered product with no files — the ghost this module's header exists to prevent.
 ///
@@ -236,14 +265,38 @@ pub struct MsiRemoval {
 /// the run was NOT asked to install has no replacement coming, so removing it would simply leave the
 /// machine without it.
 pub fn products_to_supersede(
-    installed: &[(String, ProductCode)],
+    installed: &[InstalledMsiProduct],
     installing: &[&str],
 ) -> Vec<(String, ProductCode)> {
+    let legacy_base = paths::superseded_root_base(Os::Windows);
+    let canonical = paths::protected_bin_dir();
     installed
         .iter()
-        .filter(|(stem, _)| installing.iter().any(|s| s.eq_ignore_ascii_case(stem)))
-        .cloned()
+        .filter(|p| installing.iter().any(|s| s.eq_ignore_ascii_case(&p.stem)))
+        .filter(|p| is_legacy_shadow(p.location.as_deref(), legacy_base.as_deref(), &canonical))
+        .map(|p| (p.stem.clone(), p.code.clone()))
         .collect()
+}
+
+/// Is `location` a genuine LEGACY SHADOW — under the legacy `%ProgramFiles%\DIG Network` root, and NOT
+/// under the current canonical install root? Pure, so every verdict is reachable without a registry.
+///
+/// Fail-safe by construction: an unknown location (`None`), a machine with no legacy base, or a
+/// location under the canonical root all return `false` — this run then supersedes nothing rather than
+/// risk uninstalling the live canonical install (dig_ecosystem#2304).
+fn is_legacy_shadow(
+    location: Option<&Path>,
+    legacy_base: Option<&Path>,
+    canonical_root: &Path,
+) -> bool {
+    let (Some(location), Some(legacy_base)) = (location, legacy_base) else {
+        return false;
+    };
+    // The layout is Windows-only, so path-under matching uses the Windows rules (case-insensitive,
+    // `/`- and `\`-tolerant) via the shared, cross-OS primitive.
+    let loc = location.to_string_lossy();
+    let under = |root: &Path| crate::regaudit::bin_path_under(&loc, root, Os::Windows);
+    under(legacy_base) && !under(canonical_root)
 }
 
 /// Summarise the MSI step for the uninstall report: `(ok, note)`, where `ok` means every product
@@ -318,10 +371,33 @@ fn product_codes_by_upgrade_code(package: &MsiPackage) -> Vec<ProductCode> {
         .collect()
 }
 
-/// DIG MSI products found by scanning Add/Remove Programs — the fallback for a package whose
-/// UpgradeCode index is missing. Returns `(stem, ProductCode)` pairs.
+/// The Add/Remove-Programs `InstallLocation` a Windows Installer product recorded for `code`, if any.
+///
+/// The ARP subkey for an MSI product is named by its (braced) ProductCode, so the location the package
+/// declared (`dig-node.wxs` → `INSTALLFOLDER`) is read straight from that subkey. An empty or missing
+/// value is `None` — treated by [`is_legacy_shadow`] as unknown, i.e. never superseded.
 #[cfg(windows)]
-fn arp_msi_candidates() -> Vec<(String, ProductCode)> {
+fn arp_install_location(code: &ProductCode) -> Option<PathBuf> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let path = format!("{UNINSTALL_KEY}\\{}", code.as_str());
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, KEY_READ)
+        .ok()?;
+    let loc: String = key.get_value("InstallLocation").ok()?;
+    let trimmed = loc.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+/// DIG MSI products found by scanning Add/Remove Programs — the fallback for a package whose
+/// UpgradeCode index is missing.
+#[cfg(windows)]
+fn arp_msi_candidates() -> Vec<InstalledMsiProduct> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
 
@@ -349,24 +425,38 @@ fn arp_msi_candidates() -> Vec<(String, ProductCode)> {
             .find(|p| display.trim().eq_ignore_ascii_case(p.display_name))
             .map(|p| p.stem.to_string())
             .unwrap_or_else(|| display.clone());
-        found.push((stem, code));
+        let location: Option<String> = entry.get_value("InstallLocation").ok();
+        let location = location
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from);
+        found.push(InstalledMsiProduct {
+            stem,
+            code,
+            location,
+        });
     }
     found
 }
 
-/// Every MSI-installed DIG product currently registered on this machine, as `(stem, ProductCode)`.
+/// Every MSI-installed DIG product currently registered on this machine.
 /// UpgradeCode-indexed products first, then any Add/Remove-Programs fallback match not already found.
 #[cfg(windows)]
-pub fn installed_dig_products() -> Vec<(String, ProductCode)> {
-    let mut found: Vec<(String, ProductCode)> = Vec::new();
+pub fn installed_dig_products() -> Vec<InstalledMsiProduct> {
+    let mut found: Vec<InstalledMsiProduct> = Vec::new();
     for package in MSI_PACKAGES {
         for code in product_codes_by_upgrade_code(package) {
-            found.push((package.stem.to_string(), code));
+            let location = arp_install_location(&code);
+            found.push(InstalledMsiProduct {
+                stem: package.stem.to_string(),
+                code,
+                location,
+            });
         }
     }
-    for (stem, code) in arp_msi_candidates() {
-        if !found.iter().any(|(_, c)| *c == code) {
-            found.push((stem, code));
+    for product in arp_msi_candidates() {
+        if !found.iter().any(|p| p.code == product.code) {
+            found.push(product);
         }
     }
     found
@@ -374,7 +464,7 @@ pub fn installed_dig_products() -> Vec<(String, ProductCode)> {
 
 /// No Windows Installer database off Windows, so nothing is ever MSI-installed.
 #[cfg(not(windows))]
-pub fn installed_dig_products() -> Vec<(String, ProductCode)> {
+pub fn installed_dig_products() -> Vec<InstalledMsiProduct> {
     Vec::new()
 }
 
@@ -415,7 +505,7 @@ pub fn remove_product(_code: &ProductCode) -> MsiOutcome {
 pub fn remove_all_dig_products(dry_run: bool) -> Vec<MsiRemoval> {
     installed_dig_products()
         .into_iter()
-        .map(|(stem, code)| remove_one_product(stem, code, dry_run))
+        .map(|p| remove_one_product(p.stem, p.code, dry_run))
         .collect()
 }
 
@@ -608,6 +698,88 @@ mod tests {
             "DIG Network",
             true
         ));
+    }
+
+    /// A canonical install location for a test product: the current protected bin dir.
+    fn canonical_location() -> Option<PathBuf> {
+        Some(paths::protected_bin_dir())
+    }
+
+    /// A genuine legacy-shadow location under `%ProgramFiles%\DIG Network\<stem>`.
+    fn legacy_shadow_location(stem: &str) -> Option<PathBuf> {
+        Some(
+            paths::superseded_root_base(Os::Windows)
+                .expect("Windows has a legacy base")
+                .join(stem),
+        )
+    }
+
+    fn product(stem: &str, location: Option<PathBuf>) -> InstalledMsiProduct {
+        InstalledMsiProduct {
+            stem: stem.to_string(),
+            code: parse_product_code("{7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E}").unwrap(),
+            location,
+        }
+    }
+
+    /// AC1 (dig_ecosystem#2304): a dig-node MSI installed to the CURRENT canonical
+    /// `%ProgramFiles%\DIG\bin` must NOT be superseded — superseding it `msiexec /x`'d the live install
+    /// in dig-node 0.99.9+. Under the pre-#2304 stem-only filter this returned the product; now it is
+    /// empty. The fixture varies ONLY the location from the legacy-shadow control below.
+    #[test]
+    fn a_canonical_location_dig_node_is_not_superseded() {
+        let installed = vec![product("dig-node", canonical_location())];
+        assert!(
+            products_to_supersede(&installed, &["dig-node"]).is_empty(),
+            "the canonical install must never be selected for msiexec /x"
+        );
+    }
+
+    /// B (regression, #2205 kept): a dig-node MSI at the legacy shadow root IS still superseded — the
+    /// genuine second-copy case the step exists for.
+    #[test]
+    fn a_legacy_shadow_dig_node_is_still_superseded() {
+        let installed = vec![product("dig-node", legacy_shadow_location("dig-node"))];
+        let selected = products_to_supersede(&installed, &["dig-node"]);
+        assert_eq!(selected.len(), 1, "got: {selected:?}");
+        assert_eq!(selected[0].0, "dig-node");
+    }
+
+    /// D (fail-safe): an UNKNOWN location (`None`) must NOT be superseded — on absent evidence the step
+    /// does nothing rather than risk uninstalling the live install.
+    #[test]
+    fn an_unknown_location_is_never_superseded() {
+        let installed = vec![product("dig-node", None)];
+        assert!(
+            products_to_supersede(&installed, &["dig-node"]).is_empty(),
+            "absent location evidence must fail safe, not msiexec /x the canonical install"
+        );
+    }
+
+    /// The pure location predicate directly, both bounds pinned: legacy → shadow, canonical → not,
+    /// unknown → not. The canonical/legacy roots are named the way `products_to_supersede` names them.
+    #[test]
+    fn only_a_location_under_the_legacy_root_is_a_shadow() {
+        let legacy_base = paths::superseded_root_base(Os::Windows);
+        let canonical = paths::protected_bin_dir();
+        let shadow = legacy_base.as_ref().unwrap().join("dig-node");
+        assert!(is_legacy_shadow(
+            Some(shadow.as_path()),
+            legacy_base.as_deref(),
+            &canonical
+        ));
+        assert!(
+            !is_legacy_shadow(
+                Some(canonical.as_path()),
+                legacy_base.as_deref(),
+                &canonical
+            ),
+            "the canonical install root is not a legacy shadow"
+        );
+        assert!(
+            !is_legacy_shadow(None, legacy_base.as_deref(), &canonical),
+            "an unknown location is not a legacy shadow"
+        );
     }
 
     #[test]
