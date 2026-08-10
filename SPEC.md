@@ -727,7 +727,9 @@ Otherwise the KNOWN DIG binary filenames are deleted one by one via `symlink_met
 recursive walk, never following a reparse point), the directory is removed NON-recursively, and the root
 is dropped from EVERY persisted `Path` scope that carries it — machine and user
 (`paths::remove_from_persisted_path`), preserving each value's own registry type so a `REG_SZ` `Path` is
-never promoted to `REG_EXPAND_SZ`. The PATH drop MUST also run for a candidate whose directory is already
+never promoted to `REG_EXPAND_SZ`. A failure cleaning one scope MUST NOT skip the others: an unelevated
+run whose machine (`HKLM`) write is refused still cleans the user (`HKCU`) entry, and reports the machine
+failure — a short-circuit that left the user entry behind would keep shadowing the current root. The PATH drop MUST also run for a candidate whose directory is already
 gone, since a stale machine-PATH entry outlives its directory and still shadows. Nothing here is fatal:
 what cannot be cleaned is recorded in `InstallReport.superseded_roots` / `InstallReport.msi_superseded`
 and the reachability check remains free to fail the install.

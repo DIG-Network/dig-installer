@@ -140,7 +140,10 @@ pub fn decide(evidence: &RootEvidence) -> Verdict {
 
     if let Some(product) = &evidence.registered_msi_product {
         return Verdict::Refuse(format!(
-            "{root} belongs to the registered Windows Installer product \"{product}\" — it can \n             only be removed by `msiexec /x`, which also removes its Add/Remove-Programs entry, \n             its machine-PATH component and its service; deleting the directory would leave a \n             registered product with no files"
+            "{root} belongs to the registered Windows Installer product \"{product}\" — it can \
+             only be removed by `msiexec /x`, which also removes its Add/Remove-Programs entry, \
+             its machine-PATH component and its service; deleting the directory would leave a \
+             registered product with no files"
         ));
     }
     if !evidence.referencing_registrations.is_empty() {
@@ -295,12 +298,74 @@ pub fn remove_superseded_roots_with(
     remove_path_entry: &mut PathEntryRemover<'_>,
     log: &mut dyn FnMut(&str),
 ) -> SupersedeResult {
+    remove_superseded_roots_on(target, &RealRootFs, remove_path_entry, log)
+}
+
+/// The filesystem side of [`remove_superseded_roots_with`], injected as a trait.
+///
+/// The `is_dir` test, the evidence gather (a real `read_dir` plus a `Get-Process` spawn in
+/// production) and the deletion all reach the real machine. Injecting them lets a test drive the whole
+/// Windows orchestration — including the `Verdict::Remove` path — without ever touching the real
+/// filesystem or spawning a process, WHATEVER the host machine happens to hold (dig-installer#62
+/// review F3, dig_ecosystem#2305): a dev box that really has `C:\Program Files\DIG Network\dig-node`
+/// can never send a unit test to a real deletion. Production is [`RealRootFs`].
+trait RootFs {
+    /// The immediate entry names of the CURRENT install root, for the duplicate comparison.
+    fn current_entries(&self, current_root: &Path) -> Vec<String>;
+    /// Whether the candidate root exists as a directory. `false` takes the already-gone-directory
+    /// branch, which still drops a stale PATH entry naming it.
+    fn is_dir(&self, root: &Path) -> bool;
+    /// The evidence for a present candidate root — the whole input to [`decide`].
+    fn gather(&self, target: &Target, root: &Path, current_entries: &[String]) -> RootEvidence;
+    /// Delete a cleared root's DIG binaries, the directory, and its emptied base.
+    fn remove_root(
+        &self,
+        target: &Target,
+        root: &Path,
+        base: Option<&Path>,
+        result: &mut SupersedeResult,
+        log: &mut dyn FnMut(&str),
+    );
+}
+
+/// The production [`RootFs`]: real reads, real deletes — a thin adapter over the free functions.
+struct RealRootFs;
+
+impl RootFs for RealRootFs {
+    fn current_entries(&self, current_root: &Path) -> Vec<String> {
+        entry_names(current_root)
+    }
+    fn is_dir(&self, root: &Path) -> bool {
+        root.is_dir()
+    }
+    fn gather(&self, target: &Target, root: &Path, current_entries: &[String]) -> RootEvidence {
+        gather(target, root, current_entries)
+    }
+    fn remove_root(
+        &self,
+        target: &Target,
+        root: &Path,
+        base: Option<&Path>,
+        result: &mut SupersedeResult,
+        log: &mut dyn FnMut(&str),
+    ) {
+        remove_root(target, root, base, result, log)
+    }
+}
+
+/// [`remove_superseded_roots_with`] over an injected filesystem boundary — the shared orchestration.
+fn remove_superseded_roots_on(
+    target: &Target,
+    fs: &dyn RootFs,
+    remove_path_entry: &mut PathEntryRemover<'_>,
+    log: &mut dyn FnMut(&str),
+) -> SupersedeResult {
     let mut result = SupersedeResult::default();
     let current_root = paths::protected_bin_dir();
-    let current_entries = entry_names(&current_root);
+    let current_entries = fs.current_entries(&current_root);
 
     for root in paths::superseded_roots(target.os) {
-        if !root.is_dir() {
+        if !fs.is_dir(&root) {
             // The directory is gone but a PATH entry naming it can outlive it. Dropping that costs
             // nothing and stops it shadowing again if anything ever recreates the directory — and a
             // machine-PATH write is a real change, so it must show up in the report either way.
@@ -313,14 +378,14 @@ pub fn remove_superseded_roots_with(
             result.acted = true;
             log("Cleaning up a superseded DIG install root (#2205):");
         }
-        let evidence = gather(target, &root, &current_entries);
+        let evidence = fs.gather(target, &root, &current_entries);
         match decide(&evidence) {
             Verdict::Refuse(reason) => {
                 log(&format!("    · left in place: {reason}"));
                 result.refused.push(reason);
             }
             Verdict::Remove => {
-                remove_root(
+                fs.remove_root(
                     target,
                     &root,
                     paths::superseded_root_base(target.os).as_deref(),
@@ -575,6 +640,29 @@ mod tests {
                  entry, a broken repair, and a service pointing at nothing"
             ),
         }
+    }
+
+    /// Refusal 0's message is a SINGLE clean line — no embedded newline and no run of interior spaces
+    /// — so the log line and the `--json` `refused` field are not wrapped and indented (§6.2,
+    /// dig_ecosystem#2305 F5). The other three refusals already satisfy this via `\`-continuation;
+    /// refusal 0 must match, not embed a literal `\n` plus padding.
+    #[test]
+    fn the_msi_refusal_message_is_a_single_clean_line() {
+        let evidence = RootEvidence {
+            registered_msi_product: Some("DIG NETWORK: NODE".to_string()),
+            ..duplicate_root()
+        };
+        let Verdict::Refuse(reason) = decide(&evidence) else {
+            panic!("a registered MSI product must be refused");
+        };
+        assert!(
+            !reason.contains('\n'),
+            "the message must not embed a newline: {reason:?}"
+        );
+        assert!(
+            !reason.contains("  "),
+            "the message must not embed a run of interior spaces: {reason:?}"
+        );
     }
 
     /// Refusal 0 outranks every other reason, including a still-live service.
@@ -849,6 +937,41 @@ mod tests {
         );
     }
 
+    /// The deletion treats ONLY a real file as a removable binary: a reparse point at a binary's path
+    /// is left alone, never deleted as a plain file.
+    ///
+    /// Replacing the `Ok(md) if md.file_type().is_file()` guard with a wildcard `Ok(_md)` kills no
+    /// other test (a surviving mutant — dig_ecosystem#2305 F2). A symlink is the portable stand-in for
+    /// a Windows reparse point: `symlink_metadata` does not follow it, so its `file_type` is a symlink,
+    /// not a file. Under the mutation the link would be `remove_file`d and vanish; the guard keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn remove_root_leaves_a_reparse_point_at_a_binary_path_untouched() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("DIG Network");
+        let root = base.join("dig-node");
+        std::fs::create_dir_all(&root).expect("create");
+        let sentinel = tmp.path().join("keep-me");
+        std::fs::write(&sentinel, b"precious").expect("write");
+        let target = host_target();
+        let link = root.join(target.exe_name("dig-node"));
+        symlink(&sentinel, &link).expect("symlink");
+
+        let mut result = SupersedeResult::default();
+        remove_root(&target, &root, Some(&base), &mut result, &mut |_| {});
+
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "a reparse point is not a file and must NOT be deleted as one"
+        );
+        assert!(sentinel.exists(), "the symlink target must be untouched");
+        assert!(
+            result.removed_binaries.is_empty(),
+            "a non-file entry is never counted as a removed binary"
+        );
+    }
+
     /// `entry_names` reports what is really there, and an unreadable/absent directory yields nothing
     /// rather than panicking — the verdict for a vanished root must still be reachable.
     #[test]
@@ -961,24 +1084,116 @@ mod tests {
     /// Also pins the non-gating report defect the reviewer found: a run whose only change was a
     /// machine-PATH edit on an already-gone directory must still report `acted`, or that edit is
     /// invisible in `--json`.
+    /// A `RootFs` whose every answer is scripted, so the orchestration is driven with ZERO real
+    /// filesystem or process reach — hermetic whatever the host holds (dig_ecosystem#2305 F3). It also
+    /// records the roots it was asked to delete, so the `Verdict::Remove` deletion leg is observable.
+    struct FakeRootFs {
+        is_dir: bool,
+        evidence: RootEvidence,
+        removed: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RootFs for FakeRootFs {
+        fn current_entries(&self, _current_root: &Path) -> Vec<String> {
+            self.evidence.current_entries.clone()
+        }
+        fn is_dir(&self, _root: &Path) -> bool {
+            self.is_dir
+        }
+        fn gather(
+            &self,
+            _target: &Target,
+            root: &Path,
+            _current_entries: &[String],
+        ) -> RootEvidence {
+            // The scripted verdict inputs, re-homed onto the candidate actually being scanned.
+            RootEvidence {
+                root: root.to_path_buf(),
+                ..self.evidence.clone()
+            }
+        }
+        fn remove_root(
+            &self,
+            _target: &Target,
+            root: &Path,
+            _base: Option<&Path>,
+            result: &mut SupersedeResult,
+            _log: &mut dyn FnMut(&str),
+        ) {
+            self.removed.borrow_mut().push(root.display().to_string());
+            result.removed_roots.push(root.display().to_string());
+        }
+    }
+
+    /// A `Verdict::Remove` root has BOTH its files removed AND its persisted PATH entry dropped —
+    /// dropping the PATH entry is what stops the superseded root shadowing the current one.
+    ///
+    /// Deleting the `drop_path_entries` call on the Remove verdict leaves every other lib test green
+    /// (a surviving mutant — dig-installer#62 review, dig_ecosystem#2305 F1); this pins it by driving
+    /// the Remove path through the injected boundary and asserting the PATH drop was requested.
     #[test]
-    fn every_candidate_reaches_the_path_drop_and_a_path_only_change_is_reported() {
-        // Windows STATED, not `host_target()`. The gating `test + coverage` job runs ubuntu-only, and
-        // `superseded_roots(Os::Linux)` is empty -- so on the one runner that blocks merge the loop
-        // body never executed and the test fell into its own `candidates.is_empty()` arm, which is
-        // true for ANY loop body including none. Proven: deleting the PATH-drop leg fails this test
-        // on a Windows target and PASSES on a Linux one (dig-installer#62 review, round 2).
-        //
-        // Host-independent: `superseded_roots(Os::Windows)` is a pure function of the OS, and the
-        // not-a-directory branch these candidates take reaches no Windows-only I/O.
+    fn a_removed_root_also_has_its_path_entries_dropped() {
         let target = Target {
             os: Os::Windows,
             arch: host_target().arch,
         };
+        let candidates = paths::superseded_roots(target.os);
+        assert!(
+            !candidates.is_empty(),
+            "Windows must have superseded candidates for this test to exercise the Remove path"
+        );
+
+        let fs = FakeRootFs {
+            is_dir: true,
+            evidence: duplicate_root(), // a pure duplicate -> Verdict::Remove
+            removed: std::cell::RefCell::new(Vec::new()),
+        };
         let mut seen = Vec::new();
         let result = {
             let mut remover = recording_remover(Ok(vec![paths::PathScope::Machine]), &mut seen);
-            remove_superseded_roots_with(&target, &mut remover, &mut |_| {})
+            remove_superseded_roots_on(&target, &fs, &mut remover, &mut |_| {})
+        };
+
+        assert_eq!(
+            fs.removed.borrow().len(),
+            candidates.len(),
+            "every cleared root's files must be removed"
+        );
+        assert_eq!(
+            seen.len(),
+            candidates.len(),
+            "every cleared root must reach the PATH drop"
+        );
+        assert_eq!(
+            result.path_entries_removed.len(),
+            candidates.len(),
+            "a removed root MUST also have its PATH entry dropped, or it keeps shadowing"
+        );
+    }
+
+    /// The PATH drop runs for EVERY candidate, including ones whose directory is already gone — a stale
+    /// machine-PATH entry outlives its directory and still shadows. A path-only change must report
+    /// `acted`, or that edit is invisible in `--json`.
+    ///
+    /// Hermetic REGARDLESS OF HOST: the filesystem boundary is injected and forced to the
+    /// already-gone-directory branch, so a dev machine that really holds
+    /// `C:\Program Files\DIG Network\dig-node` can never send this test to a real deletion or a
+    /// `Get-Process` spawn (dig_ecosystem#2305 F3).
+    #[test]
+    fn every_candidate_reaches_the_path_drop_and_a_path_only_change_is_reported() {
+        let target = Target {
+            os: Os::Windows,
+            arch: host_target().arch,
+        };
+        let fs = FakeRootFs {
+            is_dir: false,
+            evidence: RootEvidence::default(),
+            removed: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut seen = Vec::new();
+        let result = {
+            let mut remover = recording_remover(Ok(vec![paths::PathScope::Machine]), &mut seen);
+            remove_superseded_roots_on(&target, &fs, &mut remover, &mut |_| {})
         };
 
         let candidates = paths::superseded_roots(target.os);
@@ -986,6 +1201,10 @@ mod tests {
             seen.len(),
             candidates.len(),
             "every candidate must reach the PATH drop, not only the ones whose directory exists"
+        );
+        assert!(
+            fs.removed.borrow().is_empty(),
+            "the already-gone-directory branch never deletes files"
         );
         if candidates.is_empty() {
             // unix: nothing to supersede, so nothing may be reported either.
