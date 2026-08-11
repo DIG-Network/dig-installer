@@ -30,7 +30,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.42.4"
+version = "0.43.0"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -85,6 +85,13 @@ service-manager = "0.7"
 # `--help-json` doc value) can never drift from dig-node's real default. Consumed
 # from crates.io; a single shared version resolves across all consumers.
 dig-constants = "0.10"
+# The shared release-selection + host-loadability contract (#1774): the
+# `loadability` module answers "will this artifact actually LOAD on this host?"
+# by PARSING the ELF's dynamic-linking requirements — never by executing it. The
+# install-time selector here and the update-time selector in dig-updater's beacon
+# reach the BYTE-IDENTICAL verdict from this ONE crate, so a host never oscillates
+# between calling a build loadable and unloadable. Consumed from crates.io.
+dig-release-resolver = "0.2"
 
 # unix-only: `O_NOFOLLOW` for the root child's O_NOFOLLOW read of the private
 # macOS elevation plan file (#639 osascript relaunch) AND the Linux forcelist

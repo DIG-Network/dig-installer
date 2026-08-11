@@ -409,6 +409,23 @@ pub struct ComponentResult {
     /// [`update::UpdateDecision::installed_version`]; `None` for the
     /// untracked components above.
     pub previous_version: Option<String>,
+    /// For a component that ships build VARIANTS (today: dig-app's `tray` vs
+    /// `headless` Linux builds — #1774), which one this host resolved. `None` for
+    /// every single-variant component, whose selection never branches on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_variant: Option<String>,
+    /// Whether the selected variant was PROVEN loadable on this host (`Some(true)`)
+    /// or taken permissively because loadability could not be established —
+    /// `Loadability::Indeterminate`, e.g. a non-Linux host (`Some(false)`). `None`
+    /// for a component whose bytes were never inspected. Never `Some` for a build
+    /// that was refused: an `Unloadable` build is not placed (see `refused`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loadable: Option<bool>,
+    /// The reason EVERY build variant was refused on this host (all `Unloadable`),
+    /// when so — in which case NO binary was placed for this component (#1753/#1774).
+    /// `None` on the normal path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// The PATH change applied (or that would be).
@@ -755,7 +772,125 @@ fn resolve_component(
         // matches their existing always-fresh-download behavior.
         update_action: update::UpdateAction::Install,
         previous_version: None,
+        // Single-variant components never branch on the host — the variant fields
+        // stay unset; only dig-app's variant path (below) populates them.
+        selected_variant: None,
+        loadable: None,
+        refused: None,
     })
+}
+
+/// The outcome of resolving a component that ships build VARIANTS (dig-app —
+/// #1774): either a variant was chosen (proceed to download it) or every variant
+/// was refused as unloadable on this host (record it, place nothing).
+#[derive(Debug)]
+enum VariantResolved {
+    /// A variant was chosen; its [`ComponentResult`] carries `selected_variant` +
+    /// `loadable`, and the caller downloads + places it exactly as a single-variant
+    /// component.
+    Selected(ComponentResult),
+    /// EVERY variant is unloadable here. The [`ComponentResult`] carries the
+    /// `refused` reason and NO destination — the caller records it and places
+    /// nothing, rather than installing a binary that dies before `main`.
+    Refused(ComponentResult),
+}
+
+/// Resolve a variant-bearing component (dig-app), picking the first build this
+/// host can actually LOAD in tray→headless preference order (#1753/#1774).
+///
+/// `probe` answers a candidate build's [`asset::Loadability`] from its download
+/// URL — the injected seam. Production wires it to
+/// [`download_and_inspect`] (download the candidate to a private temp file and
+/// PARSE its ELF, never execute it); tests inject a scripted classifier so both
+/// the selected and refused branches run on any OS. A release with no build for
+/// this OS/arch raises `ASSET_NOT_FOUND`, exactly as [`resolve_component`] does.
+fn resolve_variant_component(
+    resolve: &ReleaseResolver<'_>,
+    repo: &Repo,
+    requested: &Option<String>,
+    target: &Target,
+    kind: AssetKind,
+    bin_dir: &std::path::Path,
+    probe: &dyn Fn(&str) -> asset::Loadability,
+) -> Result<VariantResolved, InstallError> {
+    let rel = resolve(repo, requested)?;
+    let version = release::version_from_tag(&rel.tag_name);
+    let loadable = |asset_name: &str| probe(&repo.asset_download_url(&rel.tag_name, asset_name));
+
+    match asset::select_loadable_variant(&rel.asset_names, target, kind, &repo.stem, &loadable) {
+        asset::VariantOutcome::NoCandidate => Err(InstallError::asset_not_found(format!(
+            "no {} asset for {target} in {}/{} release {}",
+            repo.stem, repo.owner, repo.name, rel.tag_name
+        ))
+        .with_hint("pin a known-good version with the matching --*-version flag")),
+        asset::VariantOutcome::Selected {
+            asset,
+            variant,
+            loadable,
+        } => {
+            let dest = bin_dir.join(target.exe_name(&repo.stem));
+            let url = repo.asset_download_url(&rel.tag_name, &asset);
+            Ok(VariantResolved::Selected(ComponentResult {
+                component: repo.stem.clone(),
+                version,
+                tag: rel.tag_name,
+                url,
+                asset,
+                dest: dest.to_string_lossy().into_owned(),
+                update_action: update::UpdateAction::Install,
+                previous_version: None,
+                selected_variant: Some(variant.to_string()),
+                loadable: Some(loadable),
+                refused: None,
+            }))
+        }
+        asset::VariantOutcome::Refused { reason } => {
+            Ok(VariantResolved::Refused(ComponentResult {
+                component: repo.stem.clone(),
+                version,
+                tag: rel.tag_name,
+                asset: String::new(),
+                url: String::new(),
+                dest: String::new(),
+                update_action: update::UpdateAction::Install,
+                previous_version: None,
+                selected_variant: None,
+                loadable: None,
+                refused: Some(reason),
+            }))
+        }
+    }
+}
+
+/// Download a candidate build to a private temp file and answer its loadability
+/// on THIS host by PARSING it — the production `probe` for
+/// [`resolve_variant_component`].
+///
+/// The artifact is read, never executed: running a dig-app candidate under the
+/// elevated installer could seal a master seed and bind a signing socket, so
+/// loadability is decided from the ELF's own dynamic-linking requirements via the
+/// shared `dig_release_resolver::loadability` contract. A download failure is
+/// [`asset::Loadability::Indeterminate`] (fail-open) — a network hiccup must not
+/// masquerade as a refusal.
+fn download_and_inspect(
+    url: &str,
+    checker: &dig_release_resolver::loadability::LoadabilityCheck<'_>,
+) -> asset::Loadability {
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return asset::Loadability::Indeterminate {
+                why: format!("could not create a temp dir to inspect {url}: {e}"),
+            }
+        }
+    };
+    let path = dir.path().join("candidate");
+    match download::download_binary(url, &path, None) {
+        Ok(_) => checker(&path),
+        Err(e) => asset::Loadability::Indeterminate {
+            why: format!("could not download {url} to inspect it: {e}"),
+        },
+    }
 }
 
 /// Detect what's already at a resolved component's destination, decide
@@ -811,6 +946,64 @@ fn download_component(
     let outcome = download_binary_to_dest(c)?;
     adopt_placed_file_step(std::path::Path::new(&c.dest), log);
     Ok(outcome)
+}
+
+/// Install an OPTIONAL alias binary (`digs`/`dign`/`digd`) — a separately-published
+/// asset shipped in the SAME release as its base component, sharing that
+/// component's version pin and bin dir.
+///
+/// A MISSING alias asset is a graceful SKIP, never a failure: the alias is a real
+/// separate asset (`digs-*`/`dign-*`/`digd-*`) that older releases predate, and it
+/// no longer collides with the base component's own asset now that RawBinary
+/// selection is base-anchored (`asset::matched_candidates`, #1774). Before that
+/// anchor a loose match wrongly resolved e.g. `digd` → `dig-dns-<ver>-…`, so this
+/// path never fired; with the anchor a pinned old release (dig-dns v0.9.1 has no
+/// `digd-*`) correctly reports `ASSET_NOT_FOUND` — which must SKIP the alias, not
+/// roll back the whole install, since the base component already installed and is
+/// unaffected. A genuine transport error still propagates.
+// Threads the shared install context (resolve/repo/target/bin_dir/report/guard/dry_run/log)
+// plus the alias's own requested version; a params struct would only relocate the same set.
+#[allow(clippy::too_many_arguments)]
+fn install_optional_alias(
+    resolve: &ReleaseResolver<'_>,
+    repo: &Repo,
+    requested: &Option<String>,
+    target: &Target,
+    bin_dir: &std::path::Path,
+    base_component: &str,
+    report: &mut InstallReport,
+    guard: &mut RollbackGuard,
+    dry_run: bool,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), InstallError> {
+    match resolve_component(
+        resolve,
+        repo,
+        requested,
+        target,
+        AssetKind::RawBinary,
+        bin_dir,
+    ) {
+        Ok(alias) => {
+            log_component(log, &alias);
+            let outcome = download_component(&alias, dry_run, log)?;
+            report.restart_required |= log_write_outcome(log, &repo.stem, outcome.outcome);
+            if !dry_run {
+                note_binary_written(report, guard, &alias.dest, Some(&outcome));
+            }
+            report.components.push(alias);
+            Ok(())
+        }
+        Err(e) if e.code() == "ASSET_NOT_FOUND" => {
+            log(&format!(
+                "    · {} alias not available for this release ({e}) — skipping; {base_component} \
+                 itself is unaffected",
+                repo.stem
+            ));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Adopt a file the elevated installer just created in the protected root into
@@ -1068,21 +1261,18 @@ fn run_report_gated(
             report.components.push(c);
 
             log("Installing the digs alias (same dig-store CLI, published as a separate binary):");
-            let digs = resolve_component(
+            install_optional_alias(
                 resolve,
                 &Repo::digs(),
                 &plan.digstore_version,
                 &target,
-                AssetKind::RawBinary,
                 &plan.bin_dir_for("digs", target.os),
+                "dig-store",
+                report,
+                guard,
+                plan.dry_run,
+                log,
             )?;
-            log_component(log, &digs);
-            let outcome = download_component(&digs, plan.dry_run, log)?;
-            report.restart_required |= log_write_outcome(log, "digs", outcome.outcome);
-            if !plan.dry_run {
-                note_binary_written(report, guard, &digs.dest, Some(&outcome));
-            }
-            report.components.push(digs);
         }
 
         // The veneer's posture is measured ONCE, here, before anything is wired or linked, and the same
@@ -1232,30 +1422,18 @@ fn run_report_gated(
             log(
             "Installing the dign alias (same dig-node local node, published as a separate binary):",
         );
-            match resolve_component(
+            install_optional_alias(
                 resolve,
                 &Repo::dign(),
                 &plan.dig_node_version,
                 &target,
-                AssetKind::RawBinary,
                 &plan.bin_dir_for("dign", target.os),
-            ) {
-                Ok(dign) => {
-                    log_component(log, &dign);
-                    let outcome = download_component(&dign, plan.dry_run, log)?;
-                    report.restart_required |= log_write_outcome(log, "dign", outcome.outcome);
-                    if !plan.dry_run {
-                        note_binary_written(report, guard, &dign.dest, Some(&outcome));
-                    }
-                    report.components.push(dign);
-                }
-                Err(e) if e.code() == "ASSET_NOT_FOUND" => {
-                    log(&format!(
-                    "    · dign alias not available for this release ({e}) — skipping; dig-node itself is unaffected"
-                ));
-                }
-                Err(e) => return Err(e),
-            }
+                "dig-node",
+                report,
+                guard,
+                plan.dry_run,
+                log,
+            )?;
 
             report.service = Some(register_dig_node(
                 &dig_node_path,
@@ -1306,16 +1484,57 @@ fn run_report_gated(
         //     asset for this OS/arch must never sink the otherwise-successful stack install.
         if plan.with_dig_app {
             log("Installing dig-app (the DIG identity agent + tray):");
-            match resolve_component(
+            // dig-app ships two Linux builds under the SAME `linux-x64` slug — a
+            // GTK-linked `tray` build and a GTK-less `-headless` build. Pick the
+            // first this host can actually LOAD (tray→headless), by PARSING each
+            // candidate's ELF, so a stock headless server is not handed the GTK
+            // build that dies inside `ld.so` before `main` (#1753/#1774). The
+            // artifact is read, never executed — running a dig-app candidate under
+            // the elevated installer could seal a master seed.
+            let checker = dig_release_resolver::loadability::host_checker();
+            let probe = |url: &str| -> asset::Loadability {
+                if plan.dry_run {
+                    // Nothing is downloaded on a dry run, so loadability cannot be
+                    // established — the permissive default picks the tray build.
+                    asset::Loadability::Indeterminate {
+                        why: "dry-run: the candidate was not downloaded to inspect".to_string(),
+                    }
+                } else {
+                    download_and_inspect(url, &*checker)
+                }
+            };
+            match resolve_variant_component(
                 resolve,
                 &Repo::dig_app(),
                 &plan.dig_app_version,
                 &target,
                 AssetKind::RawBinary,
                 &plan.bin_dir_for("dig-app", target.os),
+                &probe,
             ) {
-                Ok(mut c) => {
+                Ok(VariantResolved::Refused(c)) => {
+                    // Every build variant is unloadable here — place NOTHING (the
+                    // #1753 regression this selector exists to prevent) and record
+                    // why, so `--json` shows `refused` rather than a false `✓`.
+                    log(&format!(
+                        "    ! dig-app was not installed — {} — skipping; the rest of the stack is \
+                         unaffected",
+                        c.refused.as_deref().unwrap_or("no loadable build for this host")
+                    ));
+                    report.components.push(c);
+                }
+                Ok(VariantResolved::Selected(mut c)) => {
                     log_component(log, &c);
+                    if let Some(variant) = &c.selected_variant {
+                        log(&format!(
+                            "    · selected the {variant} build ({})",
+                            if c.loadable == Some(true) {
+                                "loadable on this host"
+                            } else {
+                                "loadability could not be established — installing permissively"
+                            }
+                        ));
+                    }
                     // #309 version-aware updater: dig-app is a tracked component (it is a
                     // first-class installed binary, not an alias sharing another component's
                     // version pin), so a re-run skips a download that would change nothing.
@@ -1448,32 +1667,27 @@ fn run_report_gated(
                     // in the SAME dig-dns release under its own asset stem,
                     // installed alongside it — same version pin, same bin dir, no
                     // separate PATH entry needed — exactly mirroring
-                    // digs-alongside-digstore above. Unlike dign (which has a
-                    // pre-rename legacy-repo fallback dig-node itself can take),
-                    // digd resolves against the IDENTICAL repo + version pin as
-                    // dig-dns itself with no such divergence, so it always
-                    // succeeds whenever dig-dns just did — no separate gate is
-                    // needed here (only reached inside this `Ok(mut c)` arm, i.e.
-                    // once dig-dns itself resolved; the ASSET_NOT_FOUND gate below
-                    // handles dig-dns being entirely unpublished). Not
+                    // digs-alongside-digstore above. A release cut before the
+                    // `digd-*` asset existed (e.g. dig-dns v0.9.1) has no digd to
+                    // resolve now that RawBinary selection is base-anchored (#1774,
+                    // which correctly stops digd matching `dig-dns-*`), so — like
+                    // the dign alias — a missing digd asset SKIPS gracefully rather
+                    // than rolling back the otherwise-complete install. Not
                     // update-tracked (mirrors digs, #309 §7.3): it always
                     // re-downloads fresh, sharing dig-dns's version pin.
                     log("Installing the digd alias (same dig-dns resolver, published as a separate binary):");
-                    let digd = resolve_component(
+                    install_optional_alias(
                         resolve,
                         &Repo::digd(),
                         &plan.dig_dns_version,
                         &target,
-                        AssetKind::RawBinary,
                         &plan.bin_dir_for("digd", target.os),
+                        "dig-dns",
+                        report,
+                        guard,
+                        plan.dry_run,
+                        log,
                     )?;
-                    log_component(log, &digd);
-                    let outcome = download_component(&digd, plan.dry_run, log)?;
-                    report.restart_required |= log_write_outcome(log, "digd", outcome.outcome);
-                    if !plan.dry_run {
-                        note_binary_written(report, guard, &digd.dest, Some(&outcome));
-                    }
-                    report.components.push(digd);
 
                     let dns_result = register_dig_dns(&dig_dns_path, plan, &decision, log);
                     // #627 WU2: `dig-dns configure-os` wires + flushes + VERIFIES
@@ -4888,6 +5102,133 @@ mod tests {
         }
     }
 
+    // -- dig-app variant resolution wiring (#1774) ------------------------------------------------
+
+    /// A Linux/x64 target — the only platform on which dig-app ships two variants,
+    /// asserted explicitly (not `Target::current()`) so the wiring is exercised on
+    /// every runner regardless of the host OS.
+    fn linux_x64() -> Target {
+        Target {
+            os: crate::target::Os::Linux,
+            arch: crate::target::Arch::X64,
+        }
+    }
+
+    /// A dig-app release carrying BOTH the GTK tray build and the `-headless`
+    /// build under the same `linux-x64` slug.
+    fn dig_app_release() -> HashMap<&'static str, (&'static str, Vec<&'static str>)> {
+        let mut m = HashMap::new();
+        m.insert(
+            "dig-app",
+            (
+                "v3.1.0",
+                vec![
+                    "dig-app-3.1.0-linux-x64",
+                    "dig-app-3.1.0-linux-x64-headless",
+                ],
+            ),
+        );
+        m
+    }
+
+    #[test]
+    fn a_gtk_less_host_resolves_dig_app_to_the_headless_build() {
+        // The whole point of the wiring: a probe that refuses the GTK tray build
+        // (as a real headless server's parse would) but loads the headless build
+        // must resolve the `-headless` asset, with `selected_variant`/`loadable`
+        // recorded for `--json`.
+        let resolve = resolver_from(dig_app_release());
+        let bin = tempfile::tempdir().expect("tempdir");
+        let probe = |url: &str| {
+            if url.contains("headless") {
+                asset::Loadability::Loadable
+            } else {
+                asset::Loadability::Unloadable {
+                    missing: vec!["libgtk-3.so.0".to_string()],
+                }
+            }
+        };
+        let resolved = resolve_variant_component(
+            &resolve,
+            &Repo::dig_app(),
+            &None,
+            &linux_x64(),
+            AssetKind::RawBinary,
+            bin.path(),
+            &probe,
+        )
+        .expect("a headless build resolves");
+        match resolved {
+            VariantResolved::Selected(c) => {
+                assert_eq!(c.asset, "dig-app-3.1.0-linux-x64-headless");
+                assert_eq!(c.selected_variant.as_deref(), Some("headless"));
+                assert_eq!(c.loadable, Some(true));
+                assert!(c.url.ends_with("dig-app-3.1.0-linux-x64-headless"));
+                assert!(
+                    c.dest.ends_with("dig-app"),
+                    "placed under its stem, dest={}",
+                    c.dest
+                );
+            }
+            VariantResolved::Refused(_) => {
+                panic!("expected the headless build to be selected, got a refusal")
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_that_can_load_neither_dig_app_build_refuses_and_places_nothing() {
+        // Both builds unloadable → Refused, with the reason recorded and NO dest.
+        let resolve = resolver_from(dig_app_release());
+        let bin = tempfile::tempdir().expect("tempdir");
+        let nothing_loads = |_url: &str| asset::Loadability::Unloadable {
+            missing: vec!["libc.so.6".to_string()],
+        };
+        match resolve_variant_component(
+            &resolve,
+            &Repo::dig_app(),
+            &None,
+            &linux_x64(),
+            AssetKind::RawBinary,
+            bin.path(),
+            &nothing_loads,
+        )
+        .expect("a refusal is not an error — it is a recorded outcome")
+        {
+            VariantResolved::Refused(c) => {
+                assert!(c.dest.is_empty(), "a refused build places nothing");
+                assert!(
+                    c.refused.is_some(),
+                    "the refusal reason is recorded for --json"
+                );
+                assert!(c.loadable.is_none());
+            }
+            VariantResolved::Selected(_) => panic!("no build should have been selected"),
+        }
+    }
+
+    #[test]
+    fn a_release_without_a_matching_dig_app_asset_is_asset_not_found() {
+        // No linux build at all → ASSET_NOT_FOUND, so the caller's graceful skip
+        // fires exactly as it does for a single-variant component.
+        let mut only_macos = HashMap::new();
+        only_macos.insert("dig-app", ("v3.1.0", vec!["dig-app-3.1.0-macos-arm64"]));
+        let resolve = resolver_from(only_macos);
+        let bin = tempfile::tempdir().expect("tempdir");
+        let never = |_url: &str| asset::Loadability::Loadable;
+        let err = resolve_variant_component(
+            &resolve,
+            &Repo::dig_app(),
+            &None,
+            &linux_x64(),
+            AssetKind::RawBinary,
+            bin.path(),
+            &never,
+        )
+        .expect_err("no matching asset");
+        assert_eq!(err.code(), "ASSET_NOT_FOUND");
+    }
+
     /// The full DIG asset set across every component repo, for the current OS
     /// (the test runs against `Target::current()`, so resolve the live slug).
     fn all_releases() -> HashMap<&'static str, (&'static str, Vec<&'static str>)> {
@@ -5653,6 +5994,48 @@ mod tests {
         );
         // dry-run installs nothing on disk.
         assert!(report.installed.is_empty());
+    }
+
+    #[test]
+    fn a_missing_digd_alias_asset_skips_gracefully_and_the_install_still_succeeds() {
+        // dig_ecosystem#1774 regression: an OLD dig-dns release (e.g. v0.9.1) was
+        // cut before the `digd-*` alias asset existed. Base-anchored RawBinary
+        // selection correctly stops `digd` from matching `dig-dns-<ver>-…` (the
+        // pre-anchor bug wrongly installed the dig-dns binary under the digd name),
+        // so `digd` now legitimately resolves to ASSET_NOT_FOUND for such a
+        // release. That MUST skip the optional alias — exactly like the dign alias
+        // already does — never roll back the whole install: dig-dns itself
+        // resolved and installed fine.
+        //
+        // Before the fix, the digd step used `?` and this ASSET_NOT_FOUND sank the
+        // entire run (the failure that reddened five e2e jobs); the assertion that
+        // the install SUCCEEDS is what fails on that path.
+        let mut releases = HashMap::new();
+        releases.insert(
+            "dig-dns",
+            (
+                "v0.9.1",
+                vec![
+                    // dig-dns's own per-OS/arch builds — but NO `digd-*` asset.
+                    "dig-dns-0.9.1-windows-x64.exe",
+                    "dig-dns-0.9.1-linux-x64",
+                    "dig-dns-0.9.1-macos-arm64",
+                    "dig-dns-0.9.1-macos-x64",
+                ],
+            ),
+        );
+        let mut plan = base_plan();
+        plan.with_dig_dns = true;
+        let report =
+            run_dry(&plan, releases).expect("a missing digd alias must not fail the whole install");
+        assert!(
+            report.components.iter().any(|c| c.component == "dig-dns"),
+            "dig-dns itself installed"
+        );
+        assert!(
+            !report.components.iter().any(|c| c.component == "digd"),
+            "the absent digd alias was skipped, not placed"
+        );
     }
 
     #[test]
@@ -6915,6 +7298,9 @@ mod tests {
                 .into_owned(),
             previous_version: None,
             update_action: update::UpdateAction::Install,
+            selected_variant: None,
+            loadable: None,
+            refused: None,
         });
 
         // UNSAFE veneer: nothing may be linked, and the removal must be REACHED. `to_link` is empty here,

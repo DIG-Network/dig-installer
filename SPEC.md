@@ -100,6 +100,21 @@ treats it unlike every daemon in this catalogue:
   privileged on unix: it is executed by the logged-in user, not by a service manager, so it stays in
   the elevation-free user bin dir and a `dig-app`-only install requires no elevation on unix.
   (On Windows the whole stack shares the protected root, §1.6.)
+- **Variant-aware, loadability-driven selection (#1774/#1753).** dig-app publishes TWO Linux builds
+  under the SAME `linux-x64` slug — the default GTK-linked `tray` build (`dig-app-<ver>-linux-x64`)
+  and a GTK-less `headless` build (`dig-app-<ver>-linux-x64-headless`). Because both match the slug,
+  the plain `select_asset` shortest-name tiebreak would always hand a headless server the GTK build,
+  which dies inside `ld.so` (`libgtk-3.so.0` absent) before `main`. So `dig-app` is resolved through
+  `asset::select_loadable_variant`, which orders the matched builds **tray → headless** and picks the
+  first the host can actually LOAD. Loadability is decided by the shared
+  `dig_release_resolver::loadability` contract — the SAME crate dig-updater's beacon selects with, so
+  the install-time and update-time verdicts are byte-identical — by PARSING each candidate's ELF
+  (`inspect_artifact`), never by executing it: running a dig-app candidate under the elevated installer
+  could seal a master seed. The three-valued verdict is asymmetric: only an `Unloadable` build is
+  skipped; a `Loadable` build is taken immediately; an `Indeterminate` build (a non-Linux host, a
+  musl box, an unparseable image) is taken permissively when no build proves loadable. Every build
+  `Unloadable` → the installer places NOTHING for dig-app and records `refused`. `--json`
+  surfaces `selected_variant` (`tray`/`headless`), `loadable`, and `refused` per component.
 - **Registered for autostart, never as a service.** `src/autostart.rs` writes ONE per-user,
   unelevated artifact per OS:
 

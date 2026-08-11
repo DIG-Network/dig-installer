@@ -185,13 +185,71 @@ pub fn select_asset(
     kind: AssetKind,
     stem: &str,
 ) -> Option<String> {
+    matched_candidates(asset_names, target, kind, stem)
+        .into_iter()
+        .next()
+        .map(|c| c.name.clone())
+}
+
+/// One release asset that matched `target`/`kind`/`stem`, with the ranking keys
+/// [`select_asset`] orders by. Kept as a struct (not a bare tuple) so the
+/// variant-aware selector ([`select_loadable_variant`]) can order by
+/// [`Self::variant_rank`] AHEAD of these without re-deriving them.
+struct Candidate<'a> {
+    name: &'a String,
+    /// Lowercased once, reused by the variant classifier.
+    name_lc: String,
+    /// Position in [`os_arch_tokens`] — most-specific first (lower is better).
+    token_rank: usize,
+    /// `0` when the name starts with the canonical stem, else `1`.
+    stem_rank: usize,
+}
+
+impl Candidate<'_> {
+    /// The base ordering key, most-significant first — the exact tuple
+    /// [`select_asset`] historically compared, so single-variant selection is
+    /// byte-for-byte unchanged.
+    fn base_rank(&self) -> (usize, usize, usize) {
+        (self.token_rank, self.stem_rank, self.name.len())
+    }
+
+    /// Preference rank among a component's build variants: the default (tray)
+    /// build first, the `-headless` build second. A component that ships both a
+    /// GTK-linked tray build and a GTK-less `-headless` build publishes two
+    /// assets that BOTH carry the same OS/arch slug (e.g. `…-linux-x64` and
+    /// `…-linux-x64-headless`), so this is the ONLY key that distinguishes them
+    /// — and it is deliberately ordered ahead of the shortest-name tiebreak,
+    /// which would otherwise always pick the (shorter) tray name.
+    fn variant_rank(&self) -> usize {
+        usize::from(self.name_lc.contains("-headless"))
+    }
+
+    /// The human-facing variant label surfaced in the install report.
+    fn variant_label(&self) -> &'static str {
+        if self.variant_rank() == 0 {
+            "tray"
+        } else {
+            "headless"
+        }
+    }
+}
+
+/// Every asset that is a valid build for `target`/`kind`/`stem`, ordered
+/// best-first by [`Candidate::base_rank`]. The shared core of [`select_asset`]
+/// (which takes the first) and [`select_loadable_variant`] (which re-orders by
+/// variant preference and then probes loadability).
+fn matched_candidates<'a>(
+    asset_names: &'a [String],
+    target: &Target,
+    kind: AssetKind,
+    stem: &str,
+) -> Vec<Candidate<'a>> {
     let tokens = os_arch_tokens(target);
     let exts = accepted_extensions(kind, target);
     let competing = competing_arch_tokens(target);
     let stem_lc = stem.to_ascii_lowercase();
 
-    // (token_rank, stem_rank, name_len, name) — lower is better in each slot.
-    let mut best: Option<(usize, usize, usize, &String)> = None;
+    let mut candidates: Vec<Candidate<'a>> = Vec::new();
     for name in asset_names {
         let name_lc = name.to_ascii_lowercase();
         if !has_accepted_ext(&name_lc, &exts) {
@@ -207,24 +265,152 @@ pub fn select_asset(
         {
             continue;
         }
+        // A RawBinary asset must BELONG to this component: its name is
+        // `{stem}-{version}-{os_arch}[-variant][.ext]`, so it MUST start with
+        // `{stem}-`. Anchoring on the base name (not merely the OS/arch token) is
+        // what keeps a sibling binary published in the SAME release out of this
+        // component's candidate set — e.g. `dign-<ver>-linux-x64` (the dign CLI)
+        // ships alongside `dig-app-<ver>-linux-x64` in the dig-app release and
+        // matches the same `linux-x64` slug, but it is NOT a dig-app build and
+        // must never be installed as one (dig_ecosystem#1774/#1753). The `-`
+        // boundary is decisive: `dign-…` does not start with `dig-app-`.
+        //
+        // Installer assets are deliberately NOT anchored — a native installer
+        // legitimately carries a product name unrelated to the stem (DIG Browser
+        // ships `ungoogled-chromium_<ver>_installer_x64.exe`), so that kind keeps
+        // resolving via the OS/arch token + `stem_rank` preference below.
+        if kind == AssetKind::RawBinary && !name_lc.starts_with(&format!("{stem_lc}-")) {
+            continue;
+        }
         // Reject an asset that explicitly carries a DIFFERENT arch token —
         // a wrong-arch binary would crash at runtime.
         if competing.iter().any(|t| contains_token(&name_lc, t)) {
             continue;
         }
-        let Some(rank) = tokens.iter().position(|t| name_lc.contains(t)) else {
+        let Some(token_rank) = tokens.iter().position(|t| name_lc.contains(t)) else {
             continue;
         };
         // Prefer the canonical-stem name (rank 0) over an arbitrary match (1).
         let stem_rank = usize::from(!name_lc.starts_with(&stem_lc));
-        let cand = (rank, stem_rank, name.len(), name);
-        best = match best {
-            None => Some(cand),
-            Some((br, bs, bl, _)) if (rank, stem_rank, name.len()) < (br, bs, bl) => Some(cand),
-            other => other,
+        candidates.push(Candidate {
+            name,
+            name_lc,
+            token_rank,
+            stem_rank,
+        });
+    }
+    candidates.sort_by_key(Candidate::base_rank);
+    candidates
+}
+
+/// Re-exported from the shared contract so a consumer can spell the oracle's
+/// return type without a second dependency line.
+pub use dig_release_resolver::loadability::Loadability;
+
+/// The outcome of picking a build among a component's OS/arch-matched variants,
+/// with the host's loadability verdict folded in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantOutcome {
+    /// A variant was chosen. `loadable` is `true` for a proven-[`Loadability::Loadable`]
+    /// pick and `false` for a permissively-chosen [`Loadability::Indeterminate`]
+    /// one (a non-ELF artifact, or a host whose library set could not be
+    /// established) — never for an `Unloadable` one, which is refused instead.
+    Selected {
+        asset: String,
+        /// `"tray"` or `"headless"`.
+        variant: &'static str,
+        loadable: bool,
+    },
+    /// EVERY matched variant is [`Loadability::Unloadable`] on this host — the
+    /// installer must NOT place any of them (that is the #1753 regression this
+    /// selector exists to prevent). Carries the first refusal, phrased for an
+    /// operator.
+    Refused { reason: String },
+    /// No asset matched this OS/arch at all — the caller raises `ASSET_NOT_FOUND`,
+    /// exactly as [`select_asset`] returning `None` does.
+    NoCandidate,
+}
+
+/// Pick the build a component should install for `target`, among its OS/arch
+/// variants, preferring the first that the host can actually LOAD.
+///
+/// Preference order is tray → headless (via [`Candidate::variant_rank`]), so a
+/// desktop host that can load the tray build gets it, and a GTK-less server
+/// falls through to the `-headless` build instead of being handed the GTK-linked
+/// tray build the shortest-name tiebreak would otherwise steal (#1753/#1774).
+///
+/// `loadable` is the injected oracle: given an asset NAME it answers that build's
+/// [`Loadability`] on this host. It is a parameter — never an execution — so this
+/// stays pure and unit-testable on any OS; production wires it to a closure that
+/// downloads the candidate and PARSES its ELF via
+/// `dig_release_resolver::loadability::inspect_artifact` (the artifact is read,
+/// never run — executing a candidate under a root beacon could seal a seed).
+///
+/// The three-valued verdict is asymmetric (the shared crate's contract): only an
+/// `Unloadable` variant is skipped. `Loadable` is taken immediately; an
+/// `Indeterminate` variant is taken permissively if no `Loadable` one is found —
+/// refusing what cannot be proven harmful would strand a musl host or a
+/// non-ELF artifact forever. All variants `Unloadable` → [`VariantOutcome::Refused`].
+pub fn select_loadable_variant(
+    asset_names: &[String],
+    target: &Target,
+    kind: AssetKind,
+    stem: &str,
+    loadable: &dyn Fn(&str) -> Loadability,
+) -> VariantOutcome {
+    let mut candidates = matched_candidates(asset_names, target, kind, stem);
+    if candidates.is_empty() {
+        return VariantOutcome::NoCandidate;
+    }
+    // Variant preference DOMINATES the base rank, so tray is probed before
+    // headless even though the (shorter) tray name would win the base tiebreak.
+    candidates.sort_by(|a, b| {
+        a.variant_rank()
+            .cmp(&b.variant_rank())
+            .then_with(|| a.base_rank().cmp(&b.base_rank()))
+    });
+
+    let mut permissive: Option<(&Candidate, String)> = None;
+    let mut first_refusal: Option<String> = None;
+    for candidate in &candidates {
+        match loadable(candidate.name) {
+            Loadability::Loadable => {
+                return VariantOutcome::Selected {
+                    asset: candidate.name.clone(),
+                    variant: candidate.variant_label(),
+                    loadable: true,
+                };
+            }
+            indeterminate @ Loadability::Indeterminate { .. } => {
+                // Remember the FIRST (highest-preference) indeterminate build as
+                // the fallback, but keep looking for a provably loadable one.
+                if permissive.is_none() {
+                    let why = match &indeterminate {
+                        Loadability::Indeterminate { why } => why.clone(),
+                        _ => unreachable!("matched the Indeterminate arm"),
+                    };
+                    permissive = Some((candidate, why));
+                }
+            }
+            refused @ (Loadability::Unloadable { .. } | Loadability::WrongMachine { .. }) => {
+                if first_refusal.is_none() {
+                    first_refusal = refused.refusal();
+                }
+            }
+        }
+    }
+
+    if let Some((candidate, _why)) = permissive {
+        return VariantOutcome::Selected {
+            asset: candidate.name.clone(),
+            variant: candidate.variant_label(),
+            loadable: false,
         };
     }
-    best.map(|(_, _, _, n)| n.clone())
+    VariantOutcome::Refused {
+        reason: first_refusal
+            .unwrap_or_else(|| "every build variant is unloadable on this host".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +883,303 @@ mod tests {
         // Not a delimited token (would be a false positive):
         assert!(!contains_token("max640", "x64"));
         assert!(!contains_token("linux", "x64"));
+    }
+
+    // -- variant-aware, loadability-driven selection (#1774) -----------------------------------
+
+    /// dig-app's two Linux builds: the default GTK-linked tray build and the
+    /// GTK-less `-headless` build. BOTH match the `linux-x64` slug, so the
+    /// shortest-name tiebreak used to hand the (shorter) tray name to every host.
+    fn dig_app_linux_variants() -> Vec<String> {
+        vec![
+            "dig-app-3.1.0-linux-x64".to_string(),
+            "dig-app-3.1.0-linux-x64-headless".to_string(),
+        ]
+    }
+
+    /// A scripted loadability oracle: exact asset name → verdict. Any name not in
+    /// the table is [`Loadability::Indeterminate`] (the fail-open default), which
+    /// keeps a typo in a fixture from masquerading as a refusal.
+    fn oracle(table: Vec<(&'static str, Loadability)>) -> impl Fn(&str) -> Loadability {
+        move |name: &str| {
+            table
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Loadability::Indeterminate {
+                    why: "not scripted".to_string(),
+                })
+        }
+    }
+
+    fn unloadable(missing: &str) -> Loadability {
+        Loadability::Unloadable {
+            missing: vec![missing.to_string()],
+        }
+    }
+
+    #[test]
+    fn dig_app_selection_never_picks_the_dign_cli_from_the_same_release() {
+        // dig_ecosystem#1774 regression: dig-app's release also ships the `dign`
+        // CLI (`dign-<ver>-linux-x64`) — a DIFFERENT binary — under the same
+        // linux-x64 slug. Before base-anchoring, `dign-*` was admitted as a
+        // dig-app candidate and, being a plain (non-GTK) CLI that loads on a
+        // headless box, it was selected as the "tray" build ahead of dig-app's
+        // own headless build (which sorts after it by variant_rank). The result
+        // on debian:bookworm-slim: `selected_variant: "tray"`, asset
+        // `dign-10.1.1-linux-x64` — the installer placed the dign CLI as dig-app.
+        //
+        // A dig-app candidate must be `dig-app-*`, never `dign-*`. This holds
+        // across BOTH the loadability fall-through AND the plain matcher.
+        let names = vec![
+            "dig-app-10.1.1-linux-x64".to_string(),
+            "dig-app-10.1.1-linux-x64-headless".to_string(),
+            "dign-10.1.1-linux-x64".to_string(),
+        ];
+        // On a GTK-less host the tray build is Unloadable; the fall-through must
+        // reach dig-app's OWN headless build, NEVER the dign CLI.
+        let gtk_less = oracle(vec![
+            ("dig-app-10.1.1-linux-x64", unloadable("libgtk-3.so.0")),
+            ("dig-app-10.1.1-linux-x64-headless", Loadability::Loadable),
+            // dign loads on a headless box — it is the trap this guards against.
+            ("dign-10.1.1-linux-x64", Loadability::Loadable),
+        ]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &gtk_less
+            ),
+            VariantOutcome::Selected {
+                asset: "dig-app-10.1.1-linux-x64-headless".to_string(),
+                variant: "headless",
+                loadable: true,
+            },
+            "a GTK-less host must get dig-app's headless build, never the dign CLI"
+        );
+        // And the plain matcher must never resolve dig-app to the dign CLI either
+        // (the pre-existing latent bug: dign is shorter than dig-app, so if
+        // dig-app's own build were ever absent, stem_rank could fall through).
+        let selected = select_asset(
+            &names,
+            &t(Os::Linux, Arch::X64),
+            AssetKind::RawBinary,
+            "dig-app",
+        );
+        assert_eq!(selected.as_deref(), Some("dig-app-10.1.1-linux-x64"));
+        assert!(
+            !selected.unwrap().starts_with("dign-"),
+            "dig-app must never resolve to the dign CLI"
+        );
+        // Querying the SAME release for the dign CLI still resolves dign — the
+        // base anchor separates the two families, it does not hide either.
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dign"
+            ),
+            Some("dign-10.1.1-linux-x64".to_string())
+        );
+    }
+
+    #[test]
+    fn desktop_host_gets_the_tray_build_when_it_loads() {
+        // Both builds load on a GTK host; tray is preferred, so the desktop user
+        // gets the tray agent — not the headless one merely because a probe ran.
+        let names = dig_app_linux_variants();
+        let both_load = oracle(vec![
+            ("dig-app-3.1.0-linux-x64", Loadability::Loadable),
+            ("dig-app-3.1.0-linux-x64-headless", Loadability::Loadable),
+        ]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &both_load
+            ),
+            VariantOutcome::Selected {
+                asset: "dig-app-3.1.0-linux-x64".to_string(),
+                variant: "tray",
+                loadable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn gtk_less_host_falls_through_to_the_headless_build() {
+        // THE #1753/#1774 property: on a host that cannot load the GTK tray build,
+        // the selector must NOT hand it over on the shortest-name tiebreak — it
+        // falls through to the `-headless` build, which loads. Exactly ONE actor
+        // varies (the tray build's loadability); the headless build stays a
+        // truthful loadable control, so an implementation that refused everything
+        // could not pass this.
+        let names = dig_app_linux_variants();
+        let headless_only = oracle(vec![
+            ("dig-app-3.1.0-linux-x64", unloadable("libgtk-3.so.0")),
+            ("dig-app-3.1.0-linux-x64-headless", Loadability::Loadable),
+        ]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &headless_only
+            ),
+            VariantOutcome::Selected {
+                asset: "dig-app-3.1.0-linux-x64-headless".to_string(),
+                variant: "headless",
+                loadable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn every_variant_unloadable_is_refused_not_placed() {
+        // Neither build can load (e.g. a broken host libc). The selector must
+        // REFUSE rather than place a binary that dies before main.
+        let names = dig_app_linux_variants();
+        let nothing_loads = oracle(vec![
+            ("dig-app-3.1.0-linux-x64", unloadable("libgtk-3.so.0")),
+            ("dig-app-3.1.0-linux-x64-headless", unloadable("libc.so.6")),
+        ]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &nothing_loads
+            ),
+            VariantOutcome::Refused {
+                // The FIRST (tray) refusal is surfaced, and it NAMES the library.
+                reason: "needs files this host does not provide (libgtk-3.so.0)".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_indeterminate_variant_is_taken_permissively_when_none_prove_loadable() {
+        // A non-ELF artifact, a musl host, a non-Linux host: loadability cannot be
+        // established. Refusing would strand the host forever, so the highest-
+        // preference indeterminate build is taken with loadable=false. The tray
+        // build here is indeterminate and headless is unloadable — tray must win
+        // (preference order), proving indeterminate outranks a refusal.
+        let names = dig_app_linux_variants();
+        let tray_indeterminate = oracle(vec![
+            (
+                "dig-app-3.1.0-linux-x64",
+                Loadability::Indeterminate {
+                    why: "not an ELF host".to_string(),
+                },
+            ),
+            ("dig-app-3.1.0-linux-x64-headless", unloadable("libc.so.6")),
+        ]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &tray_indeterminate
+            ),
+            VariantOutcome::Selected {
+                asset: "dig-app-3.1.0-linux-x64".to_string(),
+                variant: "tray",
+                loadable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_loadable_headless_beats_an_indeterminate_tray() {
+        // Preference is tray-first, but a PROVEN-loadable build beats a merely-
+        // indeterminate higher-preference one: correctness over preference.
+        let names = dig_app_linux_variants();
+        let table = oracle(vec![
+            (
+                "dig-app-3.1.0-linux-x64",
+                Loadability::Indeterminate {
+                    why: "unreadable".to_string(),
+                },
+            ),
+            ("dig-app-3.1.0-linux-x64-headless", Loadability::Loadable),
+        ]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &table
+            ),
+            VariantOutcome::Selected {
+                asset: "dig-app-3.1.0-linux-x64-headless".to_string(),
+                variant: "headless",
+                loadable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn no_matching_asset_is_no_candidate() {
+        // A release with no build for this OS/arch: the oracle is never consulted,
+        // and the caller maps this to ASSET_NOT_FOUND exactly as select_asset's
+        // None does.
+        let names = vec!["dig-app-3.1.0-macos-arm64".to_string()];
+        let never = oracle(vec![]);
+        assert_eq!(
+            select_loadable_variant(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app",
+                &never
+            ),
+            VariantOutcome::NoCandidate
+        );
+    }
+
+    #[test]
+    fn the_shortest_name_tiebreak_no_longer_steals_the_gtk_build_on_a_gtk_less_host() {
+        // Guarding the exact regression: with the OLD select_asset the shorter
+        // `…-linux-x64` (the GTK tray build) always won. The variant selector on a
+        // GTK-less host must pick the LONGER `-headless` name instead — so the two
+        // functions now disagree on this input, which is the whole point.
+        let names = dig_app_linux_variants();
+        assert_eq!(
+            select_asset(
+                &names,
+                &t(Os::Linux, Arch::X64),
+                AssetKind::RawBinary,
+                "dig-app"
+            ),
+            Some("dig-app-3.1.0-linux-x64".to_string()),
+            "select_asset still blindly prefers the shortest name"
+        );
+        let gtk_less = oracle(vec![
+            ("dig-app-3.1.0-linux-x64", unloadable("libgtk-3.so.0")),
+            ("dig-app-3.1.0-linux-x64-headless", Loadability::Loadable),
+        ]);
+        match select_loadable_variant(
+            &names,
+            &t(Os::Linux, Arch::X64),
+            AssetKind::RawBinary,
+            "dig-app",
+            &gtk_less,
+        ) {
+            VariantOutcome::Selected { asset, .. } => assert_eq!(
+                asset, "dig-app-3.1.0-linux-x64-headless",
+                "the variant selector must not inherit the GTK-build bug"
+            ),
+            other => panic!("expected the headless build, got {other:?}"),
+        }
     }
 
     #[test]

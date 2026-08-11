@@ -1069,11 +1069,12 @@ dependencies = [
 
 [[package]]
 name = "dig-installer"
-version = "0.42.4"
+version = "0.43.0"
 dependencies = [
  "clap",
  "dig-cert",
  "dig-constants",
+ "dig-release-resolver",
  "dirs 5.0.1",
  "hex",
  "libc",
@@ -1087,6 +1088,17 @@ dependencies = [
  "ureq",
  "windows-sys 0.59.0",
  "winreg 0.52.0",
+]
+
+[[package]]
+name = "dig-release-resolver"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76dd0171b14ba547744c173a9923b61d66139509efbf3770445366a08b9d43f"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
