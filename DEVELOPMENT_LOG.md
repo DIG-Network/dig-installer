@@ -3,6 +3,27 @@
 High-signal, durable realizations from building dig-installer. Concise facts with
 context — not a change diary. See CLAUDE.md → §4.5 for how this is maintained.
 
+## Root-exec-guard tests need a root-secure fixture root, not `/tmp` (#2623)
+
+The root-exec guard (`rootchain::verify`, reached via `secure::root_exec_guard` /
+`guardedcmd::GuardedCommand::for_installed_binary`) walks EVERY ancestor of a binary's directory up to
+`/` and refuses if any level allows group/other write. `sources::fixture_root()` defaults to the system
+temp dir (`/tmp`, sticky `1777`), so under a root (uid 0) test runner the guard correctly refuses any
+fixture there — and every test that must reach the guard's PASS path (the doctor/pac spawns, the
+`verify_existing` live-path probe, the positive control arm of the group-writable-dir refusal tests)
+fails for a reason unrelated to the property under test. On the non-root CI runner the guard is inert,
+so these pass there and the breakage is invisible to CI while being loud in root sandboxes.
+
+- **Fix the fixture LOCATION, never relax the verify.** An unprivileged-behaviour assertion that cannot
+  be made meaningful as root SKIPS with a printed reason (the existing `if is_root() { eprintln!(...);
+  return; }` idiom in `secure.rs` / `guardedcmd.rs`); it must never `#[ignore]`, silently pass, or
+  weaken the assertion. But a test that needs the guard to PASS as root does not skip — it places its
+  fixture on a root-secure chain via `sources::root_secure_fixture_root()`, which honours
+  `DIG_TEST_FIXTURE_ROOT` (the baked-container path) and otherwise, as root, provisions a root-owned
+  `0755` directory directly beneath `/` (whose only judged ancestor is `/` itself). Unprivileged it is
+  exactly `fixture_root()`, so CI runs are byte-for-byte unchanged. A world-writable leaf a test sets
+  itself is still refused; only the incidental `/tmp` ancestor is removed.
+
 ## "Running now" is not "ready" — a daemon must be gated on reboot survival, not health (#1984)
 
 `evaluate_readiness` computed, reported, and even e2e-asserted a service's `survives_reboot` /

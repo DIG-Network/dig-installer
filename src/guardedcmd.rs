@@ -120,8 +120,8 @@ mod tests {
     fn a_refused_directory_yields_no_command_at_all() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir =
-            crate::sources::fixture_root().join(format!("dig-guardedcmd-{}", std::process::id()));
+        let dir = crate::sources::root_secure_fixture_root()
+            .join(format!("dig-guardedcmd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("dig-dns");

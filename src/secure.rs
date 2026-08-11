@@ -1124,8 +1124,8 @@ mod tests {
             eprintln!("skipped: the guard is deliberately inert unelevated");
             return;
         }
-        let dir =
-            crate::sources::fixture_root().join(format!("dig-rootexec-{}", std::process::id()));
+        let dir = crate::sources::root_secure_fixture_root()
+            .join(format!("dig-rootexec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("dig-node");

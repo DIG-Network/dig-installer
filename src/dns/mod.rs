@@ -436,7 +436,7 @@ mod tests {
     }
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        crate::sources::fixture_root().join(format!(
+        crate::sources::root_secure_fixture_root().join(format!(
             "dig-installer-dns-mod-{tag}-{}",
             std::process::id()
         ))
