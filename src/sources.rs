@@ -102,6 +102,36 @@ pub fn fixture_root() -> std::path::PathBuf {
     }
 }
 
+/// A fixture root the root-exec guard ([`crate::rootchain::verify`], which walks every ancestor to `/`)
+/// accepts — for the tests that must reach the guard's PASS path, or the logic behind it, WHILE running
+/// as root.
+///
+/// [`fixture_root`]'s default (`/tmp`, sticky `1777`) is correctly REFUSED as root, so those tests fail
+/// for a reason unrelated to the property under test unless the fixture lives on a root-secure chain. When
+/// `DIG_TEST_FIXTURE_ROOT` already points at a baked hardened root (the container path documented on
+/// [`fixture_root`]), it is honoured as-is. Otherwise, as root, one is PROVISIONED here: a root-owned
+/// `0755` directory placed directly beneath `/`, whose only judged ancestor is `/` itself (root-owned
+/// `0755`, and the base the walk does not judge). Unprivileged, the guard is inert and `/tmp` is fine, so
+/// this is exactly [`fixture_root`] — the CI (non-root) runs are byte-for-byte unchanged.
+///
+/// Fixing the fixture LOCATION rather than relaxing the verify keeps every security assertion live: a
+/// world-writable leaf a test sets itself is still refused; only the incidental `/tmp` ancestor is removed.
+#[cfg(test)]
+pub fn root_secure_fixture_root() -> std::path::PathBuf {
+    #[cfg(unix)]
+    if crate::invoker::is_root() && std::env::var_os("DIG_TEST_FIXTURE_ROOT").is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let secure = std::path::PathBuf::from("/dig-installer-test-secure-root");
+        std::fs::create_dir_all(&secure).expect("create root-secure fixture root");
+        // Created by root, so root-owned; pin `0755` so no stray group/other write bit (a prior run's
+        // umask, say) makes the whole-chain walk refuse it.
+        std::fs::set_permissions(&secure, std::fs::Permissions::from_mode(0o755))
+            .expect("pin root-secure fixture root to 0755");
+        return secure;
+    }
+    fixture_root()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

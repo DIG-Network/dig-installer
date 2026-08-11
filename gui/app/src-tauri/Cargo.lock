@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "dig-installer"
-version = "0.42.3"
+version = "0.42.4"
 dependencies = [
  "clap",
  "dig-cert",

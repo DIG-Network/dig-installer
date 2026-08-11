@@ -115,7 +115,7 @@ mod tests {
     const PAC_JSON: &str = r#"{"loopback_ip":"127.0.0.5","port":80,"tld":"dig","pac":"function FindProxyForURL(url, host) { return \"DIRECT\"; }"}"#;
 
     fn tmp_subdir(tag: &str) -> std::path::PathBuf {
-        let d = crate::sources::fixture_root()
+        let d = crate::sources::root_secure_fixture_root()
             .join(format!("dig-installer-doctor-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -202,8 +202,8 @@ mod tests {
 
     #[test]
     fn run_doctor_errors_when_binary_is_missing() {
-        let missing =
-            crate::sources::fixture_root().join("definitely-not-a-real-dig-dns-binary-xyz");
+        let missing = crate::sources::root_secure_fixture_root()
+            .join("definitely-not-a-real-dig-dns-binary-xyz");
         let err = run_doctor(&missing).unwrap_err();
         assert!(err.contains("could not run"), "got: {err}");
     }
