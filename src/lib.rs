@@ -961,6 +961,9 @@ fn download_component(
 /// `digd-*`) correctly reports `ASSET_NOT_FOUND` — which must SKIP the alias, not
 /// roll back the whole install, since the base component already installed and is
 /// unaffected. A genuine transport error still propagates.
+// Threads the shared install context (resolve/repo/target/bin_dir/report/guard/dry_run/log)
+// plus the alias's own requested version; a params struct would only relocate the same set.
+#[allow(clippy::too_many_arguments)]
 fn install_optional_alias(
     resolve: &ReleaseResolver<'_>,
     repo: &Repo,
