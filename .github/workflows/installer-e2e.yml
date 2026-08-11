@@ -326,6 +326,33 @@ jobs:
           jq -e '.result.ready == true' install.json
           jq -e '.result.failures == []' install.json
 
+      # #1774: dig-app must resolve a build this host can actually LOAD, on the
+      # default path — never the GTK-linked build handed over by the old
+      # shortest-name tiebreak that dies inside `ld.so` before `main` (#1753).
+      # The variant CHOSEN is incidental here (stock ubuntu-latest may lack
+      # libxdo.so.3, so even it can fall through to `-headless`) — the property is
+      # that a loadable, non-refused build was selected. The genuinely GTK-less
+      # `headless-linux-e2e` job below pins the `-headless` choice explicitly.
+      - name: Assert dig-app resolved a loadable, non-refused build (#1774)
+        run: |
+          DIGAPP='.result.components[] | select(.component=="dig-app")'
+          jq -e "[$DIGAPP] | length == 1" install.json
+          jq -e "$DIGAPP | has(\"refused\") | not" install.json
+          jq -e "$DIGAPP | .selected_variant != null" install.json
+      - name: (Linux) Assert the selected dig-app build is loadable and its DT_NEEDED resolve (#1774)
+        if: runner.os == 'Linux'
+        run: |
+          DIGAPP='.result.components[] | select(.component=="dig-app")'
+          jq -e "$DIGAPP | .loadable == true" install.json
+          dest=$(jq -r "$DIGAPP | .dest" install.json)
+          echo "placed dig-app at: $dest"
+          # The install verdict said loadable by PARSING; prove it on the host too —
+          # no DT_NEEDED of the placed binary may resolve to "not found".
+          if ldd "$dest" 2>&1 | grep -i "not found"; then
+            echo "FAIL: the placed dig-app build has unresolved shared libraries"
+            exit 1
+          fi
+
       # #565: the install root a privileged service runs from was actually
       # ACL-verified admin-only (not merely assumed), and no privileged
       # registration's binPath resolves under a legacy/user-writable root.
@@ -549,6 +576,116 @@ jobs:
             uninstall-node.json
             uninstall-dns.json
             uninstall-updater.json
+          if-no-files-found: ignore
+
+  # dig_ecosystem#1774: a genuinely GTK-less host must install a dig-app build it
+  # can actually LOAD.
+  #
+  # The `e2e` job runs on stock `ubuntu-latest`, which ships libgtk-3 — so it
+  # cannot prove the fall-through, only that SOME loadable build was chosen. This
+  # job runs the whole install inside a `debian:bookworm-slim` container with NO
+  # GTK3 installed, which is exactly the #1753 headless-server shape: the GTK
+  # `tray` build's `DT_NEEDED` (libgtk-3.so.0, …) resolve to nothing, so the
+  # loadability-driven selector MUST fall through to the `-headless` build and
+  # report it loadable — never place the GTK build that dies before `main`.
+  #
+  # The install runs INSIDE the container (not a host-built binary shipped in) so
+  # the installer's own glibc matches the box it inspects. Only dig-app is
+  # installed (per-user, no services) to keep the leg fast + focused.
+  headless-linux-e2e:
+    name: "#1774 a GTK-less host installs the headless dig-app build (debian:bookworm-slim)"
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # rustup/cargo live under a writable HOME inside the container.
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
+    steps:
+      # curl + ca-certificates: fetch rustup and the GitHub release assets.
+      # gcc + build-essential: native deps (ring) compile. git: the Cargo.toml
+      # `dig-cert` git dependency. jq: the JSON assertions. Deliberately NO
+      # libgtk-3 — a GTK-less box is the whole point of this leg.
+      - name: Install build prerequisites (NO GTK)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates gcc build-essential git jq pkg-config
+          # Prove the box really lacks GTK3 — if a base-image change ever adds it,
+          # this leg would silently stop testing the fall-through.
+          if ldconfig -p | grep -qi 'libgtk-3'; then
+            echo "FAIL: this container unexpectedly ships libgtk-3 — the fall-through is not exercised"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build dig-installer (release)
+        run: cargo build --release --locked --bin dig-installer
+
+      - name: A stable, root-owned bin dir under a world-traversable /opt
+        run: |
+          # /opt in a fresh debian image is root-owned 0755, satisfying the #1748
+          # install-root chain verify. --bin-dir places dig-app here.
+          chmod 755 /opt
+          mkdir -p /opt/dig-bin && chmod 755 /opt/dig-bin
+          echo "BIN_DIR=/opt/dig-bin" >> "$GITHUB_ENV"
+
+      # dig-app only: per-user, no OS-service registration, so no elevation dance
+      # and no systemd needed (the container has no init). The run is root (uid 0),
+      # which satisfies the elevation gate for the nothing-privileged plan.
+      - name: Install dig-app on the GTK-less host
+        run: |
+          ./target/release/dig-installer \
+            --no-digstore --no-dig-node --no-dig-dns --no-auto-update \
+            --bin-dir "$BIN_DIR" \
+            --json | tee install.json
+
+      - name: Assert dig-app fell through to the -headless build and it is loadable (#1774)
+        run: |
+          DIGAPP='.result.components[] | select(.component=="dig-app")'
+          # Exactly one dig-app component, and it was NOT refused (a refusal would
+          # mean NO build loaded — the headless build must have).
+          jq -e "[$DIGAPP] | length == 1" install.json
+          jq -e "$DIGAPP | has(\"refused\") | not" install.json
+          # THE property: a GTK-less host selects the headless build, proven loadable.
+          jq -e "$DIGAPP | .selected_variant == \"headless\"" install.json
+          jq -e "$DIGAPP | .loadable == true" install.json
+          # And the chosen asset name really is the -headless artifact.
+          jq -e "$DIGAPP | .asset | test(\"-headless\")" install.json
+
+      - name: Prove the placed headless build's DT_NEEDED resolve on this GTK-less box
+        run: |
+          DIGAPP='.result.components[] | select(.component=="dig-app")'
+          dest=$(jq -r "$DIGAPP | .dest" install.json)
+          echo "placed dig-app at: $dest"
+          ldd "$dest" || true
+          if ldd "$dest" 2>&1 | grep -i "not found"; then
+            echo "FAIL: the placed headless dig-app build has unresolved shared libraries"
+            exit 1
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-headless-linux-e2e
+          path: install.json
           if-no-files-found: ignore
 
   # #565 H3 — the seeded-legacy MIGRATION + DEFAULT-protected-root proof.
