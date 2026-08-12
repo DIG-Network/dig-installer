@@ -15,6 +15,72 @@ use crate::release::Repo;
 /// GitHub requires a User-Agent on API requests.
 const USER_AGENT: &str = concat!("dig-installer/", env!("CARGO_PKG_VERSION"));
 
+/// How many times a transient HTTP failure is retried before the install gives
+/// up (dig_ecosystem#2784).
+///
+/// An install is a chain of GitHub calls, and ANY one of them failing aborts
+/// the whole install and rolls back every completed step. Single-shot requests
+/// therefore turn an ordinary, self-healing blip — a dropped TLS handshake, a
+/// 502 from `api.github.com`, a truncated body — into a red install. Three
+/// attempts covers the observed blips without hiding a genuine outage (which
+/// still fails, just a few seconds later).
+const HTTP_ATTEMPTS: u32 = 3;
+
+/// The pause before the first retry; doubled for each subsequent attempt.
+const HTTP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A failed HTTP attempt plus the one thing the retry loop needs to know about
+/// it: whether trying again could plausibly produce a different answer.
+///
+/// Classification is on the typed `ureq` error, never on a formatted string,
+/// so a message reword can never silently change retry behaviour.
+struct HttpFailure {
+    message: String,
+    retryable: bool,
+}
+
+/// Classify a `ureq` error: transport-level failures (DNS, connect, TLS
+/// handshake, dropped connection) and the server-side transient statuses (429
+/// rate-limit, 5xx) are worth retrying. Every other status — notably the 404
+/// that [`latest_release`] deliberately reads as "no published release" and the
+/// 401/403 of a bad or exhausted token — is a real answer, and retrying it only
+/// delays the report.
+fn classify(url: &str, err: ureq::Error) -> HttpFailure {
+    let retryable = match &err {
+        ureq::Error::Transport(_) => true,
+        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
+    };
+    HttpFailure {
+        message: format!("GET {url}: {err}"),
+        retryable,
+    }
+}
+
+/// Run `op` until it succeeds, it fails non-retryably, or `attempts` is spent.
+///
+/// `backoff` is the first pause and doubles each retry; tests pass
+/// `Duration::ZERO` so they exercise the real loop without real sleeping.
+fn with_retry<T>(
+    attempts: u32,
+    backoff: std::time::Duration,
+    mut op: impl FnMut() -> Result<T, HttpFailure>,
+) -> Result<T, String> {
+    let mut pause = backoff;
+    for _ in 1..attempts {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(f) if f.retryable => {
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+                pause *= 2;
+            }
+            Err(f) => return Err(f.message),
+        }
+    }
+    op().map_err(|f| f.message)
+}
+
 /// A GitHub release reduced to what the installer needs: the tag and the names
 /// of every uploaded asset (so the OS/arch matcher in [`crate::asset`] can pick
 /// the right one, instead of betting on a single guessed filename).
@@ -153,14 +219,32 @@ const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 /// socket) without mutating the process environment. `token: None` sends the
 /// SAME anonymous request as before this option existed.
 fn get_text_with_token(url: &str, token: Option<&str>) -> Result<String, String> {
-    let mut req = ureq::get(url)
-        .set("User-Agent", USER_AGENT)
-        .set("Accept", "application/vnd.github+json");
-    if let Some(t) = token.filter(|t| !t.is_empty()) {
-        req = req.set("Authorization", &format!("Bearer {t}"));
-    }
-    let resp = req.call().map_err(|e| format!("GET {url}: {e}"))?;
-    resp.into_string().map_err(|e| format!("read {url}: {e}"))
+    get_text_with_token_retrying(url, token, HTTP_ATTEMPTS, HTTP_RETRY_BACKOFF)
+}
+
+/// [`get_text_with_token`] with the retry budget injected, so the retry
+/// behaviour is unit-tested against a real socket without real sleeping.
+fn get_text_with_token_retrying(
+    url: &str,
+    token: Option<&str>,
+    attempts: u32,
+    backoff: std::time::Duration,
+) -> Result<String, String> {
+    with_retry(attempts, backoff, || {
+        let mut req = ureq::get(url)
+            .set("User-Agent", USER_AGENT)
+            .set("Accept", "application/vnd.github+json");
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req.call().map_err(|e| classify(url, e))?;
+        // A body that fails mid-read is the same class of blip as a dropped
+        // handshake — the request is repeatable, so retry it too.
+        resp.into_string().map_err(|e| HttpFailure {
+            message: format!("read {url}: {e}"),
+            retryable: true,
+        })
+    })
 }
 
 /// Hex SHA-256 of a byte slice.
@@ -173,18 +257,37 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// Download `url` into memory. Returns the bytes (binaries are tens of MB —
 /// fine to hold in RAM, and it lets us checksum before writing anything).
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url)
-        .set("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read body {url}: {e}"))?;
-    if buf.is_empty() {
-        return Err(format!("downloaded 0 bytes from {url}"));
-    }
-    Ok(buf)
+    fetch_bytes_retrying(url, HTTP_ATTEMPTS, HTTP_RETRY_BACKOFF)
+}
+
+/// [`fetch_bytes`] with the retry budget injected (see
+/// [`get_text_with_token_retrying`]).
+fn fetch_bytes_retrying(
+    url: &str,
+    attempts: u32,
+    backoff: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    with_retry(attempts, backoff, || {
+        let resp = ureq::get(url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| classify(url, e))?;
+        let mut buf = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut buf)
+            .map_err(|e| HttpFailure {
+                message: format!("read body {url}: {e}"),
+                retryable: true,
+            })?;
+        if buf.is_empty() {
+            // An empty body from a 200 is a truncated response, not an answer.
+            return Err(HttpFailure {
+                message: format!("downloaded 0 bytes from {url}"),
+                retryable: true,
+            });
+        }
+        Ok(buf)
+    })
 }
 
 /// The result of writing a component binary to its destination.
@@ -1185,6 +1288,193 @@ mod tests {
             }
         });
         port
+    }
+
+    // -- retry of transient network failures (dig_ecosystem#2784) -----------
+    //
+    // The macOS e2e leg went red because a SINGLE `api.github.com` request
+    // failed its TLS handshake ("invalid peer certificate ...
+    // UnsupportedCertVersion") mid-install, which aborted the install and
+    // rolled back every completed step. Sibling reds on the same workflow
+    // failed the same way on a 403. The requests were single-shot, so any blip
+    // was fatal.
+    //
+    // These drive the REAL `ureq` request against a local server that fails a
+    // controlled number of requests first, so the assertion is on observed
+    // wire behaviour (how many requests reached the server, and what came
+    // back) — not a re-statement of the retry loop's own branches.
+
+    /// Read an HTTP request head off `stream`, returning `None` if the peer
+    /// sent nothing before closing.
+    fn read_request_head(stream: &mut std::net::TcpStream) -> Option<String> {
+        use std::io::Read;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(1000)))
+            .ok();
+        let mut buf = [0u8; 4096];
+        let mut request = Vec::new();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| {
+                        w == b"
+
+"
+                    }) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        (!request.is_empty()).then(|| String::from_utf8_lossy(&request).into_owned())
+    }
+
+    /// A local server that hard-drops (closes without writing a byte — the
+    /// transport-level failure `ureq` also reports for a failed TLS handshake)
+    /// its first `drops` requests, then answers every later request with
+    /// `status_line` and a release JSON body. Returns the port plus a counter
+    /// of REQUESTS received.
+    fn server_dropping_first_requests(
+        drops: usize,
+        status_line: &'static str,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // Count REQUESTS, not accepted sockets: a connection carrying
+                // no request must not be mistaken for an attempt.
+                if read_request_head(&mut stream).is_none() {
+                    continue;
+                }
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < drops {
+                    drop(stream);
+                    continue;
+                }
+                let body = r#"{"tag_name":"v1.2.3","assets":[]}"#;
+                let response = format!(
+                    "{status_line}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (port, seen)
+    }
+
+    #[test]
+    fn get_text_retries_a_dropped_connection_and_succeeds_on_a_later_attempt() {
+        use std::sync::atomic::Ordering;
+
+        let (port, seen) = server_dropping_first_requests(2, "HTTP/1.1 200 OK");
+        let body = get_text_with_token_retrying(
+            &format!("http://127.0.0.1:{port}/"),
+            None,
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect("two transport blips are inside the retry budget");
+        assert!(body.contains("v1.2.3"), "got: {body}");
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "should have retried twice");
+    }
+
+    #[test]
+    fn get_text_gives_up_once_the_retry_budget_is_spent() {
+        use std::sync::atomic::Ordering;
+
+        // One more blip than the budget covers: the failure is still reported,
+        // after exactly `HTTP_ATTEMPTS` attempts — a retry loop must not become
+        // an unbounded hang.
+        let (port, seen) =
+            server_dropping_first_requests(HTTP_ATTEMPTS as usize, "HTTP/1.1 200 OK");
+        let err = get_text_with_token_retrying(
+            &format!("http://127.0.0.1:{port}/"),
+            None,
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("budget spent");
+        assert!(err.contains("GET http://127.0.0.1"), "got: {err}");
+        assert_eq!(seen.load(Ordering::SeqCst), HTTP_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn get_text_does_not_retry_a_404_so_the_no_release_fallback_stays_cheap() {
+        use std::sync::atomic::Ordering;
+
+        // `latest_release` reads a 404 as "no published release" and falls back
+        // to the full list. Retrying it would triple every fallback and change
+        // no answer.
+        let (port, seen) = server_dropping_first_requests(0, "HTTP/1.1 404 Not Found");
+        let err = get_text_with_token_retrying(
+            &format!("http://127.0.0.1:{port}/"),
+            None,
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("404 is an answer, not a blip");
+        assert!(is_release_not_found(&err), "got: {err}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "404 must not be retried");
+    }
+
+    #[test]
+    fn fetch_bytes_retries_a_dropped_connection() {
+        use std::sync::atomic::Ordering;
+
+        let (port, seen) = server_dropping_first_requests(1, "HTTP/1.1 200 OK");
+        let bytes = fetch_bytes_retrying(
+            &format!("http://127.0.0.1:{port}/asset"),
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect("one transport blip is inside the retry budget");
+        assert!(!bytes.is_empty());
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "should have retried once");
+    }
+
+    #[test]
+    fn get_text_retries_a_502_but_not_a_401() {
+        use std::sync::atomic::Ordering;
+
+        let (bad_gateway, seen) = server_dropping_first_requests(0, "HTTP/1.1 502 Bad Gateway");
+        let _ = get_text_with_token_retrying(
+            &format!("http://127.0.0.1:{bad_gateway}/"),
+            None,
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("every attempt 502s");
+        assert_eq!(seen.load(Ordering::SeqCst), HTTP_ATTEMPTS as usize);
+
+        let (unauthorized, seen) = server_dropping_first_requests(0, "HTTP/1.1 401 Unauthorized");
+        let _ = get_text_with_token_retrying(
+            &format!("http://127.0.0.1:{unauthorized}/"),
+            None,
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a rejected token is an answer");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "401 must not be retried");
     }
 
     #[test]
