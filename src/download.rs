@@ -43,12 +43,22 @@ struct HttpFailure {
 /// handshake, dropped connection) and the server-side transient statuses (429
 /// rate-limit, 5xx) are worth retrying. Every other status — notably the 404
 /// that [`latest_release`] deliberately reads as "no published release" and the
-/// 401/403 of a bad or exhausted token — is a real answer, and retrying it only
+/// 401 of a rejected credential — is a real answer, and retrying it only
 /// delays the report.
-fn classify(url: &str, err: ureq::Error) -> HttpFailure {
+///
+/// `authenticated` should be `true` when the request carried an `Authorization`
+/// header (i.e. `get_text_with_token_retrying` with a non-empty token).
+/// When `authenticated` is `false` (the unauthenticated asset-download path),
+/// a **403** is also retried: GitHub returns 403 — not 401 — for anonymous
+/// rate-limit and abuse-detection trips on `releases/download`, and those are
+/// transient by construction. On the authenticated path a 403 is a rejected or
+/// exhausted token and retrying it would only waste the budget.
+fn classify(url: &str, err: ureq::Error, authenticated: bool) -> HttpFailure {
     let retryable = match &err {
         ureq::Error::Transport(_) => true,
-        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
+        ureq::Error::Status(code, _) => {
+            *code == 429 || *code >= 500 || (*code == 403 && !authenticated)
+        }
     };
     HttpFailure {
         message: format!("GET {url}: {err}"),
@@ -234,10 +244,11 @@ fn get_text_with_token_retrying(
         let mut req = ureq::get(url)
             .set("User-Agent", USER_AGENT)
             .set("Accept", "application/vnd.github+json");
+        let has_token = token.map_or(false, |t| !t.is_empty());
         if let Some(t) = token.filter(|t| !t.is_empty()) {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
-        let resp = req.call().map_err(|e| classify(url, e))?;
+        let resp = req.call().map_err(|e| classify(url, e, has_token))?;
         // A body that fails mid-read is the same class of blip as a dropped
         // handshake — the request is repeatable, so retry it too.
         resp.into_string().map_err(|e| HttpFailure {
@@ -271,7 +282,7 @@ fn fetch_bytes_retrying(
         let resp = ureq::get(url)
             .set("User-Agent", USER_AGENT)
             .call()
-            .map_err(|e| classify(url, e))?;
+            .map_err(|e| classify(url, e, false))?;
         let mut buf = Vec::new();
         resp.into_reader()
             .read_to_end(&mut buf)
@@ -1319,11 +1330,7 @@ mod tests {
                 Ok(0) => break,
                 Ok(n) => {
                     request.extend_from_slice(&buf[..n]);
-                    if request.windows(4).any(|w| {
-                        w == b"
-
-"
-                    }) {
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
                         break;
                     }
                 }
@@ -1366,12 +1373,7 @@ mod tests {
                 }
                 let body = r#"{"tag_name":"v1.2.3","assets":[]}"#;
                 let response = format!(
-                    "{status_line}
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{}",
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -1475,6 +1477,44 @@ Connection: close
         )
         .expect_err("a rejected token is an answer");
         assert_eq!(seen.load(Ordering::SeqCst), 1, "401 must not be retried");
+    }
+
+    #[test]
+    fn fetch_bytes_retries_403_but_get_text_with_token_does_not() {
+        use std::sync::atomic::Ordering;
+
+        // `fetch_bytes_retrying` sends no Authorization header; GitHub returns
+        // 403 for anonymous rate-limit/abuse trips, which are transient.
+        let (forbidden_asset, seen_asset) =
+            server_dropping_first_requests(0, "HTTP/1.1 403 Forbidden");
+        let _ = fetch_bytes_retrying(
+            &format!("http://127.0.0.1:{forbidden_asset}/asset"),
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("every attempt 403s");
+        assert_eq!(
+            seen_asset.load(Ordering::SeqCst),
+            HTTP_ATTEMPTS as usize,
+            "anonymous 403 must be retried on the asset path"
+        );
+
+        // `get_text_with_token_retrying` with a real token sends Authorization;
+        // a 403 there means the token is bad or exhausted — single-shot.
+        let (forbidden_api, seen_api) =
+            server_dropping_first_requests(0, "HTTP/1.1 403 Forbidden");
+        let _ = get_text_with_token_retrying(
+            &format!("http://127.0.0.1:{forbidden_api}/"),
+            Some("ghp_tok"),
+            HTTP_ATTEMPTS,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("authenticated 403 is an answer");
+        assert_eq!(
+            seen_api.load(Ordering::SeqCst),
+            1,
+            "authenticated 403 must not be retried"
+        );
     }
 
     #[test]

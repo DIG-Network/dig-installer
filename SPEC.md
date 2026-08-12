@@ -66,8 +66,12 @@ before the first retry and doubling thereafter. Only failures that could plausib
 differently are retried: transport-level errors (DNS, connect, TLS handshake, dropped connection),
 HTTP **429**, and HTTP **5xx**. Every other status is a real answer and is reported at once — in
 particular a **404** stays a single request, because `download::latest_release` reads it as "no
-published release" and falls back to the releases list, and **401/403** mean a rejected or exhausted
-token that a retry cannot change. See `download::with_retry`.
+published release" and falls back to the releases list, and **401** is a rejected credential.
+**403** is treated differently by path: on the unauthenticated asset-download path
+(`fetch_bytes_retrying`) a 403 is retried, because GitHub returns 403 for anonymous rate-limit and
+abuse-detection trips on `releases/download`, which are transient; on the authenticated API path
+(`get_text_with_token_retrying` with a non-empty token) a 403 is a rejected or exhausted token and
+is not retried. See `download::with_retry` and `download::classify`.
 
 ### 1.1 First-class alias binaries (`digs`, `dign`, `digd`)
 
