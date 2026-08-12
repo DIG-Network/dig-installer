@@ -4,14 +4,13 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.43.0] - 2026-08-11
+## [0.43.0] - 2026-08-12
 
 ### Features
-- **installer:** Select a headless-loadable dig-app build on GTK-less hosts via the shared `dig-release-resolver` loadability check, on the default path — never the GTK-linked build that dies inside `ld.so` before `main` (#1774, #1753). Adds `selected_variant`, `loadable`, and `refused` to each component in `--json`.
+- **installer:** Select a headless-loadable dig-app build via the shared loadability check (#67)
 
-### Bug Fixes
-- **installer:** Base-anchor RawBinary asset selection on the component stem, so dig-app never resolves to the `dign` CLI shipped in the same release (both match the `linux-x64` slug) — the installer no longer installs the dign CLI as dig-app on Linux (#1774).
-- **installer:** Skip an optional alias binary (`digs`/`dign`/`digd`) gracefully when its asset is absent from an older pinned release, instead of failing the whole install — the base-anchor fix means `digd` no longer wrongly matches `dig-dns-*`, so a release predating the alias (e.g. dig-dns v0.9.1) now correctly skips it (#1774).
+### Testing
+- **installer:** Root-secure the guarded-exec test fixtures so the suite runs as uid 0 (#2623)
 
 ## [0.42.3] - 2026-08-11
 
@@ -330,3 +329,5 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Gui
 - Correct stage-binary error hint for the new home
+
+
