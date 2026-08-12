@@ -880,3 +880,23 @@ survives to clean it. Anything that scans for such files afterwards must match o
 WRITER's own tag constants, never on a name the scanner spells out for itself —
 otherwise a rename of the tag silently empties the scan, which is the drift that made
 these files invisible to begin with.
+
+## The installer's own trust-store mutation cannot break its own HTTPS (dig_ecosystem#2784)
+
+The macOS e2e went red with `invalid peer certificate: Other(OtherError(UnsupportedCertVersion))` on
+the first `api.github.com` call, in the step immediately after the installer minted a CA and added it
+to the macOS **system keychain**. The ordering makes "our own CA poisoned the trust set" the obvious
+story, and it is wrong twice over:
+
+* `ureq` is built here with `default-features = false, features = ["tls"]`, which resolves roots from
+  the compiled-in **webpki-roots**, not the platform store. Nothing in `Cargo.lock` pulls
+  `rustls-native-certs` or `rustls-platform-verifier`. The system keychain is structurally not part
+  of the installer's trust set — on any OS.
+* The dig-node asset download over HTTPS **succeeded seven seconds after** the keychain was mutated,
+  in the same process.
+
+The real cause was that every request was single-shot: one transient handshake failure aborted the
+install and rolled back every completed step. The sibling reds on the same workflow were the same
+shape with different blips (a 403, a missing asset). Before attributing a TLS error to a trust-store
+change, check which root source the HTTP client is actually compiled against — the answer is in
+`Cargo.lock`, not in the ordering of the log.
