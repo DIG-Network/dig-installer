@@ -9,11 +9,20 @@
 //! at the caller's level. (Service registration that needs admin is delegated to
 //! dig-node, which prompts for elevation itself when required.)
 //!
+//! It also compiles `assets/dig.rc`, which carries the branded DIG application
+//! icon, into the same binaries. The two are independent resource kinds
+//! (RT_GROUP_ICON/RT_ICON from the .res, RT_MANIFEST from `/MANIFEST:EMBED`)
+//! and coexist: the manifest is NOT declared in the .rc precisely so neither
+//! can displace the other.
+//!
 //! No-op on non-Windows.
 
 fn main() {
     #[cfg(windows)]
-    embed_manifest();
+    {
+        embed_manifest();
+        embed_icon();
+    }
 }
 
 #[cfg(windows)]
@@ -45,4 +54,26 @@ fn embed_manifest() {
         manifest_path.display()
     );
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Compile the branded DIG icon into the installer binary.
+///
+/// `embed_resource::compile` links the compiled `.res` with
+/// `cargo:rustc-link-arg-bins`, so it reaches the shipped binaries and NOT the
+/// unit-test harness. That is the deliberate opposite of the manifest above:
+/// the manifest must reach the test harness (Windows would otherwise try to
+/// auto-elevate it), whereas a test harness has no need of an icon, and
+/// leaving its link line untouched keeps this change off the os-error-740 path.
+///
+/// The result is checked rather than discarded: an environment that cannot
+/// compile a resource would otherwise silently produce an unbranded binary,
+/// which is precisely the failure this build step exists to prevent.
+#[cfg(windows)]
+fn embed_icon() {
+    embed_resource::compile("assets/dig.rc", embed_resource::NONE)
+        .manifest_required()
+        .expect("failed to compile assets/dig.rc — no usable Windows resource compiler?");
+
+    println!("cargo:rerun-if-changed=assets/dig.rc");
+    println!("cargo:rerun-if-changed=assets/dig.ico");
 }

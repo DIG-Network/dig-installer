@@ -1857,6 +1857,28 @@ magenta(`#FF00DE`) accent gradient, Space Grotesk / Space Mono. This is a delibe
 `SYSTEM.md` → "Canonical terminology & branding" — see `DEVELOPMENT_LOG.md`); the installer GUI's
 canonical theme going forward is dark.
 
+## 5.1 Windows executable icon (dig_ecosystem#2917)
+
+The Windows `dig-installer.exe` MUST carry the branded DIG mark as its application icon, so the
+shipped binary is identifiable in Explorer, the taskbar and the Alt-Tab switcher.
+
+* The icon is `assets/dig.ico`, vendored verbatim and byte-pinned at sha256
+  `2f0fb11a1254fc9275248dc340b7aa9c7236484a9531f8aaad2e4bcdf8900096`. `scripts/check-icon.sh`
+  asserts the pin and MUST run on every pull request. The bytes MUST NOT be re-saved, re-exported
+  or re-encoded: the identical file is vendored by sibling DIG repos against the same literal.
+* It carries ten frames — 16, 20, 24, 32, 40, 48, 64, 96, 128 and 256 pixels — with hardened alpha
+  at 32 pixels and below so the D's counter stays open at taskbar size.
+* `assets/dig.rc` declares it as icon ordinal `1` and MUST remain the only `ICON` statement in that
+  file: Windows renders the lowest-ordinal icon resource as the executable's icon.
+* `build.rs` compiles the resource via `embed-resource` and MUST fail the build when compilation
+  does not succeed; a silently unbranded binary is the defect this step exists to prevent.
+* The `asInvoker` manifest (§4.1) is embedded through the linker and is deliberately NOT declared
+  in `assets/dig.rc`, so neither resource can displace the other. Both MUST be present in the
+  linked binary.
+
+macOS (`.icns`) and Linux (`.desktop` + hicolor PNG) icons, and the icons carried by the generated
+`.msi`/`.pkg`/`.deb` packages, are out of scope here and are specified separately.
+
 ## 6. GUI (`gui/app`) architecture note
 
 The GUI is a Tauri 2 desktop wizard (Welcome → License → Components → Install → Done). Its `digstore`

@@ -30,7 +30,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.43.0"
+version = "0.44.0"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -128,10 +128,17 @@ windows-sys = { version = "0.59", features = [
     # immune to the current-directory search-order hijack (#657, proc::system_tool).
     "Win32_System_SystemInformation",
 ] }
+
 # NOTE: the `windows-service` crate (the SCM service-protocol dispatcher) was
 # removed with the host-shim (#499): the dig-dns Windows service now runs
 # `dig-dns.exe run-service` DIRECTLY — dig-dns owns its own SCM entrypoint — so
 # the installer no longer hosts the service and needs no dispatcher of its own.
+
+# Compiles `assets/dig.rc` (the branded application icon) into the Windows
+# binary. Used only by `build.rs`, only when the build script itself is built
+# for Windows; see build.rs for the icon-vs-manifest interaction.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
 
 [profile.release]
 overflow-checks = true
