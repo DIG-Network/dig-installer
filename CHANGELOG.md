@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.44.0] - 2026-08-15
+
+### Features
+- **installer:** Embed the branded DIG icon in the Windows binary (#69)
+
 ## [0.43.0] - 2026-08-12
 
 ### Features
