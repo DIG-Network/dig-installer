@@ -4605,6 +4605,25 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
             }
         }
+        // The abandoned write-siblings an interrupted install left behind
+        // (#1911 path 4). Swept in the same pass and under the same `skip`
+        // rule: a component whose service could not be deregistered keeps
+        // BOTH its binary and its backup, so an elevated re-run still has
+        // something to restore.
+        for stem in uninstall::COMPONENT_STEMS {
+            if skip.iter().any(|s| s == stem) {
+                continue;
+            }
+            for root in &roots {
+                let (swept, leftover_errs) =
+                    download::remove_interrupted_install_leftovers(root, &target.exe_name(stem));
+                removed += swept;
+                if !leftover_errs.is_empty() {
+                    ok = false;
+                    errs.extend(leftover_errs);
+                }
+            }
+        }
         // The VENEER links go too (#1748 F4). They live in neither bin root, so the residue scan below never
         // looked at them and an uninstall reported `residue: []` while `/usr/local/bin/digs` still pointed at
         // a binary that no longer exists. That is a false machine-consumed claim on its own — `--uninstall`
@@ -4792,6 +4811,15 @@ fn residue_in(
             if std::fs::symlink_metadata(&path).is_ok() {
                 residue.push(path.display().to_string());
             }
+            // An INTERRUPTED install's abandoned write-siblings (#1911 path 4).
+            // They are pid-tagged, so no later run ever names them again; without
+            // this the scan reported `residue: []` while a full copy of every
+            // replaced binary was still sitting in the install root.
+            residue.extend(
+                download::interrupted_install_leftovers(root, &target.exe_name(stem))
+                    .into_iter()
+                    .map(|p| p.display().to_string()),
+            );
         }
     }
     residue
@@ -7394,6 +7422,62 @@ mod tests {
                 "unelevated, the veneer's posture is the user's own authority"
             );
         }
+    }
+
+    /// dig_ecosystem#1911 recovery path 4: an INTERRUPTED install's abandoned
+    /// backup is residue, and `--uninstall` must be able to see it.
+    ///
+    /// The fixture is made by the production writer (`download::back_up_existing`)
+    /// and then simply abandoned, which is exactly what a killed install leaves.
+    /// That input is what distinguishes the implementations: the scan this
+    /// replaces joined `root/<exe name>` and nothing else, so it reported this
+    /// directory CLEAN while holding a full copy of the replaced binary — the
+    /// same false zero-residue claim as #854, reached by a different route.
+    ///
+    /// The controls pin it from the other side: the live binary is reported once
+    /// (not twice), and a directory holding only a foreign hidden file is clean —
+    /// so this is not "the scan now reports every dotfile it finds".
+    #[test]
+    fn an_interrupted_installs_abandoned_backup_is_residue() {
+        let target = Target::current().expect("host target");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dest = root.join(target.exe_name("dig-node"));
+        std::fs::write(&dest, b"the binary the user already had").unwrap();
+        let abandoned = download::back_up_existing(&dest)
+            .expect("the backup succeeds")
+            .expect("there was a prior file to back up");
+        // The run dies here. Nothing will ever name this pid-tagged file again.
+
+        let found = residue_in(std::slice::from_ref(&root), &target, None);
+        assert!(
+            found.contains(&abandoned.display().to_string()),
+            "an interrupted install's abandoned backup is residue: {found:?}"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .filter(|f| **f == dest.display().to_string())
+                .count(),
+            1,
+            "the live binary is reported exactly once, not once per scan pass: {found:?}"
+        );
+
+        // CONTROL — a foreign hidden file sharing the prefix is not residue, so
+        // the assertion above is about OUR tags and not about dotfiles.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        std::fs::write(
+            clean.join(format!(".{}.notes", target.exe_name("dig-node"))),
+            b"x",
+        )
+        .unwrap();
+        assert!(
+            residue_in(std::slice::from_ref(&clean), &target, None).is_empty(),
+            "a file this installer never wrote is not residue"
+        );
     }
 
     /// A DANGLING veneer link is residue, and the veneer is one of the directories scanned (#1748 F4).
