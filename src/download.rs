@@ -260,11 +260,92 @@ impl WriteResult {
 /// (root-owned, protected) directory, so a concurrent run never collides and an
 /// attacker cannot pre-plant or tamper with it.
 fn backup_path(dest: &Path) -> PathBuf {
+    sibling_path(dest, BACKUP_TAG)
+}
+
+/// The infix marking a hidden sibling as this installer's pre-overwrite BACKUP
+/// of a destination ([`backup_path`]).
+pub const BACKUP_TAG: &str = ".dig-bak-";
+
+/// The infix marking a hidden sibling as bytes STAGED for a reboot-time replace
+/// ([`staging_path`]). Windows-only in production; the constant is unconditional
+/// so the leftover scan ([`interrupted_install_leftovers`]) — and its test — are
+/// falsifiable on every platform rather than only under `#[cfg(windows)]`.
+pub const STAGING_TAG: &str = ".pending-";
+
+/// A hidden, pid-tagged neighbour of `dest`: `.<file name><tag><pid>`.
+///
+/// Hidden so it never looks like an installed binary, pid-tagged so two
+/// concurrent runs cannot collide on it. Both properties are what make an
+/// ABANDONED one recognizable afterwards — see [`interrupted_install_leftovers`].
+fn sibling_path(dest: &Path, tag: &str) -> PathBuf {
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "binary".to_string());
-    dest.with_file_name(format!(".{name}.dig-bak-{}", std::process::id()))
+    dest.with_file_name(format!(".{name}{tag}{}", std::process::id()))
+}
+
+/// Every abandoned write-sibling of `dest` left in its directory by an
+/// INTERRUPTED install — a backup copied aside before an overwrite, or bytes
+/// staged for a reboot-time replace — regardless of which run's pid tagged it.
+///
+/// # Why this exists (dig_ecosystem#1911, recovery path 4)
+///
+/// Both sibling shapes are tagged with the WRITING process's pid, so a run that
+/// is killed between creating one and cleaning it up leaves a file no later run
+/// will ever name again: the next install computes a fresh pid and looks right
+/// past it, and the uninstall's residue scan only ever joined
+/// `root/<exe name>` — so the one artifact an interrupted install is guaranteed
+/// to leave was invisible to BOTH recovery routes. `--uninstall` then reported
+/// `residue: []` with a full copy of every replaced binary still on disk, which
+/// is the #854 false-zero-residue claim over again.
+///
+/// Matching is by the WRITER's own tags ([`BACKUP_TAG`]/[`STAGING_TAG`]), which
+/// is the point: the scanner cannot drift from the naming it is scanning for.
+///
+/// Scoped tightly — a name must be the hidden form of THIS `exe_name` and carry
+/// one of the two tags — so nothing a user or another product put in the
+/// directory is ever matched. Returns an empty vec for an unreadable/absent
+/// directory: a leftover we cannot see is reported as nothing found, never as
+/// an error that would fail an otherwise clean uninstall.
+pub fn interrupted_install_leftovers(root: &Path, exe_name: &str) -> Vec<PathBuf> {
+    let prefix = format!(".{exe_name}");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                return false;
+            };
+            [BACKUP_TAG, STAGING_TAG]
+                .iter()
+                .any(|tag| rest.starts_with(tag))
+        })
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
+}
+
+/// Delete every abandoned write-sibling of `exe_name` in `root`
+/// ([`interrupted_install_leftovers`]), returning how many were removed and one
+/// message per file that could not be. Idempotent: a directory with nothing
+/// abandoned removes nothing and reports no error, so a second uninstall run
+/// stays the clean no-op `uninstall`'s contract promises.
+pub fn remove_interrupted_install_leftovers(root: &Path, exe_name: &str) -> (usize, Vec<String>) {
+    let mut removed = 0usize;
+    let mut errors = Vec::new();
+    for leftover in interrupted_install_leftovers(root, exe_name) {
+        match std::fs::remove_file(&leftover) {
+            Ok(()) => removed += 1,
+            Err(e) => errors.push(format!("{}: {e}", leftover.display())),
+        }
+    }
+    (removed, errors)
 }
 
 /// Copy `dest`'s current bytes aside to a protected sibling BEFORE the write
@@ -284,7 +365,7 @@ fn backup_path(dest: &Path) -> PathBuf {
 /// The backup is **adopted into privileged ownership at creation** — see
 /// [`back_up_existing_with`] for why a restore path with no downstream #565 gate
 /// makes that a security requirement, not a nicety.
-fn back_up_existing(dest: &Path) -> Result<Option<PathBuf>, String> {
+pub(crate) fn back_up_existing(dest: &Path) -> Result<Option<PathBuf>, String> {
     back_up_existing_with(dest, &crate::secure::adopt_placed_file)
 }
 
@@ -614,11 +695,7 @@ fn is_sharing_violation(e: &std::io::Error) -> bool {
 /// serves ([`schedule_replace_on_reboot`]) never runs on other platforms.
 #[cfg(windows)]
 fn staging_path(dest: &Path) -> std::path::PathBuf {
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "binary".to_string());
-    dest.with_file_name(format!(".{name}.pending-{}", std::process::id()))
+    sibling_path(dest, STAGING_TAG)
 }
 
 /// Stage `bytes` beside `dest` and schedule an atomic replace of `dest` on the
@@ -664,7 +741,7 @@ fn schedule_replace_on_reboot_with(
     std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
     if let Err(e) = adopt(&staging) {
         return Err(format!(
-            "staged {} but could not give it privileged ownership ({e}) — promoting it at              reboot would leave a binary a non-SYSTEM principal can rewrite",
+            "staged {} but could not give it privileged ownership ({e}) — promoting it at reboot would leave a binary a non-SYSTEM principal can rewrite",
             staging.display()
         ));
     }
@@ -1572,5 +1649,133 @@ mod tests {
 
         assert_eq!(scheduled.get(), 0, "nothing may be queued for the reboot");
         assert!(err.contains("privileged ownership"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod interrupted_install_leftover_tests {
+    use super::*;
+
+    /// dig_ecosystem#1911 recovery path 4 (repair after an interrupted install).
+    ///
+    /// The fixture is produced by the PRODUCTION writer — `back_up_existing` —
+    /// never by a test-local literal name. A scan written against a name the
+    /// test itself invented would keep passing after a rename of the tag, which
+    /// is the exact drift that made these files invisible in the first place.
+    ///
+    /// Asserts on disk: the abandoned copy is FOUND, and it still holds the
+    /// bytes of the binary it replaced (so a report of it is a report of real
+    /// recoverable data, not of an empty marker).
+    #[test]
+    fn finds_the_backup_the_real_writer_abandoned() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let dest = tmp.path().join("dig-node.exe");
+        std::fs::write(&dest, b"the version the user already had").unwrap();
+
+        let backup = back_up_existing(&dest)
+            .expect("the backup succeeds")
+            .expect("a prior file was there to back up");
+        // From here on the run is "killed": nothing cleans the backup up.
+
+        let found = interrupted_install_leftovers(tmp.path(), "dig-node.exe");
+        assert_eq!(
+            found,
+            vec![backup.clone()],
+            "the scan must find exactly the file the writer left"
+        );
+        assert_eq!(
+            std::fs::read(&found[0]).unwrap(),
+            b"the version the user already had",
+            "the leftover still holds the replaced binary's bytes"
+        );
+    }
+
+    /// The scan must be narrow enough to run inside a shared install root. Three
+    /// distinguishing neighbours, each one a way the nearest wrong
+    /// implementation goes wrong:
+    ///
+    /// * the destination binary itself — a scan matching any name CONTAINING the
+    ///   exe name would take it, and the uninstall would then report the live
+    ///   binary twice;
+    /// * a DIFFERENT component's abandoned backup — a scan ignoring the exe name
+    ///   would sweep it under the wrong stem, defeating the `skip` rule that
+    ///   keeps a failed-teardown component's backup in place;
+    /// * a foreign hidden file with the same prefix but no tag — a prefix-only
+    ///   scan would delete a file this installer never wrote.
+    #[test]
+    fn matches_only_this_components_tagged_siblings() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mine = tmp.path().join(format!(".dig-node.exe{BACKUP_TAG}4242"));
+        for (name, bytes) in [
+            (mine.clone(), &b"mine"[..]),
+            (tmp.path().join("dig-node.exe"), &b"live"[..]),
+            (
+                tmp.path().join(format!(".dig-dns.exe{BACKUP_TAG}4242")),
+                &b"other component"[..],
+            ),
+            (
+                tmp.path().join(".dig-node.exe.notes"),
+                &b"someone else's file"[..],
+            ),
+        ] {
+            std::fs::write(&name, bytes).unwrap();
+        }
+
+        assert_eq!(
+            interrupted_install_leftovers(tmp.path(), "dig-node.exe"),
+            vec![mine]
+        );
+    }
+
+    /// Staged bytes are the second abandoned shape, and on a killed run they are
+    /// the more dangerous one: `MoveFileEx` promotes a staging file's whole
+    /// security descriptor onto the destination at the next reboot, so one left
+    /// unswept is a pending write nobody is tracking.
+    #[test]
+    fn finds_abandoned_staged_bytes_too() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let staged = tmp.path().join(format!(".dig-app.exe{STAGING_TAG}99"));
+        std::fs::write(&staged, b"staged").unwrap();
+
+        assert_eq!(
+            interrupted_install_leftovers(tmp.path(), "dig-app.exe"),
+            vec![staged]
+        );
+    }
+
+    /// The sweep's outcome is asserted on disk (gone), not on its return value,
+    /// and the neighbours must survive it — a sweep that empties the directory
+    /// would satisfy a "the leftover is gone" assertion just as well.
+    #[test]
+    fn the_sweep_removes_the_leftover_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let dest = tmp.path().join("dig-node.exe");
+        std::fs::write(&dest, b"live").unwrap();
+        let backup = back_up_existing(&dest).unwrap().unwrap();
+        let foreign = tmp.path().join(".dig-node.exe.notes");
+        std::fs::write(&foreign, b"not ours").unwrap();
+
+        let (removed, errors) = remove_interrupted_install_leftovers(tmp.path(), "dig-node.exe");
+
+        assert_eq!((removed, errors.as_slice()), (1, &[][..]));
+        assert!(!backup.exists(), "the abandoned backup is gone from disk");
+        assert!(dest.exists(), "the installed binary is untouched");
+        assert!(
+            foreign.exists(),
+            "a file the installer never wrote is untouched"
+        );
+    }
+
+    /// `uninstall` promises a second run is a clean no-op, so the sweep must
+    /// report nothing removed and no error on an already-clean root.
+    #[test]
+    fn sweeping_a_clean_root_is_a_silent_no_op() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(tmp.path().join("dig-node.exe"), b"live").unwrap();
+
+        let (removed, errors) = remove_interrupted_install_leftovers(tmp.path(), "dig-node.exe");
+
+        assert_eq!(removed, 0);
+        assert!(errors.is_empty());
     }
 }

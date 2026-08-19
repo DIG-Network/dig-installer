@@ -858,3 +858,25 @@ the elevated installer freshly CREATES in it is owned by the invoking admin USER
 refuses to register its service ("the program file itself is not owned by root/SYSTEM"), so an install
 that FOLLOWS an uninstall leaves dig-node unregisterable until the ownership is repaired. It is
 invisible on a first install, where the file already existed with the right owner.
+
+## An interrupted install leaves files no later run can ever name (dig_ecosystem#1911)
+
+Both hidden siblings a binary write creates — the pre-overwrite backup
+`.<exe>.dig-bak-<pid>` and the reboot-replace staging file `.<exe>.pending-<pid>` —
+are tagged with the WRITING process's pid. That is deliberate: two concurrent runs
+must not collide on them. The consequence nobody had followed through is that a run
+KILLED between creating one and cleaning it up leaves a file the next run cannot
+recognise, because the next run computes a fresh pid.
+
+The uninstall's residue scan compounded it by only ever joining `<root>/<exe name>`,
+so `--uninstall` reported `residue: []` with a full copy of every replaced binary
+still sitting in the install root — the same false zero-residue claim as #854,
+reached by a completely different route. Neither recovery route a user has (re-run
+the installer, or uninstall and start over) could see or clear the artifact that an
+interrupted install is GUARANTEED to leave.
+
+The general lesson: a pid-tagged temporary is only self-cleaning for a process that
+survives to clean it. Anything that scans for such files afterwards must match on the
+WRITER's own tag constants, never on a name the scanner spells out for itself —
+otherwise a rename of the tag silently empties the scan, which is the drift that made
+these files invisible to begin with.

@@ -1140,12 +1140,12 @@ fn root_add_to_path(
         String::new()
     } else {
         format!(
-            " — and {UNIX_MACHINE_BIN_DIR} is not safe to use instead, so there is no reachable path left:              the binaries are installed under {} but no shell will find them by name. Repair              {UNIX_MACHINE_BIN_DIR} (root-owned, no group/other write) or add {dir} to PATH yourself",
+            " — and {UNIX_MACHINE_BIN_DIR} is not safe to use instead, so there is no reachable path left: the binaries are installed under {} but no shell will find them by name. Repair {UNIX_MACHINE_BIN_DIR} (root-owned, no group/other write) or add {dir} to PATH yourself",
             bin_dir.display()
         )
     };
     Err(format!(
-        "wrote {fragment_file} but {dir} is STILL not on {}'s login PATH (it searches:          {observed}){no_alternative}",
+        "wrote {fragment_file} but {dir} is STILL not on {}'s login PATH (it searches: {observed}){no_alternative}",
         user.name
     ))
 }

@@ -1695,6 +1695,15 @@ repair/modify, and an upgrade that believes an older version is still present.
 - **Proof.** A product still registered with Windows Installer after the step is reported as
   **residue**, so completeness is judged against the Installer database rather than the step's own log.
 
+**The residue scan and the binary deletion both cover an interrupted install's abandoned
+write-siblings.** A write backs the destination up (`.<exe>.dig-bak-<pid>`) and may stage bytes for a
+reboot-time replace (`.<exe>.pending-<pid>`); both are tagged with the WRITING process's pid, so a run
+killed before it cleans up leaves a file no later run ever names again. Scanning only `<root>/<exe>`
+therefore reported `residue: []` with a full copy of every replaced binary still in the install root.
+Matching is by the writer's own tags and is scoped to a known component's exe name, so a file this
+installer never wrote is neither reported nor removed; a component held back by a failed service
+teardown keeps its backup, so an elevated re-run still has something to restore.
+
 It then re-scans and reports any residue. The result is a structured `UninstallReport { steps:
 [{id, ok, note}], residue: [..], dry_run }`; `complete()` is true iff every step reached its
 end-state AND the post-run inventory found nothing left. **Invariants:** idempotent (a second run is
@@ -1976,7 +1985,7 @@ For each tracked component, in this order:
    | absent                  | —                      | **Install**                          |
    | present, parses, older  | installed < latest    | **Update**                            |
    | present, parses, equal  | installed == latest   | **Skip** (up to date)                 |
-   | present, parses, newer  | installed > latest    | **Skip** (never downgrade)            |
+   | present, parses, newer  | installed > latest    | **Skip** (never downgrade) — reported as AHEAD of the latest release, never as "up to date", and the summary names `--force-reinstall` as the way back onto a published build |
    | present, does not parse | —                      | **Update** (treated as a reinstall)   |
 
 `--force-reinstall` upgrades a would-be Skip to Update (`update::decide_with_force`); it never

@@ -2222,7 +2222,7 @@ fn retract_service_rearm_claims(
         }
         record.applied = false;
         record.note = format!(
-            "{} — then REMOVED again by the rollback of this failed install, so {} is \n             unregistered on this host; restore it with `{}`",
+            "{} — then REMOVED again by the rollback of this failed install, so {} is unregistered on this host; restore it with `{}`",
             record.note, service.label, service.restore_command
         );
         log(&format!("    ↩ {}", record.note));
@@ -2484,13 +2484,13 @@ fn link_protected_clis(
             let removed = paths::remove_veneer_links(&names, target.os);
             if removed.is_empty() {
                 log(&format!(
-                    "    · no link planted in {} — it is not safe to resolve DIG commands from, \n                     so the protected root is on PATH directly instead",
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the protected root is on PATH directly instead",
                     paths::UNIX_MACHINE_BIN_DIR
                 ));
             } else {
                 for link in &removed {
                     log(&format!(
-                        "    ✓ removed {link} — a link in a directory a non-root account can write is one                          they can re-point, and root runs whatever it points at"
+                        "    ✓ removed {link} — a link in a directory a non-root account can write is one they can re-point, and root runs whatever it points at"
                     ));
                 }
             }
@@ -2962,7 +2962,7 @@ fn evaluate_readiness_when(
     // is its own failure.
     if elevated && !report.preceding_unsafe_path_dirs.is_empty() {
         failures.push(format!(
-            "PATH order: {} precede{} the DIG install directory on root's PATH and are not root-owned              without group/other write — a non-root account can create `dign`/`digs` there and root will              run it; repair those directories or remove them from root's PATH",
+            "PATH order: {} precede{} the DIG install directory on root's PATH and are not root-owned without group/other write — a non-root account can create `dign`/`digs` there and root will run it; repair those directories or remove them from root's PATH",
             report.preceding_unsafe_path_dirs.join(", "),
             if report.preceding_unsafe_path_dirs.len() == 1 { "s" } else { "" }
         ));
@@ -2979,7 +2979,7 @@ fn evaluate_readiness_when(
         if let Some(sec) = &report.veneer_security {
             if sec.is_blocking() {
                 failures.push(format!(
-                    "PATH directory {}: {} — this is where root's own shell resolves DIG commands, so an                      account that can write there replaces a link this installer planted and root runs it;                      repair the directory permissions",
+                    "PATH directory {}: {} — this is where root's own shell resolves DIG commands, so an account that can write there replaces a link this installer planted and root runs it; repair the directory permissions",
                     sec.root, sec.note
                 ));
             }
@@ -4605,6 +4605,25 @@ impl uninstall::UninstallActions for SystemActions<'_> {
                 }
             }
         }
+        // The abandoned write-siblings an interrupted install left behind
+        // (#1911 path 4). Swept in the same pass and under the same `skip`
+        // rule: a component whose service could not be deregistered keeps
+        // BOTH its binary and its backup, so an elevated re-run still has
+        // something to restore.
+        for stem in uninstall::COMPONENT_STEMS {
+            if skip.iter().any(|s| s == stem) {
+                continue;
+            }
+            for root in &roots {
+                let (swept, leftover_errs) =
+                    download::remove_interrupted_install_leftovers(root, &target.exe_name(stem));
+                removed += swept;
+                if !leftover_errs.is_empty() {
+                    ok = false;
+                    errs.extend(leftover_errs);
+                }
+            }
+        }
         // The VENEER links go too (#1748 F4). They live in neither bin root, so the residue scan below never
         // looked at them and an uninstall reported `residue: []` while `/usr/local/bin/digs` still pointed at
         // a binary that no longer exists. That is a false machine-consumed claim on its own — `--uninstall`
@@ -4792,6 +4811,15 @@ fn residue_in(
             if std::fs::symlink_metadata(&path).is_ok() {
                 residue.push(path.display().to_string());
             }
+            // An INTERRUPTED install's abandoned write-siblings (#1911 path 4).
+            // They are pid-tagged, so no later run ever names them again; without
+            // this the scan reported `residue: []` while a full copy of every
+            // replaced binary was still sitting in the install root.
+            residue.extend(
+                download::interrupted_install_leftovers(root, &target.exe_name(stem))
+                    .into_iter()
+                    .map(|p| p.display().to_string()),
+            );
         }
     }
     residue
@@ -4972,7 +5000,7 @@ pub fn help_json() -> String {
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": SCHEMA_VERSION,
         "description": "Universal DIG installer: by default installs the full DIG stack (the \
-    dig-store CLI + the dig-node boot-start service + the dig-app per-user identity agent + the     dig-dns boot-start service) in one run, \
+    dig-store CLI + the dig-node boot-start service + the dig-app per-user identity agent + the dig-dns boot-start service) in one run, \
     resolving + downloading the latest per-OS/arch release asset for each. dig-relay and the DIG \
     Browser are opt-in.",
         "components": [
@@ -7394,6 +7422,118 @@ mod tests {
                 "unelevated, the veneer's posture is the user's own authority"
             );
         }
+    }
+
+    /// dig_ecosystem#1911 recovery path 3 (upgrade across a payload-set change):
+    /// every component an install PLACES must be a component the teardown can
+    /// SEE, derived from the plan rather than listed by hand.
+    ///
+    /// This is the shape that has already failed twice: dig-app entered the
+    /// payload at 0.30.0 and `uninstall_all` never stopped or removed it, and
+    /// `COMPONENT_STEMS` still named the pre-rename `digstore` while the
+    /// installer placed `dig-store` (#854). Both are the same defect — the
+    /// install list grew and the teardown list did not — and both were invisible
+    /// to a test that names its components, because the names it asserts are the
+    /// ones somebody remembered to add.
+    ///
+    /// So the fixture is DERIVED: it plants a real file per component the plan
+    /// actually selects, then asserts the production residue scan finds every
+    /// one of them. Adding a component to `selected_components` without adding
+    /// it to `COMPONENT_STEMS` fails here on the next run, with no test edit.
+    /// The existing hand-written `contains(&"dig-app")` assertion cannot do that
+    /// — it only ever re-checks the component that already caused an incident.
+    #[test]
+    fn every_component_an_install_places_is_visible_to_the_teardown() {
+        let target = Target::current().expect("host target");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Everything this installer can place, from the plan itself.
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: true,
+            with_dig_app: true,
+            with_dig_dns: true,
+            auto_update: true,
+            with_relay: true,
+            ..InstallPlan::default()
+        };
+        let placed = plan.selected_components();
+        assert!(
+            placed.len() >= 6,
+            "an all-on plan must select the whole payload, got {placed:?}"
+        );
+
+        let mut expected = Vec::new();
+        for id in &placed {
+            let path = root.join(target.exe_name(id));
+            std::fs::write(&path, b"MZ").unwrap();
+            expected.push(path.display().to_string());
+        }
+
+        let found = residue_in(std::slice::from_ref(&root), &target, None);
+        let missed: Vec<&String> = expected.iter().filter(|e| !found.contains(e)).collect();
+        assert!(
+            missed.is_empty(),
+            "these components are installed but invisible to the uninstall scan, so an uninstall would report zero residue while leaving them on disk: {missed:?}"
+        );
+    }
+
+    /// dig_ecosystem#1911 recovery path 4: an INTERRUPTED install's abandoned
+    /// backup is residue, and `--uninstall` must be able to see it.
+    ///
+    /// The fixture is made by the production writer (`download::back_up_existing`)
+    /// and then simply abandoned, which is exactly what a killed install leaves.
+    /// That input is what distinguishes the implementations: the scan this
+    /// replaces joined `root/<exe name>` and nothing else, so it reported this
+    /// directory CLEAN while holding a full copy of the replaced binary — the
+    /// same false zero-residue claim as #854, reached by a different route.
+    ///
+    /// The controls pin it from the other side: the live binary is reported once
+    /// (not twice), and a directory holding only a foreign hidden file is clean —
+    /// so this is not "the scan now reports every dotfile it finds".
+    #[test]
+    fn an_interrupted_installs_abandoned_backup_is_residue() {
+        let target = Target::current().expect("host target");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dest = root.join(target.exe_name("dig-node"));
+        std::fs::write(&dest, b"the binary the user already had").unwrap();
+        let abandoned = download::back_up_existing(&dest)
+            .expect("the backup succeeds")
+            .expect("there was a prior file to back up");
+        // The run dies here. Nothing will ever name this pid-tagged file again.
+
+        let found = residue_in(std::slice::from_ref(&root), &target, None);
+        assert!(
+            found.contains(&abandoned.display().to_string()),
+            "an interrupted install's abandoned backup is residue: {found:?}"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .filter(|f| **f == dest.display().to_string())
+                .count(),
+            1,
+            "the live binary is reported exactly once, not once per scan pass: {found:?}"
+        );
+
+        // CONTROL — a foreign hidden file sharing the prefix is not residue, so
+        // the assertion above is about OUR tags and not about dotfiles.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        std::fs::write(
+            clean.join(format!(".{}.notes", target.exe_name("dig-node"))),
+            b"x",
+        )
+        .unwrap();
+        assert!(
+            residue_in(std::slice::from_ref(&clean), &target, None).is_empty(),
+            "a file this installer never wrote is not residue"
+        );
     }
 
     /// A DANGLING veneer link is residue, and the veneer is one of the directories scanned (#1748 F4).
