@@ -22,11 +22,8 @@
 # `tests/cli.rs` cases it mirrors — stays deterministic across either repo's
 # release-in-progress window instead of racing GitHub's `/releases/latest`.
 # Bump these deliberately when validating against a newer release.
-# DIG_DNS_VERSION is pinned to 0.9.1, NOT the newer 0.10.x tags: dig-dns's own
-# release pipeline has been failing to publish a GitHub Release for those (its
-# native-package smoke test breaks post-#494's DIG_NODE_PORT/service-identity
-# changes — tracked separately as dig_ecosystem#525); 0.9.1 is the last tag
-# with real, downloadable assets.
+# DIG_DNS_VERSION is pinned to 0.15.1, a stable release with all required
+# binaries (dig-dns and digd) needed by the installer's default component set.
 name: Installer e2e (install -> health -> uninstall)
 
 on:
@@ -49,7 +46,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   DIG_NODE_VERSION: "0.29.0"
-  DIG_DNS_VERSION: "0.9.1"
+  DIG_DNS_VERSION: "0.15.1"
   # Auto-update beacon (#514) — pinned for the same determinism reason as the
   # two above (dig_ecosystem#524): a specific tagged release, never "latest".
   DIG_UPDATER_VERSION: "0.6.0"
