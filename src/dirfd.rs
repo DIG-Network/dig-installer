@@ -119,7 +119,7 @@ pub fn open_dir_nofollow(
         // module exists to catch, so they are reported as such - never as "could not read", which every
         // caller treats as an inconclusive pass.
         Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(OpenRefusal::NotADirectory(format!(
-            "{} is a symlink or not a directory - refusing to treat it as a directory, because \n             a planted link is how a root-side operation is redirected somewhere it must never \n             reach",
+            "{} is a symlink or not a directory - refusing to treat it as a directory, because a planted link is how a root-side operation is redirected somewhere it must never reach",
             name.display()
         ))),
         _ => Err(OpenRefusal::Unreadable(format!(

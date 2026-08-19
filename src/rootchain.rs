@@ -69,7 +69,7 @@ const GROUP_OR_OTHER_WRITE: u32 = 0o022;
 fn require_normalized_absolute(root: &Path) -> Result<(), String> {
     if !root.is_absolute() {
         return Err(format!(
-            "{} is not an absolute path — an install root must be stated absolutely, because every              permission check here is a statement about its levels",
+            "{} is not an absolute path — an install root must be stated absolutely, because every permission check here is a statement about its levels",
             root.display()
         ));
     }
@@ -78,7 +78,7 @@ fn require_normalized_absolute(root: &Path) -> Result<(), String> {
             Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {}
             Component::ParentDir | Component::CurDir => {
                 return Err(format!(
-                    "{} contains a `.` or `..` component — refusing, because a path that walks outward                      cannot be verified level by level, and resolving it would either follow a symlink                      or disagree with what the kernel does",
+                    "{} contains a `.` or `..` component — refusing, because a path that walks outward cannot be verified level by level, and resolving it would either follow a symlink or disagree with what the kernel does",
                     root.display()
                 ))
             }

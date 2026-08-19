@@ -179,7 +179,7 @@ pub fn decide(detected: &DetectedVersion, latest_version: &str) -> UpdateDecisio
                         installed_version: Some(installed.to_string()),
                         latest_version: latest.clone(),
                         summary: format!(
-                            "v{installed} is NEWER than the latest release v{latest} — left as                              is; re-run with --force-reinstall to move to v{latest}"
+                            "v{installed} is NEWER than the latest release v{latest} — left as is; re-run with --force-reinstall to move to v{latest}"
                         ),
                     }
                 }
@@ -479,6 +479,11 @@ mod tests {
             d.summary.contains("NEWER") && d.summary.contains("--force-reinstall"),
             "the summary must name the state and the recovery: {}",
             d.summary
+        );
+        assert_eq!(
+            d.summary,
+            "v0.16.0 is NEWER than the latest release v0.15.0 — left as is; re-run with --force-reinstall to move to v0.15.0",
+            "the sentence a user reads must be the sentence as written: a wrapped literal that loses its continuation still contains every word this test looks for, so only the whole string can see the damage"
         );
         assert_eq!(d.installed_version.as_deref(), Some("0.16.0"));
     }

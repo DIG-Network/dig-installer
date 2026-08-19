@@ -741,7 +741,7 @@ fn schedule_replace_on_reboot_with(
     std::fs::write(&staging, bytes).map_err(|e| format!("stage {}: {e}", staging.display()))?;
     if let Err(e) = adopt(&staging) {
         return Err(format!(
-            "staged {} but could not give it privileged ownership ({e}) — promoting it at              reboot would leave a binary a non-SYSTEM principal can rewrite",
+            "staged {} but could not give it privileged ownership ({e}) — promoting it at reboot would leave a binary a non-SYSTEM principal can rewrite",
             staging.display()
         ));
     }

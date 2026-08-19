@@ -467,7 +467,7 @@ fn apply_linux(
     // this run wrote is what actually starts the agent.
     let stale = remove_stale_systemd_user_unit(xdg);
     Ok(format!(
-        "wrote the XDG autostart entry {} — dig-app starts at {}'s next login, with no \n         further step{stale}",
+        "wrote the XDG autostart entry {} — dig-app starts at {}'s next login, with no further step{stale}",
         path.display(),
         user.name,
     ))

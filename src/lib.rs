@@ -2222,7 +2222,7 @@ fn retract_service_rearm_claims(
         }
         record.applied = false;
         record.note = format!(
-            "{} — then REMOVED again by the rollback of this failed install, so {} is \n             unregistered on this host; restore it with `{}`",
+            "{} — then REMOVED again by the rollback of this failed install, so {} is unregistered on this host; restore it with `{}`",
             record.note, service.label, service.restore_command
         );
         log(&format!("    ↩ {}", record.note));
@@ -2484,13 +2484,13 @@ fn link_protected_clis(
             let removed = paths::remove_veneer_links(&names, target.os);
             if removed.is_empty() {
                 log(&format!(
-                    "    · no link planted in {} — it is not safe to resolve DIG commands from, \n                     so the protected root is on PATH directly instead",
+                    "    · no link planted in {} — it is not safe to resolve DIG commands from, so the protected root is on PATH directly instead",
                     paths::UNIX_MACHINE_BIN_DIR
                 ));
             } else {
                 for link in &removed {
                     log(&format!(
-                        "    ✓ removed {link} — a link in a directory a non-root account can write is one                          they can re-point, and root runs whatever it points at"
+                        "    ✓ removed {link} — a link in a directory a non-root account can write is one they can re-point, and root runs whatever it points at"
                     ));
                 }
             }
@@ -2962,7 +2962,7 @@ fn evaluate_readiness_when(
     // is its own failure.
     if elevated && !report.preceding_unsafe_path_dirs.is_empty() {
         failures.push(format!(
-            "PATH order: {} precede{} the DIG install directory on root's PATH and are not root-owned              without group/other write — a non-root account can create `dign`/`digs` there and root will              run it; repair those directories or remove them from root's PATH",
+            "PATH order: {} precede{} the DIG install directory on root's PATH and are not root-owned without group/other write — a non-root account can create `dign`/`digs` there and root will run it; repair those directories or remove them from root's PATH",
             report.preceding_unsafe_path_dirs.join(", "),
             if report.preceding_unsafe_path_dirs.len() == 1 { "s" } else { "" }
         ));
@@ -2979,7 +2979,7 @@ fn evaluate_readiness_when(
         if let Some(sec) = &report.veneer_security {
             if sec.is_blocking() {
                 failures.push(format!(
-                    "PATH directory {}: {} — this is where root's own shell resolves DIG commands, so an                      account that can write there replaces a link this installer planted and root runs it;                      repair the directory permissions",
+                    "PATH directory {}: {} — this is where root's own shell resolves DIG commands, so an account that can write there replaces a link this installer planted and root runs it; repair the directory permissions",
                     sec.root, sec.note
                 ));
             }
@@ -5000,7 +5000,7 @@ pub fn help_json() -> String {
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": SCHEMA_VERSION,
         "description": "Universal DIG installer: by default installs the full DIG stack (the \
-    dig-store CLI + the dig-node boot-start service + the dig-app per-user identity agent + the     dig-dns boot-start service) in one run, \
+    dig-store CLI + the dig-node boot-start service + the dig-app per-user identity agent + the dig-dns boot-start service) in one run, \
     resolving + downloading the latest per-OS/arch release asset for each. dig-relay and the DIG \
     Browser are opt-in.",
         "components": [
@@ -7476,7 +7476,7 @@ mod tests {
         let missed: Vec<&String> = expected.iter().filter(|e| !found.contains(e)).collect();
         assert!(
             missed.is_empty(),
-            "these components are installed but invisible to the uninstall scan, so an              uninstall would report zero residue while leaving them on disk: {missed:?}"
+            "these components are installed but invisible to the uninstall scan, so an uninstall would report zero residue while leaving them on disk: {missed:?}"
         );
     }
 
