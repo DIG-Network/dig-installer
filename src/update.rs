@@ -145,7 +145,7 @@ fn extract_version_token(raw: &str) -> Option<&str> {
 /// | [`DetectedVersion::Absent`]       | —                  | Install  |
 /// | present, parses, older            | installed < latest | Update   |
 /// | present, parses, equal            | installed == latest| Skip     |
-/// | present, parses, newer            | installed > latest | Skip     |
+/// | present, parses, newer            | installed > latest | Skip (reported as ahead-of-latest, not as up to date — #1858) |
 /// | present, does not parse           | —                  | Update (treated as a reinstall) |
 pub fn decide(detected: &DetectedVersion, latest_version: &str) -> UpdateDecision {
     let latest = latest_version.to_string();
@@ -167,10 +167,24 @@ pub fn decide(detected: &DetectedVersion, latest_version: &str) -> UpdateDecisio
                         summary: format!("v{installed} → v{latest} (update)"),
                     }
                 }
+                (Some(installed), Some(latest_parsed)) if installed > latest_parsed => {
+                    // AHEAD of the latest published release (dig_ecosystem#1858).
+                    // Still Skip — a bare re-run never downgrades — but it is NOT
+                    // "up to date", and saying so is the lie this arm exists to
+                    // stop: a user on a broken locally-newer build read "up to
+                    // date" and had no reason to know a re-run could not help
+                    // them. Name the state AND the one flag that moves them back.
+                    UpdateDecision {
+                        action: UpdateAction::Skip,
+                        installed_version: Some(installed.to_string()),
+                        latest_version: latest.clone(),
+                        summary: format!(
+                            "v{installed} is NEWER than the latest release v{latest} — left as                              is; re-run with --force-reinstall to move to v{latest}"
+                        ),
+                    }
+                }
                 (Some(installed), Some(_)) => UpdateDecision {
-                    // installed == latest, or installed > latest (a locally
-                    // newer build than the latest published release) — both
-                    // are "nothing to do" per the decision matrix above.
+                    // installed == latest — genuinely nothing to do.
                     action: UpdateAction::Skip,
                     installed_version: Some(installed.to_string()),
                     latest_version: latest.clone(),
@@ -439,16 +453,50 @@ mod tests {
         assert_eq!(d.summary, "v0.15.0 (up to date)");
     }
 
+    /// dig_ecosystem#1858 / #1911 path 8 (downgrade): an installed version AHEAD
+    /// of the latest release is still Skip — a bare re-run must never downgrade —
+    /// but the summary must not CLAIM it is up to date, and it must name the one
+    /// flag that gets the user back onto a published build.
+    ///
+    /// How this discriminates: the nearest wrong implementation is the one that
+    /// shipped — folding this cell into the equal-version arm, which prints
+    /// `"v0.16.0 (up to date)"`. That string fails both assertions below. The
+    /// `equal_installed_decides_skip` control keeps the honest phrase for the
+    /// cell that has earned it, so "delete the phrase everywhere" does not pass.
     #[test]
-    fn newer_installed_than_latest_decides_skip() {
-        // A locally newer build than the latest published release is still
-        // "nothing to do" — never downgrade.
+    fn newer_installed_than_latest_skips_without_claiming_up_to_date() {
         let d = decide(
             &DetectedVersion::Present("dig-dns 0.16.0".to_string()),
             "0.15.0",
         );
-        assert_eq!(d.action, UpdateAction::Skip);
-        assert_eq!(d.summary, "v0.16.0 (up to date)");
+        assert_eq!(d.action, UpdateAction::Skip, "a re-run never downgrades");
+        assert!(
+            !d.summary.contains("up to date"),
+            "an ahead-of-latest install must not be reported as up to date: {}",
+            d.summary
+        );
+        assert!(
+            d.summary.contains("NEWER") && d.summary.contains("--force-reinstall"),
+            "the summary must name the state and the recovery: {}",
+            d.summary
+        );
+        assert_eq!(d.installed_version.as_deref(), Some("0.16.0"));
+    }
+
+    /// The recovery the summary above promises must actually exist: the very
+    /// same detection, run with `--force-reinstall`, must become an Update that
+    /// replaces the ahead-of-latest binary. A summary naming a flag that does
+    /// nothing would be a second lie, and `decide_with_force`'s own test only
+    /// covers the EQUAL-version Skip.
+    #[test]
+    fn force_reinstall_recovers_an_ahead_of_latest_install() {
+        let forced = decide_with_force(
+            &DetectedVersion::Present("dig-dns 0.16.0".to_string()),
+            "0.15.0",
+            true,
+        );
+        assert_eq!(forced.action, UpdateAction::Update);
+        assert_eq!(forced.latest_version, "0.15.0");
     }
 
     #[test]
