@@ -7424,6 +7424,62 @@ mod tests {
         }
     }
 
+    /// dig_ecosystem#1911 recovery path 3 (upgrade across a payload-set change):
+    /// every component an install PLACES must be a component the teardown can
+    /// SEE, derived from the plan rather than listed by hand.
+    ///
+    /// This is the shape that has already failed twice: dig-app entered the
+    /// payload at 0.30.0 and `uninstall_all` never stopped or removed it, and
+    /// `COMPONENT_STEMS` still named the pre-rename `digstore` while the
+    /// installer placed `dig-store` (#854). Both are the same defect — the
+    /// install list grew and the teardown list did not — and both were invisible
+    /// to a test that names its components, because the names it asserts are the
+    /// ones somebody remembered to add.
+    ///
+    /// So the fixture is DERIVED: it plants a real file per component the plan
+    /// actually selects, then asserts the production residue scan finds every
+    /// one of them. Adding a component to `selected_components` without adding
+    /// it to `COMPONENT_STEMS` fails here on the next run, with no test edit.
+    /// The existing hand-written `contains(&"dig-app")` assertion cannot do that
+    /// — it only ever re-checks the component that already caused an incident.
+    #[test]
+    fn every_component_an_install_places_is_visible_to_the_teardown() {
+        let target = Target::current().expect("host target");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Everything this installer can place, from the plan itself.
+        let plan = InstallPlan {
+            with_digstore: true,
+            with_dig_node: true,
+            with_dig_app: true,
+            with_dig_dns: true,
+            auto_update: true,
+            with_relay: true,
+            ..InstallPlan::default()
+        };
+        let placed = plan.selected_components();
+        assert!(
+            placed.len() >= 6,
+            "an all-on plan must select the whole payload, got {placed:?}"
+        );
+
+        let mut expected = Vec::new();
+        for id in &placed {
+            let path = root.join(target.exe_name(id));
+            std::fs::write(&path, b"MZ").unwrap();
+            expected.push(path.display().to_string());
+        }
+
+        let found = residue_in(std::slice::from_ref(&root), &target, None);
+        let missed: Vec<&String> = expected.iter().filter(|e| !found.contains(e)).collect();
+        assert!(
+            missed.is_empty(),
+            "these components are installed but invisible to the uninstall scan, so an              uninstall would report zero residue while leaving them on disk: {missed:?}"
+        );
+    }
+
     /// dig_ecosystem#1911 recovery path 4: an INTERRUPTED install's abandoned
     /// backup is residue, and `--uninstall` must be able to see it.
     ///
