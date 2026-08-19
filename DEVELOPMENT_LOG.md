@@ -858,3 +858,5 @@ the elevated installer freshly CREATES in it is owned by the invoking admin USER
 refuses to register its service ("the program file itself is not owned by root/SYSTEM"), so an install
 that FOLLOWS an uninstall leaves dig-node unregisterable until the ownership is repaired. It is
 invisible on a first install, where the file already existed with the right owner.
+
+<!-- #1911 recovery-path suite: WIP -->
