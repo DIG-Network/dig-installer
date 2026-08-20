@@ -58,6 +58,21 @@ installer behaves exactly as before this existed; the token is never required, n
 release ASSET download itself (a `github.com/.../releases/download/...` redirect, not the API) is
 never authenticated — only the JSON API lookups are. See `download::get_text_with_token`.
 
+**Transient network failures are retried (dig_ecosystem#2784).** An install is a chain of GitHub
+requests and ANY failure aborts it and rolls back every completed step, so a single self-healing
+blip — a dropped TLS handshake, a 502 from `api.github.com`, a truncated body — MUST NOT fail an
+install. Every release lookup and every asset download makes at most **3 attempts**, pausing 500 ms
+before the first retry and doubling thereafter. Only failures that could plausibly answer
+differently are retried: transport-level errors (DNS, connect, TLS handshake, dropped connection),
+HTTP **429**, and HTTP **5xx**. Every other status is a real answer and is reported at once — in
+particular a **404** stays a single request, because `download::latest_release` reads it as "no
+published release" and falls back to the releases list, and **401** is a rejected credential.
+**403** is treated differently by path: on the unauthenticated asset-download path
+(`fetch_bytes_retrying`) a 403 is retried, because GitHub returns 403 for anonymous rate-limit and
+abuse-detection trips on `releases/download`, which are transient; on the authenticated API path
+(`get_text_with_token_retrying` with a non-empty token) a 403 is a rejected or exhausted token and
+is not retried. See `download::with_retry` and `download::classify`.
+
 ### 1.1 First-class alias binaries (`digs`, `dign`, `digd`)
 
 Three components are real installed binaries, not shell aliases, that behave IDENTICALLY to a
