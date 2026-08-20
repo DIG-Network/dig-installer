@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.45.1] - 2026-08-20
+
+### Bug Fixes
+- **download:** Retry transient GitHub API/network failures during install (#68)
+
 ## [0.45.0] - 2026-08-20
 
 ### Testing
