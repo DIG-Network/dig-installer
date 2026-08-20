@@ -244,11 +244,15 @@ fn get_text_with_token_retrying(
         let mut req = ureq::get(url)
             .set("User-Agent", USER_AGENT)
             .set("Accept", "application/vnd.github+json");
-        let has_token = token.map_or(false, |t| !t.is_empty());
-        if let Some(t) = token.filter(|t| !t.is_empty()) {
+        // One binding decides both the header and the retry policy, so the
+        // two can never disagree about whether this request is authenticated.
+        let credential = token.filter(|t| !t.is_empty());
+        if let Some(t) = credential {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
-        let resp = req.call().map_err(|e| classify(url, e, has_token))?;
+        let resp = req
+            .call()
+            .map_err(|e| classify(url, e, credential.is_some()))?;
         // A body that fails mid-read is the same class of blip as a dropped
         // handshake — the request is repeatable, so retry it too.
         resp.into_string().map_err(|e| HttpFailure {
@@ -1501,8 +1505,7 @@ mod tests {
 
         // `get_text_with_token_retrying` with a real token sends Authorization;
         // a 403 there means the token is bad or exhausted — single-shot.
-        let (forbidden_api, seen_api) =
-            server_dropping_first_requests(0, "HTTP/1.1 403 Forbidden");
+        let (forbidden_api, seen_api) = server_dropping_first_requests(0, "HTTP/1.1 403 Forbidden");
         let _ = get_text_with_token_retrying(
             &format!("http://127.0.0.1:{forbidden_api}/"),
             Some("ghp_tok"),
