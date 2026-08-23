@@ -42,6 +42,7 @@ downloads it. Sources:
   (formerly `dig-companion`)
 - the **dig-app** identity agent from [`DIG-Network/dig-app`](https://github.com/DIG-Network/dig-app/releases)
 - the **dig-dns** local resolver (and its `digd` alias) from [`DIG-Network/dig-dns`](https://github.com/DIG-Network/dig-dns/releases)
+- the **dig-app** identity agent **and its `diga` CLI** from [`DIG-Network/dig-app`](https://github.com/DIG-Network/dig-app/releases)
 - the **auto-update beacon** (+ its worker sibling) from [`DIG-Network/dig-updater`](https://github.com/DIG-Network/dig-updater/releases)
 - the **dig-relay** from [`DIG-Network/dig-relay`](https://github.com/DIG-Network/dig-relay/releases)
 - the **DIG Browser** from [`DIG-Network/DIG_Browser`](https://github.com/DIG-Network/DIG_Browser/releases)
@@ -175,6 +176,7 @@ dig-installer --uninstall-dig-updater # remove the auto-update beacon's daily sc
 | `--with-dig-dns` | on | Redundant explicit opt-in — dig-dns installs + registers as a **boot-start** OS service (local `*.dig` name resolution) + wires OS split-DNS/NRPT + the Chrome/Edge DoH policy, by default. |
 | `--dig-dns-version <VER>` | latest | Install a specific dig-dns version. |
 | `--dig-dns-node <URL>` | dig-dns's own ladder | Explicit dig-node endpoint dig-dns's gateway should use (forwarded as `dig-dns serve --node <URL>`). |
+| _(no flag)_ | — | The **`diga`** CLI (`diga <args>` — dig-app's command-line half, the counterpart of dig-node's `dign`) installs alongside `dig-app` automatically — it follows the `--*-dig-app*` flags and has none of its own. |
 | _(no flag)_ | — | The **`digd`** alias binary (`digd <args>` ≡ `dig-dns <args>`) installs alongside `dig-dns` automatically — it follows the `--*-dig-dns*` flags above and has none of its own. |
 | `--uninstall-dig-dns` | — | Remove the dig-dns service + every OS artifact (service, split-DNS/NRPT rule, browser policy key) THIS installer created; leaves zero residue. Standalone action — ignores every other flag except `--dry-run`/`--json`. |
 | `--no-auto-update` | off | Opt out of installing + registering the DIG auto-update beacon (installed by default; see [Auto-update beacon](#auto-update-beacon-dig-updater) below). |

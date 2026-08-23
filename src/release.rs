@@ -73,14 +73,26 @@ impl Repo {
     /// reusable `build-binaries.yml`, whose asset naming exists specifically for
     /// this installer to resolve.
     ///
-    /// The SAME release also carries dig-app's own `dign-*` assets (the #908 U7 CLI
-    /// migration). This installer deliberately does NOT take `dign` from here:
-    /// [`Repo::dign`] still resolves it from the dig-node release, which is what the
-    /// `chia://` scheme handler (`dign open`) is wired against. The asset selector
-    /// prefers a canonical-stem match, so asking this repo for `dig-app` never
-    /// returns dig-app's `dign` by accident.
+    /// The SAME release also carries dig-app's own CLI as `diga-*` ([`Repo::diga`]).
+    /// The two stems are canonical and distinct — `dign` is dig-node's CLI, `diga` is
+    /// dig-app's — so [`Repo::dign`] keeps resolving against the dig-node release,
+    /// which is what the `chia://` scheme handler (`dign open`) is wired against. The
+    /// asset selector prefers a canonical-stem match, so asking this repo for
+    /// `dig-app` never returns `diga` by accident, and vice versa.
     pub fn dig_app() -> Repo {
         Repo::new("DIG-Network", "dig-app", "dig-app")
+    }
+
+    /// The `diga` CLI's release source (issue #73, epic dig_ecosystem#908): `diga` is
+    /// dig-app's command-line half — canonically the counterpart of dig-node's
+    /// [`dign`](Repo::dign) — published in the **SAME** `DIG-Network/dig-app` release
+    /// as the `dig-app` tray binary, under its own asset stem
+    /// (`diga-<ver>-<os_arch>[.exe]` — byte-for-byte the same shape as
+    /// `dig-app-<ver>-<os_arch>[.exe]`). Same owner/repo as [`Repo::dig_app`], only
+    /// the stem differs, so it resolves via the SAME
+    /// [`crate::asset::select_asset`] matcher, mirroring [`Repo::digs`].
+    pub fn diga() -> Repo {
+        Repo::new("DIG-Network", "dig-app", "diga")
     }
 
     /// The DIG Browser release source (`DIG-Network/DIG_Browser`). Publishes a
@@ -394,6 +406,39 @@ mod tests {
         assert_eq!(
             Repo::dign().binary_url("v0.31.0", "0.31.0", &win()),
             "https://github.com/DIG-Network/dig-node/releases/download/v0.31.0/dign-0.31.0-windows-x64.exe"
+        );
+    }
+
+    #[test]
+    fn diga_shares_the_dig_app_repo_with_its_own_stem() {
+        // Issue #73: dig-app's CLI is published in the SAME dig-app release, under
+        // its own stem — the same shape as digs/dign/digd. Only the stem differs
+        // from the tray binary, which is what lets one matcher serve both.
+        let diga = Repo::diga();
+        let dig_app = Repo::dig_app();
+        assert_eq!(diga.owner, dig_app.owner);
+        assert_eq!(diga.name, dig_app.name);
+        assert_eq!(diga.stem, "diga");
+        assert_ne!(
+            diga.stem, dig_app.stem,
+            "the CLI and the tray agent are distinct assets in one release"
+        );
+        // And it is NOT dig-node's CLI: `dign` stays pinned to the dig-node repo,
+        // so the scheme handler keeps resolving the engine, not the app (#912).
+        assert_ne!(Repo::diga().name, Repo::dign().name);
+    }
+
+    #[test]
+    fn diga_binary_url_matches_published_asset_naming() {
+        // dig-app's build-binaries.yml publishes diga-<ver>-<os_arch>[.exe]
+        // alongside dig-app-<ver>-<os_arch>[.exe].
+        assert_eq!(
+            Repo::diga().binary_url("v12.39.0", "12.39.0", &lin()),
+            "https://github.com/DIG-Network/dig-app/releases/download/v12.39.0/diga-12.39.0-linux-x64"
+        );
+        assert_eq!(
+            Repo::diga().binary_url("v12.39.0", "12.39.0", &win()),
+            "https://github.com/DIG-Network/dig-app/releases/download/v12.39.0/diga-12.39.0-windows-x64.exe"
         );
     }
 

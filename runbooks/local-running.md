@@ -179,6 +179,24 @@ node -e "
 
 Drive `button.btn-primary`/`.agree` clicks to advance through License → Components as needed.
 
+## Verifying the `diga` CLI is on PATH (#73)
+
+`diga` is dig-app's command-line half (the counterpart of dig-node's `dign`), installed alongside
+the tray agent from the same release. Verify it from a shell opened AFTER the install — a PATH
+change is only visible to processes started after it:
+
+```bash
+diga --version              # Windows: diga.exe
+command -v diga             # Windows: where diga
+```
+
+Both must answer without a path prefix. `diga` is placed even when the `dig-app` tray binary is
+skipped (no asset for this OS/arch, or no loadable Linux build), because the CLI has no desktop
+dependency — so a headless host still gets a working command.
+
+A dig-app release cut before the `diga-*` asset existed has none to install; the installer logs
+`diga alias not available for this release … skipping` and the rest of the install is unaffected.
+
 ## Verifying the dig-app install (#912)
 
 A default install places the dig-app identity agent alongside the node and registers it to start at

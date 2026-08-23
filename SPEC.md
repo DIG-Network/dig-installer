@@ -29,6 +29,7 @@ opt-in.
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dign`     | `DIG-Network/dig-node` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-node`) | NO separate flag — follows `dig-node`'s `--no-dig-node`/`--with-dig-node`/`--dig-node-version` | follows `dig-node` |
 | `dig-app`  | `DIG-Network/dig-app`         | raw binary, added to PATH + **per-user login autostart** (§1.11) — never a machine-wide service | on by default; `--no-dig-app` opts out; `--with-dig-app` (redundant); `--no-dig-app-autostart` keeps the binary but skips the login registration | yes |
+| `diga`     | `DIG-Network/dig-app` (CLI, issue #73) | raw binary, added to PATH (same bin dir as `dig-app`) | NO separate flag — follows `dig-app`'s `--no-dig-app`/`--with-dig-app`/`--dig-app-version` | follows `dig-app` |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
 | `digd`     | `DIG-Network/dig-dns` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-dns`) | NO separate flag — follows `dig-dns`'s `--no-dig-dns`/`--with-dig-dns`/`--dig-dns-version` | follows `dig-dns` |
 | `dig-updater` | `DIG-Network/dig-updater`  | raw binary + a daily OS-scheduled task/timer/LaunchDaemon (issue #514, §1.5) | on by default; `--no-auto-update` opts out; `--auto-update` (redundant) | yes, as the "Keep DIG up to date automatically" option |
@@ -75,6 +76,9 @@ is not retried. See `download::with_retry` and `download::classify`.
 
 ### 1.1 First-class alias binaries (`digs`, `dign`, `digd`)
 
+`diga` (§1.1a) is placed by the same mechanism but is NOT an alias: it is dig-app's own CLI, a
+different program from the `dig-app` tray binary rather than a second name for it.
+
 Three components are real installed binaries, not shell aliases, that behave IDENTICALLY to a
 primary component (same subcommands/flags/`--json`/help): `digs` ↔ `digstore` (issue #434), `dign`
 ↔ `dig-node`, and `digd` ↔ `dig-dns` (both issue #548). Each is published in the **SAME** GitHub
@@ -98,6 +102,23 @@ the modern `DIG-Network/dig-node` repo), so a dig-node install that fell back to
 resolves dig-node itself successfully while having no `dign` asset to find. That must never sink
 the otherwise-successful install — `digd` needs no equivalent gate, since it resolves against the
 identical repo + version pin as `dig-dns` itself with no such divergence.
+
+### 1.1a `diga` — dig-app's user CLI (issue #73, epic dig_ecosystem#908)
+
+`diga` is dig-app's command-line half, the canonical counterpart of `dign` (dig-node's CLI): `dign`
+drives the engine, `diga` drives the identity agent. It is published in the SAME `DIG-Network/dig-app`
+release as the `dig-app` tray binary, under its own asset stem `diga-<ver>-<os>-<arch>[.exe]`, and the
+installer places it exactly like `digs`/`dign`/`digd` — same version pin as `dig-app`, same bin dir,
+covered by the same PATH wiring, no flag of its own.
+
+`diga` MUST be installed whenever `dig-app` is selected, INDEPENDENTLY of whether the `dig-app` tray
+binary itself resolved. The tray binary is variant- and loadability-gated (§1.11) and legitimately
+resolves to nothing on a host that can load neither Linux build; `diga` is a plain CLI with no desktop
+dependency, so gating it behind the tray would leave a documented command not on PATH on exactly the
+hosts that need the CLI most.
+
+A release cut before the `diga-*` asset existed has none to resolve; that is a graceful SKIP, never an
+install failure, matching `dign`/`digd`.
 
 ### 1.11 dig-app — the per-user identity agent + login autostart (#912)
 

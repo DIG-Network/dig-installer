@@ -7,7 +7,7 @@
 //! composes them into a single ordered, idempotent orchestration that:
 //!
 //!   1. stops + deregisters ALL services (dig-node, dig-relay, dig-dns),
-//!   2. stops the user-session processes (dig-app, dign) + removes dig-app's
+//!   2. stops the user-session processes (dig-app, dign, diga) + removes dig-app's
 //!      login autostart — before any deletion, because a running image cannot be
 //!      deleted on Windows,
 //!   3. removes the auto-update beacon's scheduler registration,
@@ -64,6 +64,8 @@ pub const COMPONENT_STEMS: &[&str] = &[
     // ever points at it — its per-user autostart artifact is torn down separately
     // (`autostart::deregister`).
     "dig-app",
+    // dig-app's CLI half (issue #73), placed beside the tray agent in the same bin dir.
+    "diga",
     "dig-installer",
 ];
 
@@ -126,7 +128,7 @@ impl UninstallReport {
 pub trait UninstallActions {
     /// Stop + deregister all DIG services (dig-node, dig-relay, dig-dns).
     fn stop_services(&mut self) -> ServiceTeardown;
-    /// Stop the running user-session processes (`dig-app`, `dign`) and remove dig-app's per-user
+    /// Stop the running user-session processes (`dig-app`, `dign`, `diga`) and remove dig-app's per-user
     /// login autostart.
     ///
     /// These have no service registration, so nothing else stops them — and on Windows a running
@@ -619,6 +621,7 @@ mod tests {
             "dig-store",
             "digs",
             "dig-app",
+            "diga",
             "dig-relay",
             "dig-installer",
         ] {
