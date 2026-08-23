@@ -14,7 +14,9 @@
 //!   under a separate asset stem, installed alongside dig-node in the same bin
 //!   dir — and (best-effort) a `127.0.0.2 dig.local` hosts entry so consumers
 //!   reach it port-free,
-//! * **dig-app** (`DIG-Network/dig-app`) → the per-user identity agent + tray
+//! * **dig-app** (`DIG-Network/dig-app`) → the per-user identity agent + tray, along with its
+//!   **`diga` CLI** (issue #73) — dig-app's command-line half, the canonical counterpart of
+//!   dig-node's `dign`, published in the same release under its own asset stem
 //!   (issue #912), the user-facing half of the #908 engine/app split. Placed on
 //!   PATH like a user CLI and registered for PER-USER autostart at login (see
 //!   [`autostart`]) — Windows HKCU `Run` value / macOS LaunchAgent / Linux
@@ -326,7 +328,7 @@ impl InstallPlan {
             c.extend(["dig-node", "dign"]);
         }
         if self.with_dig_app {
-            c.push("dig-app");
+            c.extend(["dig-app", "diga"]);
         }
         if self.with_dig_dns {
             c.extend(["dig-dns", "digd"]);
@@ -383,8 +385,8 @@ impl Default for InstallPlan {
 /// One installed/resolved component in the result.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ComponentResult {
-    /// Component id: `digstore` | `digs` | `dig-node` | `dign` | `dig-dns` |
-    /// `digd` | `dig-relay` | `DIG-Browser`.
+    /// Component id: `digstore` | `digs` | `dig-node` | `dign` | `dig-app` |
+    /// `diga` | `dig-dns` | `digd` | `dig-relay` | `DIG-Browser`.
     pub component: String,
     /// Resolved version (bare semver, e.g. `0.6.0`).
     pub version: String,
@@ -948,12 +950,12 @@ fn download_component(
     Ok(outcome)
 }
 
-/// Install an OPTIONAL alias binary (`digs`/`dign`/`digd`) — a separately-published
+/// Install an OPTIONAL alias binary (`digs`/`dign`/`digd`/`diga`) — a separately-published
 /// asset shipped in the SAME release as its base component, sharing that
 /// component's version pin and bin dir.
 ///
 /// A MISSING alias asset is a graceful SKIP, never a failure: the alias is a real
-/// separate asset (`digs-*`/`dign-*`/`digd-*`) that older releases predate, and it
+/// separate asset (`digs-*`/`dign-*`/`digd-*`/`diga-*`) that older releases predate, and it
 /// no longer collides with the base component's own asset now that RawBinary
 /// selection is base-anchored (`asset::matched_candidates`, #1774). Before that
 /// anchor a loose match wrongly resolved e.g. `digd` → `dig-dns-<ver>-…`, so this
@@ -1610,6 +1612,32 @@ fn run_report_gated(
                 }
                 Err(e) => return Err(e),
             }
+
+            // diga (issue #73): dig-app's user CLI, published in the SAME dig-app
+            // release under its own asset stem — the canonical counterpart of
+            // dig-node's `dign`. Same version pin, same bin dir, no separate PATH
+            // entry, and a release cut before the `diga-*` asset existed skips
+            // gracefully, exactly like `dign`/`digd`.
+            //
+            // Deliberately OUTSIDE the tray binary's match above: the tray build is
+            // variant- and loadability-gated and legitimately resolves to nothing on
+            // a host with no matching asset or no loadable Linux build, whereas
+            // `diga` is a plain CLI with no desktop dependency. Nesting it in the
+            // tray success arm would leave a documented command off PATH on exactly
+            // the hosts whose only usable surface is the CLI (dig-node#316).
+            log("Installing the diga CLI (dig-app's command-line half, published as a separate binary):");
+            install_optional_alias(
+                resolve,
+                &Repo::diga(),
+                &plan.dig_app_version,
+                &target,
+                &plan.bin_dir_for("diga", target.os),
+                "dig-app",
+                report,
+                guard,
+                plan.dry_run,
+                log,
+            )?;
         }
 
         // 4. dig-dns (optional): local `*.dig` name resolution, installed as an OS service, along
@@ -2385,6 +2413,7 @@ const REQUIRED_CLIS: &[&str] = &[
     "dig-dns",
     "digd",
     "dig-app",
+    "diga",
 ];
 
 /// The subset of [`REQUIRED_CLIS`] that is a GUI application rather than a command-line tool.
@@ -4484,12 +4513,12 @@ impl uninstall::UninstallActions for SystemActions<'_> {
         if self.dry_run {
             return (
                 true,
-                "would stop dig-app + dign and remove dig-app's login autostart".into(),
+                "would stop dig-app + dign + diga and remove dig-app's login autostart".into(),
             );
         }
-        // Both user-session images. `dign` is a short-lived CLI, but an open `dign` shell holds its
-        // binary just as firmly as the tray agent holds its own.
-        let stops: Vec<(String, running::StopOutcome)> = ["dig-app", "dign"]
+        // Every user-session image. `dign`/`diga` are short-lived CLIs, but an open `dign` or
+        // `diga` shell holds its binary just as firmly as the tray agent holds its own.
+        let stops: Vec<(String, running::StopOutcome)> = ["dig-app", "dign", "diga"]
             .iter()
             .map(|stem| {
                 let image = target.exe_name(stem);
@@ -5009,6 +5038,7 @@ pub fn help_json() -> String {
             { "id": "dig-node", "repo": "DIG-Network/dig-node", "default": true, "flag": "--no-dig-node disables; --with-dig-node/--service redundant", "kind": "raw_binary+boot-start-service+dig.local+health-check" },
             { "id": "dign", "repo": "DIG-Network/dig-node", "default": true, "flag": "alias of dig-node — no separate flag; follows --no-dig-node/--with-dig-node/--dig-node-version", "kind": "raw_binary_alias" },
             { "id": "dig-app", "repo": "DIG-Network/dig-app", "default": true, "flag": "--no-dig-app disables; --with-dig-app redundant; --no-dig-app-autostart keeps the binary but skips the login registration", "kind": "raw_binary+per-user-login-autostart" },
+            { "id": "diga", "repo": "DIG-Network/dig-app", "default": true, "flag": "alias of dig-app — no separate flag; follows --no-dig-app/--with-dig-app/--dig-app-version", "kind": "raw_binary_alias" },
             { "id": "dig-relay", "repo": "DIG-Network/dig-relay", "default": false, "flag": "--with-relay", "kind": "raw_binary+service" },
             { "id": "dig-dns", "repo": "DIG-Network/dig-dns", "default": true, "flag": "--no-dig-dns disables; --with-dig-dns redundant", "kind": "raw_binary+boot-start-service+split-dns+browser-policy" },
             { "id": "digd", "repo": "DIG-Network/dig-dns", "default": true, "flag": "alias of dig-dns — no separate flag; follows --no-dig-dns/--with-dig-dns/--dig-dns-version", "kind": "raw_binary_alias" },
@@ -5323,19 +5353,20 @@ mod tests {
             "dig-updater-worker-0.6.0-macos-x64",
         ];
         // dig-app publishes BOTH first-class binaries of the #908 form-factor split from ONE
-        // release — the tray agent `dig-app` AND its own `dign` CLI (the U7 migration). The `dign`
-        // assets are deliberately present in this fixture: they are the reason asking this repo for
-        // `dig-app` must be stem-anchored. `dign` is the SHORTER name, and the selector's length
+        // release — the tray agent `dig-app` AND its own `diga` CLI (issue #73). Canonically `dign`
+        // is dig-node's CLI and `diga` is dig-app's, so dig-app's CLI carries the `diga-*` stem.
+        // Both stems are deliberately present in this fixture: they are the reason asking this repo
+        // for `dig-app` must be stem-anchored. `diga` is the SHORTER name, and the selector's length
         // tiebreak would hand it back for `dig-app` if the canonical-stem preference were dropped.
         let app: Vec<&'static str> = vec![
             "dig-app-3.0.0-windows-x64.exe",
             "dig-app-3.0.0-linux-x64",
             "dig-app-3.0.0-macos-arm64",
             "dig-app-3.0.0-macos-x64",
-            "dign-3.0.0-windows-x64.exe",
-            "dign-3.0.0-linux-x64",
-            "dign-3.0.0-macos-arm64",
-            "dign-3.0.0-macos-x64",
+            "diga-3.0.0-windows-x64.exe",
+            "diga-3.0.0-linux-x64",
+            "diga-3.0.0-macos-arm64",
+            "diga-3.0.0-macos-x64",
         ];
         let mut m = HashMap::new();
         m.insert("dig-app", ("v3.0.0", app));
@@ -5977,6 +6008,156 @@ mod tests {
         let plan = base_plan(); // with_dig_node defaults false in base_plan()
         let report = run_dry(&plan, all_releases()).expect("empty plan ok");
         assert!(!report.components.iter().any(|c| c.component == "dign"));
+    }
+
+    /// A dig-app release fixture, parameterised on which of the two first-class
+    /// binaries it actually carries — so a test can express "the tray build is
+    /// missing for this host but the CLI is published", which is the state that
+    /// separates a `diga` installed BESIDE dig-app from one installed INSIDE
+    /// dig-app's success branch.
+    fn dig_app_release_with(
+        tray: bool,
+        cli: bool,
+    ) -> HashMap<&'static str, (&'static str, Vec<&'static str>)> {
+        let mut assets: Vec<&'static str> = Vec::new();
+        if tray {
+            assets.extend([
+                "dig-app-3.0.0-windows-x64.exe",
+                "dig-app-3.0.0-linux-x64",
+                "dig-app-3.0.0-macos-arm64",
+                "dig-app-3.0.0-macos-x64",
+            ]);
+        }
+        if cli {
+            assets.extend([
+                "diga-3.0.0-windows-x64.exe",
+                "diga-3.0.0-linux-x64",
+                "diga-3.0.0-macos-arm64",
+                "diga-3.0.0-macos-x64",
+            ]);
+        }
+        let mut m = HashMap::new();
+        m.insert("dig-app", ("v3.0.0", assets));
+        m
+    }
+
+    #[test]
+    fn diga_alias_installs_alongside_dig_app_from_the_same_release() {
+        // Issue #73 / epic dig_ecosystem#908: `diga` is dig-app's user CLI —
+        // canonically the counterpart of dig-node's `dign` — published in the SAME
+        // dig-app release under its own asset stem. Selecting dig-app must resolve
+        // + place BOTH binaries, sharing the bin dir (so the existing PATH wiring
+        // already covers the CLI) and dig-app's version pin.
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        let report = run_dry(&plan, all_releases()).expect("dig-app + diga resolve");
+        let ids: Vec<&str> = report
+            .components
+            .iter()
+            .map(|c| c.component.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["dig-app", "diga"],
+            "diga installs right after dig-app"
+        );
+
+        let dig_app = &report.components[0];
+        let diga = report
+            .components
+            .iter()
+            .find(|c| c.component == "diga")
+            .expect("diga component present");
+        assert_eq!(diga.version, "3.0.0");
+        assert_eq!(diga.tag, "v3.0.0");
+        assert!(
+            diga.asset.starts_with("diga-3.0.0-"),
+            "the CLI resolves its OWN stem, never dig-app's: asset={}",
+            diga.asset
+        );
+        assert!(diga
+            .url
+            .contains("github.com/DIG-Network/dig-app/releases/download/v3.0.0/"));
+
+        // Same bin dir as dig-app — the dir already on PATH, so no new PATH entry.
+        let dig_app_dir = std::path::Path::new(&dig_app.dest).parent().unwrap();
+        let diga_dir = std::path::Path::new(&diga.dest).parent().unwrap();
+        assert_eq!(dig_app_dir, diga_dir);
+        assert_ne!(
+            dig_app.dest, diga.dest,
+            "dig-app and diga are distinct files"
+        );
+        assert!(report.installed.is_empty(), "dry run writes nothing");
+    }
+
+    #[test]
+    fn diga_installs_even_when_the_dig_app_tray_binary_is_unavailable_for_this_host() {
+        // THE PLACEMENT TEST. `diga` is a plain CLI with no desktop dependency,
+        // while the `dig-app` tray binary is variant- and loadability-gated and
+        // legitimately resolves to nothing on some hosts (no asset for this
+        // OS/arch; or, on Linux, neither build loadable). Installing the CLI
+        // INSIDE dig-app's success branch would satisfy the test above
+        // identically, and would leave `diga` off PATH on exactly the hosts whose
+        // only usable surface IS the CLI — the dig-node#316 defect class, where a
+        // documented command is command-not-found after a supported install.
+        //
+        // Two actors, one varied: the tray asset is absent, the CLI asset is
+        // published. A `diga` step nested in the tray Ok arm places nothing here.
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        let report = run_dry(&plan, dig_app_release_with(false, true))
+            .expect("an absent tray build must not sink the install");
+        assert!(
+            !report.components.iter().any(|c| c.component == "dig-app"),
+            "the fixture publishes no tray asset, so dig-app itself is skipped"
+        );
+        let diga = report
+            .components
+            .iter()
+            .find(|c| c.component == "diga")
+            .expect("diga is placed even though the tray binary was not");
+        assert!(diga.asset.starts_with("diga-3.0.0-"));
+    }
+
+    #[test]
+    fn a_missing_diga_alias_asset_skips_gracefully_and_the_install_still_succeeds() {
+        // The mirror of the digd/dign case: a dig-app release cut before the
+        // `diga-*` asset existed (every release up to and including v12.38.0, whose
+        // CLI still shipped under the pre-rename `dign-*` stem) has no `diga` to
+        // resolve. Base-anchored RawBinary selection correctly reports
+        // ASSET_NOT_FOUND rather than handing back `dig-app-*`, and that must SKIP
+        // the alias — never roll back the tray install that already succeeded.
+        let mut plan = base_plan();
+        plan.with_dig_app = true;
+        let report = run_dry(&plan, dig_app_release_with(true, false))
+            .expect("a missing diga alias must not fail the whole install");
+        assert!(
+            report.components.iter().any(|c| c.component == "dig-app"),
+            "dig-app itself still installs"
+        );
+        assert!(
+            !report.components.iter().any(|c| c.component == "diga"),
+            "the absent diga alias was skipped, not placed"
+        );
+    }
+
+    #[test]
+    fn diga_is_verified_to_resolve_by_bare_name_after_install() {
+        // dig-node#316: the defect is not "the binary was downloaded", it is "the
+        // documented command is not on PATH". `diga` therefore belongs in the set
+        // the post-install check RESOLVES by bare name, alongside dign/digd/digs.
+        assert!(
+            REQUIRED_CLIS.contains(&"diga"),
+            "diga must be PATH-verified after install, not merely written to disk"
+        );
+    }
+
+    #[test]
+    fn diga_is_not_installed_when_dig_app_is_opted_out() {
+        // diga has no separate flag: --no-dig-app opts out of both binaries.
+        let plan = base_plan(); // with_dig_app defaults false in base_plan()
+        let report = run_dry(&plan, all_releases()).expect("empty plan ok");
+        assert!(!report.components.iter().any(|c| c.component == "diga"));
     }
 
     #[test]
@@ -8872,6 +9053,7 @@ mod tests {
                 "dig-node",
                 "dign",
                 "dig-app",
+                "diga",
                 "dig-dns",
                 "digd",
                 "dig-updater",
@@ -8926,7 +9108,7 @@ mod tests {
     ///
     /// The load-bearing part is the second hop. The fixture release also contains `dign-*` assets
     /// (as the real one does) and `dign` is the SHORTER name — so a stem-blind selector returns
-    /// dig-app's `dign` here and this test fails. Asserting only "a component resolved" would pass
+    /// dig-app's `diga` here and this test fails. Asserting only "a component resolved" would pass
     /// on that wrong implementation.
     #[test]
     fn dig_app_is_carried_in_the_installer_payload_912() {
@@ -8938,14 +9120,14 @@ mod tests {
             .iter()
             .map(|c| c.component.as_str())
             .collect();
-        assert_eq!(ids, vec!["dig-app"]);
+        assert_eq!(ids, vec!["dig-app", "diga"]);
 
         let app = &report.components[0];
         assert_eq!(app.version, "3.0.0");
         assert_eq!(app.tag, "v3.0.0");
         assert!(
             app.asset.starts_with("dig-app-3.0.0-"),
-            "resolved the dig-app asset, not the dign sibling in the same release: {}",
+            "resolved the dig-app asset, not the diga sibling in the same release: {}",
             app.asset
         );
         assert!(app
@@ -8959,10 +9141,11 @@ mod tests {
         );
     }
 
-    /// `dign` keeps coming from the dig-NODE release even though dig-app publishes a `dign` of its
-    /// own — the `chia://` scheme handler is wired against `dign open` from the node, so silently
-    /// repointing it would change which binary answers every clicked link. Both components are
-    /// selected here so the two `dign` sources compete; the version + URL pin which one won.
+    /// `dign` keeps coming from the dig-NODE release — the `chia://` scheme handler is wired
+    /// against `dign open` from the node, so silently repointing it would change which binary
+    /// answers every clicked link. dig-app publishes a CLI from the same-shaped asset naming under
+    /// its own `diga` stem, and both components are selected here so the two releases compete; the
+    /// version + URL pin which binary each stem resolved from.
     #[test]
     fn dign_still_resolves_from_the_dig_node_release_not_dig_app_912() {
         let mut plan = base_plan();
@@ -8974,7 +9157,7 @@ mod tests {
             .iter()
             .map(|c| c.component.as_str())
             .collect();
-        assert_eq!(ids, vec!["dig-node", "dign", "dig-app"]);
+        assert_eq!(ids, vec!["dig-node", "dign", "dig-app", "diga"]);
 
         let dign = &report.components[1];
         assert_eq!(dign.version, "0.2.0", "dign rides dig-node's version pin");
@@ -9013,7 +9196,11 @@ mod tests {
         plan.with_dig_app = true;
         plan.dig_app_autostart = false;
         let report = run_dry(&plan, all_releases()).expect("dig-app resolves");
-        assert_eq!(report.components.len(), 1, "the binary is still installed");
+        assert_eq!(
+            report.components.len(),
+            2,
+            "both binaries — the tray agent and its diga CLI — are still installed"
+        );
         assert!(
             report.autostart.is_none(),
             "declining autostart registers nothing"
