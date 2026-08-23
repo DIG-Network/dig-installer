@@ -29,6 +29,7 @@ opt-in.
 | `dig-node` | `DIG-Network/dig-node`        | raw binary + boot-start OS service + `dig.local` hosts entry | on by default; `--no-dig-node` opts out; `--with-dig-node`/`--service` (redundant) | yes |
 | `dign`     | `DIG-Network/dig-node` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-node`) | NO separate flag — follows `dig-node`'s `--no-dig-node`/`--with-dig-node`/`--dig-node-version` | follows `dig-node` |
 | `dig-app`  | `DIG-Network/dig-app`         | raw binary, added to PATH + **per-user login autostart** (§1.11) — never a machine-wide service | on by default; `--no-dig-app` opts out; `--with-dig-app` (redundant); `--no-dig-app-autostart` keeps the binary but skips the login registration | yes |
+| `diga`     | `DIG-Network/dig-app` (CLI, issue #73) | raw binary, added to PATH (same bin dir as `dig-app`) | NO separate flag — follows `dig-app`'s `--no-dig-app`/`--with-dig-app`/`--dig-app-version` | follows `dig-app` |
 | `dig-dns`  | `DIG-Network/dig-dns`         | raw binary + boot-start OS service + split-DNS/NRPT + browser DoH policy | on by default; `--no-dig-dns` opts out; `--with-dig-dns` (redundant) | yes |
 | `digd`     | `DIG-Network/dig-dns` (alias, issue #548) | raw binary, added to PATH (same bin dir as `dig-dns`) | NO separate flag — follows `dig-dns`'s `--no-dig-dns`/`--with-dig-dns`/`--dig-dns-version` | follows `dig-dns` |
 | `dig-updater` | `DIG-Network/dig-updater`  | raw binary + a daily OS-scheduled task/timer/LaunchDaemon (issue #514, §1.5) | on by default; `--no-auto-update` opts out; `--auto-update` (redundant) | yes, as the "Keep DIG up to date automatically" option |
@@ -74,6 +75,9 @@ abuse-detection trips on `releases/download`, which are transient; on the authen
 is not retried. See `download::with_retry` and `download::classify`.
 
 ### 1.1 First-class alias binaries (`digs`, `dign`, `digd`)
+
+`diga` (§1.1a) is placed by the same mechanism but is NOT an alias: it is dig-app's own CLI, a
+different program from the `dig-app` tray binary rather than a second name for it.
 
 Three components are real installed binaries, not shell aliases, that behave IDENTICALLY to a
 primary component (same subcommands/flags/`--json`/help): `digs` ↔ `digstore` (issue #434), `dign`

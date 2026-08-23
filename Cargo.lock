@@ -601,9 +601,9 @@ dependencies = [
 
 [[package]]
 name = "dig-constants"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19577d01365c1fa5d369927ef691805fd9b5f4169c43eb5863b24105cad54b56"
+checksum = "ddae5ea66f2a07ac28241eac51a0a7f6221b1b1262ed4d7043c3233fa227c9d3"
 dependencies = [
  "chia-consensus",
  "chia-protocol",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "dig-installer"
-version = "0.45.1"
+version = "0.46.0"
 dependencies = [
  "assert_cmd",
  "clap",
