@@ -99,6 +99,23 @@ resolves dig-node itself successfully while having no `dign` asset to find. That
 the otherwise-successful install — `digd` needs no equivalent gate, since it resolves against the
 identical repo + version pin as `dig-dns` itself with no such divergence.
 
+### 1.1a `diga` — dig-app's user CLI (issue #73, epic dig_ecosystem#908)
+
+`diga` is dig-app's command-line half, the canonical counterpart of `dign` (dig-node's CLI): `dign`
+drives the engine, `diga` drives the identity agent. It is published in the SAME `DIG-Network/dig-app`
+release as the `dig-app` tray binary, under its own asset stem `diga-<ver>-<os>-<arch>[.exe]`, and the
+installer places it exactly like `digs`/`dign`/`digd` — same version pin as `dig-app`, same bin dir,
+covered by the same PATH wiring, no flag of its own.
+
+`diga` MUST be installed whenever `dig-app` is selected, INDEPENDENTLY of whether the `dig-app` tray
+binary itself resolved. The tray binary is variant- and loadability-gated (§1.11) and legitimately
+resolves to nothing on a host that can load neither Linux build; `diga` is a plain CLI with no desktop
+dependency, so gating it behind the tray would leave a documented command not on PATH on exactly the
+hosts that need the CLI most.
+
+A release cut before the `diga-*` asset existed has none to resolve; that is a graceful SKIP, never an
+install failure, matching `dign`/`digd`.
+
 ### 1.11 dig-app — the per-user identity agent + login autostart (#912)
 
 `dig-app` is the USER-FACING half of the node/app split (`SYSTEM.md` → dig-node ⇄ dig-app, epic
