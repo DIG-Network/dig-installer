@@ -1288,10 +1288,13 @@ jobs:
           jq -r '.result.components[] | "\(.component) -> \(.dest)"' planned.json
           # An EXACT count plus explicit membership: "> 2" stayed green if a plan
           # regression silently dropped dig-app (or anything else) from the default set.
-          jq -e '(.result.components | length) == 9' planned.json \
+          # 9 -> 10 on 2026-08-24: `diga`, dig-app's CLI half, joined the DEFAULT set (#73).
+          # It was green on that PR only because dig-app v12.38.0 shipped no diga asset, so
+          # the install took its skip path; cutting v13.1.2 made the component real.
+          jq -e '(.result.components | length) == 10' planned.json \
             || { echo "FAIL: the default component set changed -- update this count deliberately"; \
                  jq -r '.result.components | length' planned.json; exit 1; }
-          for want in dig-store digs dig-node dign dig-app dig-dns digd dig-updater dig-updater-worker; do
+          for want in dig-store digs dig-node dign dig-app diga dig-dns digd dig-updater dig-updater-worker; do
             jq -e --arg c "$want" 'any(.result.components[]; .component == $c)' planned.json \
               || { echo "FAIL: $want is missing from the DEFAULT plan"; exit 1; }
           done
