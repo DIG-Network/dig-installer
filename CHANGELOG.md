@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.46.1] - 2026-08-25
+
+### Bug Fixes
+- **e2e:** The DEFAULT component set is 10 — diga joined it deliberately (#75)
+
 ## [0.46.0] - 2026-08-24
 
 ### Features
