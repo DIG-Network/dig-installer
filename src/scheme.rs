@@ -122,15 +122,14 @@ pub fn app_windows_handler_command(app_bin: &Path) -> String {
 /// Pure.
 pub fn linux_app_desktop_contents(app_bin: &Path) -> String {
     format!(
-        "[Desktop Entry]
-         Type=Application
-         Name=DIG App Link Handler
-         Comment=Open dig-app: links in the DIG App
-         Exec=\"{}\" %u
-         Terminal=false
-         NoDisplay=true
-         MimeType=x-scheme-handler/{DIG_APP_SCHEME};
-",
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=DIG App Link Handler\n\
+         Comment=Open dig-app: links in the DIG App\n\
+         Exec=\"{}\" %u\n\
+         Terminal=false\n\
+         NoDisplay=true\n\
+         MimeType=x-scheme-handler/{DIG_APP_SCHEME};\n",
         app_bin.display()
     )
 }
@@ -258,14 +257,17 @@ pub fn register_app(app_bin: &Path, dry_run: bool) -> SchemeResult {
             registered: false,
             schemes,
             note: format!(
-                "would register the {DIG_APP_SCHEME}: URL-scheme handler → {}                  (so a notification click opens the DIG App)",
+                "would register the {DIG_APP_SCHEME}: URL-scheme handler → {} (so a notification click opens the DIG App)",
                 app_bin.display()
             ),
         };
     }
     #[cfg(windows)]
     {
-        register_windows_commands(&[(DIG_APP_SCHEME.to_string(), app_windows_handler_command(app_bin))])
+        register_windows_commands(&[(
+            DIG_APP_SCHEME.to_string(),
+            app_windows_handler_command(app_bin),
+        )])
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -375,7 +377,7 @@ fn register_windows_commands(pairs: &[(String, String)]) -> SchemeResult {
             let (cmd_key, _) = hkcu
                 .create_subkey_with_flags(format!("{base}\\shell\\open\\command"), KEY_WRITE)
                 .map_err(|e| format!("create {base}\\shell\\open\\command: {e}"))?;
-            cmd_key.set_value("", &cmd).map_err(|e| e.to_string())?;
+            cmd_key.set_value("", cmd).map_err(|e| e.to_string())?;
             Ok(())
         };
         if let Err(e) = write() {
@@ -457,25 +459,40 @@ pub fn is_our_handler_command(command: &str) -> bool {
 /// `sudo` this used to write `/root/.local/share/applications/…`, so the handler was registered in
 /// root's XDG scope and the user's browser never saw it — the same inversion that put the CLIs in
 /// `/root/.dig/bin`.
+const DIGN_DESKTOP_FILE: &str = "dig-network-url-handler.desktop";
+
+/// The `dig-app:` handler's own desktop entry. A SEPARATE file from
+/// [`DIGN_DESKTOP_FILE`] because the two schemes point at different binaries, so
+/// they must be independently writable and independently removable.
+const APP_DESKTOP_FILE: &str = "dig-app-url-handler.desktop";
+
 #[cfg(all(unix, not(target_os = "macos")))]
-fn desktop_file_path() -> Option<std::path::PathBuf> {
+fn desktop_file_path(file_name: &str) -> Option<std::path::PathBuf> {
     Some(
         crate::invoker::target_user()
             .home
             .join(".local")
             .join("share")
             .join("applications")
-            .join("dig-network-url-handler.desktop"),
+            .join(file_name),
     )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
-    use crate::proc::HideConsole;
-    use std::process::Command;
     let refs: Vec<&str> = schemes.iter().map(String::as_str).collect();
     let body = linux_desktop_contents(dign_bin, &refs);
-    let path = match desktop_file_path() {
+    register_linux_entry(DIGN_DESKTOP_FILE, &body, schemes)
+}
+
+/// Write one desktop entry and make it the default handler for `schemes`.
+/// Shared by both registrations so the `dig-app:` handler inherits the
+/// write-as-the-invoking-user rule (#1748) rather than re-deriving it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn register_linux_entry(file_name: &str, body: &str, schemes: &[String]) -> SchemeResult {
+    use crate::proc::HideConsole;
+    use std::process::Command;
+    let path = match desktop_file_path(file_name) {
         Some(p) => p,
         None => {
             return SchemeResult {
@@ -490,7 +507,7 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
     // deterministic filename. Writing as the user also leaves the entry theirs to manage, and the
     // desktop-database refresh below runs in their session, not ours.
     let user = crate::invoker::target_user();
-    if let Err(e) = crate::userwrite::write_as_user(&path, &body, user) {
+    if let Err(e) = crate::userwrite::write_as_user(&path, body, user) {
         return SchemeResult {
             registered: false,
             schemes: schemes.to_vec(),
@@ -525,20 +542,27 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn unregister_linux(schemes: &[String]) -> SchemeResult {
-    let path = desktop_file_path();
-    let removed = match &path {
-        Some(p) if p.exists() => std::fs::remove_file(p).is_ok(),
-        _ => false,
-    };
+    // BOTH entries, unconditionally. Registration is per-target — `dig-app:` is
+    // only written when dig-app is installed — but removal must not depend on
+    // remembering which targets a given run chose, or an uninstall leaves a
+    // handler pointing at a deleted binary and the OS keeps routing to it.
+    let removed_any = [DIGN_DESKTOP_FILE, APP_DESKTOP_FILE]
+        .iter()
+        .filter(|name| match desktop_file_path(name) {
+            Some(p) if p.exists() => std::fs::remove_file(&p).is_ok(),
+            _ => false,
+        })
+        .count()
+        > 0;
     SchemeResult {
         registered: false,
-        schemes: if removed {
+        schemes: if removed_any {
             schemes.to_vec()
         } else {
             Vec::new()
         },
-        note: if removed {
-            "removed the DIG .desktop scheme handler".to_string()
+        note: if removed_any {
+            "removed the DIG .desktop scheme handler(s)".to_string()
         } else {
             "no DIG .desktop scheme handler to remove".to_string()
         },
@@ -578,6 +602,47 @@ mod tests {
         let lower = cmd.to_ascii_lowercase();
         assert!(!lower.contains("cmd"), "no shell wrapper: {cmd}");
         assert!(!lower.contains("/c "), "no /C shell flag: {cmd}");
+    }
+
+    #[test]
+    fn app_desktop_entry_has_no_leading_whitespace_on_any_line() {
+        // A desktop entry is parsed line-by-line with the key at column 0; a
+        // body built from an indented multi-line literal carries the source's
+        // indentation into the file and every key is silently ignored. The
+        // control is the SIBLING entry, which is known-good and built the same
+        // way — so this fails only for the entry actually under test.
+        for (label, body) in [
+            (
+                "dig-app",
+                linux_app_desktop_contents(&PathBuf::from("/opt/dig/bin/dig-app")),
+            ),
+            (
+                "dign",
+                linux_desktop_contents(&PathBuf::from("/opt/dig/bin/dign"), &["dig"]),
+            ),
+        ] {
+            for line in body.lines() {
+                assert_eq!(
+                    line.trim_start(),
+                    line,
+                    "{label} desktop entry line is indented: {line:?}"
+                );
+            }
+            assert!(
+                body.starts_with(
+                    "[Desktop Entry]
+"
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_desktop_entries_are_separate_files_so_either_survives_the_others_removal() {
+        // One shared file would make registering `dig-app:` overwrite the `dign`
+        // handler (and vice versa), and make removing either remove both.
+        assert_ne!(DIGN_DESKTOP_FILE, APP_DESKTOP_FILE);
     }
 
     #[test]
@@ -662,7 +727,9 @@ mod tests {
         assert!(is_our_app_handler_command(
             r#""C:\Program Files\DIG\bin\dig-app.exe" "%1""#
         ));
-        assert!(is_our_app_handler_command(r#""/home/u/.dig/bin/dig-app" %u"#));
+        assert!(is_our_app_handler_command(
+            r#""/home/u/.dig/bin/dig-app" %u"#
+        ));
 
         // A neighbouring binary whose name merely STARTS with ours. A substring
         // check — the nearest wrong implementation — calls this ours and deletes
@@ -720,12 +787,18 @@ mod tests {
     #[test]
     fn linux_app_desktop_entry_registers_only_the_app_scheme_and_takes_no_verb() {
         let body = linux_app_desktop_contents(&PathBuf::from("/home/u/.dig/bin/dig-app"));
-        assert!(body.contains("MimeType=x-scheme-handler/dig-app;"), "{body}");
+        assert!(
+            body.contains("MimeType=x-scheme-handler/dig-app;"),
+            "{body}"
+        );
         assert!(
             !body.contains("x-scheme-handler/dig;"),
             "must not claim the content scheme: {body}"
         );
-        assert!(body.contains(r#"Exec="/home/u/.dig/bin/dig-app" %u"#), "{body}");
+        assert!(
+            body.contains(r#"Exec="/home/u/.dig/bin/dig-app" %u"#),
+            "{body}"
+        );
         assert!(!body.to_ascii_lowercase().contains("sh -c"), "{body}");
     }
 
@@ -743,4 +816,3 @@ mod tests {
         assert_eq!(v["note"], "ok");
     }
 }
-
