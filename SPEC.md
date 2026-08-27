@@ -351,11 +351,16 @@ can navigate to `dig-app:<anything>`, so the scheme is public input, not a priva
 notification and the app. Two properties bound it, and both live in the registration shape rather than
 in a later check: no shell is ever involved (the OS substitutes `%1` / `%u` as a SINGLE argument), and
 the installer adds no verb, flag or path of its own for a crafted URI to ride on. The installer never
-parses a URI. Deciding what one MEANS is dig-app's, against an **allowlist of known routes** —
-`deposit` is the only route today, and an unrecognised route opens the app to its default view. No
+parses a URI. Deciding what one MEANS is dig-app's, against an **allowlist of known routes**, and
+that allowlist is dig-app's to define: `deposit` is the only route this scheme is intended to carry.
+As of this version dig-app interprets NO route — its argv shell classes the activation URI as an
+unrecognised argument, logs it and opens the default view — so an activation currently opens the app
+but not the deposit tab. That is the safe direction to be incomplete in, and it is deliberate: the
+installer opens the door, and what walks through it is bounded by the app, never by the installer. No
 route may move money, initiate a send, pre-fill an amount or select a recipient; a route that
 pre-stages a transaction is a one-click phishing primitive and must not be added without a threat
-model. Both the cold-start and already-running activation paths resolve against that same allowlist.
+model. Both the cold-start and already-running activation paths must resolve against that same
+allowlist — an app that routes only its cold path leaves the running-instance path unguarded.
 
 ### 1.4 App-scoped firewall rule for dig-node's peer-RPC port (#424)
 
