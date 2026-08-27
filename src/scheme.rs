@@ -150,11 +150,27 @@ pub fn is_our_app_handler_command(command: &str) -> bool {
     let Some((exe, tail)) = rest.split_once('"') else {
         return false;
     };
-    let stem = Path::new(exe)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    stem.eq_ignore_ascii_case(DIG_APP_SCHEME) && matches!(tail.trim(), "\"%1\"" | "%u")
+    executable_stem(exe).eq_ignore_ascii_case(DIG_APP_SCHEME)
+        && matches!(tail.trim(), "\"%1\"" | "%u")
+}
+
+/// The bare name of an executable path, without its directories or a `.exe`
+/// suffix. Pure.
+///
+/// Splits on BOTH separators rather than using [`Path::file_stem`], because the
+/// string being parsed is a foreign path, not a host path: a Windows registry
+/// command is backslash-separated whatever machine reads it, and `Path` on unix
+/// treats a backslash as an ordinary character — so `file_stem` returns the
+/// WHOLE `C:\Program Files\DIG\bin\dig-app` string and ownership silently
+/// fails to match. That direction is the safe one (an uninstall skips a key it
+/// does own) but it is still wrong, and it made the invariant untestable off
+/// Windows.
+fn executable_stem(exe: &str) -> &str {
+    let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+    match name.rfind('.') {
+        Some(dot) if name[dot..].eq_ignore_ascii_case(".exe") => &name[..dot],
+        _ => name,
+    }
 }
 
 /// The schemes registered for a given `with_urn` choice: always `dig` + `chia`,

@@ -1041,8 +1041,9 @@ dependencies = [
 
 [[package]]
 name = "dig-cert"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-cert?tag=v0.1.0#408d604ad2fd398c635b9e5759eadeaf9ad4eb11"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f59d114a13fd504e960f5281eb6a75485e3f2ffb1279c819cb90e14db2c82419"
 dependencies = [
  "arc-swap",
  "rcgen",
@@ -1058,9 +1059,9 @@ dependencies = [
 
 [[package]]
 name = "dig-constants"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddae5ea66f2a07ac28241eac51a0a7f6221b1b1262ed4d7043c3233fa227c9d3"
+checksum = "278a92d841fcde5e575c54f461ddcc5938ab38230d6695b480552e88ee53d287"
 dependencies = [
  "chia-consensus",
  "chia-protocol",
@@ -1069,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "dig-installer"
-version = "0.46.1"
+version = "0.47.0"
 dependencies = [
  "clap",
  "dig-cert",
