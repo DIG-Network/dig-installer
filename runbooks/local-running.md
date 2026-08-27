@@ -236,6 +236,48 @@ than silent.
 registration. `dig-installer --json` reports both under `components[]` (`"component": "dig-app"`)
 and `autostart` (`mechanism` / `artifact` / `registered` / `disposition` / `note`).
 
+## Verifying and removing the `dig-app:` URL scheme (#76)
+
+An install that places dig-app also registers the `dig-app:` URL scheme, so dig-app's out-of-funds
+notification (which activates by protocol with `dig-app:deposit`) can open the app even from cold.
+This is a **system-level side effect that outlives the process**, so it is worth verifying by hand and
+knowing how to remove.
+
+**Verify the registration (Windows):**
+
+```powershell
+reg query "HKCU\Software\Classes\dig-app\shell\open\command" /ve
+# expect: (Default)  REG_SZ  "C:\Program Files\DIGin\dig-app.exe" "%1"
+```
+
+**Verify the click actually routes** — this, not the key existing, is the acceptance evidence:
+
+```powershell
+Start-Process "dig-app:deposit"     # the DIG App should come to the front on its deposit view
+Start-Process "dig-app:nonsense"    # an unknown route must open the default view, never crash
+```
+
+**Verify on Linux:**
+
+```bash
+xdg-mime query default x-scheme-handler/dig-app   # expect: dig-app-url-handler.desktop
+cat ~/.local/share/applications/dig-app-url-handler.desktop
+xdg-open 'dig-app:deposit'
+```
+
+macOS binds a scheme to a `.app` bundle rather than a bare binary, so a CLI-only install reports the
+registration as a best-effort no-op — that is expected, not a failure.
+
+**Remove it.** `dig-installer --unregister-scheme` (or any uninstall) removes it, together with the
+`dig://`/`chia://`/`urn:` handlers. Removal is unconditional and idempotent: it does not depend on
+which components the original run installed, so it cannot leave a handler pointing at a binary that
+has since been deleted — the OS would still route to such a handler. Only commands matching the exact
+shape the installer writes are removed, so a third-party registration of the same scheme is left
+alone. To confirm removal, re-run the `reg query` / `xdg-mime query` above and expect a not-found.
+
+**Re-running the installer is safe.** Registration rewrites the same key or file with identical
+values, so an update or a repeat install never duplicates or corrupts the association.
+
 ## Service scope — will the node come back after a reboot?
 
 An elevated install registers the engine services (dig-node, dig-relay, dig-dns) MACHINE-WIDE, so

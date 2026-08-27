@@ -315,6 +315,48 @@ shell. Registration is **best-effort within the install**: a failure is recorded
 Unregister removes ONLY DIG-owned handlers — those whose command delegates to `dign open` (and,
 for upgrade cleanup, the legacy `handle-url` form) — never a foreign registration.
 
+### 1.3a The `dig-app:` app-navigation scheme (#76)
+
+Separately from the `{dig, chia, urn}` set above, an install that places **dig-app** also registers
+the **`dig-app:`** scheme, pointing at the installed `dig-app` binary. It rides the same
+`register_scheme` toggle but is a distinct registration: `dig://` is CONTENT addressing resolved by
+the node, `dig-app:` is navigation within the app, and a scheme that means two things cannot be
+routed. Registration is what makes dig-app's Windows out-of-funds notification — which activates by
+protocol with `launch="dig-app:deposit"` — do anything at all; without it the click is inert.
+
+| OS | Registration |
+|----|--------------|
+| Windows | `HKCU\Software\Classes\dig-app` with an empty `URL Protocol` value + `shell\open\command` = `"<dig-app>" "%1"` |
+| Linux | a `~/.local/share/applications/dig-app-url-handler.desktop` with `MimeType=x-scheme-handler/dig-app;` + `xdg-mime default`, `Exec="<dig-app>" %u` — a SEPARATE file from the `dign` entry, so either survives the other's removal |
+| macOS | best-effort no-op, for the reason given in §1.3 |
+
+The handler binary is read from the plan's own `bin_dir_for("dig-app", …)`, never a fixed location,
+so a custom `--bin-dir` install registers the binary it actually placed.
+
+**Conditional registration.** `InstallReport.app_scheme` is `Some` only when `with_dig_app` is set. A
+handler pointing at a binary that was never placed is worse than no handler, because the OS routes to
+it just as willingly and the launch simply fails.
+
+**Unconditional removal.** Unregister covers `dig-app` alongside the `dign` set
+(`scheme::removal_scheme_set`) regardless of which targets a given run installed, so no uninstall or
+rollback can leave a handler pointing at a deleted binary. Each key is removed only when its command
+is the exact shape this installer writes: ownership is decided by the executable's own file stem plus
+an exact URI-placeholder tail, so `"C:\evil\dig-app-thief.exe" "%1"` is not ours and is left alone.
+
+**Idempotent.** Re-running the installer or an update rewrites the same key/file with identical
+values, which is a no-op; nothing is duplicated or appended.
+
+**The URL surface is an attacker-controlled entry point.** Once registered, any page the user visits
+can navigate to `dig-app:<anything>`, so the scheme is public input, not a private channel between the
+notification and the app. Two properties bound it, and both live in the registration shape rather than
+in a later check: no shell is ever involved (the OS substitutes `%1` / `%u` as a SINGLE argument), and
+the installer adds no verb, flag or path of its own for a crafted URI to ride on. The installer never
+parses a URI. Deciding what one MEANS is dig-app's, against an **allowlist of known routes** —
+`deposit` is the only route today, and an unrecognised route opens the app to its default view. No
+route may move money, initiate a send, pre-fill an amount or select a recipient; a route that
+pre-stages a transaction is a one-click phishing primitive and must not be added without a threat
+model. Both the cold-start and already-running activation paths resolve against that same allowlist.
+
 ### 1.4 App-scoped firewall rule for dig-node's peer-RPC port (#424)
 
 By default the installer opens an inbound firewall rule scoped to the installed **dig-node**

@@ -459,11 +459,16 @@ pub fn is_our_handler_command(command: &str) -> bool {
 /// `sudo` this used to write `/root/.local/share/applications/…`, so the handler was registered in
 /// root's XDG scope and the user's browser never saw it — the same inversion that put the CLIs in
 /// `/root/.dig/bin`.
+// Named on every platform, not just Linux, so the "these are two distinct
+// files" invariant is asserted by a test wherever CI runs; only the Linux
+// registration paths read them.
+#[allow(dead_code)]
 const DIGN_DESKTOP_FILE: &str = "dig-network-url-handler.desktop";
 
 /// The `dig-app:` handler's own desktop entry. A SEPARATE file from
 /// [`DIGN_DESKTOP_FILE`] because the two schemes point at different binaries, so
 /// they must be independently writable and independently removable.
+#[allow(dead_code)]
 const APP_DESKTOP_FILE: &str = "dig-app-url-handler.desktop";
 
 #[cfg(all(unix, not(target_os = "macos")))]
