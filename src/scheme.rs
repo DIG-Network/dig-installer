@@ -61,6 +61,16 @@ pub const URN_SCHEME: &str = "urn";
 /// resolves a URI itself.
 pub const DIGN_OPEN_SUBCOMMAND: &str = "open";
 
+/// dig-app's own navigation scheme (#76). Registered SEPARATELY from the set
+/// above because it points at a different binary — the installed `dig-app`, not
+/// `dign` — and means a different thing: `dig://` is CONTENT addressing, this is
+/// app navigation, and a scheme that means two things cannot be routed.
+///
+/// Its one route today is `dig-app:deposit`, which the Windows out-of-funds
+/// notification launches by protocol activation (dig-app PR#290). Registration
+/// is what makes that click do anything at all.
+pub const DIG_APP_SCHEME: &str = "dig-app";
+
 /// The Windows handler command string written to
 /// `HKCU\Software\Classes\<scheme>\shell\open\command`: the quoted `dign` binary
 /// path, the `open` subcommand, and the quoted `%1` URI placeholder. Pure.
@@ -92,6 +102,77 @@ pub fn linux_desktop_contents(dign_bin: &Path, schemes: &[&str]) -> String {
     )
 }
 
+/// The Windows handler command for `dig-app:` — the quoted `dig-app` binary and
+/// the quoted `%1` URI placeholder, and nothing else. Pure.
+///
+/// # Why there is no verb
+///
+/// dig-app takes the activation URI as a bare argument, so the command carries
+/// no subcommand and no flag: the OS substitutes `%1` as a SINGLE argument (no
+/// shell is involved), and the app receives exactly one `argv` element that it
+/// matches against its own route allowlist. The installer never interprets the
+/// URI, and adds nothing to the command line that a crafted URI could ride on.
+pub fn app_windows_handler_command(app_bin: &Path) -> String {
+    format!("\"{}\" \"%1\"", app_bin.display())
+}
+
+/// The `.desktop` body registering `dig-app` as the `dig-app:` handler on Linux.
+/// Kept as its OWN entry rather than added to the `dign` one, so the two schemes
+/// stay independently removable and neither binary inherits the other's schemes.
+/// Pure.
+pub fn linux_app_desktop_contents(app_bin: &Path) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=DIG App Link Handler\n\
+         Comment=Open dig-app: links in the DIG App\n\
+         Exec=\"{}\" %u\n\
+         Terminal=false\n\
+         NoDisplay=true\n\
+         MimeType=x-scheme-handler/{DIG_APP_SCHEME};\n",
+        app_bin.display()
+    )
+}
+
+/// Is a registered `dig-app:` handler command the EXACT shape this installer
+/// writes? Pure.
+///
+/// Ownership is decided by the executable's own file stem plus an exact tail,
+/// never by a substring: `"C:\evil\dig-app-thief.exe" "%1"` contains our name
+/// and is not ours, and deleting it on uninstall would remove a third party's
+/// registration. The tail must be exactly the URI placeholder in one of the two
+/// shapes we emit (`"%1"` on Windows, `%u` in a desktop entry) — a command with
+/// an extra flag was edited by something else and is not ours to revert.
+pub fn is_our_app_handler_command(command: &str) -> bool {
+    let Some(rest) = command.trim().strip_prefix('"') else {
+        return false;
+    };
+    let Some((exe, tail)) = rest.split_once('"') else {
+        return false;
+    };
+    executable_stem(exe).eq_ignore_ascii_case(DIG_APP_SCHEME)
+        && matches!(tail.trim(), "\"%1\"" | "%u")
+}
+
+/// The bare name of an executable path, without its directories or a `.exe`
+/// suffix. Pure.
+///
+/// Splits on BOTH separators rather than using [`Path::file_stem`], because the
+/// string being parsed is a foreign path, not a host path: a Windows registry
+/// command is backslash-separated whatever machine reads it, and `Path` on unix
+/// treats a backslash as an ordinary character — so `file_stem` returns the
+/// WHOLE `C:\Program Files\DIG\bin\dig-app` string and ownership silently
+/// fails to match. That direction is the safe one (an uninstall skips a key it
+/// does own) but it is still wrong, and it made the invariant untestable off
+/// Windows.
+fn executable_stem(exe: &str) -> &str {
+    let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+    match name.rfind('.') {
+        Some(dot) if name[dot..].eq_ignore_ascii_case(".exe") => &name[..dot],
+        _ => name,
+    }
+}
+
 /// The schemes registered for a given `with_urn` choice: always `dig` + `chia`,
 /// plus `urn` when the OS supports a generic handler. Pure.
 pub fn scheme_set(with_urn: bool) -> Vec<String> {
@@ -99,6 +180,20 @@ pub fn scheme_set(with_urn: bool) -> Vec<String> {
     if with_urn {
         schemes.push(URN_SCHEME.to_string());
     }
+    schemes
+}
+
+/// Every scheme this installer has ever registered, in removal order.
+///
+/// Registration is per-target (the `dign` set, and `dig-app:` only when dig-app
+/// is installed); removal is TOTAL and unconditional. A handler left pointing at
+/// a binary that has been deleted is worse than no handler — the OS still routes
+/// to it — so uninstall and rollback must not depend on remembering which
+/// targets a particular run happened to install. Each key is still checked for
+/// [ownership](is_our_handler_command) before it is touched.
+pub fn removal_scheme_set() -> Vec<String> {
+    let mut schemes = scheme_set(true);
+    schemes.push(DIG_APP_SCHEME.to_string());
     schemes
 }
 
@@ -158,16 +253,76 @@ pub fn register(dign_bin: &Path, with_urn: bool, dry_run: bool) -> SchemeResult 
     }
 }
 
-/// Unregister the scheme handlers this installer created (idempotent — absent is
-/// a clean no-op). Per-user, no elevation. Only removes handlers that point at
-/// `dign open` (ours) — never clobbers a foreign registration.
-pub fn unregister(dry_run: bool) -> SchemeResult {
-    let schemes = scheme_set(true);
+/// Register the `dig-app:` URL-scheme handler, pointing at the installed
+/// `dig-app` binary (#76). Per-user, no elevation. `dry_run` reports the intent
+/// without touching the OS.
+///
+/// # This is a remote-triggerable entry point
+///
+/// Once registered, any page the user visits can navigate to `dig-app:<x>`, so
+/// the URI is attacker-supplied by construction. Two properties keep that safe,
+/// and both live in the shape written here rather than in a check performed
+/// later: the URI reaches the app as ONE argument with no shell in the path
+/// (see [`app_windows_handler_command`]), and the installer adds no verb, flag
+/// or path of its own for it to ride on. Deciding what a URI MEANS is the app's,
+/// against its own allowlist of known routes — this installer never parses one.
+pub fn register_app(app_bin: &Path, dry_run: bool) -> SchemeResult {
+    let schemes = vec![DIG_APP_SCHEME.to_string()];
     if dry_run {
         return SchemeResult {
             registered: false,
             schemes,
-            note: "would unregister the dig:// / chia:// / urn: URL-scheme handler(s)".to_string(),
+            note: format!(
+                "would register the {DIG_APP_SCHEME}: URL-scheme handler → {} (so a notification click opens the DIG App)",
+                app_bin.display()
+            ),
+        };
+    }
+    #[cfg(windows)]
+    {
+        register_windows_commands(&[(
+            DIG_APP_SCHEME.to_string(),
+            app_windows_handler_command(app_bin),
+        )])
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        register_linux_entry(
+            APP_DESKTOP_FILE,
+            &linux_app_desktop_contents(app_bin),
+            &schemes,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app_bin;
+        macos_unsupported(schemes)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = app_bin;
+        SchemeResult {
+            registered: false,
+            schemes,
+            note: "URL-scheme registration is not supported on this OS".to_string(),
+        }
+    }
+}
+
+/// Unregister every scheme handler this installer creates — the `dign` set AND
+/// `dig-app:` ([`removal_scheme_set`]) — idempotent; absent is a clean no-op.
+/// Per-user, no elevation. Each key is removed only when its command is the exact
+/// shape we write, so a foreign registration is never clobbered.
+pub fn unregister(dry_run: bool) -> SchemeResult {
+    let schemes = removal_scheme_set();
+    if dry_run {
+        return SchemeResult {
+            registered: false,
+            note: format!(
+                "would unregister the DIG-owned URL-scheme handler(s): {}",
+                schemes.join(", ")
+            ),
+            schemes,
         };
     }
     #[cfg(windows)]
@@ -209,12 +364,22 @@ fn macos_unsupported(schemes: Vec<String>) -> SchemeResult {
 
 #[cfg(windows)]
 fn register_windows(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
+    let cmd = windows_handler_command(dign_bin);
+    let pairs: Vec<(String, String)> = schemes.iter().cloned().map(|s| (s, cmd.clone())).collect();
+    register_windows_commands(&pairs)
+}
+
+/// Write one `HKCU\Software\Classes\<scheme>` handler per `(scheme, command)`
+/// pair. Re-writing an existing key with identical values is a no-op, which is
+/// what makes a re-install or an update idempotent.
+#[cfg(windows)]
+fn register_windows_commands(pairs: &[(String, String)]) -> SchemeResult {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
     use winreg::RegKey;
 
-    let cmd = windows_handler_command(dign_bin);
+    let schemes: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    for scheme in schemes {
+    for (scheme, cmd) in pairs {
         let base = format!("Software\\Classes\\{scheme}");
         let write = || -> Result<(), String> {
             let (key, _) = hkcu
@@ -228,24 +393,24 @@ fn register_windows(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
             let (cmd_key, _) = hkcu
                 .create_subkey_with_flags(format!("{base}\\shell\\open\\command"), KEY_WRITE)
                 .map_err(|e| format!("create {base}\\shell\\open\\command: {e}"))?;
-            cmd_key.set_value("", &cmd).map_err(|e| e.to_string())?;
+            cmd_key.set_value("", cmd).map_err(|e| e.to_string())?;
             Ok(())
         };
         if let Err(e) = write() {
             return SchemeResult {
                 registered: false,
-                schemes: schemes.to_vec(),
-                note: format!("could not register the {scheme}:// handler: {e}"),
+                schemes,
+                note: format!("could not register the {scheme}: handler: {e}"),
             };
         }
     }
     SchemeResult {
         registered: true,
-        schemes: schemes.to_vec(),
         note: format!(
-            "registered the {} URL-scheme handler(s) under HKCU\\Software\\Classes → `dign open`",
+            "registered the {} URL-scheme handler(s) under HKCU\\Software\\Classes",
             schemes.join(", ")
         ),
+        schemes,
     }
 }
 
@@ -263,7 +428,13 @@ fn unregister_windows(schemes: &[String]) -> SchemeResult {
             .open_subkey(format!("{base}\\shell\\open\\command"))
             .ok()
             .and_then(|k| k.get_value::<String, _>("").ok())
-            .map(|v| is_our_handler_command(&v))
+            .map(|v| {
+                if scheme == DIG_APP_SCHEME {
+                    is_our_app_handler_command(&v)
+                } else {
+                    is_our_handler_command(&v)
+                }
+            })
             .unwrap_or(false);
         if ours {
             let _ = hkcu.delete_subkey_all(&base);
@@ -304,25 +475,45 @@ pub fn is_our_handler_command(command: &str) -> bool {
 /// `sudo` this used to write `/root/.local/share/applications/…`, so the handler was registered in
 /// root's XDG scope and the user's browser never saw it — the same inversion that put the CLIs in
 /// `/root/.dig/bin`.
+// Named on every platform, not just Linux, so the "these are two distinct
+// files" invariant is asserted by a test wherever CI runs; only the Linux
+// registration paths read them.
+#[allow(dead_code)]
+const DIGN_DESKTOP_FILE: &str = "dig-network-url-handler.desktop";
+
+/// The `dig-app:` handler's own desktop entry. A SEPARATE file from
+/// [`DIGN_DESKTOP_FILE`] because the two schemes point at different binaries, so
+/// they must be independently writable and independently removable.
+#[allow(dead_code)]
+const APP_DESKTOP_FILE: &str = "dig-app-url-handler.desktop";
+
 #[cfg(all(unix, not(target_os = "macos")))]
-fn desktop_file_path() -> Option<std::path::PathBuf> {
+fn desktop_file_path(file_name: &str) -> Option<std::path::PathBuf> {
     Some(
         crate::invoker::target_user()
             .home
             .join(".local")
             .join("share")
             .join("applications")
-            .join("dig-network-url-handler.desktop"),
+            .join(file_name),
     )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
-    use crate::proc::HideConsole;
-    use std::process::Command;
     let refs: Vec<&str> = schemes.iter().map(String::as_str).collect();
     let body = linux_desktop_contents(dign_bin, &refs);
-    let path = match desktop_file_path() {
+    register_linux_entry(DIGN_DESKTOP_FILE, &body, schemes)
+}
+
+/// Write one desktop entry and make it the default handler for `schemes`.
+/// Shared by both registrations so the `dig-app:` handler inherits the
+/// write-as-the-invoking-user rule (#1748) rather than re-deriving it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn register_linux_entry(file_name: &str, body: &str, schemes: &[String]) -> SchemeResult {
+    use crate::proc::HideConsole;
+    use std::process::Command;
+    let path = match desktop_file_path(file_name) {
         Some(p) => p,
         None => {
             return SchemeResult {
@@ -337,7 +528,7 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
     // deterministic filename. Writing as the user also leaves the entry theirs to manage, and the
     // desktop-database refresh below runs in their session, not ours.
     let user = crate::invoker::target_user();
-    if let Err(e) = crate::userwrite::write_as_user(&path, &body, user) {
+    if let Err(e) = crate::userwrite::write_as_user(&path, body, user) {
         return SchemeResult {
             registered: false,
             schemes: schemes.to_vec(),
@@ -372,20 +563,27 @@ fn register_linux(dign_bin: &Path, schemes: &[String]) -> SchemeResult {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn unregister_linux(schemes: &[String]) -> SchemeResult {
-    let path = desktop_file_path();
-    let removed = match &path {
-        Some(p) if p.exists() => std::fs::remove_file(p).is_ok(),
-        _ => false,
-    };
+    // BOTH entries, unconditionally. Registration is per-target — `dig-app:` is
+    // only written when dig-app is installed — but removal must not depend on
+    // remembering which targets a given run chose, or an uninstall leaves a
+    // handler pointing at a deleted binary and the OS keeps routing to it.
+    let removed_any = [DIGN_DESKTOP_FILE, APP_DESKTOP_FILE]
+        .iter()
+        .filter(|name| match desktop_file_path(name) {
+            Some(p) if p.exists() => std::fs::remove_file(&p).is_ok(),
+            _ => false,
+        })
+        .count()
+        > 0;
     SchemeResult {
         registered: false,
-        schemes: if removed {
+        schemes: if removed_any {
             schemes.to_vec()
         } else {
             Vec::new()
         },
-        note: if removed {
-            "removed the DIG .desktop scheme handler".to_string()
+        note: if removed_any {
+            "removed the DIG .desktop scheme handler(s)".to_string()
         } else {
             "no DIG .desktop scheme handler to remove".to_string()
         },
@@ -425,6 +623,47 @@ mod tests {
         let lower = cmd.to_ascii_lowercase();
         assert!(!lower.contains("cmd"), "no shell wrapper: {cmd}");
         assert!(!lower.contains("/c "), "no /C shell flag: {cmd}");
+    }
+
+    #[test]
+    fn app_desktop_entry_has_no_leading_whitespace_on_any_line() {
+        // A desktop entry is parsed line-by-line with the key at column 0; a
+        // body built from an indented multi-line literal carries the source's
+        // indentation into the file and every key is silently ignored. The
+        // control is the SIBLING entry, which is known-good and built the same
+        // way — so this fails only for the entry actually under test.
+        for (label, body) in [
+            (
+                "dig-app",
+                linux_app_desktop_contents(&PathBuf::from("/opt/dig/bin/dig-app")),
+            ),
+            (
+                "dign",
+                linux_desktop_contents(&PathBuf::from("/opt/dig/bin/dign"), &["dig"]),
+            ),
+        ] {
+            for line in body.lines() {
+                assert_eq!(
+                    line.trim_start(),
+                    line,
+                    "{label} desktop entry line is indented: {line:?}"
+                );
+            }
+            assert!(
+                body.starts_with(
+                    "[Desktop Entry]
+"
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_desktop_entries_are_separate_files_so_either_survives_the_others_removal() {
+        // One shared file would make registering `dig-app:` overwrite the `dign`
+        // handler (and vice versa), and make removing either remove both.
+        assert_ne!(DIGN_DESKTOP_FILE, APP_DESKTOP_FILE);
     }
 
     #[test]
@@ -473,6 +712,115 @@ mod tests {
         assert!(!r.registered);
         assert_eq!(r.schemes, vec!["dig", "chia", "urn"]);
         assert!(r.note.contains("dign open"));
+    }
+
+    // -----------------------------------------------------------------------
+    // `dig-app:` — the app-navigation scheme (#76)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_dign_scheme_set_never_claims_dig_app() {
+        // `dig-app:` points at a DIFFERENT binary. If it ever leaked into the
+        // set registered against `dign open`, an activation would launch the
+        // node CLI with a URI it does not know instead of opening the app.
+        for with_urn in [true, false] {
+            assert!(
+                !scheme_set(with_urn).iter().any(|s| s == DIG_APP_SCHEME),
+                "dig-app must not be registered against dign"
+            );
+        }
+    }
+
+    #[test]
+    fn app_command_passes_the_uri_as_one_argument_with_no_verb_and_no_shell() {
+        let cmd =
+            app_windows_handler_command(&PathBuf::from(r"C:\Program Files\DIG\bin\dig-app.exe"));
+        assert_eq!(cmd, r#""C:\Program Files\DIG\bin\dig-app.exe" "%1""#);
+        let lower = cmd.to_ascii_lowercase();
+        assert!(!lower.contains("cmd"), "no shell wrapper: {cmd}");
+        assert!(!lower.contains("/c "), "no /C shell flag: {cmd}");
+        assert!(!lower.contains("powershell"), "no shell wrapper: {cmd}");
+    }
+
+    #[test]
+    fn app_handler_ownership_is_decided_by_the_executable_not_by_a_substring() {
+        // Ours, both host shapes.
+        assert!(is_our_app_handler_command(
+            r#""C:\Program Files\DIG\bin\dig-app.exe" "%1""#
+        ));
+        assert!(is_our_app_handler_command(
+            r#""/home/u/.dig/bin/dig-app" %u"#
+        ));
+
+        // A neighbouring binary whose name merely STARTS with ours. A substring
+        // check — the nearest wrong implementation — calls this ours and deletes
+        // a third party's registration on uninstall.
+        assert!(!is_our_app_handler_command(
+            r#""C:\evil\dig-app-thief.exe" "%1""#
+        ));
+        // Our binary, but a command shape this installer never writes: something
+        // else edited the key, and reverting it is not ours to do.
+        assert!(!is_our_app_handler_command(
+            r#""C:\Program Files\DIG\bin\dig-app.exe" --deposit "%1""#
+        ));
+        // A foreign handler with the identical trailing placeholder.
+        assert!(!is_our_app_handler_command(r#""C:\Otheriewer.exe" "%1""#));
+        // Unquoted / empty are not shapes we write.
+        assert!(!is_our_app_handler_command(r#"dig-app.exe "%1""#));
+        assert!(!is_our_app_handler_command(""));
+    }
+
+    #[test]
+    fn the_dign_ownership_check_does_not_claim_the_app_handler_and_vice_versa() {
+        // The two predicates guard different keys; neither may answer for the
+        // other, or one uninstall path would delete a handler it did not write.
+        let app = r#""C:\Program Files\DIG\bin\dig-app.exe" "%1""#;
+        let dign = r#""C:\Program Files\DIG\bin\dign.exe" open "%1""#;
+        assert!(!is_our_handler_command(app));
+        assert!(!is_our_app_handler_command(dign));
+    }
+
+    #[test]
+    fn removal_covers_dig_app_so_uninstall_cannot_leave_a_dangling_handler() {
+        // A handler pointing at a deleted binary is worse than none: the OS still
+        // routes to it. Registration is per-target; removal is TOTAL.
+        let set = removal_scheme_set();
+        for expected in [DIG_SCHEME, CHIA_SCHEME, URN_SCHEME, DIG_APP_SCHEME] {
+            assert!(set.iter().any(|s| s == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn dry_run_unregister_names_dig_app_among_the_handlers_it_would_remove() {
+        let r = unregister(true);
+        assert!(r.schemes.iter().any(|s| s == DIG_APP_SCHEME), "{r:?}");
+        assert!(r.note.contains(DIG_APP_SCHEME), "{}", r.note);
+    }
+
+    #[test]
+    fn dry_run_register_app_reports_intent_without_touching_the_os() {
+        let r = register_app(&PathBuf::from(r"C:\DIG\bin\dig-app.exe"), true);
+        assert!(!r.registered);
+        assert_eq!(r.schemes, vec![DIG_APP_SCHEME]);
+        assert!(r.note.contains("dig-app:"), "{}", r.note);
+    }
+
+    #[test]
+    fn linux_app_desktop_entry_registers_only_the_app_scheme_and_takes_no_verb() {
+        let body = linux_app_desktop_contents(&PathBuf::from("/home/u/.dig/bin/dig-app"));
+        assert!(
+            body.contains("MimeType=x-scheme-handler/dig-app;"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("x-scheme-handler/dig;"),
+            "must not claim the content scheme: {body}"
+        );
+        assert!(
+            body.contains(r#"Exec="/home/u/.dig/bin/dig-app" %u"#),
+            "{body}"
+        );
+        assert!(!body.to_ascii_lowercase().contains("sh -c"), "{body}");
     }
 
     #[test]

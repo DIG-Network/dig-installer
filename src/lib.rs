@@ -518,6 +518,10 @@ pub struct InstallReport {
     /// The `chia://`/`urn:` URL-scheme registration result (only when
     /// `register_scheme`) — #389.
     pub scheme: Option<scheme::SchemeResult>,
+    /// The `dig-app:` URL-scheme registration result — `None` unless dig-app was
+    /// part of this install, since a handler pointing at a binary that was never
+    /// placed is worse than no handler (#76).
+    pub app_scheme: Option<scheme::SchemeResult>,
     /// The app-scoped firewall rule result (only when `with_dig_node &&
     /// open_firewall`) — #424.
     pub firewall: Option<firewall::FirewallResult>,
@@ -1135,6 +1139,7 @@ fn run_report_gated(
         relay: None,
         dns: None,
         scheme: None,
+        app_scheme: None,
         firewall: None,
         beacon: None,
         autostart: None,
@@ -1910,6 +1915,13 @@ fn run_report_gated(
             if report.scheme.as_ref().is_some_and(|s| s.registered) {
                 guard.record(InstallAction::SchemeRegistered);
             }
+            // The `dig-app:` handler rides the same toggle but a different
+            // binary (#76): without it the out-of-funds notification's protocol
+            // activation has nothing to launch and the click is inert.
+            report.app_scheme = register_app_scheme_handler(plan, &target, log);
+            if report.app_scheme.as_ref().is_some_and(|s| s.registered) {
+                guard.record(InstallAction::SchemeRegistered);
+            }
         }
 
         // PATH verification (#496): confirm each required DIG CLI resolves by bare
@@ -2392,6 +2404,44 @@ fn register_scheme_handler(
         log(&format!("    ! {}", r.note));
     }
     r
+}
+
+/// Register the `dig-app:` OS URL-scheme handler, pointing at the installed
+/// `dig-app` binary (#76).
+///
+/// Separate from [`register_scheme_handler`] because it targets a different
+/// binary and is conditional: registering `dig-app:` when dig-app was not
+/// installed would create a handler pointing at a path that does not exist, and
+/// an OS routes to a broken handler just as willingly as to a working one.
+///
+/// Registration is what makes the out-of-funds notification's protocol
+/// activation (`dig-app:deposit`, dig-app PR#290) do anything at all. The
+/// installer only points the scheme at the binary; deciding what a URI MEANS is
+/// dig-app's, against its own allowlist of known routes.
+///
+/// Never aborts — a failure is recorded in the returned result.
+fn register_app_scheme_handler(
+    plan: &InstallPlan,
+    target: &Target,
+    log: &mut dyn FnMut(&str),
+) -> Option<scheme::SchemeResult> {
+    if !plan.with_dig_app {
+        return None;
+    }
+    // The installer's OWN bin dir for this component, never a hardcoded path —
+    // a custom `--bin-dir` install must register the binary it actually placed.
+    let app_bin = plan
+        .bin_dir_for("dig-app", target.os)
+        .join(target.exe_name("dig-app"));
+    let r = scheme::register_app(&app_bin, plan.dry_run);
+    if plan.dry_run {
+        log(&format!("    ({})", r.note));
+    } else if r.registered {
+        log(&format!("    ✓ {}", r.note));
+    } else {
+        log(&format!("    ! {}", r.note));
+    }
+    Some(r)
 }
 
 /// The user-facing DIG binaries that MUST be runnable by bare name after install.
@@ -5418,6 +5468,55 @@ mod tests {
         run_report_with(plan, &resolve, &mut |_| {})
     }
 
+    /// The install must REACH the `dig-app:` registration, not merely contain a
+    /// function that could perform it (#76).
+    ///
+    /// The salvaged first draft had a complete, well-tested `register_app` that
+    /// nothing ever called, so the scheme was never written and the out-of-funds
+    /// notification's click stayed inert — a defect no unit test of the helper
+    /// can see. This drives the real orchestration and reads the report, so the
+    /// call site is the thing under test.
+    ///
+    /// Two installs differing in ONE field are the fixture: dig-app present and
+    /// dig-app absent. A registration hoisted out of its `with_dig_app` guard
+    /// passes the first and fails the second; one dropped entirely fails the
+    /// first. Neither case alone distinguishes them.
+    #[test]
+    fn an_install_that_places_dig_app_registers_the_dig_app_scheme_and_one_that_does_not_does_not()
+    {
+        let mut with = base_plan();
+        with.register_scheme = true;
+        with.with_dig_app = true;
+        let report = run_dry(&with, dig_app_release()).expect("dry install resolves");
+        let app = report
+            .app_scheme
+            .expect("dig-app was installed, so the install must register dig-app:");
+        assert_eq!(app.schemes, vec![scheme::DIG_APP_SCHEME.to_string()]);
+        // The binary this plan actually places, never a fixed location: a
+        // hardcoded `C:\Program Files\DIGin` satisfies every other
+        // assertion here and breaks a custom `--bin-dir` install.
+        let placed = with
+            .bin_dir_for("dig-app", Target::current().expect("host target").os)
+            .join(Target::current().expect("host target").exe_name("dig-app"));
+        assert!(
+            app.note.contains(&placed.display().to_string()),
+            "must point at the placed binary: {}",
+            app.note
+        );
+
+        // The control: same install, dig-app not selected. A handler pointing at
+        // a binary that was never placed is worse than no handler, because the
+        // OS keeps routing to it.
+        let mut without = base_plan();
+        without.register_scheme = true;
+        without.with_dig_app = false;
+        let report = run_dry(&without, dig_app_release()).expect("dry install resolves");
+        assert!(
+            report.app_scheme.is_none(),
+            "nothing was placed, so nothing may claim the scheme"
+        );
+    }
+
     /// Regression for #573/#544 (partial-failure rollback): a mid-install failure
     /// must never leave a half-written stack. `rollback_partial_install` runs the
     /// PRODUCTION undo (`undo_install_action`) for every privileged action a
@@ -7004,6 +7103,7 @@ mod tests {
             relay: None,
             dns: None,
             scheme: None,
+            app_scheme: None,
             firewall: None,
             beacon: None,
             autostart: None,
