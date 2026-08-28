@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.47.0] - 2026-08-28
+
+### Features
+- **scheme:** Register the dig-app: URL scheme on install, remove it on uninstall (#77)
+
 ## [0.46.1] - 2026-08-25
 
 ### Bug Fixes
