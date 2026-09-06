@@ -87,7 +87,10 @@ fn job_condition(workflow: &str, job_name: &str) -> String {
     let job_header = format!("  {job_name}:");
     let mut lines = workflow.lines();
     let found = lines.by_ref().any(|line| line == job_header);
-    assert!(found, "job `{job_name}` not found — looked for the line `{job_header}`");
+    assert!(
+        found,
+        "job `{job_name}` not found — looked for the line `{job_header}`"
+    );
 
     let mut condition: Vec<&str> = Vec::new();
     let mut in_if = false;
@@ -95,7 +98,11 @@ fn job_condition(workflow: &str, job_name: &str) -> String {
         // A sibling job (exactly 2-space indent, e.g. `  nightly-meta:`) ends this job's body
         // before an `if:` was ever found — this job has none, which is itself a finding the
         // trailing assert reports.
-        if !in_if && line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':') {
+        if !in_if
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+        {
             break;
         }
         if !in_if && line.trim_start().starts_with("if:") {
