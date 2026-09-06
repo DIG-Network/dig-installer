@@ -70,14 +70,17 @@ jobs:
   # → commit + tag + push (RELEASE_TOKEN). The pushed `v*` tag fires release.yml (the binary build).
   stable:
     name: Stable — changelog + tag
-    # Run on the schedule (both channels) or when dispatch selects stable/both. The
-    # `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT on
-    # schedule/dispatch (there is no `head_commit`), but it keeps the release changelog commit
-    # self-labelled so the loop stays safe even if a push trigger is ever re-introduced.
+    # Reachable ONLY from a manual workflow_dispatch selecting stable/both — cutting a stable
+    # vX.Y.Z is a DECISION, never an accident of the clock (CLAUDE.md §3.6-A). The midnight cron
+    # alone must never satisfy this condition; only the nightly channel below runs unattended.
+    # `!startsWith(...chore(release):...)` guards the (currently unused) push-to-main era: it is
+    # INERT on workflow_dispatch (there is no `head_commit`), kept so the release changelog commit
+    # stays self-labelled if a push trigger is ever re-introduced.
     if: >-
       ${{
         !startsWith(github.event.head_commit.message, 'chore(release):') &&
-        (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
+        github.event_name == 'workflow_dispatch' &&
+        (inputs.channel == 'stable' || inputs.channel == 'both')
       }}
     runs-on: ubuntu-latest
     steps:
