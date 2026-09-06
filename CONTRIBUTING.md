@@ -140,24 +140,22 @@ under the required `ci.yml` test job.
   root crate's version.)
 - `main` is a protected branch: PR required, all checks above green, zero
   unresolved review threads, squash-merge only.
-- **Releases are cut on a nightly cron, not on every merge.** Every midnight
-  UTC, `.github/workflows/nightly-release.yml`'s `stable` job runs when:
+- **Releases are cut on a nightly cron plus manual dispatch — the cron NEVER cuts a stable
+  release.** Every midnight UTC, `.github/workflows/nightly-release.yml`'s **nightly** channel
+  builds `main` HEAD and publishes an unversioned `nightly-YYYYMMDD` pre-release regardless of
+  whether the version changed. The **stable** job is gated to a manual dispatch only:
 
   ```
   !startsWith(github.event.head_commit.message, 'chore(release):') &&
-  (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
+  github.event_name == 'workflow_dispatch' &&
+  (inputs.channel == 'stable' || inputs.channel == 'both')
   ```
 
-  In practice that means the cron itself is enough to cut a stable release: it
-  reads the version from `Cargo.toml`, and if the tag `vX.Y.Z` for that version
-  doesn't already exist, it generates the changelog, tags, and pushes —
-  which fires `release.yml`'s binary build/publish. So merging a version bump
-  to `main` doesn't publish a release immediately, but it **will** ship
-  automatically at the next nightly cron, with no separate manual step
-  required. The same workflow also builds and publishes an unversioned
-  `nightly-YYYYMMDD` pre-release from `main` HEAD every night regardless of
-  whether the version changed. A manual `workflow_dispatch` can drive either
-  channel (or both) on demand.
+  So merging a version bump to `main` does **not** publish a release by itself — nothing does
+  until a maintainer runs `workflow_dispatch` with `channel: stable` (or `both`). At that point the
+  job reads the version from `Cargo.toml`, and if the tag `vX.Y.Z` for that version doesn't already
+  exist, it generates the changelog, tags, and pushes — which fires `release.yml`'s binary
+  build/publish. A stable release is a deliberate act, never an accident of the clock.
 
 ## Where things live
 

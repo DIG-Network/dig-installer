@@ -30,7 +30,7 @@
 # migrated out of digstore (which previously shipped a Tauri GUI installer).
 [package]
 name = "dig-installer"
-version = "0.47.1"
+version = "0.47.2"
 description = "Universal DIG installer — installs the digstore CLI, the dig-node service, the dig-dns service, and the DIG auto-update beacon by default (dig-relay + DIG Browser opt-in)"
 authors = ["DIG Network"]
 edition = "2021"
@@ -70,7 +70,7 @@ time = "0.3"
 # drifted two patches behind. Byte-identical to dig-node's own dependency
 # (release-first, §4.1): the installer provisions the exact root (#623/#858)
 # dig-node reads.
-dig-cert = "0.1.2"
+dig-cert = "0.1.3"
 dirs = "5"
 tempfile = "3"
 # Cross-platform service manager (Windows SCM via sc.exe, Linux systemd,
@@ -86,7 +86,7 @@ service-manager = "0.7"
 # `ServiceConfig::default`, the `--dig-node-port` CLI default, and the
 # `--help-json` doc value) can never drift from dig-node's real default. Consumed
 # from crates.io; a single shared version resolves across all consumers.
-dig-constants = "0.12"
+dig-constants = "0.13"
 # The shared release-selection + host-loadability contract (#1774): the
 # `loadability` module answers "will this artifact actually LOAD on this host?"
 # by PARSING the ELF's dynamic-linking requirements — never by executing it. The
